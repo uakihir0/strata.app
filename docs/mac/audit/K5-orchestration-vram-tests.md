@@ -1282,7 +1282,7 @@ logits are compared with llama.cpp.
   - `--dump-layers` (:1052). It is written only by `session_loop`, at :3203-3208, so it is not available on the
     verify path.
   - `--dump-halves` (:1053), `--dump-routing` (:1054) and `--prefill-until` (:1131).
-- **Dump format** (`bench/results/2026-09-27-esp/esp_kl.py:52-54`): int32 `[n_vocab, rows]`, then f32 rows.
+- **Dump format** (`tools/metal/tf_compare.py`): int32 `[n_vocab, rows]`, then f32 rows.
 - **Why it matters:** the regression history shows the gate earning its keep. `include/strata/core/hit_hook.hpp:35` (and `src/core/expert_source.cpp:1494`) records
   KL rising from 9.69e-02 to 1.03.
 - **Metal:** this is the first end-to-end gate. It needs a T=1 path with the dump hooks before anything is
@@ -1386,7 +1386,7 @@ that a new backend introduces. The table maps each one to a Metal equivalent.
      - Record the Apple GPU family and OS version in each test's output.
 3. **T=1 end-to-end verifier with the dump hooks, before any optimisation.**
    - Implement `--dump-logits`, `--dump-layers` and `--dump-routing` on the Metal path, in the format read by
-     `esp_kl.py:52-54`.
+     `tools/metal/tf_compare.py`.
    - Note that `--dump-layers` today exists only in `session_loop` (`generate.cpp:3203-3208`). The Metal path should
      emit it from the verify window too, so per-layer bisection works for T>1.
    - Script gate C1 against llama.cpp (ggml-metal is available on the same machine) and the KL procedure from

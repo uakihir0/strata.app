@@ -46,7 +46,7 @@ measurement or review may overturn.
 | P4 | Kernels against oracles, the model against references | A kernel is tested against its CPU oracle in [04](04-metal-kernels.md), section 10. This document tests the whole model. A model-level failure is bisected down to a kernel with the dumps of section 3.1. |
 | P5 | Frozen inputs | Prompts, golden data and test models are named by SHA-256 in manifests in git. A run whose inputs do not match their manifest fails before it starts. |
 | P6 | A criterion is a command | Every criterion is checked by a script that exits 0 on a pass and non-zero otherwise (section 3.2), and writes its numbers to a result file. Only the reviews named in section 7.6 need a person. |
-| P7 | Upstream's tools run unchanged | `tools/needle_bench.py`, the six `tools/conversation_cache_*.py` gates, `tools/make_profile.py` and `esp_kl.py`'s file format are used as upstream ships them. The Mac wraps them; it does not modify them. |
+| P7 | Keep reference formats stable | The upstream needle and conversation-cache tools remain the numerical reference. `tools/metal/tf_compare.py` reads the retained logits dump format directly and runs on macOS without the old workstation-specific launcher. |
 | P8 | No retries | A test that fails once has failed. A test that passes and fails on the same inputs is a bug in the engine or the test, filed as one (section 10.2). |
 
 ### 1.2 Layers
@@ -262,10 +262,10 @@ The golden data is recorded on a PC with upstream's own build, not on a Mac:
 | `STRATA_PREFILL_MMQ` | `0` | The prompt path's experts on the FP16 arm, the Mac's arithmetic ([04](04-metal-kernels.md), section 6.6) |
 | `STRATA_PLE_BATCH` | unset | Upstream's default PLE block ([06](06-engine-host-port.md), section 5.4) |
 | `STRATA_IQ_MT_MIN` | `1` for IQ formats (Coder, IQ2_XS, IQ3_XXS, IQ3_S) | Upstream issue #152: without it, CUDA's IQ runs are not repeatable (K5 section 6) |
-| `--expert-cache`, `--pcie-frac`, `--adapt-swaps` | `4000`, `0`, `0` | Fixed experts: the same expert is computed the same way at every position (as `esp_kl.py`'s `base_args`) |
+| `--expert-cache`, `--pcie-frac`, `--adapt-swaps` | `4000`, `0`, `0` | Fixed experts: the same expert is computed the same way at every position, matching the retained teacher-forced reference run |
 | `--prompt-cache` | `0` | No reuse between runs |
 | `--spec` | `0` | Plain decode for every golden stream; speculation is checked Mac against Mac (C2) |
-| `--prefill` | removed for the teacher-forced runs (every position through the token path); `auto` for the prompt-path runs (section 2.5) | As upstream's `esp_kl.py` and prefill yardstick |
+| `--prefill` | removed for the teacher-forced runs (every position through the token path); `auto` for the prompt-path runs (section 2.5) | Matches the retained teacher-forced reference run and the separate prefill yardstick |
 
 ### 2.5 The golden set (work item R12 of [03](03-model-reference.md))
 
@@ -507,36 +507,34 @@ and 5 has a test that it passes on equal inputs and fails on its planted differe
 
 ### 3.3 Comparing logits: `tools/metal/tf_compare.py`
 
-```
+```text
 python3 tools/metal/tf_compare.py <reference.logits> <test.logits> --ids <set>.ids
                                   [--rows A:B] [--margins m0,m1] [--json OUT]
 ```
 
-Upstream's `bench/results/2026-09-27-esp/esp_kl.py` computes the same numbers, but it has hard-coded Windows paths
-and file names, so it cannot run as is. `tf_compare.py` uses its arithmetic:
+The old upstream comparison launcher embedded Windows checkout paths and is removed. `tf_compare.py` reads the two
+logits files directly; it does not launch the engine. It keeps the eight-byte little-endian header and the F32 row
+format used by the retained measurements.
 
-- Rows are read as `esp_kl.py`'s `load` reads them, with the short-file rule of section 3.1. The two files must have
-  the same `n_vocab` and cover the same positions; the compared rows are those whose next token is in `ids`
-  (`esp_kl.py` takes `n = min(rows, len(ids) − 1)`), cut further by `--rows`.
-- Each row is turned into log-probabilities in F64 as `esp_kl.py`'s `lsm` does: subtract the maximum, subtract the
-  log of the sum of exponentials.
-- **Same top-1**: the argmax of the two rows is equal. The argmax takes the lowest id among equal maxima, as numpy's
-  does.
-- **KL**: KL(reference ‖ test) = Σ p_ref · (log p_ref − log p_test), per row. Reported as mean, median, p99 and
-  maximum.
-- **Perplexity**: exp of the mean of −log p(next token), for each file.
-- **Paired difference**: Δ = mean over rows of (−log p_test(next) + log p_ref(next)) in nats per token, with its
-  standard error sd/√n. Upstream's cache-parity README reports the same quantity ("On − off (nats per token)").
-- **Margin**: the reference row's top-1 logit minus its top-2 logit. Same top-1 is also reported by margin band:
-  [0, m0), [m0, m1) and [m1, ∞), with m0 = 0.5 and m1 = m₁ (section 4.1).
-- **Disagreements**: every row whose top-1 differs, with its position, the margin, both top-1 ids and both
-  log-probabilities, so that a failure can be read without rerunning.
-- A non-finite value in either file fails the comparison: the engine itself fails on a non-finite logit
-  (`generate.cpp:5881-5887`).
+- The header is `int32 n_vocab, int32 declared_rows`, followed by complete `n_vocab`-wide F32 rows. The file length
+  determines how many rows were written. A short prompt-path dump begins at `declared_rows - rows_present`, as in
+  section 3.1. Both dumps must cover the same positions and vocabulary.
+- A row at position `p` predicts `ids[p + 1]`. Rows without a next-token ID are omitted; selected IDs outside the
+  vocabulary fail with the token position. `--rows A:B` selects zero-based rows of the present dump, with B excluded.
+- Log probabilities use stable row-wise F64 log-softmax. Same top-1 uses the lowest token ID on ties. KL is
+  KL(reference ‖ test), summarized by mean, median, p99 and maximum. The p99 uses NumPy's 99th percentile.
+- Perplexity is `exp(mean(-log p(next token)))` for each dump. The paired test-reference NLL delta is
+  `mean(-log p_test + log p_reference)` in nats per token; its standard error is `sd / sqrt(n)` for at least two
+  rows, and is reported as unavailable for a one-row comparison.
+- Reference margins divide rows into `[0,m0)`, `[m0,m1)` and `[m1,infinity)`; defaults are 0.5 and 1.0. Every
+  top-1 disagreement includes its position, reference margin, both top-1 IDs and both next-token log probabilities.
+- NaN and infinity are rejected. The full-file validation and comparison read bounded row blocks so long-context
+  dumps do not require both full vocabularies in memory at once.
 
-The unit test of `tf_compare.py` imports `load` and `lsm` from upstream's `esp_kl.py` (the module's path constants
-are only strings, so the import works on any OS) and checks that both give the same same-top-1 count and the same
-mean, median and p99 KL, to 1e-9, on synthetic files.
+`tools/metal/test_tf_compare.py` uses synthetic dumps with hand-checked outcomes. It covers the short-file rule,
+equal inputs, paired deltas, top-1 ties and disagreements, row selection, vocabulary errors (including oversized IDs),
+empty comma fields, non-finite values, chunk boundaries, one-row uncertainty reporting, and protection against JSON
+outputs aliasing inputs through either the same path or a hard link.
 
 ---
 
@@ -1265,7 +1263,7 @@ runs the same fixture with concurrent dispatch enabled.
 | `dense_vs_gguf_test` | [03](03-model-reference.md), work item R5 | The full compare of `dense.bin` against the GGUF for every model that has a pack (R-4); setup's 32-tensor sample is the same code |
 | `ple_oracle_model_test` | [03](03-model-reference.md), work item R9 | `ple_parity`'s probe rows against the ISTA shard 2 and the Swift shard 1 |
 | `mtp_reader_test` | [03](03-model-reference.md), work item R10 | The MTP runtime reader on each model's `mtp/` folder, and on truncated copies |
-| `dump_formats_test` | [03](03-model-reference.md), work item R11 | Upstream's `esp_kl.py` `load` reads a Mac `--dump-logits` file, and `tools/make_profile.py` reads a Mac `--dump-routing` trace. The tokens part of R11 is `dump_eq_nodump`. |
+| `dump_formats_test` | [03](03-model-reference.md), work item R11 | `tools/metal/tf_compare.py` reads a Mac `--dump-logits` file, and `tools/make_profile.py` reads a Mac `--dump-routing` trace. The tokens part of R11 is `dump_eq_nodump`. |
 | `metal_embed_model_test`, `metal_ple_model_test`, `metal_gr_model_test`, `metal_gdn_model_test`, `metal_qsa_model_test`, `metal_attn_model_test`, `metal_mv_model_test`, `metal_moe_model_test`, `metal_mtp_model_test`, `metal_prefill_model_test` | [04](04-metal-kernels.md), section 10.1 | The `real` set of each twin whose kernels read tensors. `metal_math_test`, `metal_sampler_parity_test` and `metal_util_test` read no tensors and have no `real` set. |
 | `window_eq_decode`, `state_after_commit_eq_decode`, `write_through_eq_commit`, `cvec_off_eq_stock`, `mtp_kv_t_independent`, `tiered_eq_full`, `dump_eq_nodump`, `metal_dispatch_modes_test`, `prefill_chunk_independent` | [04](04-metal-kernels.md), section 10.4 | The nine `model` properties |
 | `metal_full_vs_tiered` | [05](05-memory-and-residency.md), section 13 | C4's model-level part (section 4.4) |
@@ -1492,7 +1490,7 @@ Each item becomes one task in [10-implementation-plan.md](10-implementation-plan
 | T2 | `record_golden.py`, the golden manifest and the first golden set (section 2.5), with [03](03-model-reference.md) R12, and the IQ formats' `tf-code` files | The set is on the reference Mac, its manifest is in git, and T-7 is in appendix A |
 | T3 | `models.json` with `cc_pressure_mib` and the `mmproj` entries, `test_models.py`, the pack fixtures of section 9.1, the disk of section 2.3 | `fetch` gives every model of section 2.3 on the reference Mac; `check` passes; a changed byte fails `check --quick` when it is in the first or last 64 MiB, and the full check otherwise |
 | T4 | The planned `accept.py` framework (section 3.2): runs, options, exit codes, `result.json`, step limits, crash-report copies; `engine.py`, `criteria.py`, `fake_engine.py`, `test_accept.py` | Planned: the macOS Python suite covers planted differences; the runner dry-run lists each acceptance command |
-| T5 | `tf_compare.py` and its test against `esp_kl.py` (section 3.3); `lc_dump` (section 2.5) | The test passes; `lc_dump` writes files that `tf_compare.py` and `ladder_compare.py` read, and fails on a renamed graph node |
+| T5 | `tf_compare.py` and its synthetic comparison tests (section 3.3); `lc_dump` (section 2.5) | The tests pass; `lc_dump` writes files that `tf_compare.py` and `ladder_compare.py` read, and fails on a renamed graph node |
 | T6 | C1 (section 4.1): `ladder_compare.py` and its test, `metal_router_replay`, `metal_layer_replay`, the twins' `--layer` option | `accept.py c1` passes on Q2_0 and Coder; a planted ulp error in one layer's `strata_gr_down` is found at that layer by the steps of section 10.1 |
 | T7 | The gates (section 6): `accept.py g1`, `g2`, `g3`; `balloon.py`; `docs/mac/gates/` | Each gate's run gives its result folder; `balloon.py --gib 16` holds 16 GiB without swap-outs growing by more than 1 GiB |
 | T8 | C2 (section 4.2), every arm | `accept.py c2` passes on Q2_0; arm (d) shows at least 95% accepted drafts |

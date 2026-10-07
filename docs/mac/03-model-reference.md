@@ -74,7 +74,7 @@ engine does not support ([06](06-engine-host-port.md), section 6.1).
 | A.1 and B.3: routers `ffn_gate_inp` are BF16 | Swift stores its 96 router tensors as F32 that hold exact BF16 values. The pack narrows them to BF16 without loss (section 3.7). |
 | D.5.2: "native IQ3: about 0.9 GB per layer" | 512 experts of a layer are 0.89 GB on average for IQ3_XXS (0.67-1.19 GB) and 1.05 GB for IQ3_S (0.77-1.36 GB). |
 | B 2.3: "MTP rt … dense ~0.2 GB" | `mtp/rt/dense.bin` is 116,099,072 B (0.108 GiB); the whole `rt/` folder is 823,887,872 B (section 4.4). |
-| A.2 rule 6: "`--dump-layers` writes per layer `2N + 2hc + NH·HD + 5·NKV·HD + 8` floats"; E.3: `esp_kl.py` L52-54 | `--dump-layers` writes the residual ladder, `(48 + 1) × 4 × 2560` floats per position. The 13,840-float layout is `--dump-halves`, and the code writes more slots than A.2 lists. The reader is `esp_kl.py:50-52` (section 9). |
+| A.2 rule 6: "`--dump-layers` writes per layer `2N + 2hc + NH·HD + 5·NKV·HD + 8` floats"; E.3: retained teacher-forced dump format | `--dump-layers` writes the residual ladder, `(48 + 1) × 4 × 2560` floats per position. The 13,840-float layout is `--dump-halves`, and the code writes more slots than A.2 lists. The reader is `tools/metal/tf_compare.py` ([09](09-testing-and-validation.md), section 3.3). |
 | A.10, B.1 table (Q5_K row) and K4 section 2.3: the Q5_K head uses `native_q5_k_f32` "with f32 activations" | That function quantises its F32 input to Q8_1 before the Q5_K mat-vec (`native_mmvq.cu:1192-1203`). Every head format meets a Q8_1 activation (sections 3.3 and 5). |
 | A.1: norms "stored as 1 + w" | The GGUF stores the final multiplier (the converter has already added 1; `output_hc_norm` ranges 0.63-13.4). The engine multiplies by the stored value and never adds 1 (section 3.7). This restates the audit; it does not change it. |
 
@@ -1065,7 +1065,7 @@ The Mac keeps the fused read and completes the pending FFN write on the dump slo
 
 | Flag | Content | Format (all little-endian) |
 | --- | --- | --- |
-| `--dump-logits PATH` | logits of every position | `int32 n_vocab, int32 rows`, then `rows × n_vocab` F32. `rows = n_prompt - 1 + max_new` (`generate.cpp:3284-3305`). `--logits-stride N` keeps every Nth row plus the final input and needs `--max-new 1`. Read by `bench/results/2026-09-27-esp/esp_kl.py:50-52`. |
+| `--dump-logits PATH` | logits of every position | `int32 n_vocab, int32 rows`, then `rows × n_vocab` F32. `rows = n_prompt - 1 + max_new` (`generate.cpp:3284-3305`). `--logits-stride N` keeps every Nth row plus the final input and needs `--max-new 1`. Read by `tools/metal/tf_compare.py`. |
 | `STRATA_DUMP_FIRST_LOGITS=PATH` | the first verify window's first row, after the batched prompt path | `n_vocab` F32, no header (`generate.cpp:6183-6189`). This is the only logits dump that sees the prompt path of a native pack. |
 | `--dump-layers PATH` | the residual ladder (gate C1) | per position `(48 + 1) × 4 × 2560` F32: slot 0 is the embedding broadcast to the 4 streams (llama.cpp's node `hc_init`), slot l + 1 is R after layer l (`l_last-<l>`) (`include/strata/core/session.hpp:344-352`) |
 | `--dump-halves PATH` | both halves of every layer | per position `48 × 13,840` F32, layout in section 9.2 |
@@ -1146,7 +1146,7 @@ kernels are tested against.
 | R8 | `expert_address_test` (section 3.4) | For every (layer, role, expert) of every fixture, the computed address equals `data_start + tensor offset + e × slab`; Swift's straddling layer resolves each role to its shard |
 | R9 | PLE oracle on every file (section 9.3) | `ple_oracle_model_test`: `ple_parity`'s probe rows pass against the ISTA shard 2 and against the Swift shard 1, with the table located through the tensor table |
 | R10 | MTP runtime reader checks (section 4.4) | `mtp_reader_test`: sizes and names of `dense.txt`, `dense.bin`, `experts.bin` and `draft_vocab.bin` are checked; the required tensor list of `mtp.cpp:196-206` is enforced; a truncated `experts.bin` is refused |
-| R11 | Dump flags and formats (section 9.1) | `dump_formats_test`: `esp_kl.py` reads a Mac `--dump-logits` file and `tools/make_profile.py` reads a Mac `--dump-routing` trace; `dump_eq_nodump`: a run with each dump flag gives the same tokens as a run without |
+| R11 | Dump flags and formats (section 9.1) | `dump_formats_test`: `tf_compare.py` reads a Mac `--dump-logits` file and `tools/make_profile.py` reads a Mac `--dump-routing` trace; `dump_eq_nodump`: a run with each dump flag gives the same tokens as a run without |
 | R12 | CUDA golden set: `--dump-logits`, `--dump-layers`, `--dump-halves` and `--dump-routing` of the benchmark prompts on upstream's CUDA build with `STRATA_ROPE_TABLE=1`, for the Q2_0 and Coder packs, plus `STRATA_DUMP_FIRST_LOGITS` | Stored with the upstream commit, the GPU and the command lines; gate C1 and R-1, R-5 read them |
 
 ---

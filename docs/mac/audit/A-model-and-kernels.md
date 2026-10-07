@@ -1640,7 +1640,7 @@ Appendix 5 §6 and Appendix 4 §8 have every test with its CMake line.
 | `tools/iq_fixture.py` + gguf-py | IQ dequant/gemv fixtures for `iq_parity` | restore gguf-py, then run unchanged |
 | `tests/data/native_experts` | native expert layout | `expert_layout_test` |
 | Host references inside each `*_parity.cpp` | scalar / FP64 implementations of every canonical and native kernel | the main asset: split into a backend-neutral reference and a backend launch half |
-| `bench/results/*/esp_kl.py` (L52-54) | logits dump reader: int32 `[n_vocab, rows]`, then f32 rows | the KL gate |
+| `tools/metal/tf_compare.py` (retained dump format from the upstream baseline) | logits dump reader: int32 `[n_vocab, rows]`, then f32 rows | the KL gate |
 | `serve/chat_golden.json` | chat-template golden outputs, no runner | write a runner |
 | Dump hooks | `--dump-logits`, `--dump-layers` (session loop only), `--dump-halves`, `--dump-routing`, `STRATA_DUMP_FIRST_LOGITS`, `STRATA_STATE_HASH`, `STRATA_CKPT_REREAD`, `STRATA_LOGPOS(_TOPK)` | golden comparisons Metal vs CUDA vs llama.cpp |
 | **Missing** | `ple_in.bin`/`ple_out.bin` (ggml capture), `gen_ple_oracle.py`, the bench/micro ggml-oracle suite | regenerate from llama.cpp 3cf03257. On macOS, build it with ggml-metal and use it as a second reference |

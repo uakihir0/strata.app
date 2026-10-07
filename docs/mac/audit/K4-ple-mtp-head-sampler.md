@@ -651,7 +651,7 @@ the row that verifies it. Two inverse-CDF picks from one u agree far more often 
 4. `coupled_merge_kernel`: reads the counter from `step_rec[0]`, runs `sampled_tail_warp<true>`, and writes the
    token id, its probability and `ring[cap + j]`.
 
-**Test:** `coupled_draft_test` (`src/core/coupled_draft_test.cpp`, CMake L769-771).
+**Test:** `coupled_draft_test` (`tests/core/coupled_draft_test.cpp`, CMake L769-771).
 
 ### 4.7 Verify-window kernels
 
@@ -881,7 +881,7 @@ Host wrappers (L175-220) validate non-null, 4-byte aligned, non-overlapping span
 | `native_dense_ple_key_test` | `tests/core/native_dense_ple_key_test.cpp` (CMake L361-364, skip code 77) | native key loading | model | loader check |
 | `hip_ple_iq4` | `tests/hip/ple_iq4.cpp` (CMake L946) | IQ3_XXS/IQ4_XS key 2560→10240 vs reference, rel_l1_q8 ≤ 5e-5, worst ≤ 1e-4 (L178) | synthetic | template for a Metal key-GEMV parity test |
 | `sampler_parity` | `src/kernels/sampler_parity.cpp` (1284 lines; CTest variants split / one_block / old at CMake L573-582) | 18 fixtures with **exact** expected tokens: 1 greedy (L457), 2 order (L468), 3 greedy uses no RNG (L506), 4 penalties (L539), 5 temp 0 (L615), 6 sampled penalties (L646), 7 min_p (L681), 8 window tail (L721), 9 distribution share within 0.014 (L755, L775), 10 top_p before min_p (L782), 11 stale history (L806), 12 one history per row (L832), 13 out-of-vocab ids (L896), 14 top_k contract (L940), 15 `penalty_rows` (L962), 16 list under ties (L1028), 17 sampled ties (L1122), 18 fallbacks (L1200); `host_philox_uniform` L134-159 | nothing (synthetic) | **port first**: it pins the Philox variant, the tie rules, the chain order and the FP64 tail. Run it against both the Metal GPU path and the CPU tail |
-| `coupled_draft_test` | `src/core/coupled_draft_test.cpp` (CMake L769-771) | counter and penalty-window arithmetic | nothing | pure host |
+| `coupled_draft_test` | `tests/core/coupled_draft_test.cpp` (CMake L769-771) | counter and penalty-window arithmetic | nothing | pure host |
 | `suffix_drafter_test` | `src/spec/suffix_drafter_test.cpp` (CMake L753) | suffix drafter | nothing | pure host, unchanged |
 | ggml-oracle parity suite (includes `native_ple_postops_parity`) | `bench/micro` (CMake L311-334) — **absent**; `tests/CMakeLists.txt` absent (CMake L52-54) | native kernels vs a pinned llama.cpp build (`STRATA_ORACLE_SOURCE_DIR` / `BUILD_DIR`) | llama.cpp 3cf03257 build | on macOS, build the same llama.cpp with its Metal backend and compare Strata-Metal against ggml-Metal kernels |
 | verify kernels | - | **no tests** | - | write new CPU-reference tests: `gdn_step_norm_multi` (verify vs replay with `n_keep`), `copy_indexed` rollback, `window_ids`, `mtp_select` |

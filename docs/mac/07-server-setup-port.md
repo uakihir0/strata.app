@@ -889,7 +889,7 @@ user guide (work item S20) say so.
 | `--kv` | `int8`, `q4_0`, `k8v4`, planned |
 | `--vision` | `yes`/`gpu`, `cpu`, `no`/`none` (section 4.5.3) |
 | `--experimental-speed-projection` | As upstream |
-| `--port`, `--host`, `--api-key` | As upstream |
+| `--port`, `--host`, `--api-key` | The default host is `127.0.0.1`. Any non-loopback listener requires a non-empty API key from `--api-key`, `STRATA_API_KEY` or config; the server refuses to bind without one. |
 | `--gpu` | `0` only (section 4.3) |
 | `--gpus`, `--layer-split` | Fail |
 | `--data-dir`, `--models-dir`, `--gguf-dir` | As upstream, plus section 4.12 |
@@ -1094,15 +1094,14 @@ The threshold stays 6 GB. The doc-05 plan already keeps the RAM warning for plan
 ### 6.5 Why the engine died
 
 `StrataEngine.death_note()` reads at most 4 KiB of log output written since that engine process started. It reports a
-watchdog message, a useful final `strata` or `ERR` line after a normal exit, or the process signal. A `SIGKILL` without
-new log output may point to a macOS quarantine or code-signing block; with new output, memory pressure is one possible
-cause. `SIGKILL` alone does not identify why the process ended. The server asks the user to check Console and include
-the server log when reporting a failure. It does not identify an upstream issue tracker as the project tracker.
+watchdog message, a useful final `strata` or `ERR` line after a normal exit, or the process signal. `SIGKILL` alone
+does not identify why the process ended, whether or not the log grew. The server asks the user to check Console and
+system memory pressure, then include the server log when reporting a failure. It does not identify an upstream issue
+tracker as the project tracker.
 
 | Condition | Diagnostic |
 | --- | --- |
-| `rc == -9` and no new log output | Startup may have been blocked by quarantine or code-signing policy; check Privacy & Security and Console. |
-| `rc == -9` with new log output | SIGKILL; memory pressure is possible, but the signal does not prove it. Check Console and memory pressure. |
+| `rc == -9` | Report SIGKILL without guessing the cause; check Console and system memory pressure. |
 | another negative return code | Show the signal name and number. |
 | watchdog line in new output | Report that the engine stopped making progress and include that line. |
 | normal exit with a final `strata` or `ERR` line | Show the last line. |
@@ -1241,8 +1240,9 @@ class _Apple:
   unchanged, so `serve/test_monitor.py` keeps passing.
 - `static` gains, on darwin only:
   `"unified": True`, `"gpu_cores": dev["cores"]`, `"perflevels": macos.perf_levels()`, `"computer": "Mac"`.
-- `GET /health` (`server.py:1883-1886`) returns `"computer": "Mac"`, so the chat page can say "this Mac" before the
-  Monitor has loaded.
+- `GET /health` (`server.py`) returns `"computer": "Mac"`, so the chat page can say "this Mac" before the Monitor
+  has loaded. It uses the same API-key check as the other API routes. The browser sends its saved bearer key, leaves
+  the current health state alone on an unauthorized response, and retries health and MCP after the key changes.
 - `/v1/status`'s `machine.gpu` (`server.py:1111-1117`) works unchanged: name, used and total memory, load. `temp_c`
   and `power_w` are null.
 
@@ -1495,7 +1495,8 @@ New. Each test is skipped off macOS unless its name says it runs everywhere.
 | PC calibration tests | Removed with the PC-only calibration utility (D-IMPL-236) |
 | `test_run_script_quoting` | `write_run_script` into a temporary ROOT named `Strata $x "q" ` + "`b`": `sh -n` accepts both scripts, and running the `.sh` with a stub Python prints the exact arguments |
 | `test_data_folder` (everywhere) | `setup.MAC` patched True and `HOME` set to a temporary folder: a ROOT under `~/Documents`, `~/Desktop`, `~/Downloads`, `~/Library/Mobile Documents` or `~/Library/CloudStorage` gives `~/Strata-data` and the ok line; a ROOT of `~/src/x` gives `~/src/Strata-data`; a folder from the settings file is kept; creating the folder writes an empty `.metadata_never_index` and calls `macos.tm_exclude` (patched) once (section 4.12) |
-| `test_death_note` (everywhere) | With `macos.MAC` patched True and a temporary log: `rc` −9 and an unchanged log size give the signature text of section 6.5; `rc` −9 and a grown log give the jetsam text; `rc` −11 gives `The engine ended on signal SIGSEGV (11).` and the jetsam text's last sentence; a last line `ERR gpu error: x` gives the GPU text. With `MAC` False, each case gives upstream's text. |
+| `test_death_note` (everywhere) | With `macos.MAC` patched True and a temporary log, `rc` −9 gives the same cause-neutral SIGKILL text with either an unchanged or grown log; `rc` −11 gives `The engine ended on signal SIGSEGV (11).`; a watchdog line is reported with the line. The server log offset excludes earlier runs. |
+| `WebHealthAuthContract` | The page sends its saved key to `/health`, keeps the previous state after a non-OK response, avoids retrying a 401 until the key changes, and reloads health and MCP after the key is saved. |
 | `test_keep_awake` | A `Service` with `keep_awake` true and a stub engine that has `alive()` and `unload()` (upstream's `MockEngine` has no `unload`): after `ensure_loaded()`, `pgrep -P <test pid> caffeinate` finds one `caffeinate -i -w <test pid>`; after `unload()` it is gone; a second `ensure_loaded()` starts a new one. With `keep_awake` false, none runs (section 6.9). |
 | `test_geometry_plans` | Skipped without `engine/strata`: every `data/geometry/<tag>.txt`, planned at the points of its `.check` file, gives the recorded PLAN lines key for key (section 4.4.3) |
 | `test_geometry_equals_files` | Skipped unless `STRATA_TEST_MODELS` points at downloaded models: for each, the geometry plan equals the live real-files plan at three W values. Part of the parity run (section 4.4.3). |
@@ -1543,8 +1544,8 @@ engineering detail in this directory; do not preserve duplicate PC-specific user
 
 ## 13. Docker
 
-Docker support has been removed. The Metal engine needs a native macOS process and Apple GPU; there is no Dockerfile,
-container entrypoint or Linux container setup path in this repository.
+Docker support has been removed. The Metal engine needs a native macOS process and Apple GPU; the product has no
+Dockerfile, container entrypoint or supported Linux container setup path.
 
 ---
 
@@ -1599,7 +1600,7 @@ Each item becomes one task in [10-implementation-plan.md](10-implementation-plan
 | S9 | Step 6 and 7 on a Mac: pack, MTP, disk, args, final plan, config (sections 4.8-4.9) | The Mac golden set's config and args assertions pass; a real install of Q2_0 writes a config that the server starts |
 | S10 | Run scripts, `.command` files, quarantine (section 4.10) | `test_run_script_quoting` and `test_command_launchers` pass; a ZIP download of the checkout starts after one "Open Anyway" |
 | S11 | `start()` on a Mac, data folder, sleep, flags and texts (sections 4.11-4.16) | Every flag row of section 4.14 behaves as written (a table-driven test in the golden set); `test_data_folder` passes |
-| S12 | `serve/server.py` changes (section 6) | `test_port_probe`, `test_sighup_shutdown`, `test_death_note` and `test_keep_awake` pass; `kill -9` of the engine after READY gives the section 6.5 jetsam text, and before its first log line the signature text |
+| S12 | `serve/server.py` changes (section 6) | `test_port_probe`, `test_sighup_shutdown`, `test_death_note` and `test_keep_awake` pass; `kill -9` of the engine after READY gives the cause-neutral SIGKILL diagnostic in section 6.5 |
 | S13 | `serve/telemetry.py` `_Apple` reader and sampler (sections 7.1-7.2) | `/metrics` and `/v1/status` on the reference Mac show the readings of section 7.1; off darwin their keys are identical to upstream |
 | S14 | Monitor and About texts (section 7.3) | Screenshot review of the Monitor and About tabs on the reference Mac against the section 7.3 table |
 | S15 | `tools/strata_mcp.py` (section 8) | `tools.test_strata_mcp` passes on the reference Mac with no test change; `strata_models` returns engine plans (the MCP case of the golden set, section 10.2); Claude Desktop with the section 8.4 config installs and starts a model |

@@ -1,6 +1,6 @@
 # Strata for macOS: the documentation set
 
-Status: implementation in progress, 2026-10-07. The active CMake graph builds only the macOS arm64 Metal product. On Mac17,9 (64 GB, macOS 27.0.1), `mac-host` ran 36 tests with no failures and one expected skip; `mac-metal` passed 41/41 tests. `.venv/bin/python tools/metal/run_python_tests.py` passed 33/33 modules. Model-backed CTests are not registered; the `mac-model` preset intentionally fails closed until they are added. The native installer and production inference path are not ready: `setup.sh` validates the supported Mac, then exits before creating an environment or changing files. Phase 0 remains incomplete pending its reference-machine and CI exit criteria.
+Status: implementation in progress, 2026-10-07. The active CMake graph builds only the macOS arm64 Metal product. On Mac17,9 (64 GB, macOS 27.0.1), `mac-host` ran 36 tests with no failures and one expected skip; `mac-metal` passed 41/41 tests. `.venv/bin/python tools/metal/run_python_tests.py` passed 34/34 modules. Model-backed CTests are not registered; the `mac-model` preset intentionally fails closed until they are added. The native installer and production inference path are not ready: `setup.sh` validates the supported Mac, then exits before creating an environment or changing files. Phase 0 remains incomplete pending its reference-machine and CI exit criteria.
 Upstream baseline: [Niko1221/Strata](https://github.com/Niko1221/Strata) v0.1.34, commit `1678de33`.
 
 Implementation choices, constraints, and required reviews are tracked in

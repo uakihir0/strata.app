@@ -7510,7 +7510,12 @@ measuring L-15 remain open.
 | REV-035 | Review removal of non-Mac inference source trees and PLE mapping changes | The inactive CPU, HIP, prefill and discrete-GPU trees are absent from the active CMake graph; CUDA sources retained for parity are reference-only. Darwin `MADV_RANDOM` advice and page-size-based optional locking need confirmation on the reference Mac | Before claiming the macOS-only source cleanup is complete |
 | REV-036 | Confirm CUDA parity code stays outside the Mac product | CUDA kernels and standalone parity harnesses are reference inputs only; the CMake source graph and Mac CI do not compile them. The external reference workflow still needs the pinned source and a separate CUDA machine for numerical captures | Before claiming Metal numerical acceptance or shipping a release |
 | REV-037 | Verify the clean independent Git history | The `codex` branch has a parentless root and English commit messages; license, source notices and provenance remain; retired PC product files, removed fixtures and local build output are absent from every reachable commit | Before publication |
-| REV-038 | Confirm removal of unreferenced inherited assets | No retained source or documentation points to `.github/FUNDING.yml`, `docs/paper/`, `docs/media/` or `tests/data/native_experts/`; cited benchmark records and the reference loader remain available | Before publication |
+| REV-038 | Confirm removal of unreferenced inherited assets | No retained source or documentation points to `.github/FUNDING.yml`, `docs/paper/`, `docs/media/`, `tests/data/native_experts/` or `bench/results/2026-09-30-community-rtx-5090/`; benchmark records cited by Mac documents and the reference loader remain available | Before publication |
+| REV-039 | Verify non-loopback server authentication | CLI rejects a missing or empty API key before engine startup; the server factory rejects unsafe binds before opening a socket; authenticated endpoints retain constant-time key comparison | Before enabling a non-loopback listener |
+| REV-040 | Keep host-test registrations intact after relocating test sources | `conversation_cache_test` and `coupled_draft_test` remain registered in CTest and the Metal test map after moving under `tests/core/` | Before accepting the test-tree cleanup |
+| REV-041 | Replace platform-bound logits comparison launchers | The new comparer reads captured dump files directly, validates positions and token IDs, keeps memory bounded in chunks, and has synthetic coverage for the documented metrics | Before accepting the comparison-tool replacement |
+| REV-042 | Keep engine exit diagnostics evidence-based | Runtime messages, tests, and docs do not infer quarantine, code-signing, or memory-pressure causes from SIGKILL or log growth | Before accepting the diagnostic wording |
+| REV-043 | Preserve logits-comparison input integrity and metric meaning | Empty ID fields and out-of-range IDs fail cleanly, JSON output cannot alias an input, and one-row standard error is unavailable | Before accepting the comparer hardening |
 
 
 ### D-IMPL-230: Keep the unified-memory threshold advisory until measured
@@ -7525,8 +7530,9 @@ measuring L-15 remain open.
 - **Reason:** The remaining installer orchestration still contains PC GPU discovery and memory-fit assumptions. Allowing explicit model arguments to enter that code would give users an unsupported, misleading install path.
 - **Review required:** Replace the refusal only after Mac planning, model selection, download validation, Metal engine installation, and an end-to-end install/start test pass on the reference Mac.
 
-### D-IMPL-232: Do not attribute every SIGKILL to memory pressure
+### D-IMPL-232: Do not attribute every SIGKILL to memory pressure (superseded by D-IMPL-246)
 
+- **Status:** Superseded; retained to record the earlier diagnostic policy.
 - **Decision:** Engine exit diagnostics inspect only log bytes written by the current process. A SIGKILL with no new output is a startup-policy clue; with output it names memory pressure as one possibility. Other signals include their symbolic name.
 - **Reason:** Exit status -9 identifies SIGKILL, not its sender or cause. Old log lines also cannot establish what happened in a later engine process.
 - **Review required:** Compare the messages against macOS Console logs for code-signing blocks, jetsam events, user termination, and ordinary engine crashes.
@@ -7592,6 +7598,38 @@ measuring L-15 remain open.
 
 ### D-IMPL-242: Remove unreferenced inherited assets
 
-- **Decision:** Remove the upstream funding profile, unused paper and media files, and the six static native-expert fixtures whose test consumer was deleted. Keep benchmark records cited by the Mac port documentation and `ref/load.py` for offline artifact reference.
-- **Reason:** These assets are not used by the maintained product or current tests; retaining them would carry unused Strata identity and data into the smaller repository. The benchmark records and reference loader still support documented analysis.
+- **Decision:** Remove the upstream funding profile, unused paper and media files, the six static native-expert fixtures whose test consumer was deleted, and the uncited Linux/CUDA RTX 5090 benchmark package. Keep benchmark records cited by the Mac port documentation and `ref/load.py` for offline artifact reference.
+- **Reason:** These assets are not used by the maintained product or current tests; retaining them would carry unused Strata identity, non-Mac runtime instructions and data into the smaller repository. The cited benchmark records and reference loader still support documented analysis.
 - **Review required:** See REV-038. Search retained sources and docs for links to the removed assets and confirm the Mac test suite passes.
+
+### D-IMPL-243: Require authentication for non-loopback listeners
+
+- **Decision:** Permit unauthenticated requests only when the server binds to a literal loopback address or `localhost`. Require a non-empty API key before any other bind; enforce this at CLI startup and in the server factory, and keep authentication required if the key is later cleared.
+- **Reason:** AGENTS.md requires the API to stay on loopback unless the operator supplies `--api-key`. A warning after binding does not satisfy that boundary.
+- **Review required:** See REV-039. Confirm missing or empty keys fail before engine startup and before socket bind; confirm loopback startup remains unchanged and all API endpoints reject missing keys when authentication is enabled.
+
+### D-IMPL-244: Keep shared host tests under the test tree
+
+- **Decision:** Store the platform-neutral conversation-cache and coupled-draft tests in `tests/core/`; keep their CTest target names and Mac preset coverage unchanged.
+- **Reason:** They are test programs for headers used by the Metal engine, not production code or remnants of a Windows/Linux runtime. The `tests/` path makes that boundary clear.
+- **Review required:** See REV-040. Confirm test-map coverage and both `mac-host` and full Metal CTest runs after the move.
+
+### D-IMPL-245: Remove Windows-bound benchmark launchers
+
+- **Decision:** Remove the historical `esp_kl.py` and `esp_serve.py` launchers because they embed Windows checkout paths. Keep their measured outputs as historical reference data and use `tools/metal/tf_compare.py` for direct logits-dump comparisons on macOS.
+- **Reason:** The launchers cannot run in the macOS-only repository and imply support for a separate Windows benchmark workflow. Keeping the measurement tables preserves the reported evidence without retaining an unusable runner.
+- **Review required:** See REV-041. Confirm current docs point to the Mac comparer, the historical results are labeled accurately, the runner files are absent, and the comparer tests cover dump validation and reported metrics.
+
+
+### D-IMPL-246: Keep SIGKILL diagnostics cause-neutral
+
+- **Decision:** Report SIGKILL and direct the operator to Console and system memory pressure checks, but do not infer a cause from whether the engine log grew.
+- **Reason:** SIGKILL does not identify its sender. A post-start SIGKILL can come from system pressure, an operator, or another process policy; an unchanged log is not evidence of quarantine or signing failure.
+- **Review required:** See REV-042. Confirm the runtime, test contract, and setup-port documentation all match.
+
+
+### D-IMPL-247: Preserve logits alignment and comparison evidence
+
+- **Decision:** Reject empty comma-separated token fields and out-of-vocabulary IDs, prevent a JSON report path from aliasing an input file, and report standard error as unavailable for one-row comparisons.
+- **Reason:** A dropped token shifts every later target position; an output alias can destroy the measurement being checked; and a one-sample standard error is undefined rather than zero.
+- **Review required:** See REV-043. Check malformed inputs, hard-link aliases, large integer IDs, and one-row text/JSON output.
