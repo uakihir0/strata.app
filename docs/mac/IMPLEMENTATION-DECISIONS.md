@@ -7516,6 +7516,7 @@ measuring L-15 remain open.
 | REV-041 | Replace platform-bound logits comparison launchers | The new comparer reads captured dump files directly, validates positions and token IDs, keeps memory bounded in chunks, and has synthetic coverage for the documented metrics | Before accepting the comparison-tool replacement |
 | REV-042 | Keep engine exit diagnostics evidence-based | Runtime messages, tests, and docs do not infer quarantine, code-signing, or memory-pressure causes from SIGKILL or log growth | Before accepting the diagnostic wording |
 | REV-043 | Preserve logits-comparison input integrity and metric meaning | Empty ID fields and out-of-range IDs fail cleanly, JSON output cannot alias an input, and one-row standard error is unavailable | Before accepting the comparer hardening |
+| REV-044 | Remove benchmark archives unrelated to the Mac port | No retained source or Mac documentation references the nine retired PC benchmark folders; six referenced result folders remain | Before accepting the benchmark cleanup |
 
 
 ### D-IMPL-230: Keep the unified-memory threshold advisory until measured
@@ -7633,3 +7634,10 @@ measuring L-15 remain open.
 - **Decision:** Reject empty comma-separated token fields and out-of-vocabulary IDs, prevent a JSON report path from aliasing an input file, and report standard error as unavailable for one-row comparisons.
 - **Reason:** A dropped token shifts every later target position; an output alias can destroy the measurement being checked; and a one-sample standard error is undefined rather than zero.
 - **Review required:** See REV-043. Check malformed inputs, hard-link aliases, large integer IDs, and one-row text/JSON output.
+
+
+### D-IMPL-248: Remove uncited PC benchmark archives
+
+- **Decision:** Delete `bench/results/2026-09-24-final/`, `2026-09-24-vision/`, `2026-09-28-coder/`, `2026-09-28-rope-scaling/`, `2026-09-28-speed-0114/`, `2026-09-29-layer-split/`, `2026-09-29-layer-split-limits/`, `2026-09-29-rtx3090-epyc-milan/` and `2026-09-30-tc-gemv-sm75/`. Keep only benchmark archives linked by the Mac port documentation or a retained source tool.
+- **Reason:** The removed results and runners document Windows, Linux, NVIDIA and CUDA workloads that are not part of the maintained Mac product; no retained Mac document or source tool uses these archives.
+- **Review required:** See REV-044. Confirm retained references resolve, the nine folders are absent from every commit in the rewritten history, and the Mac test suite still passes.
