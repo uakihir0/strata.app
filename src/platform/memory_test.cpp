@@ -13,11 +13,8 @@ int main() {
     const std::uint64_t total = strata::platform::total_memory();
     const auto available = strata::platform::available_memory();
     const auto process = strata::platform::process_memory();
-    bool invalid_process_sample = process &&
-        (process->phys_footprint == 0 || process->resident == 0);
-#if defined(__APPLE__)
-    invalid_process_sample = invalid_process_sample || !process;
-#endif
+    const bool invalid_process_sample = !process ||
+        process->phys_footprint == 0 || process->resident == 0;
     if (total == 0 || !available || *available > total || invalid_process_sample) {
         std::fprintf(stderr, "memory probe returned an invalid or incomplete sample\n");
         return 2;

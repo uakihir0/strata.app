@@ -7653,6 +7653,7 @@ measuring L-15 remain open.
 
 
 | REV-047 | Keep PLE metadata, kernel constants and table bounds consistent | All seven model headers match the emitted n-gram constants; C++ and compiled Metal parameter blocks match the artifact values; head offsets are exact prefix sums; each PLE table appears once with shape `[160, 320001536]`; value and type mutations report their keys; the final hostile re-review has no findings | Before accepting R4 |
+| REV-048 | Keep the product macOS-only | Root CMake rejects non-Darwin targets; setup, server and MCP host gates reject unsupported machines; CI schedules only Mac runners; project-owned runtime and test sources expose no Windows/Linux backend; hostile review found no remaining product paths or harmful deletions | Before accepting platform cleanup |
 
 ### D-IMPL-251: Preserve the artifact's 90 trailing PLE rows
 
@@ -7660,6 +7661,13 @@ measuring L-15 remain open.
 - **Reason:** The values in all seven checked-in headers and `ple_artifact_consts()` agree. The existing parity harness treats the table as a bound and reports the 90-row remainder. The earlier K4 audit line incorrectly described the final offset plus vocabulary size as equal to the table length; the test exposed that documentation error.
 - **Adversarial review and resolution:** The first review found that only the C++ branch of `params.h` was exercised and Python could treat JSON booleans or floats as integers. Added Metal-branch compile-time assertions, made `metal_weight_store_test` depend on the metallib, and added strict type checks with boolean-layer and floating-point-tokenizer-EOS negatives. The final hostile re-review found no remaining issues.
 - **Review required:** See REV-047. Confirm every model fixture matches the n-gram and C++ parameter sources, Metal-side static assertions compile against the same expected values, each table is located in either shard, prefixes are exact, the 90-row remainder remains within the table, PLE EOS remains distinct from tokenizer EOS, and PLE/tokenizer EOS value/type mutations name their metadata key. Keep `ple_reader_selftest` mapped as implemented; register the model-backed `ple_oracle_model_test` when work item R9 is implemented.
+
+### D-IMPL-252: Keep the maintained product macOS-only
+
+- **Decision:** Support only Apple Silicon Macs running macOS 27 or newer. Keep the root CMake, setup, server and MCP gates that reject other hosts; require the Mac memory sample unconditionally in the project-owned memory test. Do not advertise or maintain Windows/Linux product paths. Keep vendored llama.cpp portability conditionals intact because they belong to the pinned third-party dependency and do not create supported product targets.
+- **Reason:** The user selected a simple macOS-only repository. The active build, CI and release design already targets the native Metal product; stripping platform branches from an upstream dependency would create a divergent vendored copy without changing the supported target. Negative tests that simulate Linux remain because they verify that unsupported hosts fail closed.
+- **Adversarial review and resolution:** The hostile review confirmed that CMake, setup, server and MCP still reject unsupported hosts, CI uses Mac runners, and project-owned sources do not expose Windows/Linux runtime paths. It found no harmful deletions or remaining product paths.
+- **Review required:** See REV-048. Verify that CMake and host gates still reject unsupported targets, project CI runs only on Mac runners, no project-owned Windows/Linux runtime is built, and third-party source remains outside any non-Mac product promise.
 
 ### D-IMPL-250: Map only executable coverage while the setup golden suite is pending
 

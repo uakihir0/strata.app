@@ -1,7 +1,8 @@
 # Strata
 
-Strata is a source-derived project for a native Metal engine on Apple Silicon. Its target is macOS 27
-or later, and Metal is its only graphics backend.
+Strata is a source-derived project for a native Metal engine on Apple Silicon. Its only supported product
+and build target is macOS 27 or later. Windows and Linux builds and runtime paths are not supported; Metal is the
+only graphics backend.
 
 ## Status
 
