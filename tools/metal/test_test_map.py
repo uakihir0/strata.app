@@ -31,7 +31,11 @@ class TestMapTests(unittest.TestCase):
                 target = self.root / source.relative_to(test_map.ROOT)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, target)
-        for relative in ("tools/metal/test_check_drift.py", ".github/workflows/ci.yml"):
+        for relative in (
+            "tools/metal/test_check_drift.py",
+            "tools/metal/test_dense_vs_gguf.py",
+            ".github/workflows/ci.yml",
+        ):
             source = test_map.ROOT / relative
             target = self.root / relative
             target.parent.mkdir(parents=True, exist_ok=True)

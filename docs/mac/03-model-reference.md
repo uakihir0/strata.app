@@ -766,9 +766,10 @@ size as ISTA's because its routers are narrowed to BF16.
 
 **Serving rule.** The Mac engine serves a float tensor from the GGUF when `conversions.json` does not list it, because
 the GGUF bytes are then identical to the `dense.bin` bytes (a raw copy, section 3.7). It reads `dense.bin` only for
-the listed tensors: none for ISTA and Coder files, the 96 routers (126,074,880 B) for Swift. A check at setup and in
-the test suite compares a sample of unlisted tensors byte for byte between the two files. This avoids a second copy
-of 1.4 GiB in memory ([05](05-memory-and-residency.md), section 3.2).
+the listed tensors: none for ISTA and Coder files, the 96 routers (126,074,880 B) for Swift. The standalone packer
+checks every recorded conversion payload and a deterministic sample of up to 32 unconverted tensors. The model CTest
+compares every unconverted float and recomputes every conversion payload for all seven catalogue identities. This
+avoids a second copy of 1.4 GiB in memory ([05](05-memory-and-residency.md), section 3.2).
 
 ---
 

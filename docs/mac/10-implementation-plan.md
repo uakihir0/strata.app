@@ -79,10 +79,11 @@ CTest, `tests/metal/test_map.json`, that list and `tests/metal/requirements.json
   cannot pass while anything is planned.
 - **A gate runs what is registered.** G1's `ctest --preset mac-model` runs the model tests registered by the end of
   phase 2 (section 3.3 lists them), and G2 those of phase 4.
-- **The nightly run is red until its parts exist.** `ctest --preset mac-model` fails while no model test exists
-  ([08](08-build-and-distribution.md), section 7), and the nightly acceptance step needs `accept.py` (T4) and the
-  runs of T14. Until T14 is done (phase 3), a nightly failure whose cause is a missing test or tool is expected and is
-  not triaged ([09](09-testing-and-validation.md), section 10). The push runs must be green from phase 0 on.
+- **The nightly run is red until its parts exist.** `ctest --preset mac-model` now includes `dense_vs_gguf_test`
+  and fails closed until `STRATA_TEST_MODELS` contains all seven completed catalogue packs. The broader nightly
+  acceptance step still needs `accept.py` (T4) and the runs of T14. Until T14 is done (phase 3), a nightly failure
+  caused by a missing test or tool is expected and is not triaged ([09](09-testing-and-validation.md), section 10).
+  The push runs must be green from phase 0 on.
 
 ---
 

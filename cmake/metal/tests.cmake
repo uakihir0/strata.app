@@ -455,6 +455,9 @@ strata_metal_test(ple_constants_test host ${Python3_EXECUTABLE}
                   ${CMAKE_SOURCE_DIR}/tools/metal/check_ple_constants.py
                   $<TARGET_FILE:metal_weight_store_test>
                   ${CMAKE_SOURCE_DIR}/tests/fixtures/model-headers)
+strata_metal_test(dense_vs_gguf_test model ${Python3_EXECUTABLE}
+                  ${CMAKE_SOURCE_DIR}/tools/metal/check_dense_vs_gguf.py)
+set_tests_properties(dense_vs_gguf_test PROPERTIES TIMEOUT 1800)
 add_executable(metal_window_test tests/metal/metal_window_test.cpp
                src/metal/engine/window_plan.cpp src/metal/engine/window.cpp)
 target_include_directories(metal_window_test PRIVATE ${CMAKE_SOURCE_DIR}/include)

@@ -15,7 +15,8 @@ its GGUF form:
   index.txt            the table the engine loads.  Quantized dense tensors, token_embd and output are served
                        natively from the GGUF by the engine (--native): their rows carry shape only.
   dense.bin            standalone: the BF16/F16/F32 tensors in the form the engine reads them (index kinds 4/5/2;
-                       3 = F32 narrowed to F16 by the loader) - as the GGUF stores them, or converted (FORM below).
+                       3 = F32 narrowed to F16 by the loader) - as the GGUF stores them, or converted per
+                       tools/pack_format.py.
   conversions.json     every tensor that was converted: shard, source/destination type, method, whether it was
                        exact, the largest absolute error, the source bytes' sha256 (schema 1).
                        With --base: the base (Q2_0) pack's dense.bin, hard-linked - the float tensors are
@@ -62,6 +63,10 @@ from artifact_set_lock import (  # noqa: E402
     pending_marker,
 )
 import gguf_reader as G  # noqa: E402
+from dense_vs_gguf import DenseGGUFError, verify_pack  # noqa: E402
+from pack_format import (  # noqa: E402
+    NATIVE_PLE_KEY_NAME, NATIVE_PLE_KEY_TYPES, NOT_IN_PACK, form_of, is_expert,
+)
 
 
 def _run_tokenizer(src, out, lock_fds):
@@ -76,7 +81,6 @@ def _run_tokenizer(src, out, lock_fds):
 
 FLOAT = {"BF16", "F32", "F16"}
 ROUTERS = ("ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight")
-NOT_IN_PACK = {"per_layer_token_embd.weight"}      # the 28.8 GB PLE table: read from its GGUF by the engine
 
 # The float form the engine reads each pack tensor in (name without `blk.N.`; from eddoursul/Strata's FORM table).
 # The residual, router, GDN, QSA and PLE kernels read these small projections as BF16, the norms as F32 and the PLE
@@ -89,33 +93,14 @@ NOT_IN_PACK = {"per_layer_token_embd.weight"}      # the 28.8 GB PLE table: read
 #                                                                   by default - the kernel reads nothing else
 #   F16 / BF16 -> F32                                               exact widening, by default
 # Tensors not named here are written as stored (floats) or served from the GGUF (quantized), as before.
-FORM = {
-    "ffn_gate_inp.weight": "BF16", "ffn_gate_inp_shexp.weight": "BF16",
-    "hc_attn_down.weight": "BF16", "hc_attn_up.weight": "BF16", "hc_attn_inject.weight": "BF16",
-    "hc_ffn_down.weight": "BF16", "hc_ffn_up.weight": "BF16", "hc_ffn_inject.weight": "BF16",
-    "output_hc_down.weight": "BF16", "output_hc_up.weight": "BF16",
-    "indexer.k_proj.weight": "BF16", "indexer.q_proj.weight": "BF16",
-    "ssm_alpha.weight": "BF16", "ssm_beta.weight": "BF16",
-    "ple_key.weight": "BF16", "ple_value.weight": "BF16", "ple_conv1d.weight": "F16",
-    "attn_q_norm.weight": "F32", "attn_k_norm.weight": "F32", "hc_attn_norm.weight": "F32",
-    "hc_ffn_norm.weight": "F32", "output_hc_norm.weight": "F32", "indexer.q_norm.weight": "F32",
-    "indexer.k_norm.weight": "F32", "ple_norm_conv.weight": "F32", "ple_norm_key.weight": "F32",
-    "ple_norm_query.weight": "F32", "ssm_a": "F32", "ssm_conv1d.weight": "F32", "ssm_dt.bias": "F32",
-    "ssm_norm.weight": "F32",
-}
 # PLE key encodings left in the GGUF for the engine's native PLE key (Q2_0; Q8_0 in UD-Q4_K_XL).  Other quantized
 # keys take the BF16 path (--compat-bf16), as before.
-NATIVE_PLE_KEY = {"Q2_0", "Q8_0"}
 KIND = {"BF16": "4", "F16": "5", "F32": "2"}
-
-
-def form_of(name: str):
-    return FORM.get(re.sub(r"^blk\.\d+\.", "", name))
 
 
 def needs_bf16(name: str, type_name: str) -> bool:
     """Whether the engine reads `name` as BF16 from the pack (not natively from the GGUF)."""
-    if name == "blk.1.ple_key.weight" and type_name in NATIVE_PLE_KEY:
+    if name == NATIVE_PLE_KEY_NAME and type_name in NATIVE_PLE_KEY_TYPES:
         return False
     return form_of(name) == "BF16"
 
@@ -238,10 +223,6 @@ def tensor_bytes(mm, g, t) -> np.ndarray:
     return mm[g.data_start + t.offset: g.data_start + t.offset + n]
 
 
-def is_expert(name: str) -> bool:
-    return name.startswith("blk.") and name.endswith(("_exps.weight",))
-
-
 def convert(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool):
     """The pack form of one tensor the engine reads from dense.bin: (kind, stored bytes, destination bytes,
     record or None), or an error string.  `record` describes a conversion for conversions.json."""
@@ -304,7 +285,7 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
         # --compat-bf16 to dequantize - except the native PLE key encodings
         form = form_of(name)
         native = t.type_name not in FLOAT and (form is None or (
-            name == "blk.1.ple_key.weight" and t.type_name in NATIVE_PLE_KEY))
+            name == NATIVE_PLE_KEY_NAME and t.type_name in NATIVE_PLE_KEY_TYPES))
         if t.type_name not in FLOAT and not native and not compat_bf16:
             problems.append(f"{name} is {t.type_name}, but the engine requires {form}; use --compat-bf16")
         todo.append((name, g, t, mm, p, native))
@@ -558,6 +539,19 @@ def main() -> int:
             allow_discard_stale_experts=setup_owns_pending or recovering_pending,
             lock_fds=locks.inherited_fds,
         )
+        if result == 0 and base is None:
+            try:
+                report = verify_pack(out, src.parent, sample_count=32, allow_pending=True)
+            except (DenseGGUFError, OSError) as exc:
+                print(f"dense_vs_gguf: 32-tensor sample failed: {exc}")
+                result = 1
+            else:
+                print(
+                    f"dense_vs_gguf: {report.tensors_checked} unlisted float tensors matched "
+                    f"in the deterministic sample ({report.bytes_checked} bytes); "
+                    f"{report.conversions_checked} converted tensors reproduced "
+                    f"({report.conversion_bytes_checked} dense.bin bytes)"
+                )
         if result == 0 and not setup_owns_pending and pending_marker(out).exists():
             clear_generation_pending(out)
         return result

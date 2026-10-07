@@ -726,8 +726,9 @@ A build preset of the same name exists for each.
 | `mac-metal` | `mac-dev` | label `^metal$` | the same |
 | `mac-model` | `mac-dev` | label `^model$` | the same |
 
-`noTestsAction: error` makes a filter that matches nothing fail, instead of passing silently. Until the first model
-test exists ([09](09-testing-and-validation.md)), `ctest --preset mac-model` therefore fails, by design.
+`noTestsAction: error` makes a filter that matches nothing fail, instead of passing silently. The registered
+`dense_vs_gguf_test` ([09](09-testing-and-validation.md)) also fails closed until `STRATA_TEST_MODELS` contains all
+seven completed catalogue packs.
 
 `mac-release` uses `build/` for the CMake Release configuration. `setup.py --build` is not implemented; `setup.py`
 currently exits before changing files. Build the configured release with `cmake --build --preset mac-release`.
@@ -1483,6 +1484,7 @@ environment directly, then configure and test the macOS engine:
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+export PATH="$PWD/.venv/bin:$PATH"
 cmake --preset mac-dev
 cmake --build --preset mac-dev --parallel
 ctest --preset mac-host
@@ -1490,9 +1492,12 @@ ctest --preset mac-metal
 .venv/bin/python tools/metal/run_python_tests.py
 ```
 
-CMake fetches the pinned llama.cpp revision automatically. The `mac-model` preset remains fail-closed because the
-model-backed acceptance tests and model fixtures are not registered yet. `mac-host` runs tests without a GPU;
-`mac-metal` requires an Apple GPU.
+CMake fetches the pinned llama.cpp revision automatically. Keep `.venv/bin` first in `PATH` before configuring so
+CTest uses the interpreter with the pinned Python dependencies, including NumPy for conversion-payload checks.
+`mac-model` includes `dense_vs_gguf_test` and remains fail-closed until `STRATA_TEST_MODELS` contains all seven
+completed catalogue packs. The other model acceptance tests
+and the T3 quick-hash preflight are still planned. `mac-host` runs tests without a GPU; `mac-metal` requires an Apple
+GPU.
 
 - **Editing kernels**: the manifest and `safe/` or `fast/` folder are checked during the build.
 - **Debugging kernels**: `mac-dev` keeps shader sources in the library; `strata --metal-capture /tmp/run` writes

@@ -380,8 +380,7 @@
     },
     "dense_vs_gguf_test": {
       "label": "model",
-      "origin": "03 R5",
-      "planned": "R5"
+      "origin": "03 R5"
     },
     "dump_eq_nodump": {
       "label": "model",

@@ -84,7 +84,11 @@
       "ctest:metal_weight_store_test",
       "ctest:metal_weight_store_cli_test"
     ],
-    "REQ-MOD-02": [],
+    "REQ-MOD-02": [
+      "ctest:dense_vs_gguf_test",
+      "python:tools/test_iq_pack.py",
+      "python:tools/metal/test_dense_vs_gguf.py"
+    ],
     "REQ-MOD-03": [
       "ctest:mtp_reader_test",
       "python:tools/test_artifact_set_lock.py",

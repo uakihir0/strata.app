@@ -7,8 +7,9 @@ only graphics backend.
 ## Status
 
 This repository is under active development. It contains C++ and Objective-C++ engine and host code,
-Metal kernels, Mac-only CMake build files, and host and Metal test targets. Model-backed CTests are not
-registered yet. It is not a ready-to-run inference product.
+Metal kernels, macOS-only CMake build files, and host, Metal and model test targets. The registered
+`dense_vs_gguf_test` needs all seven catalogue packs under `STRATA_TEST_MODELS`; other model acceptance
+tests are not implemented yet. It is not a ready-to-run inference product.
 
 Production inference is incomplete. The Prefill and Window production path is not fully connected, and
 the current command-line program rejects model inference options. The macOS setup and server
@@ -38,10 +39,11 @@ ctest --preset mac-metal
 .venv/bin/python tools/metal/run_python_tests.py
 ```
 
-`mac-host` runs tests that do not need a GPU; `mac-metal` needs an Apple GPU. The `mac-model` preset fails
-closed until model-backed CTests are registered. See the [developer workflow](docs/mac/08-build-and-distribution.md)
-for toolchain and archive requirements, and the [test plan](docs/mac/09-testing-and-validation.md) for planned
-model test inputs. These are development commands, not an end-user setup procedure.
+`mac-host` runs tests that do not need a GPU; `mac-metal` needs an Apple GPU. The `mac-model` preset runs
+registered model tests and fails closed until `STRATA_TEST_MODELS` contains all seven completed catalogue packs.
+See the [developer workflow](docs/mac/08-build-and-distribution.md) for toolchain and archive requirements, and the
+[test plan](docs/mac/09-testing-and-validation.md) for model test inputs and remaining acceptance work. These are
+development commands, not an end-user setup procedure.
 
 ## Source and documentation
 
