@@ -441,6 +441,8 @@ add_executable(metal_weight_store_test tests/metal/metal_weight_store_test.cpp
                src/metal/engine/mtp_bind_layout.cpp)
 target_link_libraries(metal_weight_store_test PRIVATE
                       strata_metal_platform strata_metal_options)
+# PLE parameter static_asserts in the Metal branch of params.h are compiled by the metallib.
+add_dependencies(metal_weight_store_test strata_metallib)
 target_include_directories(metal_weight_store_test PRIVATE ${CMAKE_SOURCE_DIR}/include
                            ${CMAKE_SOURCE_DIR}/tests/core)
 strata_metal_test(metal_weight_store_test host metal_weight_store_test)
@@ -449,6 +451,10 @@ strata_metal_test(model_metadata_test host ${Python3_EXECUTABLE}
                   $<TARGET_FILE:metal_weight_store_test>
                   ${CMAKE_SOURCE_DIR}/tests/fixtures/model-headers)
 strata_metal_test(model_types_test host metal_weight_store_test --test-model-types)
+strata_metal_test(ple_constants_test host ${Python3_EXECUTABLE}
+                  ${CMAKE_SOURCE_DIR}/tools/metal/check_ple_constants.py
+                  $<TARGET_FILE:metal_weight_store_test>
+                  ${CMAKE_SOURCE_DIR}/tests/fixtures/model-headers)
 add_executable(metal_window_test tests/metal/metal_window_test.cpp
                src/metal/engine/window_plan.cpp src/metal/engine/window.cpp)
 target_include_directories(metal_window_test PRIVATE ${CMAKE_SOURCE_DIR}/include)

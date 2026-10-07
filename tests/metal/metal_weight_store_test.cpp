@@ -6,6 +6,7 @@
 #include "strata/kernels/ngram.hpp"
 #include "gguf_fixture.hpp"
 #include "../../src/metal/engine/window_source_lock.hpp"
+#include "../../src/metal/kernels/common/params.h"
 
 #include <algorithm>
 #include <array>
@@ -1038,6 +1039,48 @@ void run_model_types_test() {
             "loader names and rejects a quantized tensor with a partial block: " + error);
 }
 
+void write_json_array(const std::uint64_t* values, std::size_t count) {
+    std::cout << '[';
+    for (std::size_t index = 0; index < count; ++index) {
+        if (index != 0) std::cout << ',';
+        std::cout << values[index];
+    }
+    std::cout << ']';
+}
+
+void print_ple_constants() {
+    const strata::kernels::PleConsts constants = strata::kernels::ple_artifact_consts();
+    std::cout << '{'
+              << "\"embedding_length\":" << strata::kernels::NG_N_EMBD
+              << ",\"metal_embedding_length\":" << N_EMBD
+              << ",\"embedding_length_per_layer_input\":" << strata::kernels::PLE_HEAD_DIM
+              << ",\"metal_embedding_length_per_layer_input\":" << PLE_HEAD_DIM
+              << ",\"ngram_size\":" << strata::kernels::NGRAM_SIZE
+              << ",\"metal_ngram_size\":" << PLE_NGRAM_SIZE
+              << ",\"heads_per_ngram\":" << strata::kernels::HEADS_PER_NGRAM
+              << ",\"metal_heads_per_ngram\":" << PLE_HEADS_PER_NGRAM
+              << ",\"ple_heads\":" << strata::kernels::PLE_N_HEADS
+              << ",\"metal_ple_heads\":" << PLE_HEADS
+              << ",\"conv_kernel\":" << strata::kernels::PLE_CONV_KERNEL
+              << ",\"metal_conv_kernel\":" << PLE_CONV_KERNEL
+              << ",\"ple_layers\":[" << PLE_LAYER << ']'
+              << ",\"metal_ple_layers\":[" << PLE_LAYER << ']'
+              << ",\"eos_token_id\":" << strata::kernels::PLE_EOS_TOKEN_ID
+              << ",\"metal_eos_token_id\":" << PLE_EOS
+              << ",\"image_token_id\":" << IMAGE_TOKEN_ID
+              << ",\"table_rows\":" << strata::kernels::PLE_TABLE_ROWS
+              << ",\"metal_table_rows\":" << PLE_TABLE_ROWS
+              << ",\"metal_vocab_size\":" << VOCAB_SIZE
+              << ",\"metal_history_rows\":" << PLE_HISTORY_ROWS
+              << ",\"layer_multipliers\":";
+    write_json_array(constants.mult, strata::kernels::NGRAM_SIZE);
+    std::cout << ",\"head_vocab_sizes\":";
+    write_json_array(constants.vocab, strata::kernels::PLE_N_HEADS);
+    std::cout << ",\"head_offsets\":";
+    write_json_array(constants.offset, strata::kernels::PLE_N_HEADS);
+    std::cout << "}\n";
+}
+
 void run() {
     TempDir temp;
     SyntheticModel model = make_model(temp.path);
@@ -1803,9 +1846,14 @@ int main(int argc, char** argv) {
             run_model_types_test();
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--print-ple-constants") {
+            print_ple_constants();
+            return 0;
+        }
         if (argc != 1) {
             std::cerr << "usage: metal_weight_store_test [--test-model-metadata | "
                          "--check-model-snapshot SHARD EXPERT_COUNT | --test-model-types | "
+                         "--print-ple-constants | "
                          "--test-mtp-fixture-pin FD NAME EXTERNAL | "
                          "--create-fixture DIRECTORY | "
                          "--create-fixture-with-mtp-at-fd FD NAME | "

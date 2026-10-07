@@ -39,6 +39,7 @@ STRATA_PARAMETER uint PLE_NGRAM_SIZE = 3;
 STRATA_PARAMETER uint PLE_HEADS = 16;
 STRATA_PARAMETER uint PLE_HEADS_PER_NGRAM = 8;
 STRATA_PARAMETER uint PLE_HEAD_DIM = 160;
+STRATA_PARAMETER uint PLE_CONV_KERNEL = 4;
 STRATA_PARAMETER uint PLE_TABLE_ROWS = 320001536;
 STRATA_PARAMETER uint PLE_HISTORY_ROWS = 9;
 STRATA_PARAMETER uint PLE_EOS = 248044;
@@ -49,6 +50,20 @@ STRATA_PARAMETER uint MTP_WINDOW = 32768;
 STRATA_PARAMETER uint MTP_EXPERTS = 512;
 STRATA_PARAMETER float RMS_EPSILON = 1.0e-6f;
 STRATA_PARAMETER float ROUTER_WEIGHT_FLOOR = 0x1p-14f;
+static_assert(N_EMBD == 2560, "Metal embedding length must match the model fixture");
+static_assert(PLE_LAYER == 1, "Metal PLE layer must match the model fixture");
+static_assert(PLE_NGRAM_SIZE == 3, "Metal PLE ngram size must match the model fixture");
+static_assert(PLE_HEADS_PER_NGRAM == 8, "Metal PLE heads per ngram must match the model fixture");
+static_assert(PLE_HEADS == (PLE_NGRAM_SIZE - 1) * PLE_HEADS_PER_NGRAM,
+              "Metal PLE head count must follow its ngram geometry");
+static_assert(PLE_HEAD_DIM == 160, "Metal PLE head dimension must match the model fixture");
+static_assert(PLE_CONV_KERNEL == 4, "Metal PLE convolution kernel must match the model fixture");
+static_assert(PLE_HISTORY_ROWS == (PLE_CONV_KERNEL - 1) * PLE_NGRAM_SIZE,
+              "Metal PLE history rows must follow the convolution geometry");
+static_assert(PLE_TABLE_ROWS == 320001536, "Metal PLE table rows must match the model fixture");
+static_assert(PLE_EOS == 248044, "Metal PLE EOS must match the model fixture");
+static_assert(VOCAB_SIZE == 248320, "Metal vocabulary size must match the model fixture");
+static_assert(IMAGE_TOKEN_ID == 248056, "Metal image token must match the model fixture");
 #else
 #include <cstdint>
 #define STRATA_PARAMETER inline constexpr std::uint32_t
@@ -88,6 +103,7 @@ STRATA_PARAMETER PLE_NGRAM_SIZE = 3;
 STRATA_PARAMETER PLE_HEADS = 16;
 STRATA_PARAMETER PLE_HEADS_PER_NGRAM = 8;
 STRATA_PARAMETER PLE_HEAD_DIM = 160;
+STRATA_PARAMETER PLE_CONV_KERNEL = 4;
 STRATA_PARAMETER PLE_TABLE_ROWS = 320001536;
 STRATA_PARAMETER PLE_HISTORY_ROWS = 9;
 STRATA_PARAMETER PLE_EOS = 248044;

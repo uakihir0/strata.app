@@ -7650,6 +7650,17 @@ measuring L-15 remain open.
 - **Reason:** The header snapshots preserve the real catalogue metadata and tensor tables, while full checkpoints are too large for routine host tests and the project is not yet ready for model-backed validation. Compact headers and sparse fixtures exercise production C++ paths without GPU or checkpoint downloads.
 - **Review required:** See REV-045. Confirm all seven snapshots remain covered in both readers, every changed protected key is named, unsupported expert formats and partial blocks are refused with the tensor name, and revisit against setup-produced packs when those become available.
 
+
+
+| REV-047 | Keep PLE metadata, kernel constants and table bounds consistent | All seven model headers match the emitted n-gram constants; C++ and compiled Metal parameter blocks match the artifact values; head offsets are exact prefix sums; each PLE table appears once with shape `[160, 320001536]`; value and type mutations report their keys; the final hostile re-review has no findings | Before accepting R4 |
+
+### D-IMPL-251: Preserve the artifact's 90 trailing PLE rows
+
+- **Decision:** Compare the 16 PLE head offsets against the prefix sums of the 16 head vocabulary sizes and require their total to fit within `PLE_TABLE_ROWS`. Do not require the total to equal the tensor's row count. For the pinned headers, the head ranges cover 320,001,446 rows in a tensor with 320,001,536 rows; the remaining 90 rows are left unused and their purpose is not inferred.
+- **Reason:** The values in all seven checked-in headers and `ple_artifact_consts()` agree. The existing parity harness treats the table as a bound and reports the 90-row remainder. The earlier K4 audit line incorrectly described the final offset plus vocabulary size as equal to the table length; the test exposed that documentation error.
+- **Adversarial review and resolution:** The first review found that only the C++ branch of `params.h` was exercised and Python could treat JSON booleans or floats as integers. Added Metal-branch compile-time assertions, made `metal_weight_store_test` depend on the metallib, and added strict type checks with boolean-layer and floating-point-tokenizer-EOS negatives. The final hostile re-review found no remaining issues.
+- **Review required:** See REV-047. Confirm every model fixture matches the n-gram and C++ parameter sources, Metal-side static assertions compile against the same expected values, each table is located in either shard, prefixes are exact, the 90-row remainder remains within the table, PLE EOS remains distinct from tokenizer EOS, and PLE/tokenizer EOS value/type mutations name their metadata key. Keep `ple_reader_selftest` mapped as implemented; register the model-backed `ple_oracle_model_test` when work item R9 is implemented.
+
 ### D-IMPL-250: Map only executable coverage while the setup golden suite is pending
 
 - **Decision:** Map REQ-MOD-06 to the implemented `model_types_test` and `metal_plan_test` only. Keep the documented `tools/test_setup_golden_mac.py` check out of `tests/metal/requirements.json` until its golden runner and recorded PLAN fixtures exist.

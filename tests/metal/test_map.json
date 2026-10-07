@@ -175,8 +175,7 @@
     },
     "ple_constants_test": {
       "label": "host",
-      "origin": "03 R2-R8",
-      "planned": "R4"
+      "origin": "03 R2-R8"
     },
     "ple_reader_selftest": {
       "label": "host",

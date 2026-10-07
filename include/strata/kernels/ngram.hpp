@@ -58,7 +58,7 @@ inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_FP8;
 ///
 ///     layer_multipliers = [23703573157769, 20109073645365, 8052911324071]
 ///     head_vocab_sizes  = [20000003, 20000023, ...]          16 entries, NOT an arithmetic sequence
-///     head_offsets      = [0, 20000003, 40000026, ...]       the running sum of head_vocab_sizes
+///     head_offsets      = [0, 20000003, 40000026, ...]       prefix sums of head_vocab_sizes
 ///
 /// `ref/ngram.py::selftest` calls its own copies "synthetic but STRUCTURALLY REAL"; they are in fact
 /// `20000003 + 10*i` for the vocab sizes, which the artifact's are not (20000003, 20000023, 20000033 - the

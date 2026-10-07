@@ -85,7 +85,7 @@ Per decoded or verified token:
 | L40 | `NG_HIST` | 9 | conv history rows (dilation 3 × (4-1)) |
 | L41 | `TOKEN_NULL` | -1 | |
 | L42 | `NG_RMS_EPS` | 1e-6 | |
-| L46 | `PLE_TABLE_ROWS` | 320,001,536 | = offset[15] + vocab[15] |
+| L46 | `PLE_TABLE_ROWS` | 320,001,536 | 320,001,446 indexed rows + 90 trailing rows |
 | L47 | `PLE_ROW_BYTES` | 90 | IQ4_NL: 5 blocks × 18 B |
 | L48 | `PLE_ROW_BYTES_FP8` | 160 | E4M3 |
 | L49 | `PLE_ROW_BYTES_MAX` | max of the above | raw staging size |

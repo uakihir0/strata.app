@@ -94,7 +94,10 @@
       "ctest:metal_weight_store_test",
       "ctest:metal_mtp_storage_test"
     ],
-    "REQ-MOD-04": [],
+    "REQ-MOD-04": [
+      "ctest:ple_constants_test",
+      "ctest:ple_reader_selftest"
+    ],
     "REQ-MOD-05": [
       "ctest:model_types_test",
       "ctest:codebooks",
