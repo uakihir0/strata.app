@@ -75,6 +75,7 @@
     "REQ-MNT-05": [],
     "REQ-MOD-01": [
       "ctest:model_metadata_test",
+      "ctest:model_types_test",
       "ctest:gguf_reader_test",
       "ctest:gguf_split_test",
       "ctest:native_experts_reader_test",
@@ -94,8 +95,17 @@
       "ctest:metal_mtp_storage_test"
     ],
     "REQ-MOD-04": [],
-    "REQ-MOD-05": [],
-    "REQ-MOD-06": [],
+    "REQ-MOD-05": [
+      "ctest:model_types_test",
+      "ctest:codebooks",
+      "ctest:metal_mv_test",
+      "ctest:metal_moe_test",
+      "ctest:metal_embed_test"
+    ],
+    "REQ-MOD-06": [
+      "ctest:model_types_test",
+      "ctest:metal_plan_test"
+    ],
     "REQ-MOD-07": [],
     "REQ-PLT-01": [],
     "REQ-PLT-02": [],

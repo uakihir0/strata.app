@@ -7517,6 +7517,8 @@ measuring L-15 remain open.
 | REV-042 | Keep engine exit diagnostics evidence-based | Runtime messages, tests, and docs do not infer quarantine, code-signing, or memory-pressure causes from SIGKILL or log growth | Before accepting the diagnostic wording |
 | REV-043 | Preserve logits-comparison input integrity and metric meaning | Empty ID fields and out-of-range IDs fail cleanly, JSON output cannot alias an input, and one-row standard error is unavailable | Before accepting the comparer hardening |
 | REV-044 | Remove benchmark archives unrelated to the Mac port | No retained source or Mac documentation references the nine retired PC benchmark folders; six referenced result folders remain | Before accepting the benchmark cleanup |
+| REV-045 | Verify the model contract without downloading full checkpoints | Seven pinned header snapshots are checked in Python and as compact GGUFs through the production C++ reader; synthetic loader cases mutate protected metadata, type and block geometry | Before accepting R2/R3 or loading the packs produced by Mac setup |
+| REV-046 | Keep requirement mappings executable and honest | The new model-type and planner tests exist and pass; the documented Mac setup golden suite is explicitly still future work until its engine-recorded fixtures and test harness are added | Before completing the setup golden-set phase |
 
 
 ### D-IMPL-230: Keep the unified-memory threshold advisory until measured
@@ -7641,3 +7643,15 @@ measuring L-15 remain open.
 - **Decision:** Delete `bench/results/2026-09-24-final/`, `2026-09-24-vision/`, `2026-09-28-coder/`, `2026-09-28-rope-scaling/`, `2026-09-28-speed-0114/`, `2026-09-29-layer-split/`, `2026-09-29-layer-split-limits/`, `2026-09-29-rtx3090-epyc-milan/` and `2026-09-30-tc-gemv-sm75/`. Keep only benchmark archives linked by the Mac port documentation or a retained source tool.
 - **Reason:** The removed results and runners document Windows, Linux, NVIDIA and CUDA workloads that are not part of the maintained Mac product; no retained Mac document or source tool uses these archives.
 - **Review required:** See REV-044. Confirm retained references resolve, the nine folders are absent from every commit in the rewritten history, and the Mac test suite still passes.
+
+### D-IMPL-249: Validate model metadata and tensor contracts without full checkpoints
+
+- **Decision:** Check all seven retained model-header snapshots for required metadata, per-role ggml types, block geometry and FF = 640 in Python. Serialize each snapshot as a header-only two-shard GGUF pair and check its metadata, production C++ type allowlist and block geometry. Exercise WeightStore rejection with sparse synthetic GGUF files, including mutated values for every protected metadata key, a Q5_0 expert-down tensor and a partial quantization block.
+- **Reason:** The header snapshots preserve the real catalogue metadata and tensor tables, while full checkpoints are too large for routine host tests and the project is not yet ready for model-backed validation. Compact headers and sparse fixtures exercise production C++ paths without GPU or checkpoint downloads.
+- **Review required:** See REV-045. Confirm all seven snapshots remain covered in both readers, every changed protected key is named, unsupported expert formats and partial blocks are refused with the tensor name, and revisit against setup-produced packs when those become available.
+
+### D-IMPL-250: Map only executable coverage while the setup golden suite is pending
+
+- **Decision:** Map REQ-MOD-06 to the implemented `model_types_test` and `metal_plan_test` only. Keep the documented `tools/test_setup_golden_mac.py` check out of `tests/metal/requirements.json` until its golden runner and recorded PLAN fixtures exist.
+- **Reason:** The requirements map is validated against real source paths; listing the planned but absent test would make the test-map suite fail and imply coverage that is not yet implemented. The documentation still records the intended Mac setup golden suite as follow-on work.
+- **Review required:** See REV-046. Add the setup test and its recorded engine plans, then restore the requirement mapping before accepting the setup golden-set phase.

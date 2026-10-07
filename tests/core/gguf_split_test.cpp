@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -76,6 +77,24 @@ std::string error_of(const std::vector<std::string>& paths) {
         return e.what();
     }
     return {};
+}
+
+std::string single_shard_error(const fs::path& directory, std::string_view bad_key = {}) {
+    fs::create_directories(directory);
+    const fs::path path = directory / "single.gguf";
+    std::vector<fixture::Kv> metadata = {
+        fixture::str("general.architecture", "qwen4exp"),
+    };
+    auto split = fixture::split_keys(0, 1, 1);
+    for (fixture::Kv& value : split) {
+        if (value.key != bad_key) continue;
+        if (value.key == "split.count") value.u = 2;
+        else if (value.key == "split.no") value.u = 1;
+        else if (value.key == "split.tensors.count") value.u = 2;
+    }
+    metadata.insert(metadata.end(), split.begin(), split.end());
+    fixture::write(path, metadata, {{"probe.weight", {1}, F32, 1}});
+    return error_of({path.string()});
 }
 }  // namespace
 
@@ -171,7 +190,7 @@ int main(int argc, char** argv) {
         const auto paths = write_model(d.path, [](int i, auto& kv, auto&, uint64_t&) {
             if (i == 2) kv = fixture::split_keys(1, 4, 7);    // says it is shard 2
         });
-        check(error_of(paths).find("does not declare itself shard 3 of 4") != std::string::npos,
+        check(error_of(paths).find("split.no is 1, expected 2") != std::string::npos,
               "a shard whose split.no disagrees with its place is refused");
     }
     {
@@ -188,6 +207,20 @@ int main(int argc, char** argv) {
         });
         check(error_of(paths).find("split.tensors.count is 7") != std::string::npos,
               "shards that do not add up to split.tensors.count are refused");
+    }
+    {
+        TempDir d;
+        check(single_shard_error(d.path).empty(),
+              "a single-shard model with complete split metadata is accepted");
+        check(single_shard_error(d.path / "bad-count", "split.count").find("split.count") !=
+                  std::string::npos,
+              "a single-shard model with a changed split.count is refused by key");
+        check(single_shard_error(d.path / "bad-no", "split.no").find("split.no") !=
+                  std::string::npos,
+              "a single-shard model with a changed split.no is refused by key");
+        check(single_shard_error(d.path / "bad-total", "split.tensors.count").find(
+                  "split.tensors.count") != std::string::npos,
+              "a single-shard model with a changed split.tensors.count is refused by key");
     }
     {
         TempDir d;

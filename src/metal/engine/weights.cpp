@@ -1834,11 +1834,25 @@ bool validate_qwen_tensor_inventory(const strata::GgufModel& model, std::uint64_
                 error = "GGUF contains a duplicate tensor " + tensor.name;
                 return false;
             }
+            if (tensor.name.ends_with("ffn_gate_inp.weight") && tensor.shape.size() == 2 &&
+                tensor.shape[1] != n_expert) {
+                error = "qwen4exp.expert_count does not match " + tensor.name + " ne1";
+                return false;
+            }
+            if (!validate_qwen_tensor_type(tensor, error)) return false;
+            int block_elements = 0;
+            int block_bytes = 0;
+            if (tensor.shape.empty() ||
+                !strata::block_geometry(tensor.type, block_elements, block_bytes) ||
+                tensor.shape[0] % static_cast<std::uint64_t>(block_elements) != 0 ||
+                strata::tensor_payload_bytes(tensor) == 0) {
+                error = "GGUF tensor " + tensor.name + " has invalid quantization block geometry";
+                return false;
+            }
             if (tensor.shape != found->second) {
                 error = "GGUF tensor has an unexpected shape: " + tensor.name;
                 return false;
             }
-            if (!validate_qwen_tensor_type(tensor, error)) return false;
         }
     }
     if (tensor_count != expected.size() || seen.size() != expected.size()) {
@@ -1911,6 +1925,14 @@ bool metadata_facts(const strata::GgufFile& metadata, const ExpertTable& experts
 }
 
 }  // namespace
+
+bool validate_model_tensor_type(std::string_view tensor_name, std::uint32_t tensor_type,
+                                std::string& error) {
+    strata::TensorInfo tensor;
+    tensor.name = std::string(tensor_name);
+    tensor.type = tensor_type;
+    return validate_qwen_tensor_type(tensor, error);
+}
 
 bool WeightStore::acquire_inspection_lock(const std::string& path,
                                           WindowSourceFileLock& result,

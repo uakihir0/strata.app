@@ -444,6 +444,11 @@ target_link_libraries(metal_weight_store_test PRIVATE
 target_include_directories(metal_weight_store_test PRIVATE ${CMAKE_SOURCE_DIR}/include
                            ${CMAKE_SOURCE_DIR}/tests/core)
 strata_metal_test(metal_weight_store_test host metal_weight_store_test)
+strata_metal_test(model_metadata_test host ${Python3_EXECUTABLE}
+                  ${CMAKE_SOURCE_DIR}/tools/metal/check_model_metadata.py
+                  $<TARGET_FILE:metal_weight_store_test>
+                  ${CMAKE_SOURCE_DIR}/tests/fixtures/model-headers)
+strata_metal_test(model_types_test host metal_weight_store_test --test-model-types)
 add_executable(metal_window_test tests/metal/metal_window_test.cpp
                src/metal/engine/window_plan.cpp src/metal/engine/window.cpp)
 target_include_directories(metal_window_test PRIVATE ${CMAKE_SOURCE_DIR}/include)

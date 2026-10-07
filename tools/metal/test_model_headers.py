@@ -53,6 +53,84 @@ REQUIRED_METADATA = {
     "split.count": 2,
     "split.tensors.count": 1224,
 }
+SUPPORTED_TENSOR_TYPES = {
+    "token_embd.weight": {11, 21, 23},
+    "output.weight": {13, 14, 23},
+    "output_hc_norm.weight": {0},
+    "output_hc_down.weight": {30},
+    "output_hc_up.weight": {30},
+    "per_layer_token_embd.weight": {20},
+    "hc_attn_norm.weight": {0},
+    "hc_ffn_norm.weight": {0},
+    "hc_attn_down.weight": {30},
+    "hc_ffn_down.weight": {30},
+    "hc_attn_up.weight": {30},
+    "hc_ffn_up.weight": {30},
+    "hc_attn_inject.weight": {30},
+    "hc_ffn_inject.weight": {30},
+    "ffn_gate_inp.weight": {0, 30},
+    "ffn_gate_inp_shexp.weight": {0, 30},
+    "ffn_gate_shexp.weight": {11, 12, 13, 14, 21, 23, 42},
+    "ffn_up_shexp.weight": {11, 12, 13, 14, 21, 23, 42},
+    "ffn_down_shexp.weight": {2, 6, 8, 20, 42},
+    "ffn_gate_exps.weight": {16, 17, 18, 21, 22, 23, 29, 42},
+    "ffn_up_exps.weight": {16, 17, 18, 21, 22, 23, 29, 42},
+    "ffn_down_exps.weight": {20, 42},
+    "attn_qkv.weight": {11, 12, 13, 14, 21, 23, 42},
+    "attn_gate.weight": {11, 12, 13, 14, 21, 23, 42},
+    "ssm_out.weight": {11, 12, 13, 14, 21, 23},
+    "ssm_conv1d.weight": {0},
+    "ssm_alpha.weight": {30},
+    "ssm_beta.weight": {30},
+    "ssm_a": {0},
+    "ssm_dt.bias": {0},
+    "ssm_norm.weight": {0},
+    "attn_q.weight": {11, 12, 13, 14, 21, 23, 42},
+    "attn_k.weight": {11, 12, 13, 14, 21, 23},
+    "attn_v.weight": {11, 12, 13, 14, 23},
+    "attn_output.weight": {12, 13, 14, 21, 23},
+    "attn_q_norm.weight": {0},
+    "attn_k_norm.weight": {0},
+    "indexer.q_proj.weight": {30},
+    "indexer.k_proj.weight": {30},
+    "indexer.q_norm.weight": {0},
+    "indexer.k_norm.weight": {0},
+    "ple_key.weight": {30, 42},
+    "ple_value.weight": {30},
+    "ple_norm_key.weight": {0},
+    "ple_norm_query.weight": {0},
+    "ple_norm_conv.weight": {0},
+    "ple_conv1d.weight": {1},
+}
+FFN_SHAPES = {
+    "ffn_gate_exps.weight": (2560, 640, "experts"),
+    "ffn_up_exps.weight": (2560, 640, "experts"),
+    "ffn_down_exps.weight": (640, 2560, "experts"),
+    "ffn_gate_shexp.weight": (2560, 640),
+    "ffn_up_shexp.weight": (2560, 640),
+    "ffn_down_shexp.weight": (640, 2560),
+}
+SUPPORTED_BLOCK_ELEMENTS = {
+    0: 1,   # F32
+    1: 1,   # F16
+    2: 32,  # Q4_0
+    6: 32,  # Q5_0
+    8: 32,  # Q8_0
+    11: 256,  # Q3_K
+    12: 256,  # Q4_K
+    13: 256,  # Q5_K
+    14: 256,  # Q6_K
+    16: 256,  # IQ2_XXS
+    17: 256,  # IQ2_XS
+    18: 256,  # IQ3_XXS
+    20: 32,  # IQ4_NL
+    21: 256,  # IQ3_S
+    22: 256,  # IQ2_S
+    23: 256,  # IQ4_XS
+    29: 256,  # IQ1_M
+    30: 1,  # BF16
+    42: 64,  # Q2_0
+}
 PLE_SHARD2_TENSOR = {
     "name": "per_layer_token_embd.weight",
     "ne": [160, 320_001_536],
@@ -171,6 +249,32 @@ class ModelHeaderFixtures(unittest.TestCase):
                     "qwen4exp.rope.scaling.original_context_length",
                 ):
                     self.assertNotIn(key, kv)
+
+    def test_catalogue_tensor_types_block_geometry_and_ff_width(self):
+        for model, shards in MODELS.items():
+            expert_count = SHARD1_METADATA[shards[0]][1]
+            for shard in shards:
+                data = load_fixture(shard)
+                if shard.endswith("-s1.json"):
+                    self.assertEqual(expert_count, data["kv"]["qwen4exp.expert_count"])
+                    self.assertEqual(640, data["kv"]["qwen4exp.expert_feed_forward_length"])
+                    self.assertEqual(640, data["kv"]["qwen4exp.expert_shared_feed_forward_length"])
+                for tensor in data["tensors"]:
+                    with self.subTest(model=model, shard=shard, tensor=tensor["name"]):
+                        self.assertIn(tensor["id"], SUPPORTED_BLOCK_ELEMENTS)
+                        self.assertTrue(tensor["ne"])
+                        block_elements = SUPPORTED_BLOCK_ELEMENTS[tensor["id"]]
+                        self.assertEqual(0, tensor["ne"][0] % block_elements)
+
+                        name = tensor["name"]
+                        role = name.split(".", 2)[2] if name.startswith("blk.") else name
+                        self.assertIn(role, SUPPORTED_TENSOR_TYPES)
+                        self.assertIn(tensor["id"], SUPPORTED_TENSOR_TYPES[role])
+                        if role in FFN_SHAPES:
+                            expected_shape = FFN_SHAPES[role]
+                            if expected_shape[-1] == "experts":
+                                expected_shape = (*expected_shape[:-1], expert_count)
+                            self.assertEqual(expected_shape, tuple(tensor["ne"]))
 
     def test_shared_ista_coder_shard2_contains_the_ple_tensor(self):
         data = load_fixture("q2_0-s2.json")

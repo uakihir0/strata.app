@@ -102,12 +102,18 @@ class TestMapTests(unittest.TestCase):
             errors,
         )
 
-    def test_final_fails_when_tests_are_planned_and_requirements_unchecked(self):
+    def test_final_fails_for_unchecked_requirements_without_planned_tests(self):
+        registry_path = self.root / "tests/metal/test_map.json"
+        registry = json.loads(registry_path.read_text())
+        for entry in registry["tests"].values():
+            entry.pop("planned", None)
+        registry_path.write_text(json.dumps(registry))
+
         code, _, errors = self.run_map(["--final"])
 
         self.assertEqual(1, code)
-        self.assertIn("test_map: model_metadata_test: planned (R2)", errors)
         self.assertIn("test_map: REQ-PLT-01: no check yet", errors)
+        self.assertNotIn(": planned (", errors)
 
     def test_final_requires_a_configured_ctest_build(self):
         with mock.patch.dict(os.environ, {"STRATA_BUILD_DIR": ""}):

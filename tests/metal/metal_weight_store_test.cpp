@@ -196,7 +196,9 @@ void write_conversions(const SyntheticModel& model, bool valid = true, bool wron
 std::vector<fixture::Tensor> model_tensors(std::string_view omit_tensor = {},
                                            std::string_view wrong_shape_tensor = {},
                                            std::string_view wrong_type_tensor = {},
-                                           std::uint32_t n_expert = kExperts) {
+                                           std::uint32_t n_expert = kExperts,
+                                           std::uint32_t wrong_type_id = 16,
+                                           std::string_view wrong_geometry_tensor = {}) {
     std::vector<fixture::Tensor> tensors;
     tensors.reserve(1'224);
     auto add = [&tensors](std::string name, std::vector<std::uint64_t> shape, std::uint32_t type) {
@@ -278,7 +280,15 @@ std::vector<fixture::Tensor> model_tensors(std::string_view omit_tensor = {},
             return tensor.name == wrong_type_tensor;
         });
         require(found != tensors.end(), "wrong-type fixture tensor is unavailable");
-        found->type = 16;
+        found->type = wrong_type_id;
+    }
+    if (!wrong_geometry_tensor.empty()) {
+        auto found = std::find_if(tensors.begin(), tensors.end(), [wrong_geometry_tensor](const auto& tensor) {
+            return tensor.name == wrong_geometry_tensor;
+        });
+        require(found != tensors.end() && !found->shape.empty(),
+                "invalid-geometry fixture tensor is unavailable");
+        ++found->shape[0];
     }
     return tensors;
 }
@@ -302,6 +312,27 @@ std::vector<fixture::Kv> model_metadata(std::uint32_t expert_count = kExperts) {
     };
 }
 
+bool mutate_metadata_value(std::vector<fixture::Kv>& metadata, std::string_view key) {
+    for (fixture::Kv& value : metadata) {
+        if (value.key != key) continue;
+        if (key == "general.architecture") {
+            value.s = "not-qwen4exp";
+        } else if (key == "qwen4exp.expert_count") {
+            value.u = 256;
+        } else if (key == "split.count") {
+            value.u = 3;
+        } else if (key == "split.no") {
+            value.u = 1;
+        } else if (key == "split.tensors.count") {
+            value.u = 1;
+        } else {
+            value.u = 0;
+        }
+        return true;
+    }
+    return false;
+}
+
 struct WrittenShard {
     std::uint64_t data_start = 0;
     std::uint64_t size = 0;
@@ -309,7 +340,8 @@ struct WrittenShard {
 };
 
 WrittenShard write_gguf_shard(const fs::path& path, const std::vector<fixture::Kv>& metadata,
-                              const std::vector<fixture::Tensor>& tensors) {
+                              const std::vector<fixture::Tensor>& tensors,
+                              std::string_view invalid_geometry_tensor = {}) {
     require(!tensors.empty(), "synthetic shard cannot be empty");
     std::vector<std::uint64_t> offsets;
     std::vector<std::uint64_t> sizes;
@@ -320,7 +352,8 @@ WrittenShard write_gguf_shard(const fs::path& path, const std::vector<fixture::K
         strata::TensorInfo info;
         info.shape = tensor.shape;
         info.type = tensor.type;
-        const std::uint64_t bytes = strata::tensor_payload_bytes(info);
+        std::uint64_t bytes = strata::tensor_payload_bytes(info);
+        if (bytes == 0 && tensor.name == invalid_geometry_tensor) bytes = 1;
         require(bytes != 0, "synthetic tensor has no payload size");
         offsets.push_back(cursor);
         sizes.push_back(bytes);
@@ -361,14 +394,19 @@ SyntheticModel make_model(const fs::path& root, std::string_view omit_tensor = {
                           std::string_view wrong_shape_tensor = {},
                           std::string_view wrong_type_tensor = {}, bool swift_split = false,
                           std::uint32_t n_expert = kExperts,
-                          bool per_role_split = false) {
+                          bool per_role_split = false,
+                          std::string_view wrong_metadata_key = {},
+                          std::uint32_t wrong_type_id = 16,
+                          std::string_view wrong_geometry_tensor = {},
+                          bool single_shard_split_metadata = false) {
     static_assert(std::endian::native == std::endian::little);
     SyntheticModel result;
     result.pack = root / "pack";
     result.n_expert = n_expert;
     fs::create_directories(result.pack);
 
-    result.tensors = model_tensors(omit_tensor, wrong_shape_tensor, wrong_type_tensor, n_expert);
+    result.tensors = model_tensors(omit_tensor, wrong_shape_tensor, wrong_type_tensor,
+                                   n_expert, wrong_type_id, wrong_geometry_tensor);
     const std::string first_name = swift_split ? "tiny-00001-of-00002.gguf" : "tiny.gguf";
     const std::string second_name = "tiny-00002-of-00002.gguf";
     result.shard_names.push_back(first_name);
@@ -405,6 +443,7 @@ SyntheticModel make_model(const fs::path& root, std::string_view omit_tensor = {
     }
 
     const std::vector<fixture::Kv> full_metadata = model_metadata(n_expert);
+    bool metadata_key_mutated = false;
     for (std::size_t shard = 0; shard < shard_tensors.size(); ++shard) {
         std::vector<fixture::Kv> metadata;
         if (shard == 0) {
@@ -412,11 +451,13 @@ SyntheticModel make_model(const fs::path& root, std::string_view omit_tensor = {
         } else {
             metadata = fixture::split_keys(shard, shard_tensors.size(), result.tensors.size());
         }
-        if (swift_split) {
+        if (swift_split || single_shard_split_metadata) {
             const auto split = fixture::split_keys(shard, shard_tensors.size(), result.tensors.size());
             metadata.insert(metadata.end(), split.begin(), split.end());
         }
-        const WrittenShard written = write_gguf_shard(result.shard_paths[shard], metadata, shard_tensors[shard]);
+        metadata_key_mutated = mutate_metadata_value(metadata, wrong_metadata_key) || metadata_key_mutated;
+        const WrittenShard written = write_gguf_shard(result.shard_paths[shard], metadata,
+                                                       shard_tensors[shard], wrong_geometry_tensor);
         result.shard_sizes.push_back(written.size);
         if (shard == 0) {
             result.data_start = written.data_start;
@@ -427,6 +468,8 @@ SyntheticModel make_model(const fs::path& root, std::string_view omit_tensor = {
             result.absolute_offsets.emplace(name, absolute);
         }
     }
+    require(wrong_metadata_key.empty() || metadata_key_mutated,
+            "metadata mutation key is unavailable in the synthetic shard set");
     const auto ple = result.tensor_shards.find("per_layer_token_embd.weight");
     require(ple != result.tensor_shards.end(), "synthetic PLE table has no shard assignment");
     const auto ple_shard =
@@ -929,6 +972,70 @@ void check_split_mapped_fp8_ple_table(const fs::path& directory) {
     rejects_scale(directory / "negative-signed",
                   i32("strata.ple.scale", -1),
                   "mapped FP8 rejects a negative signed-integer scale");
+}
+
+void run_model_metadata_test() {
+    TempDir temp;
+    strata::metal::Geometry geometry;
+    std::string error;
+
+    for (const std::uint32_t experts : {512u, 256u}) {
+        const std::string family = experts == 256 ? "coder" : "qwen";
+        SyntheticModel valid = make_model(temp.path / family, {}, {}, {}, false, experts);
+        require(inspect(valid, geometry, error),
+                "catalogue metadata accepts the " + family + " expert count: " + error);
+    }
+
+    constexpr std::array<std::string_view, 10> keys = {
+        "general.architecture",
+        "qwen4exp.block_count",
+        "qwen4exp.embedding_length",
+        "qwen4exp.attention.head_count",
+        "qwen4exp.attention.head_count_kv",
+        "qwen4exp.expert_count",
+        "qwen4exp.expert_used_count",
+        "split.count",
+        "split.tensors.count",
+        "split.no",
+    };
+    std::size_t case_number = 0;
+    for (const std::string_view key : keys) {
+        const bool split = key.starts_with("split.");
+        for (const bool single_shard : {false, true}) {
+            if (!split && single_shard) continue;
+            SyntheticModel changed = make_model(
+                temp.path / ("changed-" + std::to_string(case_number++)),
+                {}, {}, {}, split && !single_shard, 512, false, key, 16, {}, single_shard);
+            const bool accepted = inspect(changed, geometry, error);
+            require(!accepted && error.find(key) != std::string::npos,
+                    "loader must name changed metadata key " + std::string(key) +
+                        (single_shard ? " on one shard: " : " on split shards: ") + error);
+        }
+    }
+}
+
+void run_model_types_test() {
+    TempDir temp;
+    strata::metal::Geometry geometry;
+    std::string error;
+    const std::string expert_down = "blk.0.ffn_down_exps.weight";
+
+    SyntheticModel valid = make_model(temp.path / "valid");
+    check(inspect(valid, geometry, error), "all catalogue tensor formats pass inspection");
+
+    SyntheticModel q5_down = make_model(temp.path / "q5-down", {}, {}, expert_down,
+                                        false, kExperts, false, {}, 6);
+    const bool q5_rejected = !inspect(q5_down, geometry, error);
+    require(q5_rejected && error.find(expert_down) != std::string::npos &&
+                error.find("q5_0") != std::string::npos,
+            "loader names and rejects a synthetic Q5_0 expert-down tensor: " + error);
+
+    SyntheticModel partial_block = make_model(temp.path / "partial-block", {}, {}, {},
+                                               false, kExperts, false, {}, 16, expert_down);
+    const bool block_rejected = !inspect(partial_block, geometry, error);
+    require(block_rejected && error.find(expert_down) != std::string::npos &&
+                error.find("quantization block geometry") != std::string::npos,
+            "loader names and rejects a quantized tensor with a partial block: " + error);
 }
 
 void run() {
@@ -1659,8 +1766,47 @@ int main(int argc, char** argv) {
             make_default_draft_vocab(model.mtp / "draft_vocab.bin");
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--test-model-metadata") {
+            run_model_metadata_test();
+            return 0;
+        }
+        if (argc == 4 && std::string(argv[1]) == "--check-model-snapshot") {
+            const std::string_view expert_text(argv[3]);
+            std::uint32_t expected_experts = 0;
+            const auto [end, parse_error] = std::from_chars(
+                expert_text.data(), expert_text.data() + expert_text.size(), expected_experts);
+            require(parse_error == std::errc{} && end == expert_text.data() + expert_text.size() &&
+                        (expected_experts == 256 || expected_experts == 512),
+                    "expected expert count must be 256 or 512");
+            const strata::GgufModel model = strata::GgufModel::open(argv[2]);
+            strata::Qwen4ExpGuard guard;
+            guard.experts = expected_experts;
+            const std::string metadata_error = strata::check_architecture(model.meta(), guard);
+            require(metadata_error.empty(), metadata_error);
+            for (std::size_t shard = 0; shard < model.size(); ++shard) {
+                for (const strata::TensorInfo& tensor : model.shard(shard).tensors()) {
+                    std::string type_error;
+                    require(strata::metal::validate_model_tensor_type(tensor.name, tensor.type, type_error),
+                            type_error);
+                    int block_elements = 0;
+                    int block_bytes = 0;
+                    require(!tensor.shape.empty() &&
+                                strata::block_geometry(tensor.type, block_elements, block_bytes) &&
+                                tensor.shape[0] % static_cast<std::uint64_t>(block_elements) == 0 &&
+                                strata::tensor_payload_bytes(tensor) != 0,
+                            "GGUF tensor " + tensor.name + " has invalid quantization block geometry");
+                }
+            }
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--test-model-types") {
+            run_model_types_test();
+            return 0;
+        }
         if (argc != 1) {
-            std::cerr << "usage: metal_weight_store_test [--test-mtp-fixture-pin FD NAME EXTERNAL | "
+            std::cerr << "usage: metal_weight_store_test [--test-model-metadata | "
+                         "--check-model-snapshot SHARD EXPERT_COUNT | --test-model-types | "
+                         "--test-mtp-fixture-pin FD NAME EXTERNAL | "
                          "--create-fixture DIRECTORY | "
                          "--create-fixture-with-mtp-at-fd FD NAME | "
                          "--create-fixture-with-mtp-in-dir-fd FD DEV INO]\n";

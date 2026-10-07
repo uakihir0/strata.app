@@ -4,7 +4,9 @@
 #include "strata/metal/geometry.hpp"
 #include "strata/metal/window_plan.hpp"
 
+#include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace strata::metal {
 
@@ -18,6 +20,10 @@ struct WeightStoreOptions {
     std::string family;
     std::string model;
 };
+
+/// Check one tensor against the production Qwen role/type allowlist.
+bool validate_model_tensor_type(std::string_view tensor_name, std::uint32_t tensor_type,
+                                std::string& error);
 
 /// Validate GGUF headers and the native pack, then derive the exact facts used by Geometry and Plan.
 /// Tensor payloads are not read. The returned Geometry owns metadata only.

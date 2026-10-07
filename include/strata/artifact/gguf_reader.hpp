@@ -508,30 +508,65 @@ public:
 private:
     void validate_split() const {
         const size_t n = shards_.size();
-        const MetaValue* count0 = shards_[0]->get("split.count");
+        const GgufFile& first = *shards_[0];
+        const MetaValue* count0 = first.get("split.count");
+        const MetaValue* no0 = first.get("split.no");
+        const MetaValue* total = first.get("split.tensors.count");
         if (n == 1) {
-            if (count0 && count0->u > 1)
-                throw std::runtime_error("GGUF: " + shards_[0]->path() + " is shard 1 of " + std::to_string(count0->u) +
-                                         ", but it was opened as a whole model");
+            if (!count0 && !no0 && !total) return;
+            if (!count0)
+                throw std::runtime_error("GGUF: " + first.path() + " is missing split.count");
+            if (count0->u != 1) {
+                if (count0->u > 1)
+                    throw std::runtime_error("GGUF: " + first.path() + " split.count is " +
+                                             std::to_string(count0->u) + "; it is shard 1 of " +
+                                             std::to_string(count0->u) +
+                                             ", but it was opened as a whole model");
+                throw std::runtime_error("GGUF: " + first.path() + " split.count must be 1 for a single-shard model");
+            }
+            if (!no0)
+                throw std::runtime_error("GGUF: " + first.path() + " is missing split.no");
+            if (no0->u != 0)
+                throw std::runtime_error("GGUF: " + first.path() + " split.no must be 0 for a single-shard model");
+            if (!total)
+                throw std::runtime_error("GGUF: " + first.path() + " is missing split.tensors.count");
+            if (total->u != first.tensors().size())
+                throw std::runtime_error("GGUF: " + first.path() + " split.tensors.count is " +
+                                         std::to_string(total->u) + ", but the shard holds " +
+                                         std::to_string(first.tensors().size()) + " tensors");
             return;
         }
-        if (!shards_[0]->get("general.architecture"))
-            throw std::runtime_error("GGUF: " + shards_[0]->path() + " has no general.architecture; the first shard "
+        if (!first.get("general.architecture"))
+            throw std::runtime_error("GGUF: " + first.path() + " has no general.architecture; the first shard "
                                      "of a split model carries the metadata");
-        const MetaValue* total = shards_[0]->get("split.tensors.count");
+        if (!count0)
+            throw std::runtime_error("GGUF: " + first.path() + " is missing split.count");
+        if (!total)
+            throw std::runtime_error("GGUF: " + first.path() + " is missing split.tensors.count");
         uint64_t tensors = 0;
         for (size_t i = 0; i < n; ++i) {
             const GgufFile& g = *shards_[i];
             const MetaValue* count = g.get("split.count");
             const MetaValue* no = g.get("split.no");
             const MetaValue* tc = g.get("split.tensors.count");
-            if (!count || !no || count->u != n || no->u != i || (total && (!tc || tc->u != total->u)))
-                throw std::runtime_error("GGUF: " + g.path() + " does not declare itself shard " + std::to_string(i + 1) +
-                                         " of " + std::to_string(n) + " of this model (split.count / split.no / "
-                                         "split.tensors.count)");
+            if (!count)
+                throw std::runtime_error("GGUF: " + g.path() + " is missing split.count");
+            if (count->u != n)
+                throw std::runtime_error("GGUF: " + g.path() + " split.count is " +
+                                         std::to_string(count->u) + ", expected " + std::to_string(n));
+            if (!no)
+                throw std::runtime_error("GGUF: " + g.path() + " is missing split.no");
+            if (no->u != i)
+                throw std::runtime_error("GGUF: " + g.path() + " split.no is " +
+                                         std::to_string(no->u) + ", expected " + std::to_string(i));
+            if (!tc)
+                throw std::runtime_error("GGUF: " + g.path() + " is missing split.tensors.count");
+            if (tc->u != total->u)
+                throw std::runtime_error("GGUF: " + g.path() + " split.tensors.count is " +
+                                         std::to_string(tc->u) + ", expected " + std::to_string(total->u));
             tensors += g.tensors().size();
         }
-        if (total && tensors != total->u)
+        if (tensors != total->u)
             throw std::runtime_error("GGUF: the " + std::to_string(n) + " shards hold " + std::to_string(tensors) +
                                      " tensors, but split.tensors.count is " + std::to_string(total->u));
     }
@@ -543,15 +578,16 @@ private:
 // ---- architecture guard (P1.S2). The engine is specialised to ONE model; anything else must be
 // refused with a precise error rather than silently mis-run.
 struct Qwen4ExpGuard {
-    uint32_t block_count = 48, hidden = 2560, experts = 0, experts_used = 0, head_count = 24,
-             head_count_kv = 2;   // 0 = presence-only: pruned variants (GSQ-RCO Coder) legitimately ship
-                                  // fewer experts than the canonical 512; the graph reads the true value
+    uint32_t block_count = 48, hidden = 2560, experts = 0, experts_used = 10, head_count = 24,
+             head_count_kv = 2;   // 0 experts = presence-only: Coder legitimately ships fewer experts;
+                                  // the graph reads its true count from qwen4exp.expert_count.
 };
 
 inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& want = {}) {
     const MetaValue* arch = g.get("general.architecture");
     if (!arch) return "missing general.architecture";
-    if (arch->s != "qwen4exp") return "architecture is '" + arch->s + "', this engine requires 'qwen4exp'";
+    if (arch->s != "qwen4exp")
+        return "general.architecture is '" + arch->s + "', this engine requires 'qwen4exp'";
     struct Req {
         const char* key;
         uint64_t want;
