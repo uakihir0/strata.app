@@ -39,8 +39,7 @@
     },
     "expert_address_test": {
       "label": "host",
-      "origin": "03 R2-R8",
-      "planned": "R8"
+      "origin": "03 R8"
     },
     "gguf_reader_test": {
       "label": "host",

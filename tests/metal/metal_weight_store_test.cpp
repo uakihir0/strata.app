@@ -400,7 +400,8 @@ SyntheticModel make_model(const fs::path& root, std::string_view omit_tensor = {
                           std::string_view wrong_metadata_key = {},
                           std::uint32_t wrong_type_id = 16,
                           std::string_view wrong_geometry_tensor = {},
-                          bool single_shard_split_metadata = false) {
+                          bool single_shard_split_metadata = false,
+                          std::uint32_t swift_split_layer = 13) {
     static_assert(std::endian::native == std::endian::little);
     SyntheticModel result;
     result.pack = root / "pack";
@@ -430,12 +431,21 @@ SyntheticModel make_model(const fs::path& root, std::string_view omit_tensor = {
                 require(layer_end != std::string::npos, "could not parse synthetic tensor layer");
                 const std::uint32_t layer = static_cast<std::uint32_t>(
                     std::stoul(tensor.name.substr(4, layer_end - 4)));
-                const bool split_layer13_tensor =
-                    layer == 13 && (tensor.name.ends_with(".attn_gate.weight") ||
-                                    tensor.name.ends_with(".attn_qkv.weight"));
-                shard = layer < 13 || split_layer13_tensor ? 0 : 1;
-                if (per_role_split && tensor.name == "blk.13.attn_gate.weight") shard = 1;
-                if (per_role_split && tensor.name == "blk.13.ffn_gate_exps.weight") shard = 0;
+                const bool straddling_layer_tensor =
+                    layer == swift_split_layer &&
+                    (tensor.name.ends_with(".attn_gate.weight") ||
+                     tensor.name.ends_with(".attn_qkv.weight"));
+                shard = layer < swift_split_layer || straddling_layer_tensor ? 0 : 1;
+                if (per_role_split &&
+                    tensor.name == "blk." + std::to_string(swift_split_layer) +
+                                        ".attn_gate.weight") {
+                    shard = 1;
+                }
+                if (per_role_split &&
+                    tensor.name == "blk." + std::to_string(swift_split_layer) +
+                                        ".ffn_gate_exps.weight") {
+                    shard = 0;
+                }
             } else {
                 throw std::runtime_error("unexpected synthetic tensor name " + tensor.name);
             }
@@ -1196,6 +1206,181 @@ void run_pack_index_test() {
             "an 18-field index row is refused: " + error);
 }
 
+void verify_expert_addresses(const SyntheticModel& fixture,
+                             std::uint32_t expected_swift_layer,
+                             bool expect_role_split) {
+    strata::metal::Geometry geometry;
+    strata::metal::WindowSources sources;
+    std::string error;
+    require(inspect(fixture, geometry, error, false, &sources),
+            "WeightStore accepts the expert-address fixture: " + error);
+
+    const strata::GgufModel model = strata::GgufModel::open(fixture.native.string());
+    strata::metal::WindowPlan plan;
+    require(strata::metal::plan_windows(sources, 1024ull * 1024 * 1024, plan, error),
+            "window planner accepts the expert-address fixture: " + error);
+
+    std::map<std::string, const strata::metal::WindowFileSource*> source_files;
+    std::map<std::string,
+             std::pair<const strata::metal::WindowFileSource*,
+                       const strata::metal::WindowTensorSource*>> source_tensors;
+    for (const strata::metal::WindowFileSource& source_file : sources.files) {
+        require(source_files.emplace(source_file.path, &source_file).second,
+                "WeightStore returned a duplicate expert source file");
+        for (const strata::metal::WindowTensorSource& tensor : source_file.tensors) {
+            require(source_tensors.emplace(tensor.tensor_name,
+                                           std::make_pair(&source_file, &tensor)).second,
+                    "WeightStore returned a duplicate tensor source " + tensor.tensor_name);
+        }
+    }
+
+    using SliceKey = std::pair<std::string, std::uint64_t>;
+    using PlannedSlice = std::pair<const strata::metal::FileWindowPlan*,
+                                   const strata::metal::WindowSlice*>;
+    std::map<std::string, const strata::metal::FileWindowPlan*> plan_files;
+    std::map<SliceKey, PlannedSlice> expert_slices;
+    for (const strata::metal::FileWindowPlan& plan_file : plan.files) {
+        require(plan_files.emplace(plan_file.path, &plan_file).second,
+                "window planner returned a duplicate expert source file");
+        for (const strata::metal::WindowSlice& slice : plan_file.slices) {
+            if (slice.expert_index == strata::metal::kNoExpertIndex) continue;
+            require(expert_slices.emplace(SliceKey{slice.tensor_name, slice.expert_index},
+                                          PlannedSlice{&plan_file, &slice}).second,
+                    "window planner returned a duplicate expert slice for " + slice.tensor_name);
+        }
+    }
+    require(source_files.size() == model.size() && plan_files.size() == model.size(),
+            "WeightStore and planner must retain every GGUF shard");
+
+    constexpr std::array<std::string_view, 3> roles = {"gate", "up", "down"};
+    std::uint64_t verified_slices = 0;
+    for (std::uint32_t layer = 0; layer < kLayers; ++layer) {
+        for (const std::string_view role : roles) {
+            const std::string name = "blk." + std::to_string(layer) + ".ffn_" +
+                                     std::string(role) + "_exps.weight";
+            std::size_t shard_index = 0;
+            const strata::TensorInfo* tensor = model.find(name, &shard_index);
+            require(tensor != nullptr && shard_index < model.size(),
+                    "GGUF model is missing expert tensor " + name);
+            const strata::GgufFile& shard = model.shard(shard_index);
+            require(model.in_bounds(*tensor, shard_index),
+                    "GGUF expert tensor is outside its shard: " + name);
+            require(tensor->shape.size() == 3 && tensor->shape[2] == fixture.n_expert,
+                    "GGUF expert tensor has the wrong expert dimension: " + name);
+
+            const auto source = source_tensors.find(name);
+            require(source != source_tensors.end(),
+                    "WeightStore omitted expert tensor " + name);
+            const strata::metal::WindowFileSource& source_file = *source->second.first;
+            const strata::metal::WindowTensorSource& source_tensor = *source->second.second;
+            require(source_file.path == shard.path() &&
+                        source_file.file_size == shard.file_size() &&
+                        fs::path(source_file.path).filename() == fixture.tensor_shards.at(name),
+                    "WeightStore resolved expert tensor to the wrong GGUF shard: " + name);
+            const auto planned_file = plan_files.find(shard.path());
+            require(planned_file != plan_files.end() &&
+                        planned_file->second->path == source_file.path,
+                    "window planner omitted the expert tensor's source shard: " + name);
+
+            const std::uint64_t payload = strata::tensor_payload_bytes(*tensor);
+            require(payload > 0 &&
+                        tensor->offset <= std::numeric_limits<std::uint64_t>::max() - shard.data_start(),
+                    "GGUF expert tensor has an invalid source address: " + name);
+            const std::uint64_t expected_base = shard.data_start() + tensor->offset;
+            require(payload <= std::numeric_limits<std::uint64_t>::max() - expected_base,
+                    "GGUF expert tensor end address overflows: " + name);
+            require(source_tensor.file_offset == expected_base &&
+                        source_tensor.byte_count == payload &&
+                        payload % fixture.n_expert == 0 &&
+                        source_tensor.expert_slab_bytes == payload / fixture.n_expert,
+                    "WeightStore expert base or slab differs from GGUF: " + name);
+
+            for (std::uint64_t expert = 0; expert < fixture.n_expert; ++expert) {
+                const auto found = expert_slices.find({name, expert});
+                require(found != expert_slices.end(),
+                        "window planner omitted expert " + std::to_string(expert) + " of " + name);
+                const strata::metal::FileWindowPlan& file_plan = *found->second.first;
+                const strata::metal::WindowSlice& slice = *found->second.second;
+                require(file_plan.path == shard.path() &&
+                            expert <= (std::numeric_limits<std::uint64_t>::max() - expected_base) /
+                                          source_tensor.expert_slab_bytes,
+                        "window planner assigned an invalid shard or expert address: " + name);
+                const std::uint64_t expected_address =
+                    expected_base + expert * source_tensor.expert_slab_bytes;
+                require(slice.file_offset == expected_address &&
+                            slice.byte_count == source_tensor.expert_slab_bytes,
+                        "expert slice address differs from data_start + tensor offset + expert * slab: " +
+                            name + " expert " + std::to_string(expert));
+                require(slice.window_index < file_plan.windows.size(),
+                        "expert slice refers to a missing file window: " + name);
+                const strata::metal::FileWindow& window =
+                    file_plan.windows[static_cast<std::size_t>(slice.window_index)];
+                require(slice.file_offset >= window.start && slice.file_offset <= window.end &&
+                            slice.window_offset == slice.file_offset - window.start &&
+                            slice.byte_count <= window.end - slice.file_offset,
+                        "expert slice does not map inside its selected file window: " + name);
+                ++verified_slices;
+            }
+        }
+    }
+
+    const std::uint64_t expected_slices = static_cast<std::uint64_t>(kLayers) * roles.size() *
+                                          fixture.n_expert;
+    require(verified_slices == expected_slices && expert_slices.size() == expected_slices,
+            "expert-address fixture did not cover each expected layer, role and expert");
+
+    if (expected_swift_layer < kLayers) {
+        for (const std::string_view role : roles) {
+            const std::string name = "blk." + std::to_string(expected_swift_layer) +
+                                     ".ffn_" + std::string(role) + "_exps.weight";
+            require(fixture.tensor_shards.at(name) == fixture.shard_names[1] &&
+                        source_tensors.at(name).first->path ==
+                            fixture.shard_paths[1].string(),
+                    "Swift's straddling layer resolves " + std::string(role) +
+                        " experts to shard 2");
+        }
+    }
+
+    if (expect_role_split) {
+        const auto shard_for = [&](std::string_view role) -> const std::string& {
+            const std::string name = "blk.13.ffn_" + std::string(role) + "_exps.weight";
+            return source_tensors.at(name).first->path;
+        };
+        require(shard_for("gate") != shard_for("up") &&
+                    shard_for("up") == shard_for("down") &&
+                    fs::path(shard_for("gate")).filename() == fixture.tensor_shards.at(
+                        "blk.13.ffn_gate_exps.weight") &&
+                    fs::path(shard_for("up")).filename() == fixture.tensor_shards.at(
+                        "blk.13.ffn_up_exps.weight") &&
+                    fs::path(shard_for("down")).filename() == fixture.tensor_shards.at(
+                        "blk.13.ffn_down_exps.weight"),
+                "v4 per-role fixture resolves each expert role to its recorded shard");
+    }
+}
+
+void run_expert_address_test() {
+    TempDir temp;
+
+    SyntheticModel single = make_model(temp.path / "single-512");
+    verify_expert_addresses(single, kLayers, false);
+
+    SyntheticModel swift_iq2 = make_model(temp.path / "swift-iq2-xs-like-512", {}, {}, {}, true);
+    verify_expert_addresses(swift_iq2, 13, false);
+
+    SyntheticModel swift_iq3 =
+        make_model(temp.path / "swift-iq3-xxs-like-512", {}, {}, {}, true, kExperts,
+                   false, {}, 16, {}, false, 12);
+    verify_expert_addresses(swift_iq3, 12, false);
+
+    SyntheticModel v4_role_split =
+        make_model(temp.path / "v4-per-role-split-512", {}, {}, {}, true, kExperts, true);
+    write_native_experts(v4_role_split, true, false);
+    verify_expert_addresses(v4_role_split, kLayers, true);
+
+    SyntheticModel coder = make_model(temp.path / "coder-256", {}, {}, {}, false, 256);
+    verify_expert_addresses(coder, kLayers, false);
+}
+
 void write_json_array(const std::uint64_t* values, std::size_t count) {
     std::cout << '[';
     for (std::size_t index = 0; index < count; ++index) {
@@ -1780,6 +1965,10 @@ int main(int argc, char** argv) {
             run_pack_index_test();
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--test-expert-address") {
+            run_expert_address_test();
+            return 0;
+        }
         if (argc == 5 && std::string(argv[1]) == "--test-mtp-fixture-pin") {
             const std::string_view descriptor_text(argv[2]);
             int parent_descriptor = -1;
@@ -2019,6 +2208,7 @@ int main(int argc, char** argv) {
             std::cerr << "usage: metal_weight_store_test [--test-model-metadata | "
                          "--check-model-snapshot SHARD EXPERT_COUNT | --test-model-types | "
                          "--test-native-experts-reader | --test-pack-index | "
+                         "--test-expert-address | "
                          "--print-ple-constants | "
                          "--test-mtp-fixture-pin FD NAME EXTERNAL | "
                          "--create-fixture DIRECTORY | "
