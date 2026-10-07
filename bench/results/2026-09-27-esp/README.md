@@ -5,12 +5,16 @@ applied as `--control-vector-scaled FILE:1.0 --control-vector-layer-range 4 44 -
 per-layer`: after layers 4-44, every hyper-connection stream `h -= (h . v) v`. The package describes it as a
 refusal-direction projection. Q2_0, RTX 5070, fixed experts (`--expert-cache 4000 --pcie-frac 0 --adapt-swaps 0`).
 
+These are retained upstream measurements, not macOS results. The Windows-path launchers `esp_kl.py` and
+`esp_serve.py` were removed. `tools/metal/tf_compare.py` can compare future logits dumps on macOS; it does not
+recreate these measurements or their original engine runs.
+
 ## Kernel (`cvec_parity`)
 
 Project and add against a double-precision reference (max error 5e-7); with the switch off, the kernel's pending
 residual write is bitwise the fused hyper-connection read's own, so a loaded-but-off vector is the stock engine.
 
-## Teacher-forced, stock vs projection (`esp_kl.py`, per-token path)
+## Historical teacher-forced results, stock vs projection (per-token path)
 
 | Text | Tokens | Same top-1 | Mean KL | p99 KL | Perplexity stock | With the vector |
 |---|---:|---:|---:|---:|---:|---:|
@@ -23,7 +27,7 @@ The package reports a mean KL of 0.186 on its own neutral text with UD-Q2_K_XL i
 
 Cost on the same tokens: 44.34 -> 44.26, 46.74 -> 46.56, 47.02 -> 46.83 tok/s (0.2-0.4%).
 
-## Serve (`esp_serve.py`)
+## Historical server results
 
 - Loaded and switched off (`cvec=0`) vs an engine without it: 65 / 65 first tokens after prefixes (verify windows
   and the batched prompt path) and three 256-token generations **token-identical**.
