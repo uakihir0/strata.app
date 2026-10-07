@@ -71,6 +71,13 @@ add_executable(ple_reader_test src/ngram/ple_reader_test.cpp)
 target_link_libraries(ple_reader_test PRIVATE strata_metal_platform strata_metal_options)
 strata_metal_test(ple_reader_selftest host ple_reader_test --selftest)
 
+add_executable(ple_oracle_model_test tests/metal/ple_oracle_model_test.cpp)
+target_include_directories(ple_oracle_model_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(ple_oracle_model_test PRIVATE strata_metal_platform strata_metal_options)
+strata_metal_test(ple_oracle_layout_test host ple_oracle_model_test --selftest)
+strata_metal_test(ple_oracle_model_test model ple_oracle_model_test --models)
+set_tests_properties(ple_oracle_model_test PROPERTIES TIMEOUT 1800)
+
 # ---- tests/metal ----
 add_executable(dequant_oracle_test tests/metal/dequant_oracle_test.cpp)
 target_link_libraries(dequant_oracle_test PRIVATE strata_artifact strata_ggml_oracle strata_metal_options)

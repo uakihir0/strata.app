@@ -100,7 +100,9 @@
     ],
     "REQ-MOD-04": [
       "ctest:ple_constants_test",
-      "ctest:ple_reader_selftest"
+      "ctest:ple_reader_selftest",
+      "ctest:ple_oracle_layout_test",
+      "ctest:ple_oracle_model_test"
     ],
     "REQ-MOD-05": [
       "ctest:model_types_test",

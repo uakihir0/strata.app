@@ -1160,7 +1160,7 @@ name, except `row_t_independent`, which is step 6 of every twin and has no test 
 
 ### 9.1 CTest tests
 
-With every work item done, a `mac-dev` build registers 120 tests: 44 `host`, 48 `metal` and 28 `model`. The 28 tests
+With every work item done, a `mac-dev` build registers 121 tests: 45 `host`, 48 `metal` and 28 `model`. The 28 tests
 of the bootstrap ([08](08-build-and-distribution.md), section 6.4) are among them.
 
 | Label | Preset | Runs on |
@@ -1169,12 +1169,13 @@ of the bootstrap ([08](08-build-and-distribution.md), section 6.4) are among the
 | `metal` | `mac-metal` | The reference Mac on every push to `main`; the nightly validation-layer run; the family runs; hosted Macs if X-8 allows (section 7.5) |
 | `model` | `mac-model` | The reference Mac, nightly (section 7.2, step 1); the `metal_<area>_model_test` set also under the validation layer on Sunday |
 
-**`host` (44).**
+**`host` (45).**
 
 | Tests | Defined in | What it serves |
 | --- | --- | --- |
 | `conversation_cache_test`, `gguf_reader_test`, `gguf_split_test`, `suffix_drafter_test`, `controller_test`, `draft_policy_test`, `conv_cache_test`, `coupled_draft_test`, `bf16_bits_test`, `direct_file_async_test` | Mac host tests, labelled by `_strata_label_rest` ([08](08-build-and-distribution.md), sections 6.2 and 6.4) | Host-side unit tests. `direct_file_async_test` is one of [06](06-engine-host-port.md) work item H2's platform tests. |
 | `platform_memory_test`, `ple_reader_selftest` | [08](08-build-and-distribution.md), section 6.4 | Mac twins of the upstream tests in the CUDA block. `platform_memory_test` is H2's other platform test. |
+| `ple_oracle_layout_test` | [03](03-model-reference.md), work item R9 | A compact synthetic GGUF checks standalone Direct reads and a split-shard mapped PLE tensor at a nonzero parsed offset, with known IQ4_NL values |
 | `dequant_oracle_test`, `metal_manifest_test` | [08](08-build-and-distribution.md), section 6.4 | The pattern of the parity tests; the manifest against the built library |
 | `sampler_tail_test` | [04](04-metal-kernels.md), section 5.12 | Philox known answers, strict inverse-CDF boundary, top-p/min-p order, temperature ordering, CPU FP64 tail cases, and upstream fixture 15's host penalty-history rows |
 | `metal_moe_real_inputs_unavailable` | [04](04-metal-kernels.md), section 10.5 | Confirms that an explicit `metal_moe_test --input-set real` invocation returns 77 and CTest reports it as skipped until REV-002's model pack and CUDA dump fixture are available |
@@ -1261,7 +1262,7 @@ runs the same fixture with concurrent dispatch enabled.
 | Tests | Defined in | What it serves |
 | --- | --- | --- |
 | `dense_vs_gguf_test` | [03](03-model-reference.md), work item R5 | The full compare of every unlisted float row and complete source-float inventory against the GGUF for each of the seven catalogue identities; required pack-form tensors cannot be hidden as native rows, recorded conversion bytes are recomputed, and `native_experts.txt` must exactly match the expert layout derived from every GGUF shard; setup's deterministic shard-salted 32-tensor sample uses the same code |
-| `ple_oracle_model_test` | [03](03-model-reference.md), work item R9 | `ple_parity`'s probe rows against the ISTA shard 2 and the Swift shard 1 |
+| `ple_oracle_model_test` | [03](03-model-reference.md), work item R9 | Scans all model GGUFs for PLE tensors and compares the frozen head/tail samples and full-row L1 sums for rows 0, 12345 and 320001535; requires canonical `qwen-Q2_0` split shard 2 and `swift-IQ2_XS` split shard 1, validates their split metadata and distinct extent/offset rules, compares their packed probe rows byte-for-byte, and checks that each reader returns the same decoded values as its raw tensor bytes |
 | `mtp_reader_test` | [03](03-model-reference.md), work item R10 | The MTP runtime reader on each model's `mtp/` folder, and on truncated copies |
 | `dump_formats_test` | [03](03-model-reference.md), work item R11 | `tools/metal/tf_compare.py` reads a Mac `--dump-logits` file, and `tools/make_profile.py` reads a Mac `--dump-routing` trace. The tokens part of R11 is `dump_eq_nodump`. |
 | `metal_embed_model_test`, `metal_ple_model_test`, `metal_gr_model_test`, `metal_gdn_model_test`, `metal_qsa_model_test`, `metal_attn_model_test`, `metal_mv_model_test`, `metal_moe_model_test`, `metal_mtp_model_test`, `metal_prefill_model_test` | [04](04-metal-kernels.md), section 10.1 | The `real` set of each twin whose kernels read tensors. `metal_math_test`, `metal_sampler_parity_test` and `metal_util_test` read no tensors and have no `real` set. |
@@ -1275,8 +1276,10 @@ runs the same fixture with concurrent dispatch enabled.
 `STRATA_TEST_MODELS` and fails when inputs are missing, incomplete or mismatched. It checks the pack's recorded shard
 sizes and split metadata, then compares the unconverted float rows and recomputes converted payloads. It does not yet
 run the full first-and-last 64 MiB quick-hash preflight described for T3; that check must be added with the planned
-`tools/metal/test_models.py` before the model directory can be treated as pinned catalogue input. The other model
-acceptance tests and `tests/metal/model/` fixtures remain planned.
+`tools/metal/test_models.py` before the model directory can be treated as pinned catalogue input. The model PLE test
+checks every PLE-bearing GGUF it finds and fails if the required Q2_0 or Swift IQ2_XS source is missing. It does not
+stand in for the pinned-source quick-hash preflight. The other model acceptance tests and `tests/metal/model/`
+fixtures remain planned.
 
 **The twin's `--layer` option.** Every twin with a `real` set takes `--layer l` (and `--tensor <name>`), which
 restricts the set to one layer's tensors and adds, as activations, the slot inputs of layer l from a
