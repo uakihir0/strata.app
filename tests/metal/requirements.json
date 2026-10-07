@@ -46,6 +46,7 @@
     "REQ-MEM-02": [],
     "REQ-MEM-03": [],
     "REQ-MEM-04": [
+      "ctest:metal_plan_test",
       "ctest:metal_mtp_bind_layout_test"
     ],
     "REQ-MEM-05": [],
