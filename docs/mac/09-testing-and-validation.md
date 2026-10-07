@@ -1179,7 +1179,7 @@ of the bootstrap ([08](08-build-and-distribution.md), section 6.4) are among the
 | `sampler_tail_test` | [04](04-metal-kernels.md), section 5.12 | Philox known answers, strict inverse-CDF boundary, top-p/min-p order, temperature ordering, CPU FP64 tail cases, and upstream fixture 15's host penalty-history rows |
 | `metal_moe_real_inputs_unavailable` | [04](04-metal-kernels.md), section 10.5 | Confirms that an explicit `metal_moe_test --input-set real` invocation returns 77 and CTest reports it as skipped until REV-002's model pack and CUDA dump fixture are available |
 | `strata_version` | [08](08-build-and-distribution.md), section 6.3 | The engine's identity |
-| `model_metadata_test`, `model_types_test`, `ple_constants_test`, `native_experts_reader_test`, `pack_index_test`, `expert_address_test` | [03](03-model-reference.md), work items R2-R4 and R6-R8 | The seven header fixtures' metadata and tensor tables are parsed by the production C++ reader from compact GGUF headers; Python checks every tensor role/type, block geometry and FF = 640. `ple_constants_test` matches each fixture's PLE metadata and table shape to the n-gram kernel constants, compares the C++ parameter block and compile-time-asserts the Metal parameter block, checks the head prefix sums and 90 trailing table rows, and rejects value or JSON-type mutations, including a mistyped tokenizer EOS, with the key named. Sparse WeightStore negatives cover changed metadata keys, Q5_0 expert downs and partial quantization blocks. The per-pack cases of R6 and R7 read `tests/fixtures/packs/<tag>/`: each pack's `index.txt`, `native_experts.txt` and `conversions.json`, copied from the packs that `test_models.py fetch` builds (work item T3), so the `host` label needs no model. |
+| `model_metadata_test`, `model_types_test`, `ple_constants_test`, `native_experts_reader_test`, `pack_index_test`, `expert_address_test` | [03](03-model-reference.md), work items R2-R4 and R6-R8 | The seven header fixtures' metadata and tensor tables are parsed by the production C++ reader from compact GGUF headers; Python checks every tensor role/type, block geometry and FF = 640. `ple_constants_test` matches each fixture's PLE metadata and table shape to the n-gram kernel constants, compares the C++ parameter block and compile-time-asserts the Metal parameter block, checks the head prefix sums and 90 trailing table rows, and rejects value or JSON-type mutations, including a mistyped tokenizer EOS, with the key named. Sparse WeightStore negatives cover changed metadata keys, Q5_0 expert downs and partial quantization blocks. R6 builds a compact 1,224-tensor model in a temporary directory and exercises the production expert-table reader, so it needs no downloaded model. R7 now has a dedicated compact-pack test for valid 19-field rows, canonical `code_bits`, `compat_bf16: true`, and truncated 18-field rows; the seven real catalogue indexes remain dependent on T3's pinned packs. R8 remains planned; its copied pack fixtures are part of T3. |
 | `codebooks` | [04](04-metal-kernels.md), section 10.5, work item L1 | The codebook header against upstream's and ggml's |
 | `kernel_env_dispositions_test` | [04](04-metal-kernels.md), work item L14 | Every kernel flag and kernel-scope variable has its disposition |
 | `metal_plan_test` | [05](05-memory-and-residency.md), sections 2.3 and 13 | The memory planner; exact byte agreement between planner and QSA/MTP KV layouts for all formats, Qwen4exp session and Window scratch subtotals for 256/512 experts, MTP parameter-slot group sizing, full/tiered admission totals and append-only PLAN reporting |
@@ -1260,7 +1260,7 @@ runs the same fixture with concurrent dispatch enabled.
 
 | Tests | Defined in | What it serves |
 | --- | --- | --- |
-| `dense_vs_gguf_test` | [03](03-model-reference.md), work item R5 | The full compare of `dense.bin` against the GGUF for every model that has a pack (R-4); setup's 32-tensor sample is the same code |
+| `dense_vs_gguf_test` | [03](03-model-reference.md), work item R5 | The full compare of every unlisted float row and complete source-float inventory against the GGUF for each of the seven catalogue identities; required pack-form tensors cannot be hidden as native rows, recorded conversion bytes are recomputed, and `native_experts.txt` must exactly match the expert layout derived from every GGUF shard; setup's deterministic shard-salted 32-tensor sample uses the same code |
 | `ple_oracle_model_test` | [03](03-model-reference.md), work item R9 | `ple_parity`'s probe rows against the ISTA shard 2 and the Swift shard 1 |
 | `mtp_reader_test` | [03](03-model-reference.md), work item R10 | The MTP runtime reader on each model's `mtp/` folder, and on truncated copies |
 | `dump_formats_test` | [03](03-model-reference.md), work item R11 | `tools/metal/tf_compare.py` reads a Mac `--dump-logits` file, and `tools/make_profile.py` reads a Mac `--dump-routing` trace. The tokens part of R11 is `dump_eq_nodump`. |
@@ -1271,9 +1271,12 @@ runs the same fixture with concurrent dispatch enabled.
 | `metal_gpu_time_test`, `metal_watchdog_test` | Section 5.5; [06](06-engine-host-port.md), work item H11 | Command-buffer times; the watchdog |
 | `metal_alloc_fail_test` | [06](06-engine-host-port.md), section 2.3, step 9 | Q2_0 with `STRATA_TEST_CACHE_FAIL=1`, in full mode and with `--gpu-budget-mib 37888`: the engine exits 1, prints the PLAN line, and names the buffer it could not create. The hook makes the first long-lived buffer of step 9 fail as an allocation does. |
 
-**Model tests and their inputs.** Each `model` test starts with `test_models.py check --quick` for the models it
-reads, and fails with the tool's message when one is missing: a model test never skips. The sources are in `tests/metal/model/`. A test that needs CUDA data
-reads it from `--golden` (section 3.2's default) and checks it against the golden manifest first.
+**Model tests and their inputs.** `dense_vs_gguf_test` reads all seven completed catalogue packs under
+`STRATA_TEST_MODELS` and fails when inputs are missing, incomplete or mismatched. It checks the pack's recorded shard
+sizes and split metadata, then compares the unconverted float rows and recomputes converted payloads. It does not yet
+run the full first-and-last 64 MiB quick-hash preflight described for T3; that check must be added with the planned
+`tools/metal/test_models.py` before the model directory can be treated as pinned catalogue input. The other model
+acceptance tests and `tests/metal/model/` fixtures remain planned.
 
 **The twin's `--layer` option.** Every twin with a `real` set takes `--layer l` (and `--tensor <name>`), which
 restricts the set to one layer's tensors and adds, as activations, the slot inputs of layer l from a
@@ -1299,7 +1302,7 @@ its reviewer and is not in the map.
 ### 9.3 The Python layer
 
 `tools/metal/run_python_tests.py` discovers current `test_*.py` modules under `tools/`, `tools/metal/` and `serve/`,
-then runs each in a fresh process. It passed 33/33 modules on 2026-10-07. Rows marked planned are absent and are not
+then runs each in a fresh process. It passed 35/35 modules on 2026-10-07. Rows marked planned are absent and are not
 run. `tools/metal/test_map.py` is a CLI checker exercised through CTest, not a unittest module.
 
 | Modules | Defined in | Runs on |
@@ -1315,6 +1318,7 @@ run. `tools/metal/test_map.py` is a CLI checker exercised through CTest, not a u
 | `tools/metal/test_macos_paths.py` | [07](07-server-setup-port.md), section 8.1 | macOS Python suite; uses `samefile()` to test filesystem path identity |
 | `tools/metal/test_run_python_tests.py` | [08](08-build-and-distribution.md), section 12.1, work item B14 | macOS Python suite |
 | `tools/metal/test_model_headers.py` | [03](03-model-reference.md), work item R1 | macOS Python suite. Checks shard sizes and tensor totals, fixed metadata and the shared PLE shard, rejects duplicate fixture JSON keys, and invokes `ggufhdr.py` on a generated header. |
+| `tools/metal/test_dense_vs_gguf.py` | [03](03-model-reference.md), work item R5 | Synthetic single- and split-shard packs; deterministic sampling; source-hash and pack-form checks for converted rows; full comparison and rejection of a flipped byte, missing or native-marked float row, stale shard size, duplicate conversion, duplicate catalogue identity and unknown model identity. |
 | `tools/metal/test_accept.py` | Section 3.2 | Planned; file absent |
 | `tools/metal/test_tf_compare.py`, `tools/metal/test_ladder_compare.py` | Sections 3.3 and 4.1 | Planned; files absent |
 | `tools/metal/test_make_prompts.py` | Section 2.2 | Planned; file absent |

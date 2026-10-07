@@ -165,8 +165,7 @@
     },
     "pack_index_test": {
       "label": "host",
-      "origin": "03 R2-R8",
-      "planned": "R7"
+      "origin": "03 R7"
     },
     "platform_memory_test": {
       "label": "host",
