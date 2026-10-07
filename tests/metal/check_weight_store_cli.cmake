@@ -158,6 +158,22 @@ if(NOT _real_rc EQUAL 0 OR NOT _real_out MATCHES "^PLAN ")
   message(FATAL_ERROR "real-file plan failed (${_real_rc}): ${_real_err}${_real_out}")
 endif()
 
+file(WRITE "${_pack}/experts.bin" "legacy PC expert pack\n")
+execute_process(
+  COMMAND "${STRATA}" --plan-only --native "${_native}" --pack "${_pack}"
+          --mtp "${_mtp}" --spec 4 --mtp-window 32768 --max-context 262144
+          --plan-w-mib 131072 --plan-ram-mib 131072
+  RESULT_VARIABLE _legacy_experts_rc
+  OUTPUT_VARIABLE _legacy_experts_out
+  ERROR_VARIABLE _legacy_experts_err)
+if(NOT _legacy_experts_rc EQUAL 0 OR
+   NOT _legacy_experts_err MATCHES "strata: ignoring pack experts.bin on macOS" OR
+   NOT _legacy_experts_out STREQUAL _real_out)
+  message(FATAL_ERROR "Mac CLI must ignore and report pack experts.bin without changing the plan: "
+                      "${_legacy_experts_err}${_legacy_experts_out}")
+endif()
+file(REMOVE "${_pack}/experts.bin")
+
 set(_geometry "${_test_dir}/tiny.geometry")
 set(_sentinel "${_test_dir}/sentinel")
 file(WRITE "${_sentinel}" "sentinel must not be overwritten\n")

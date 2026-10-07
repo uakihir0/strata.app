@@ -451,6 +451,7 @@ strata_metal_test(model_metadata_test host ${Python3_EXECUTABLE}
                   $<TARGET_FILE:metal_weight_store_test>
                   ${CMAKE_SOURCE_DIR}/tests/fixtures/model-headers)
 strata_metal_test(model_types_test host metal_weight_store_test --test-model-types)
+strata_metal_test(native_experts_reader_test host metal_weight_store_test --test-native-experts-reader)
 strata_metal_test(ple_constants_test host ${Python3_EXECUTABLE}
                   ${CMAKE_SOURCE_DIR}/tools/metal/check_ple_constants.py
                   $<TARGET_FILE:metal_weight_store_test>

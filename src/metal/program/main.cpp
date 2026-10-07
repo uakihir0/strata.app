@@ -303,7 +303,11 @@ bool inspect_real_geometry(const Options& cli, Geometry& geometry, std::string& 
     if (cli.has("--mtp")) inputs.mtp_dir = std::string(cli.last_value("--mtp"));
     if (cli.has("--geometry-family")) inputs.family = std::string(cli.last_value("--geometry-family"));
     if (cli.has("--geometry-model")) inputs.model = std::string(cli.last_value("--geometry-model"));
-    return WeightStore::inspect(inputs, geometry, error, window_sources, mtp_sources);
+    std::string warning;
+    const bool inspected = WeightStore::inspect(inputs, geometry, error, window_sources, mtp_sources,
+                                                &warning);
+    if (inspected && !warning.empty()) std::fprintf(stderr, "strata: %s\n", warning.c_str());
+    return inspected;
 }
 
 int storage_check(const Options& cli) {

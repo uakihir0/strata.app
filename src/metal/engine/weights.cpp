@@ -1950,11 +1950,13 @@ bool WeightStore::acquire_inspection_lock(const std::string& path,
 }
 
 bool WeightStore::inspect(const WeightStoreOptions& options, Geometry& geometry, std::string& error,
-                          WindowSources* window_sources, MtpRuntimeSources* mtp_sources) {
+                          WindowSources* window_sources, MtpRuntimeSources* mtp_sources,
+                          std::string* warning) {
     error.clear();
     geometry = {};
     if (window_sources != nullptr) *window_sources = {};
     if (mtp_sources != nullptr) *mtp_sources = {};
+    if (warning != nullptr) warning->clear();
     try {
         MtpRuntimeSources inspected_mtp_sources;
         if (options.native_shard.empty()) {
@@ -2089,6 +2091,9 @@ bool WeightStore::inspect(const WeightStoreOptions& options, Geometry& geometry,
         if (!read_native_experts(pack_path / "native_experts.txt", source_path, model,
                                  kLayers, kHidden, kFeedForward, expert_table, error)) {
             return false;
+        }
+        if (warning != nullptr && fs::exists(pack_path / "experts.bin")) {
+            *warning = "ignoring pack experts.bin on macOS; routed experts are read from the GGUF shards";
         }
         if (expert_table.n_expert != metadata_experts) {
             error = "native_experts.txt n_expert does not match qwen4exp.expert_count";

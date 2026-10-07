@@ -109,7 +109,7 @@
     },
     "metal_weight_store_cli_test": {
       "label": "host",
-      "origin": "06 H5"
+      "origin": "03 R6, 06 H5"
     },
     "oneshot_output_test": {
       "label": "host",
@@ -149,8 +149,7 @@
     },
     "native_experts_reader_test": {
       "label": "host",
-      "origin": "03 R2-R8",
-      "planned": "R6"
+      "origin": "03 R6"
     },
     "options_dispositions_test": {
       "label": "host",

@@ -31,7 +31,8 @@ class WeightStore {
 public:
     static bool inspect(const WeightStoreOptions& options, Geometry& geometry, std::string& error,
                         WindowSources* window_sources = nullptr,
-                        MtpRuntimeSources* mtp_sources = nullptr);
+                        MtpRuntimeSources* mtp_sources = nullptr,
+                        std::string* warning = nullptr);
 
 private:
     static bool acquire_inspection_lock(const std::string& path,

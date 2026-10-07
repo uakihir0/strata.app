@@ -188,7 +188,8 @@ struct SyntheticModel {
 };
 
 void write_native_experts(const SyntheticModel& model, bool v4, bool corrupt_offset,
-                          bool omit_offsets = false, bool too_many_shards = false);
+                          bool omit_offsets = false, bool too_many_shards = false,
+                          bool wrong_slab_size = false, bool invalid_shard_name = false);
 void write_index(const SyntheticModel& model, bool valid);
 void write_conversions(const SyntheticModel& model, bool valid = true, bool wrong_form = false,
                        bool omit_router_record = false, bool lossy_router = false,
@@ -485,7 +486,8 @@ SyntheticModel make_model(const fs::path& root, std::string_view omit_tensor = {
 }
 
 void write_native_experts(const SyntheticModel& model, bool v4, bool corrupt_offset,
-                          bool omit_offsets, bool too_many_shards) {
+                          bool omit_offsets, bool too_many_shards,
+                          bool wrong_slab_size, bool invalid_shard_name) {
     std::ofstream output(model.pack / "native_experts.txt", std::ios::trunc);
     require(static_cast<bool>(output), "could not write native_experts.txt");
     const std::uint64_t total = static_cast<std::uint64_t>(kLayers) * kExpertBlob * model.n_expert;
@@ -509,10 +511,13 @@ void write_native_experts(const SyntheticModel& model, bool v4, bool corrupt_off
         const std::uint64_t up = model.absolute_offsets.at(prefix + "up_exps.weight");
         const std::uint64_t down = model.absolute_offsets.at(prefix + "down_exps.weight");
         output << layer << " 42 42 " << source_offset;
-        if (!omit_offsets) output << ' ' << kExpertBlob << ' ' << gate << ' ' << up << ' ' << down;
+        const std::uint64_t slab_bytes = wrong_slab_size && layer == 0 ? kExpertBlob + 32 : kExpertBlob;
+        if (!omit_offsets) output << ' ' << slab_bytes << ' ' << gate << ' ' << up << ' ' << down;
         if (v4) {
             output << ' ';
-            if (too_many_shards && layer == 0) {
+            if (invalid_shard_name && layer == 0) {
+                output << "shard-999.gguf," << first_shard << ',' << first_shard;
+            } else if (too_many_shards && layer == 0) {
                 output << first_shard << ',' << first_shard << ',' << first_shard << ",extra.gguf";
             } else {
                 output << model.tensor_shards.at(prefix + "gate_exps.weight") << ','
@@ -649,6 +654,66 @@ void corrupt_index_float_row_as_native(const SyntheticModel& model, const std::s
     for (const std::string& row : lines) output << row << '\n';
 }
 
+void rewrite_index_row(const SyntheticModel& model, const std::string& tensor_name,
+                       std::size_t field_index, const std::string& replacement,
+                       bool remove_last_field = false) {
+    std::ifstream input(model.pack / "index.txt");
+    require(static_cast<bool>(input), "could not read index.txt for mutation");
+    std::vector<std::string> lines;
+    std::string line;
+    bool changed = false;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.front() != '#') {
+            std::istringstream row(line);
+            std::vector<std::string> fields;
+            std::string field;
+            while (row >> field) fields.push_back(field);
+            if (!fields.empty() && fields.front() == tensor_name) {
+                require(fields.size() == 19, "target index row does not have 19 fields");
+                if (remove_last_field) {
+                    fields.pop_back();
+                } else {
+                    require(field_index < fields.size(), "target index field is out of range");
+                    fields[field_index] = replacement;
+                }
+                std::ostringstream rewritten;
+                for (std::size_t i = 0; i < fields.size(); ++i) {
+                    if (i != 0) rewritten << ' ';
+                    rewritten << fields[i];
+                }
+                line = rewritten.str();
+                changed = true;
+            }
+        }
+        lines.push_back(line);
+    }
+    require(changed, "target index row was not found: " + tensor_name);
+    std::ofstream output(model.pack / "index.txt", std::ios::trunc);
+    require(static_cast<bool>(output), "could not rewrite index.txt");
+    for (const std::string& row : lines) output << row << '\n';
+    output.close();
+    require(!output.fail(), "failed rewriting index.txt");
+}
+
+void set_compat_bf16(const SyntheticModel& model, bool compat) {
+    const fs::path path = model.pack / "conversions.json";
+    std::ifstream input(path);
+    require(static_cast<bool>(input), "could not read conversions.json for mutation");
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    std::string text = contents.str();
+    const std::string from = compat ? "\"compat_bf16\":false" : "\"compat_bf16\":true";
+    const std::string to = compat ? "\"compat_bf16\":true" : "\"compat_bf16\":false";
+    const std::size_t position = text.find(from);
+    require(position != std::string::npos, "compat_bf16 field was not found");
+    text.replace(position, from.size(), to);
+    std::ofstream output(path, std::ios::trunc);
+    require(static_cast<bool>(output), "could not rewrite conversions.json");
+    output << text;
+    output.close();
+    require(!output.fail(), "failed rewriting conversions.json");
+}
+
 strata::metal::WeightStoreOptions options_for(const SyntheticModel& model) {
     strata::metal::WeightStoreOptions options;
     options.native_shard = model.native.string();
@@ -661,11 +726,12 @@ strata::metal::WeightStoreOptions options_for(const SyntheticModel& model) {
 
 bool inspect(const SyntheticModel& model, strata::metal::Geometry& geometry, std::string& error,
              bool with_mtp = false, strata::metal::WindowSources* window_sources = nullptr,
-             strata::metal::MtpRuntimeSources* mtp_sources = nullptr) {
+             strata::metal::MtpRuntimeSources* mtp_sources = nullptr,
+             std::string* warning = nullptr) {
     auto options = options_for(model);
     if (with_mtp) options.mtp_dir = model.mtp.string();
     return strata::metal::WeightStore::inspect(options, geometry, error, window_sources,
-                                                mtp_sources);
+                                                mtp_sources, warning);
 }
 
 struct MtpTensor {
@@ -1037,6 +1103,97 @@ void run_model_types_test() {
     require(block_rejected && error.find(expert_down) != std::string::npos &&
                 error.find("quantization block geometry") != std::string::npos,
             "loader names and rejects a quantized tensor with a partial block: " + error);
+}
+
+void run_native_experts_reader_test() {
+    TempDir temp;
+    strata::metal::Geometry geometry;
+    std::string error;
+    SyntheticModel model = make_model(temp.path / "native-experts");
+
+    write_native_experts(model, false, false);
+    require(inspect(model, geometry, error), "native_experts.txt v3 is accepted: " + error);
+    write_native_experts(model, true, false);
+    require(inspect(model, geometry, error), "native_experts.txt v4 is accepted: " + error);
+
+    const fs::path table_path = model.pack / "native_experts.txt";
+    {
+        std::fstream table(table_path, std::ios::in | std::ios::out);
+        constexpr std::string_view prefix = "# strata native experts v";
+        table.seekp(static_cast<std::streamoff>(prefix.size()));
+        table.put('5');
+        table.close();
+        require(!table.fail(), "could not write unsupported native-expert version fixture");
+    }
+    require(!inspect(model, geometry, error) && error.find("native_experts.txt is v5") != std::string::npos,
+            "native_experts.txt v5 is refused with an upgrade diagnostic: " + error);
+
+    write_native_experts(model, false, false, true);
+    require(!inspect(model, geometry, error) && error.find("malformed line") != std::string::npos,
+            "native_experts.txt without role offsets is refused: " + error);
+
+    write_native_experts(model, false, false, false, false, true);
+    require(!inspect(model, geometry, error) &&
+                error.find("blob or role types do not match the GGUF") != std::string::npos,
+            "native_experts.txt with the wrong slab size is refused: " + error);
+
+    write_native_experts(model, true, false, false, false, false, true);
+    require(!inspect(model, geometry, error) &&
+                error.find("invalid shard or byte size for layer 0") != std::string::npos,
+            "native_experts.txt with an out-of-range shard reference is refused: " + error);
+
+    write_native_experts(model, false, false);
+    {
+        std::ifstream original(table_path);
+        std::string header;
+        require(static_cast<bool>(std::getline(original, header)),
+                "could not read native-expert header for truncated fixture");
+        std::ofstream table(table_path, std::ios::trunc);
+        table << header << '\n';
+    }
+    require(!inspect(model, geometry, error) &&
+                error.find("is truncated or its dimensions do not match the model") != std::string::npos,
+            "truncated native_experts.txt is refused: " + error);
+
+    write_native_experts(model, false, false);
+    {
+        std::ofstream experts(model.pack / "experts.bin", std::ios::binary | std::ios::trunc);
+        experts << "legacy PC expert pack\n";
+    }
+    std::string warning;
+    require(inspect(model, geometry, error, false, nullptr, nullptr, &warning),
+            "a legacy experts.bin beside the pack does not prevent GGUF loading: " + error);
+    require(warning.find("experts.bin") != std::string::npos &&
+                warning.find("ignoring") != std::string::npos,
+            "ignoring experts.bin is reported to the caller: " + warning);
+}
+
+void run_pack_index_test() {
+    TempDir temp;
+    strata::metal::Geometry geometry;
+    std::string error;
+
+    SyntheticModel valid = make_model(temp.path / "valid-index");
+    require(inspect(valid, geometry, error),
+            "the supported 19-field native pack index is accepted: " + error);
+
+    SyntheticModel canonical = make_model(temp.path / "canonical-code-bits");
+    rewrite_index_row(canonical, "output_hc_norm.weight", 9, "4");
+    require(!inspect(canonical, geometry, error) &&
+                error.find("malformed float row for output_hc_norm.weight") != std::string::npos,
+            "a canonical row with code_bits other than 8 is refused: " + error);
+
+    SyntheticModel compat = make_model(temp.path / "compat-bf16");
+    set_compat_bf16(compat, true);
+    require(!inspect(compat, geometry, error) &&
+                error.find("unsupported schema, tool or compat_bf16 setting") != std::string::npos,
+            "conversions.json with compat_bf16 true is refused: " + error);
+
+    SyntheticModel short_row = make_model(temp.path / "short-row");
+    rewrite_index_row(short_row, "output_hc_norm.weight", 0, {}, true);
+    require(!inspect(short_row, geometry, error) &&
+                error.find("an index row does not have 19 fields") != std::string::npos,
+            "an 18-field index row is refused: " + error);
 }
 
 void write_json_array(const std::uint64_t* values, std::size_t count) {
@@ -1615,6 +1772,14 @@ void run() {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--test-native-experts-reader") {
+            run_native_experts_reader_test();
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--test-pack-index") {
+            run_pack_index_test();
+            return 0;
+        }
         if (argc == 5 && std::string(argv[1]) == "--test-mtp-fixture-pin") {
             const std::string_view descriptor_text(argv[2]);
             int parent_descriptor = -1;
@@ -1853,6 +2018,7 @@ int main(int argc, char** argv) {
         if (argc != 1) {
             std::cerr << "usage: metal_weight_store_test [--test-model-metadata | "
                          "--check-model-snapshot SHARD EXPERT_COUNT | --test-model-types | "
+                         "--test-native-experts-reader | --test-pack-index | "
                          "--print-ple-constants | "
                          "--test-mtp-fixture-pin FD NAME EXTERNAL | "
                          "--create-fixture DIRECTORY | "
