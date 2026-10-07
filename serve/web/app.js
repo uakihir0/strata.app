@@ -93,17 +93,32 @@ function headers(json = false) {
   return h;
 }
 $("api-key").value = store.get("apikey", "");
-$("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
+$("api-key").onchange = async () => {
+  store.set("apikey", $("api-key").value.trim());
+  const accepted = await loadHealth();
+  if (accepted) await loadMcp();
+  toast(accepted ? "success" : "warn", "API key saved",
+        accepted ? "Kept in this browser only." : "The server has not accepted it yet; check the key.");
+};
 
 let health = {model: "strata", images: false, max_context: 0, computer: "Mac"};
 async function loadHealth() {
   try {
-    health = await (await fetch("health")).json();
+    const response = await fetch("health", {headers: headers()});
+    if (!response.ok) {
+      if (response.status !== 401) setTimeout(loadHealth, 2000);
+      return false;
+    }
+    const next = await response.json();
+    if (next.status !== "ok") return false;
+    health = next;
     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
     $("chat-empty-sub").textContent = `${health.model} runs on this ${health.computer || "Mac"}. Nothing leaves it.`;
+    return true;
   } catch (e) {
     setTimeout(loadHealth, 2000);
+    return false;
   }
 }
 

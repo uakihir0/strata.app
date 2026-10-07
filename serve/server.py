@@ -24,6 +24,7 @@ import collections
 import base64
 import hashlib
 import hmac
+import ipaddress
 import codecs
 import json
 import os
@@ -1740,11 +1741,12 @@ def make_handler(svc: Service):
             self.wfile.write(body)
 
         def _authorized(self) -> bool:
-            if not svc.api_key:
+            requires_key = getattr(self.server, "require_api_key", False)
+            if not svc.api_key and not requires_key:
                 return True
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if hmac.compare_digest(given.encode(), svc.api_key.encode()):   # #213: constant-time
+            if svc.api_key and hmac.compare_digest(given.encode(), svc.api_key.encode()):   # #213: constant-time
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
@@ -1815,6 +1817,8 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path in ("/health", "/api/health"):
+                if not self._authorized():
+                    return
                 self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "loaded": svc.loaded(), "service": "strata", "computer": "Mac"})
@@ -2198,9 +2202,28 @@ def lan_addresses() -> list[str]:
     return ([first] if ok(first) else []) + sorted(ip for ip in ips if ok(ip) and ip != first)
 
 
+def is_loopback_host(host: str) -> bool:
+    """Return true only for literal loopback addresses and localhost; unknown names require authentication."""
+    if not isinstance(host, str):
+        return False
+    value = host.strip().casefold()
+    if value == "localhost":
+        return True
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
+    requires_key = not is_loopback_host(host)
+    if requires_key and (not isinstance(svc.api_key, str) or not svc.api_key.strip()):
+        raise ValueError("an API key is required when listening on a non-loopback address")
     svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
+    httpd.require_api_key = requires_key
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 
@@ -2382,7 +2405,7 @@ def main() -> int:
                                      "created by the macOS setup flow")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this Mac only (the default), 0.0.0.0 = also other devices "
-                         "on your network (set an API key); also \"host\" in the config")
+                         "on your network (requires an API key); also \"host\" in the config")
     ap.add_argument("--script", action="append",
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
@@ -2394,7 +2417,7 @@ def main() -> int:
                     help="clamp max_tokens to the remaining context instead of rejecting the request "
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
     ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
-                    help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY")
+                    help="require this key on API endpoints (required for a non-loopback host); also $STRATA_API_KEY")
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
@@ -2421,6 +2444,20 @@ def main() -> int:
     except ValueError as e:
         ap.error(str(e))
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
+    if ("STRATA_API_KEY" in os.environ and not os.environ["STRATA_API_KEY"].strip()) or \
+            any(x == "--api-key" and i + 1 < len(sys.argv) and not sys.argv[i + 1].strip() or
+                x.strip() == "--api-key=" for i, x in enumerate(sys.argv)):
+        # #213: an empty key would switch authentication off without a word
+        print("[strata] an API key was given but it is empty: set a key, or leave --api-key / STRATA_API_KEY out",
+              file=sys.stderr)
+        return 2
+    configured_api_key = cfg.get("api_key", "")
+    if not isinstance(configured_api_key, str):
+        ap.error("config api_key must be a string")
+    api_key = (a.api_key or configured_api_key).strip()
+    if not is_loopback_host(a.host) and not api_key:
+        ap.error("an API key is required when listening on a non-loopback address; set --api-key, STRATA_API_KEY, "
+                 "or api_key in the config")
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError:
@@ -2493,13 +2530,7 @@ def main() -> int:
         raise SystemExit(f"[strata] config {e}")
     if svc.aliases:
         print(f"[strata] model aliases: {', '.join(svc.aliases)}", flush=True)
-    if ("STRATA_API_KEY" in os.environ and not os.environ["STRATA_API_KEY"].strip()) or             any(x == "--api-key" and i + 1 < len(sys.argv) and not sys.argv[i + 1].strip() or x.strip() == "--api-key="
-                for i, x in enumerate(sys.argv)):
-        # #213: an empty key would switch authentication off without a word
-        print("[strata] an API key was given but it is empty: set a key, or leave --api-key / STRATA_API_KEY out",
-              file=sys.stderr)
-        return 2
-    svc.api_key = a.api_key or cfg.get("api_key", "")
+    svc.api_key = api_key
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
@@ -2551,16 +2582,13 @@ def main() -> int:
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''})", flush=True)
     print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
-    if a.host not in ("127.0.0.1", "localhost", "::1"):
+    if not is_loopback_host(a.host):
         # issue #26: reachable from other devices - say at which address, and what can still block it
         ips = lan_addresses()
         for ip in ips:
             print(f"       from other devices: http://{ip}:{a.port}/   (API: http://{ip}:{a.port}/v1)", flush=True)
         if not ips:
             print("       from other devices: http://<this Mac's IP address>:" + str(a.port) + "/", flush=True)
-        if not svc.api_key:
-            print("       WARNING: no API key - anyone on your network can use this model. Add \"api_key\": \"...\" "
-                  "to the config (clients send it as their API key; the web page asks for it)", flush=True)
         from serve import macos
         if macos.firewall_on():
             python = os.path.realpath(sys.executable)

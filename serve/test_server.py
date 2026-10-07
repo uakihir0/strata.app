@@ -570,6 +570,67 @@ class MacServerHostGate(unittest.TestCase):
         self.assertEqual(result.exception.code, 2)
         self.assertIn("Strata supports macOS only", stderr.getvalue())
 
+    def test_non_loopback_listener_requires_an_api_key(self):
+        from serve.server import is_loopback_host
+
+        self.assertTrue(is_loopback_host("127.0.0.1"))
+        self.assertTrue(is_loopback_host("localhost"))
+        self.assertTrue(is_loopback_host("::1"))
+        self.assertFalse(is_loopback_host("0.0.0.0"))
+        self.assertFalse(is_loopback_host("192.0.2.10"))
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with self.assertRaisesRegex(ValueError, "API key is required"):
+            serve(svc, host="0.0.0.0", port=0)
+
+    def test_non_loopback_listener_stays_authenticated_if_its_key_is_cleared(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.api_key = "test-secret"
+        httpd = serve(svc, host="0.0.0.0", port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            svc.api_key = ""
+            for route in ("/status", "/health", "/api/health"):
+                with self.subTest(route=route), self.assertRaises(urllib.error.HTTPError) as response:
+                    urllib.request.urlopen(base + route, timeout=10)
+                self.assertEqual(response.exception.code, 401)
+                response.exception.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_main_refuses_non_loopback_without_key_before_loading_engine(self):
+        from serve import server
+
+        with (mock.patch.object(server, "macos_host_error", return_value=None),
+              mock.patch.object(server.sys, "argv", ["server.py", "--host", "0.0.0.0"]),
+              mock.patch("sys.stderr", new_callable=io.StringIO) as stderr):
+            with self.assertRaises(SystemExit) as result:
+                server.main()
+        self.assertEqual(result.exception.code, 2)
+        self.assertIn("an API key is required", stderr.getvalue())
+
+
+class WebHealthAuthContract(unittest.TestCase):
+    def test_health_fetch_uses_saved_key_and_keeps_state_on_unauthorized(self):
+        source = (ROOT / "serve/web/app.js").read_text(encoding="utf-8")
+        handler_start = source.index('$("api-key").onchange')
+        handler_end = source.index('let health =', handler_start)
+        key_handler = source[handler_start:handler_end]
+        self.assertIn("await loadHealth()", key_handler)
+        self.assertIn("if (accepted) await loadMcp()", key_handler)
+
+        load_start = source.index("async function loadHealth()")
+        load_end = source.index("// ------------------------------------------------------------------ Monitor", load_start)
+        load_health = source[load_start:load_end]
+        self.assertIn('fetch("health", {headers: headers()})', load_health)
+        self.assertIn("if (response.status !== 401)", load_health)
+        self.assertIn('if (next.status !== "ok") return false', load_health)
+        self.assertLess(load_health.index("if (!response.ok)"), load_health.index("health = next"))
+
 
 class MacEngineConfig(unittest.TestCase):
     def test_engine_args_preserve_only_explicit_arguments(self):
