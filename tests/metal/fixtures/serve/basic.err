@@ -1,0 +1,9 @@
+strata serve: 512 MiB of the GPU working set free with everything loaded
+strata serve: prompt 2 tokens = 0 reused + 2 read in 4 ms (500.0 tok/s), 2 generated in 6 ms (333.3 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: decode expert cache hit rate: 75.0% (3 hits / 4 lookups)
+strata serve: resident RAM: 2.50 GiB of experts in RAM, 7 exchanged with the VRAM tier, 8 blob reads from the file
+strata serve: expert tiers: GPU 3 hits this request; since the start RAM 9 blobs, files 10 blobs 1.5 MB read
+strata serve: prompt 1 tokens = 0 reused + 1 read in 4 ms (250.0 tok/s), 1 generated in 6 ms (166.7 tok/s), drafts accepted 0 of 0, 1 checkpoints
+strata serve: decode expert cache hit rate: 75.0% (3 hits / 4 lookups)
+strata serve: resident RAM: 2.50 GiB of experts in RAM, 7 exchanged with the VRAM tier, 8 blob reads from the file
+strata serve: expert tiers: GPU 3 hits this request; since the start RAM 9 blobs, files 10 blobs 1.5 MB read

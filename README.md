@@ -1,0 +1,60 @@
+# Strata
+
+Strata is a source-derived project for a native Metal engine on Apple Silicon. Its target is macOS 27
+or later, and Metal is its only graphics backend.
+
+## Status
+
+This repository is under active development. It contains C++ and Objective-C++ engine and host code,
+Metal kernels, Mac-only CMake build files, and host and Metal test targets. Model-backed CTests are not
+registered yet. It is not a ready-to-run inference product.
+
+Production inference is incomplete. The Prefill and Window production path is not fully connected, and
+the current command-line program rejects model inference options. The macOS setup and server
+integration also remain in progress. `./setup.sh` currently checks for Apple silicon and macOS 27 or newer,
+then exits with a clear not-implemented status before creating an environment or changing files. It is not an
+installer. CUDA kernels and parity harnesses are reference-only and are not built into a Mac backend. A successful build or a
+host or kernel test does not establish that end-to-end model inference is available. See the current status and design notes in
+[docs/mac](docs/mac/README.md), especially the [engine port](docs/mac/06-engine-host-port.md) and
+[setup and server port](docs/mac/07-server-setup-port.md).
+
+## Build and test entry points
+
+The CMake presets target arm64 and macOS 27. The `mac-dev` preset enables the Metal backend and
+development tests. The presets require CMake 3.24 or later and use Ninja. With the Apple toolchain
+available, the documented build entry points are:
+
+```sh
+cmake --preset mac-dev
+cmake --build --preset mac-dev
+```
+
+The documented test entry points are:
+
+```sh
+ctest --preset mac-host
+ctest --preset mac-metal
+.venv/bin/python tools/metal/run_python_tests.py
+```
+
+`mac-host` runs tests that do not need a GPU; `mac-metal` needs an Apple GPU. The `mac-model` preset fails
+closed until model-backed CTests are registered. See the [developer workflow](docs/mac/08-build-and-distribution.md)
+for toolchain and archive requirements, and the [test plan](docs/mac/09-testing-and-validation.md) for planned
+model test inputs. These are development commands, not an end-user setup procedure.
+
+## Source and documentation
+
+- `src/metal/` and `include/strata/metal/` contain the native Metal host and engine code.
+- `src/metal/kernels/` contains Metal shaders and their kernel manifest.
+- `cmake/metal/` contains Metal build and test integration.
+- `tests/metal/` contains Metal-specific tests and fixtures.
+- `docs/mac/` documents the macOS design, implementation status, build, and validation work.
+
+## Name, origin, and license
+
+The project name is Strata. This checkout is maintained separately rather than as a GitHub fork, and
+it currently has no configured Git remote. Its source includes material imported from
+Niko1221/Strata v0.1.34, commit `1678de33d0e0711bc414ad992b640e1a37dd814`. Separate maintenance or
+Git history does not make that source clean-room work or remove license and attribution obligations.
+See [docs/PROJECT_ORIGIN.md](docs/PROJECT_ORIGIN.md), the root [LICENSE](LICENSE), and the
+applicable third-party notices.

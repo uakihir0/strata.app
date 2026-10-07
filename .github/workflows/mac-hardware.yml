@@ -1,0 +1,153 @@
+name: Mac hardware
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      day:
+        description: "Run this weekly acceptance slice (1-7); leave blank for the hardware checks only"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  hardware:
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, macOS, ARM64, strata-ref]
+    timeout-minutes: 240
+    concurrency:
+      group: strata-ref
+      queue: max
+      cancel-in-progress: false
+    steps:
+      - name: Validate manual Mac hardware run
+        env:
+          ACCEPTANCE_DAY: ${{ inputs.day }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            exit 0
+          fi
+          case "$ACCEPTANCE_DAY" in
+            ""|1|2|3|4|5|6|7) ;;
+            *) echo "::error::day must be 1-7"; exit 2 ;;
+          esac
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+      - name: Install pinned Python and build tools
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -r requirements.txt
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Configure and build the Mac development engine
+        run: |
+          cmake --preset mac-dev
+          cmake --build --preset mac-dev
+      - name: Run the host and Metal self-tests
+        env:
+          STRATA_METAL_ARCHIVE: ${{ runner.temp }}/strata-cache
+        run: |
+          ctest --preset mac-host
+          ctest --preset mac-metal
+      - name: Run the Python test layer
+        if: github.event_name == 'workflow_dispatch' && inputs.day == ''
+        run: .venv/bin/python tools/metal/run_python_tests.py
+      - name: Run model-backed and nightly acceptance gate
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.day != '')
+        env:
+          STRATA_TEST_MODELS: /Users/Shared/strata-models
+          STRATA_RESULTS: /Users/Shared/strata-results
+        run: |
+          if [ ! -d "$STRATA_TEST_MODELS" ]; then
+            echo "::error::Reference model disk is unavailable; nightly acceptance cannot run."
+            exit 1
+          fi
+          if ! ctest --test-dir build-dev -N -L '^model$' | grep -Eq 'Total Tests: [1-9][0-9]*'; then
+            echo "::error::No model-labelled CTest targets are implemented yet."
+            exit 1
+          fi
+          ctest --preset mac-model
+          MTL_SHADER_VALIDATION=1 MTL_DEBUG_LAYER=1 ctest --preset mac-metal
+          cmake -S tools/vision -B build-vision -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=27.0
+          cmake --build build-vision --target strata-vision
+          mkdir -p engine
+          for f in strata strata.metallib; do
+            cp "build-dev/$f" "engine/.$f.new"
+            mv -f "engine/.$f.new" "engine/$f"
+          done
+          cp build-vision/bin/strata-vision engine/.strata-vision.new
+          mv -f engine/.strata-vision.new engine/strata-vision
+          .venv/bin/python tools/metal/run_python_tests.py
+          if [ -f tools/metal/accept.py ]; then
+            .venv/bin/python tools/metal/accept.py nightly
+          else
+            echo "::error::The acceptance runner is not implemented yet."
+            exit 1
+          fi
+
+  weekly:
+    needs: hardware
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.day != ''))
+    runs-on: [self-hosted, macOS, ARM64, strata-ref]
+    timeout-minutes: 600
+    concurrency:
+      group: strata-ref
+      queue: max
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+      - name: Install pinned Python and build tools
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -r requirements.txt
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Configure and build the Mac development engine
+        run: |
+          cmake --preset mac-dev
+          cmake --build --preset mac-dev
+      - name: Run host and Metal tests for this build
+        env:
+          STRATA_METAL_ARCHIVE: ${{ runner.temp }}/strata-cache
+        run: |
+          ctest --preset mac-host
+          ctest --preset mac-metal
+      - name: Run the requested weekly acceptance slice
+        env:
+          STRATA_TEST_MODELS: /Users/Shared/strata-models
+          STRATA_RESULTS: /Users/Shared/strata-results
+          ACCEPTANCE_DAY: ${{ inputs.day }}
+        run: |
+          if [ ! -d "$STRATA_TEST_MODELS" ]; then
+            echo "::error::Reference model disk is unavailable; weekly acceptance cannot run."
+            exit 1
+          fi
+          if [ ! -f tools/metal/accept.py ]; then
+            echo "::error::The acceptance runner is not implemented yet."
+            exit 1
+          fi
+          if [ -n "$ACCEPTANCE_DAY" ]; then
+            case "$ACCEPTANCE_DAY" in
+              1|2|3|4|5|6|7) ;;
+              *) echo "::error::day must be 1-7"; exit 2 ;;
+            esac
+            .venv/bin/python tools/metal/accept.py weekly --day "$ACCEPTANCE_DAY"
+          else
+            .venv/bin/python tools/metal/accept.py weekly
+          fi

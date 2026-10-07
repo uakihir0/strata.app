@@ -1,0 +1,10 @@
+# Frozen prompts are hashed byte for byte (manifest sha256): never convert their line endings.
+bench/prompts/** -text
+
+# POSIX shell scripts use LF line endings on macOS.
+*.sh text eol=lf
+
+# MAC: Metal sources and the files CMake parses keep LF on every clone (docs/mac/08-build-and-distribution.md, section 3.5)
+*.metal text eol=lf
+src/metal/kernels/manifest.txt text eol=lf
+METAL_REV text eol=lf

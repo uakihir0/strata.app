@@ -1,0 +1,2 @@
+strata serve: 512 MiB of the GPU working set free with everything loaded
+strata: GPU error in "fake_window": synthetic command-buffer failure

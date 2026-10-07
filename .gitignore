@@ -1,0 +1,48 @@
+# Generated GGUF fixtures stay out of source history.
+bench/tiny-*.gguf
+bench/wide-*.gguf
+bench/micro/*.bin
+bench/micro/*.txt
+*.log
+build*/
+pack/
+logs/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# plan v0.3 P1 (repository hygiene, review E1): profiler captures and large diagnostic dumps stay out of git.
+*.nsys-rep
+
+# Pi harness metadata (local session state, not project source)
+*.sqlite
+*.npz
+*.occ1
+td.log
+
+# Planned Mac setup output and downloaded model data
+/.venv/
+/build/
+/third_party/llama.cpp
+/models/
+/packs/
+/mtp/
+/run-*.sh
+/strata-*.json
+/strata-*.log
+/.strata-mcp/
+
+# Planned Mac setup, engine and release outputs
+/engine/
+/build-release*/
+/dist/
+*.done
+/third_party/*.zip
+
+# MAC: Finder files and GPU traces written by strata --metal-capture (docs/mac/08-build-and-distribution.md, section 3.5)
+.DS_Store
+*.gputrace
+
+# Local Codex/Claude state is user-specific and must not enter the project history.
+.claude/*.lock
+.claude/settings.local.json

@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.24)
+project(lbl LANGUAGES CXX)
+enable_testing()
+add_test(NAME up1 COMMAND true)
+include(${CMAKE_SOURCE_DIR}/t.cmake)
+add_test(NAME up2 COMMAND true)

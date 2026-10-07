@@ -1,0 +1,72 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "mac-release",
+      "displayName": "Mac engine as setup.py and the release build it",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "STRATA_ENABLE_CUDA": "OFF",
+        "STRATA_ENABLE_METAL": "ON",
+        "STRATA_BUILD_TESTS": "OFF",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "27.0"
+      }
+    },
+    {
+      "name": "mac-dev",
+      "displayName": "Mac development: tests, warnings as errors, kernel sources kept for the shader debugger",
+      "inherits": "mac-release",
+      "binaryDir": "${sourceDir}/build-dev",
+      "cacheVariables": {
+        "STRATA_BUILD_TESTS": "ON",
+        "STRATA_BUILD_CONVERSATION_TESTS": "ON",
+        "STRATA_WERROR": "ON",
+        "STRATA_METAL_EMBED_SOURCES": "ON",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "mac-ci",
+      "displayName": "Mac CI: mac-dev with the kernel sources stripped, as shipped",
+      "inherits": "mac-dev",
+      "binaryDir": "${sourceDir}/build-ci",
+      "cacheVariables": { "STRATA_METAL_EMBED_SOURCES": "OFF" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "mac-release", "configurePreset": "mac-release" },
+    { "name": "mac-dev", "configurePreset": "mac-dev" },
+    { "name": "mac-ci", "configurePreset": "mac-ci" }
+  ],
+  "testPresets": [
+    {
+      "name": "mac-host",
+      "displayName": "Tests that need no GPU",
+      "configurePreset": "mac-dev",
+      "filter": { "include": { "label": "^host$" } },
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    {
+      "name": "mac-metal",
+      "displayName": "Tests that need an Apple GPU",
+      "configurePreset": "mac-dev",
+      "filter": { "include": { "label": "^metal$" } },
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    {
+      "name": "mac-model",
+      "displayName": "Tests that need the model files (STRATA_TEST_MODELS)",
+      "configurePreset": "mac-dev",
+      "filter": { "include": { "label": "^model$" } },
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    }
+  ]
+}

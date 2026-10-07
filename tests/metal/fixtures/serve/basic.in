@@ -1,0 +1,9 @@
+GEN 2 seed=42 temperature=0.7 top_k=20 12,34
+WHAT
+GEN 0 1
+GEN 1 nope
+GEN 24 10
+GEN 1 248320
+GENI 1 /tmp/image file.sve 12,34
+GEN 1 248044
+QUIT

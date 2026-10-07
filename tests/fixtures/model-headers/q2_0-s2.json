@@ -1,0 +1,23 @@
+{
+ "version": 3,
+ "kv": {
+  "split.no": 1,
+  "split.count": 2,
+  "split.tensors.count": 1224
+ },
+ "tensors": [
+  {
+   "name": "per_layer_token_embd.weight",
+   "ne": [
+    160,
+    320001536
+   ],
+   "type": "IQ4_NL",
+   "id": 20,
+   "offset": 0,
+   "bytes": 28800138240
+  }
+ ],
+ "header_end": 173,
+ "data_start": 192
+}

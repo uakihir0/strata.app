@@ -1,0 +1,120 @@
+device: Apple M5 Pro; maxThreadgroupMemoryLength 32768; maxThreadsPerThreadgroup 1024
+k_ids: threadExecutionWidth 32, maxTotalThreadsPerThreadgroup 1024; 4096 of 4096 threads have lane = i % 32, simdgroup = (i % 1024) / 32, width 32, ballot low word 0xAAAAAAAA and high word 0
+k_tg32k (32,768 B): staticThreadgroupMemoryLength 32768, maxTotalThreadsPerThreadgroup 1024, 1024 of 1024 correct
+k_tg_over (32,784 B): pipeline refused: Threadgroup memory size (32784) exceeds the maximum threadgroup memory allowed (32768)
+
+== safe.metallib
+  k_mad                              on 838389 inputs where fused != unfused: 838389 equal unfused, 0 equal fma
+  k_fma                              on 838389 inputs where fused != unfused: 0 equal unfused, 838389 equal fma
+  k_mad_pragma_off                   on 838389 inputs where fused != unfused: 838389 equal unfused, 0 equal fma
+  x / y                                       0 of 16777216 differ (0.0000%), max 0 ulp
+  precise::divide(x, y)                       0 of 16777216 differ (0.0000%), max 0 ulp
+  1.0f / x                                    0 of 16777216 differ (0.0000%), max 0 ulp
+  fast::divide(x, 3)                 (not in this library)
+  amax / 127                                  0 of 16777216 differ (0.0000%), max 0 ulp
+  sqrt(x)                                     0 of 4194304 differ (0.0000%), max 0 ulp
+  rsqrt(x) vs 1/sqrt in double                0 of 4194304 differ (0.0000%), max 0 ulp
+  exp(x) vs double                      1593538 of 4194304 differ (37.9929%), max 1 ulp at x = -13.3255768 (gpu 1.63220818e-06, ref 1.63220807e-06)
+  precise::exp(x) vs double             1593538 of 4194304 differ (37.9929%), max 1 ulp at x = -13.3255768 (gpu 1.63220818e-06, ref 1.63220807e-06)
+  fast::exp(x) vs double             (not in this library)
+  CPU expf(x) vs double                   26349 of 4194304 differ (0.6282%), max 1 ulp at x = -13.3255768 (gpu 1.63220818e-06, ref 1.63220807e-06)
+  log(1+x) vs double                    1900715 of 4194304 differ (45.3166%), max 16384 ulp at x = 5.9068203e-05 (gpu 5.91260614e-05, ref 5.90664567e-05)
+  log1p_k(x) vs double                  1906716 of 4194304 differ (45.4597%), max 3 ulp at x = 0.261239707 (gpu 0.232095093, ref 0.232095137)
+  CPU log1pf(x) vs double                    88 of 4194304 differ (0.0021%), max 1 ulp at x = -0.021016717 (gpu -0.0212407131, ref -0.0212407112)
+  softplus vs CPU log1pf(expf)          1572126 of 4194304 differ (37.4824%), max 5 ulp at x = -2.02365875 (gpu 0.124136999, ref 0.124137037)
+  softplus vs double                    1548901 of 4194304 differ (36.9287%), max 5 ulp at x = -2.77140617 (gpu 0.06069424, ref 0.0606942214)
+  1/(1+exp(-x)) vs double               1522230 of 4194304 differ (36.2928%), max 4 ulp at x = -16.6592464 (gpu 5.82077853e-08, ref 5.82077995e-08)
+  1/(1+exp(-x)) vs CPU float             679146 of 4194304 differ (16.1921%), max 4 ulp at x = -16.6772881 (gpu 5.71670427e-08, ref 5.71670569e-08)
+  rint(x) vs rintf                            0 of 1060595 differ (0.0000%), max 0 ulp
+  round(x) vs roundf                          5 of 1060595 differ (0.0005%), max 0 ulp
+  trunc(x) vs truncf                          0 of 1060595 differ (0.0000%), max 0 ulp
+  round / rint of the edge values    0.49999997->0/0 -0.49999997->0/-0(!) 0.5->1/0 -0.5->-1/-0 1.5->2/2 -1.5->-2/-2 2.5->3/2 -2.5->-3/-2 8388609->8.38861e+06/8.38861e+06 -8388609->-8.38861e+06/-8.38861e+06 8388608->8.38861e+06/8.38861e+06 -0.25->0/-0(!) -0->0/-0(!) 0->0/0 -1e-30->0/-0(!) 1e-30->0/0
+  half(x)                            0 non-NaN and 2 NaN of 4448275 differ from the CPU's RNE conversion
+  half() of the edge values          00000000->0000 80000000->8000 7f800000->7c00 ff800000->fc00 7fc00000->7e00 7f800001->7e00 7f812345->7e00 ffc00001->7e00 477fe000->7bff 477fefff->7bff 477ff000->7c00 47800000->7c00 4e6e6b28->7c00 33000000->0000 33000001->0001 33800000->0001 38800000->0400 387fc000->03ff 00000001->0000
+  of 32768 simdgroups: the xor butterfly (16..1) equals the CPU one in 32768; simd_sum is the same in every lane in 32768, equals the 16..1 butterfly in 12239, a sequential sum in 8573, a pairwise tree in 32768, the 1..16 butterfly in every lane in 32768; simd_max and the max butterfly equal the CPU max in 32768
+  codebook lookups, 2^20 threads x 2048 lookups, best of 6:
+  k_cb_none                6.066 ms =  354.0 G lookups/s
+  k_cb_program_16          5.252 ms =  408.9 G lookups/s
+  k_cb_constant_16         5.415 ms =  396.6 G lookups/s
+  k_cb_device_16           5.419 ms =  396.3 G lookups/s
+  k_cb_threadgroup_16      5.110 ms =  420.2 G lookups/s
+  k_ch_program_16          4.811 ms =  446.3 G lookups/s
+  k_ch_constant_16         4.862 ms =  441.6 G lookups/s
+  k_ch_device_16           5.008 ms =  428.8 G lookups/s
+  k_ch_threadgroup_16      5.060 ms =  424.4 G lookups/s
+  k_cb_program_512         6.695 ms =  320.7 G lookups/s
+  k_cb_constant_512        7.131 ms =  301.2 G lookups/s
+  k_cb_device_512          7.328 ms =  293.1 G lookups/s
+  k_cb_threadgroup_512     7.470 ms =  287.5 G lookups/s
+  k_ch_program_512         3.516 ms =  610.9 G lookups/s
+  k_ch_constant_512        3.576 ms =  600.5 G lookups/s
+  k_ch_device_512          3.678 ms =  583.8 G lookups/s
+  k_ch_threadgroup_512     3.880 ms =  553.4 G lookups/s
+  k_cb_program_1k          9.387 ms =  228.8 G lookups/s
+  k_cb_constant_1k         9.928 ms =  216.3 G lookups/s
+  k_cb_device_1k          10.779 ms =  199.2 G lookups/s
+  k_cb_threadgroup_1k     11.882 ms =  180.7 G lookups/s
+  k_ch_program_1k          6.442 ms =  333.4 G lookups/s
+  k_ch_constant_1k         7.094 ms =  302.7 G lookups/s
+  k_ch_device_1k           7.797 ms =  275.4 G lookups/s
+  k_ch_threadgroup_1k      8.559 ms =  250.9 G lookups/s
+
+== safe_contract.metallib
+  k_mad                              on 838565 inputs where fused != unfused: 0 equal unfused, 838565 equal fma
+  k_fma                              on 838565 inputs where fused != unfused: 0 equal unfused, 838565 equal fma
+  k_mad_pragma_off                   on 838565 inputs where fused != unfused: 838565 equal unfused, 0 equal fma
+  x / y                                       0 of 16777216 differ (0.0000%), max 0 ulp
+  precise::divide(x, y)                       0 of 16777216 differ (0.0000%), max 0 ulp
+  1.0f / x                                    0 of 16777216 differ (0.0000%), max 0 ulp
+  fast::divide(x, 3)                 (not in this library)
+  amax / 127                                  0 of 16777216 differ (0.0000%), max 0 ulp
+  sqrt(x)                                     0 of 4194304 differ (0.0000%), max 0 ulp
+  rsqrt(x) vs 1/sqrt in double                0 of 4194304 differ (0.0000%), max 0 ulp
+  exp(x) vs double                      1594482 of 4194304 differ (38.0154%), max 1 ulp at x = -59.8147926 (gpu 1.0538181e-26, ref 1.05381802e-26)
+  precise::exp(x) vs double             1594482 of 4194304 differ (38.0154%), max 1 ulp at x = -59.8147926 (gpu 1.0538181e-26, ref 1.05381802e-26)
+  fast::exp(x) vs double             (not in this library)
+  CPU expf(x) vs double                   25832 of 4194304 differ (0.6159%), max 1 ulp at x = 71.2604523 (gpu 8.87199348e+30, ref 8.87199287e+30)
+  log(1+x) vs double                    1900628 of 4194304 differ (45.3145%), max 65535 ulp at x = 1.26957893e-05 (gpu 1.26361047e-05, ref 1.26957084e-05)
+  log1p_k(x) vs double                  1907111 of 4194304 differ (45.4691%), max 3 ulp at x = 0.127142847 (gpu 0.119685955, ref 0.119685978)
+  CPU log1pf(x) vs double                    76 of 4194304 differ (0.0018%), max 1 ulp at x = 49.3460617 (gpu 3.91892028, ref 3.91892052)
+  softplus vs CPU log1pf(expf)          1574642 of 4194304 differ (37.5424%), max 5 ulp at x = -2.05298615 (gpu 0.120757297, ref 0.120757334)
+  softplus vs double                    1549400 of 4194304 differ (36.9406%), max 4 ulp at x = -3.46582603 (gpu 0.0307689346, ref 0.0307689272)
+  1/(1+exp(-x)) vs double               1522832 of 4194304 differ (36.3071%), max 4 ulp at x = -16.6665802 (gpu 5.7782465e-08, ref 5.77824792e-08)
+  1/(1+exp(-x)) vs CPU float             678505 of 4194304 differ (16.1768%), max 4 ulp at x = -16.6590691 (gpu 5.82181165e-08, ref 5.82181308e-08)
+  rint(x) vs rintf                            0 of 1060595 differ (0.0000%), max 0 ulp
+  round(x) vs roundf                          5 of 1060595 differ (0.0005%), max 0 ulp
+  trunc(x) vs truncf                          0 of 1060595 differ (0.0000%), max 0 ulp
+  round / rint of the edge values    0.49999997->0/0 -0.49999997->0/-0(!) 0.5->1/0 -0.5->-1/-0 1.5->2/2 -1.5->-2/-2 2.5->3/2 -2.5->-3/-2 8388609->8.38861e+06/8.38861e+06 -8388609->-8.38861e+06/-8.38861e+06 8388608->8.38861e+06/8.38861e+06 -0.25->0/-0(!) -0->0/-0(!) 0->0/0 -1e-30->0/-0(!) 1e-30->0/0
+  half(x)                            0 non-NaN and 2 NaN of 4448275 differ from the CPU's RNE conversion
+  half() of the edge values          00000000->0000 80000000->8000 7f800000->7c00 ff800000->fc00 7fc00000->7e00 7f800001->7e00 7f812345->7e00 ffc00001->7e00 477fe000->7bff 477fefff->7bff 477ff000->7c00 47800000->7c00 4e6e6b28->7c00 33000000->0000 33000001->0001 33800000->0001 38800000->0400 387fc000->03ff 00000001->0000
+  of 32768 simdgroups: the xor butterfly (16..1) equals the CPU one in 32768; simd_sum is the same in every lane in 32768, equals the 16..1 butterfly in 12284, a sequential sum in 8463, a pairwise tree in 32768, the 1..16 butterfly in every lane in 32768; simd_max and the max butterfly equal the CPU max in 32768
+
+== fast.metallib
+  k_mad                              on 838070 inputs where fused != unfused: 0 equal unfused, 838070 equal fma
+  k_fma                              on 838070 inputs where fused != unfused: 0 equal unfused, 838070 equal fma
+  k_mad_pragma_off                   on 838070 inputs where fused != unfused: 838070 equal unfused, 0 equal fma
+  x / y                                 4772403 of 16777216 differ (28.4457%), max 2 ulp at x = 927.949341 (gpu -118.019348, ref -118.019333)
+  precise::divide(x, y)                       0 of 16777216 differ (0.0000%), max 0 ulp
+  1.0f / x                              1737364 of 16777216 differ (10.3555%), max 1 ulp at x = -0.00192427752 (gpu -519.675598, ref -519.675537)
+  fast::divide(x, 3)                    5591317 of 16777216 differ (33.3268%), max 1 ulp at x = -551594.5 (gpu -183864.844, ref -183864.828)
+  amax / 127                             784418 of 16777216 differ (4.6755%), max 1 ulp at x = 3.4422121 (gpu 0.0271040313, ref 0.0271040332)
+  sqrt(x)                               1188566 of 4194304 differ (28.3376%), max 2 ulp at x = 6.66781286e+10 (gpu 258221.109, ref 258221.078)
+  rsqrt(x) vs 1/sqrt in double           181727 of 4194304 differ (4.3327%), max 1 ulp at x = 0.000505492615 (gpu 44.4777298, ref 44.477726)
+  exp(x) vs double                      3950728 of 4194304 differ (94.1927%), max 64 ulp at x = -86.6435547 (gpu 2.35062829e-38, ref 2.35061932e-38)
+  precise::exp(x) vs double             1596058 of 4194304 differ (38.0530%), max 1 ulp at x = -81.3250046 (gpu 4.79732668e-36, ref 4.79732632e-36)
+  fast::exp(x) vs double                3950728 of 4194304 differ (94.1927%), max 64 ulp at x = -86.6435547 (gpu 2.35062829e-38, ref 2.35061932e-38)
+  CPU expf(x) vs double                   26131 of 4194304 differ (0.6230%), max 1 ulp at x = 66.6898651 (gpu 9.18418112e+28, ref 9.18418017e+28)
+  log(1+x) vs double                    1900820 of 4194304 differ (45.3191%), max 32767 ulp at x = 1.69873238e-05 (gpu 1.69275772e-05, ref 1.69871801e-05)
+  log1p_k(x) vs double                  1900820 of 4194304 differ (45.3191%), max 32767 ulp at x = 1.69873238e-05 (gpu 1.69275772e-05, ref 1.69871801e-05)
+  CPU log1pf(x) vs double                    96 of 4194304 differ (0.0023%), max 1 ulp at x = -0.00515925884 (gpu -0.00517261401, ref -0.00517261354)
+  softplus vs CPU log1pf(expf)          2652515 of 4194304 differ (63.2409%), max 8388588 ulp at x = -16.6355305 (gpu 1.19209261e-07, ref 5.96047585e-08)
+  softplus vs double                    2648835 of 4194304 differ (63.1531%), max 8388589 ulp at x = -16.6355305 (gpu 1.19209261e-07, ref 5.96047514e-08)
+  1/(1+exp(-x)) vs double               2416873 of 4194304 differ (57.6227%), max 29 ulp at x = -29.8180065 (gpu 1.12254837e-13, ref 1.12254641e-13)
+  1/(1+exp(-x)) vs CPU float            1855234 of 4194304 differ (44.2322%), max 30 ulp at x = -29.8154602 (gpu 1.12541039e-13, ref 1.12540836e-13)
+  rint(x) vs rintf                            0 of 1060595 differ (0.0000%), max 0 ulp
+  round(x) vs roundf                          4 of 1060595 differ (0.0004%), max 0 ulp
+  trunc(x) vs truncf                          0 of 1060595 differ (0.0000%), max 0 ulp
+  round / rint of the edge values    0.49999997->0/0 -0.49999997->0/-0(!) 0.5->1/0 -0.5->-1/-0 1.5->2/2 -1.5->-2/-2 2.5->3/2 -2.5->-3/-2 8388609->8.38861e+06/8.38861e+06 -8388609->-8.38861e+06/-8.38861e+06 8388608->8.38861e+06/8.38861e+06 -0.25->0/-0(!) -0->0/-0(!) 0->0/0 -1e-30->0/-0(!) 1e-30->0/0
+  half(x)                            0 non-NaN and 2 NaN of 4448275 differ from the CPU's RNE conversion
+  half() of the edge values          00000000->0000 80000000->8000 7f800000->7c00 ff800000->fc00 7fc00000->7e00 7f800001->7e00 7f812345->7e00 ffc00001->7e00 477fe000->7bff 477fefff->7bff 477ff000->7c00 47800000->7c00 4e6e6b28->7c00 33000000->0000 33000001->0001 33800000->0001 38800000->0400 387fc000->03ff 00000001->0000
+  of 32768 simdgroups: the xor butterfly (16..1) equals the CPU one in 32768; simd_sum is the same in every lane in 32768, equals the 16..1 butterfly in 12342, a sequential sum in 8719, a pairwise tree in 32768, the 1..16 butterfly in every lane in 32768; simd_max and the max butterfly equal the CPU max in 32768

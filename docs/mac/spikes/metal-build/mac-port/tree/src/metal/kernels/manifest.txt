@@ -1,0 +1,5 @@
+# Every kernel in strata.metallib: <function> <safe|fast> <threads per threadgroup>, one space apart.
+# cmake/metal/check_manifest.cmake fails the build when the .metal files and this list disagree
+# (docs/mac/08-build-and-distribution.md, section 5.4).
+strata_selftest_add safe 256
+strata_selftest_exp fast 256

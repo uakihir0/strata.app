@@ -1,0 +1,97 @@
+// include/strata/metal/mv_dispatch.hpp - validated Q8_1 and dense mat-vec encoders.
+#pragma once
+
+#include "strata/metal/context.hpp"
+
+#include <cstdint>
+#include <string>
+
+namespace strata::metal {
+
+class Encoder;
+
+enum class MatVecWeightFormat : std::uint8_t {
+    q8_0,
+    q4_0,
+    q5_0,
+    q2_0,
+    iq4_nl,
+    iq4_xs,
+    iq3_s,
+    q4_k,
+    q5_k,
+    q3_k,
+    q6_k,
+    bf16,
+};
+
+struct Q8_1Buffers {
+    BufferRef input_f32;
+    BufferRef output_q8_1;
+};
+
+/// Quantize row-major float activations to Q8_1, matching `strata_q_q8_1`.
+/// Width must be a supported multiple of 32. Input values must remain
+/// unchanged until the command buffer completes.
+bool encode_q8_1(Context& context, CommandBuffer& command_buffer,
+                 std::uint32_t rows, std::uint32_t width,
+                 const Q8_1Buffers& buffers, std::string& error);
+/// Add the same validated quantization dispatch to an existing compute
+/// segment. Use one segment when a later dispatch consumes these Q8_1 rows.
+bool encode_q8_1(Context& context, Encoder& encoder,
+                 std::uint32_t rows, std::uint32_t width,
+                 const Q8_1Buffers& buffers, std::string& error);
+
+struct MatVecBuffers {
+    // Q8_1 rows for quantized formats; row-major F32 activations for BF16.
+    BufferRef activations;
+    BufferRef weights;
+    // Active output columns are packed row-major, each with `n_out` values.
+    BufferRef output;
+    // Receives padded compiled columns; at least one float is required when
+    // there are no padded columns.
+    BufferRef sink;
+    // Host-visible uint32 value equal to active_columns.
+    BufferRef active_rows;
+};
+
+struct IndexedHeadMatVecBuffers {
+    MatVecBuffers matvec;
+    // Host-visible int32 row indices: output row -> full-head weight row.
+    BufferRef row_map;
+};
+
+/// Encode one dense projection with a compiled NC width of 1, 2, 4 or 8.
+/// `active_columns` may be smaller than `compiled_columns`; the unused outputs
+/// are written to `sink`. Non-indexed dense/head variants are supported.
+///
+/// All views must belong to `context`. Read-only inputs may alias each other;
+/// output and sink must not overlap any input or each other. Callers must keep
+/// inputs and `active_rows` unchanged until command completion.
+bool encode_matvec(Context& context, CommandBuffer& command_buffer,
+                   MatVecWeightFormat format, std::uint32_t n_in,
+                   std::uint32_t n_out, std::uint32_t active_columns,
+                   std::uint32_t compiled_columns,
+                   const MatVecBuffers& buffers, std::string& error);
+/// Add the same validated dense projection to an existing compute segment.
+bool encode_matvec(Context& context, Encoder& encoder,
+                   MatVecWeightFormat format, std::uint32_t n_in,
+                   std::uint32_t n_out, std::uint32_t active_columns,
+                   std::uint32_t compiled_columns,
+                   const MatVecBuffers& buffers, std::string& error);
+
+/// Encode the indexed draft-vocabulary head for Q5_K, Q6_K or IQ4_XS.
+/// `weight_rows` is the full head row count; `output_rows` is the row-map
+/// length and must not exceed it. The map is validated as signed int32 indices
+/// into the full head. This path uses one active and compiled column.
+///
+/// All views must belong to `context`. Read-only inputs may alias each other;
+/// output and sink must not overlap any input or each other. Callers must keep
+/// inputs, `row_map` and `active_rows` unchanged until command completion.
+bool encode_indexed_head_matvec(
+    Context& context, CommandBuffer& command_buffer,
+    MatVecWeightFormat format, std::uint32_t n_in,
+    std::uint32_t weight_rows, std::uint32_t output_rows,
+    const IndexedHeadMatVecBuffers& buffers, std::string& error);
+
+}  // namespace strata::metal

@@ -1,0 +1,1826 @@
+// Metal twins for the GDN block and its validated encoders (docs/mac/04 §5.5).
+#include "metallib_sha256.inc"
+#include "oracles/gdn.hpp"
+#include "strata/metal/context.hpp"
+#include "strata/metal/encoder.hpp"
+#include "strata/metal/gdn_dispatch.hpp"
+#include "strata/kernels/bf16_bits.hpp"
+#include "twin.hpp"
+
+#include "../../src/metal/kernels/common/params.h"
+
+#import <Metal/Metal.h>
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <random>
+#include <span>
+#include <string>
+#include <utility>
+#include <vector>
+
+using namespace strata::metal;
+
+namespace {
+
+constexpr std::uint32_t kStateElements = GDN_STATE_ELEMENTS;
+constexpr std::uint32_t kHistoryElements = GDN_HISTORY_ELEMENTS;
+constexpr std::uint32_t kChannels = GDN_CONV_CHANNELS;
+constexpr std::uint32_t kValueDim = GDN_VALUE_DIM;
+constexpr std::uint32_t kHeads = GDN_V_HEADS;
+constexpr std::uint32_t kHeadDim = GDN_HEAD_DIM;
+
+enum class EdgeProfile { regular, all_zero, one_outlier };
+
+int g_failures = 0;
+
+const char* edge_profile_name(EdgeProfile profile) {
+    switch (profile) {
+        case EdgeProfile::regular: return "";
+        case EdgeProfile::all_zero: return " edge=all-zero";
+        case EdgeProfile::one_outlier: return " edge=2^10-outlier";
+    }
+    return "";
+}
+
+void check(bool condition, const std::string& label,
+           const std::string& detail = {}) {
+    std::printf("%s %s%s%s\n", condition ? "ok  " : "FAIL", label.c_str(),
+                detail.empty() ? "" : ": ",
+                detail.empty() ? "" : detail.c_str());
+    std::fflush(stdout);
+    if (!condition) ++g_failures;
+}
+
+template <class T>
+std::span<T> typed(twin::GuardedBuffer& buffer) {
+    auto bytes = buffer.payload();
+    return {reinterpret_cast<T*>(bytes.data()), bytes.size() / sizeof(T)};
+}
+
+template <class T>
+std::span<const T> typed(const twin::GuardedBuffer& buffer) {
+    auto bytes = buffer.payload();
+    return {reinterpret_cast<const T*>(bytes.data()),
+            bytes.size() / sizeof(T)};
+}
+
+float sample(twin::InputSet set, std::mt19937_64& rng,
+             std::uint32_t index, float scale) {
+    if (set == twin::InputSet::edge) {
+        constexpr std::array<float, 12> edge{
+            0.0f, -0.0f, 0.125f, -0.125f, 0.25f, -0.25f,
+            0.5f, -0.5f, 1.0f, -1.0f, 2.0f, -2.0f};
+        return edge[index % edge.size()] * scale;
+    }
+    if (set == twin::InputSet::fixture) {
+        const std::int32_t value =
+            static_cast<std::int32_t>((index * 37u + 19u) % 1021u) - 510;
+        return static_cast<float>(value) * (scale / 512.0f);
+    }
+    const std::int32_t value =
+        static_cast<std::int32_t>(rng() & 0xffffu) - 32768;
+    return static_cast<float>(value) * (scale / 32768.0f);
+}
+
+template <class F>
+bool run_command(Context& context, const std::string& label, F&& encode,
+                 std::string& error) {
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    if (!encode(*command, error)) {
+        check(false, label + " encode", error);
+        command->discard();
+        return false;
+    }
+    if (!command->commit(error)) {
+        check(false, label + " submit", error);
+        return false;
+    }
+    id<MTLCommandBuffer> native =
+        (__bridge id<MTLCommandBuffer>)command->unsafe_native_handle();
+    if (native == nil) {
+        check(false, label + " native command buffer",
+              "command buffer became unavailable");
+        return false;
+    }
+    [native waitUntilCompleted];
+    if (native.status != MTLCommandBufferStatusCompleted) {
+        error = native.error.localizedDescription.UTF8String != nullptr
+            ? native.error.localizedDescription.UTF8String
+            : "Metal command buffer failed";
+        check(false, label + " GPU completion", error);
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
+bool compare_units(std::span<const float> actual,
+                   std::span<const twin::tf> expected, double units,
+                   const std::string& label, const twin::Options& options,
+                   std::uint32_t rows) {
+    const auto mismatch = twin::compare_floats(
+        actual, expected, {twin::Comparison::units, units, 0.0, 0u});
+    if (mismatch) twin::report_failure(label.c_str(), options, rows, *mismatch);
+    check(!mismatch, label + " U(" + std::to_string(units) + ")");
+    return !mismatch;
+}
+
+bool run_conv_l2_case(Context& context, std::uint32_t rows,
+                      twin::InputSet set, const twin::Options& options,
+                      EdgeProfile edge_profile = EdgeProfile::regular,
+                      bool shared_encoder = false) {
+    const std::string label =
+        "GDN conv_l2 T=" + std::to_string(rows) +
+        " set=" + twin::input_set_name(set) + edge_profile_name(edge_profile) +
+        (shared_encoder ? " shared-encoder" : "");
+    std::mt19937_64 rng(options.seed ^ (std::uint64_t{rows} << 32u) ^
+                        static_cast<std::uint64_t>(set));
+    std::vector<float> history(kHistoryElements);
+    std::vector<float> qkv(static_cast<std::size_t>(rows) * kChannels);
+    std::vector<float> weights(
+        static_cast<std::size_t>(kChannels) * GDN_CONV_KERNEL);
+    for (std::uint32_t i = 0u; i < history.size(); ++i) {
+        history[i] = sample(set, rng, i, 0.2f);
+    }
+    for (std::uint32_t i = 0u; i < qkv.size(); ++i) {
+        qkv[i] = sample(set, rng, i + 71u, 0.5f);
+    }
+    for (std::uint32_t i = 0u; i < weights.size(); ++i) {
+        weights[i] = sample(set, rng, i + 113u, 0.15f);
+    }
+    if (edge_profile == EdgeProfile::all_zero) {
+        std::fill(history.begin(), history.end(), 0.0f);
+        std::fill(qkv.begin(), qkv.end(), 0.0f);
+        std::fill(weights.begin(), weights.end(), 0.0f);
+    } else if (edge_profile == EdgeProfile::one_outlier) {
+        constexpr float base = 1.0f / 1024.0f;
+        std::fill(history.begin(), history.end(), base);
+        std::fill(qkv.begin(), qkv.end(), base);
+        std::fill(weights.begin(), weights.end(), base);
+        std::fill_n(qkv.begin() + kChannels, kChannels, 1.0f);
+    }
+    std::vector<twin::tf> expected;
+    oracle::gdn_conv_l2(history, qkv, weights, rows, expected);
+
+    std::string error;
+    twin::GuardedBuffer history_buffer, qkv_buffer, weight_buffer, output_buffer;
+    check(history_buffer.allocate(context, label + " history",
+                                  history.size() * sizeof(float), error),
+          label + " history allocation", error);
+    check(qkv_buffer.allocate(context, label + " qkv",
+                              qkv.size() * sizeof(float), error),
+          label + " qkv allocation", error);
+    check(weight_buffer.allocate(context, label + " weights",
+                                 weights.size() * sizeof(float), error),
+          label + " weights allocation", error);
+    check(output_buffer.allocate(context, label + " output",
+                                 qkv.size() * sizeof(float), error),
+          label + " output allocation", error);
+    if (!history_buffer.view() || !qkv_buffer.view() ||
+        !weight_buffer.view() || !output_buffer.view()) {
+        return false;
+    }
+    std::memcpy(history_buffer.payload().data(), history.data(),
+                history.size() * sizeof(float));
+    std::memcpy(qkv_buffer.payload().data(), qkv.data(),
+                qkv.size() * sizeof(float));
+    std::memcpy(weight_buffer.payload().data(), weights.data(),
+                weights.size() * sizeof(float));
+    const bool poisoned = output_buffer.poison_floats_against(
+        expected, twin::Comparison::units, error);
+    check(poisoned, label + " output poison", error);
+    history_buffer.capture_before_dispatch();
+    qkv_buffer.capture_before_dispatch();
+    weight_buffer.capture_before_dispatch();
+    output_buffer.capture_before_dispatch();
+
+    const GDNConvL2Buffers buffers{
+        history_buffer.view(), qkv_buffer.view(), weight_buffer.view(),
+        output_buffer.view()};
+    const bool dispatched = run_command(
+        context, label, [&](CommandBuffer& command, std::string& err) {
+            if (!shared_encoder) {
+                return encode_gdn_conv_l2(context, command, rows, buffers,
+                                          err);
+            }
+            return Encoder::encode(
+                context, command, "shared GDN convolution and q/k L2",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encode_gdn_conv_l2(context, encoder, rows, buffers,
+                                              encode_error);
+                },
+                err);
+        }, error);
+    if (!dispatched) return false;
+    const auto actual = typed<float>(output_buffer);
+    bool passed = compare_units(actual, expected, 128.0, label, options, rows);
+    passed &= !history_buffer.first_unwritten_change({});
+    passed &= !qkv_buffer.first_unwritten_change({});
+    passed &= !weight_buffer.first_unwritten_change({});
+    const std::array<twin::ByteRange, 1> output_written{{
+        {0u, qkv.size() * sizeof(float)}}};
+    const auto output_guard =
+        output_buffer.first_unwritten_change(output_written);
+    check(!output_guard, label + " output guards",
+          output_guard ? output_guard->reason : "");
+    check(passed, label + " inputs remain unchanged");
+    return passed;
+}
+
+bool run_conv_commit_case(Context& context, std::uint32_t rows,
+                          const twin::Options& options,
+                          EdgeProfile edge_profile = EdgeProfile::regular,
+                          bool shared_encoder = false) {
+    const std::string label =
+        "GDN conv_commit n_keep=" + std::to_string(rows) +
+        edge_profile_name(edge_profile) +
+        (shared_encoder ? " shared-encoder" : "");
+    std::mt19937_64 rng(options.seed ^ (std::uint64_t{rows} << 40u) ^
+                        0x434f4e56434f4d4dull);
+    std::vector<float> qkv(8u * kChannels);
+    std::vector<float> initial(kHistoryElements);
+    for (std::uint32_t i = 0u; i < qkv.size(); ++i) {
+        qkv[i] = sample(options.input_set, rng, i, 0.4f);
+    }
+    for (std::uint32_t i = 0u; i < initial.size(); ++i) {
+        initial[i] = sample(options.input_set, rng, i + 17u, 0.3f);
+    }
+    if (edge_profile == EdgeProfile::all_zero) {
+        std::fill(qkv.begin(), qkv.end(), 0.0f);
+        std::fill(initial.begin(), initial.end(), 0.0f);
+    } else if (edge_profile == EdgeProfile::one_outlier) {
+        constexpr float base = 1.0f / 1024.0f;
+        std::fill(qkv.begin(), qkv.end(), base);
+        std::fill(initial.begin(), initial.end(), base);
+        std::fill_n(qkv.end() - kChannels, kChannels, 1.0f);
+    }
+    std::vector<float> expected = initial;
+    oracle::gdn_conv_commit(expected, qkv, rows);
+
+    std::string error;
+    twin::GuardedBuffer history_buffer, qkv_buffer;
+    check(history_buffer.allocate(context, label + " history",
+                                  initial.size() * sizeof(float), error),
+          label + " history allocation", error);
+    check(qkv_buffer.allocate(context, label + " qkv",
+                              qkv.size() * sizeof(float), error),
+          label + " qkv allocation", error);
+    if (!history_buffer.view() || !qkv_buffer.view()) return false;
+    std::memcpy(history_buffer.payload().data(), initial.data(),
+                initial.size() * sizeof(float));
+    std::memcpy(qkv_buffer.payload().data(), qkv.data(),
+                qkv.size() * sizeof(float));
+    history_buffer.capture_before_dispatch();
+    qkv_buffer.capture_before_dispatch();
+
+    const GDNConvCommitBuffers buffers{history_buffer.view(),
+                                       qkv_buffer.view()};
+    const bool dispatched = run_command(
+        context, label, [&](CommandBuffer& command, std::string& err) {
+            if (!shared_encoder) {
+                return encode_gdn_conv_commit(context, command, rows, buffers,
+                                              err);
+            }
+            return Encoder::encode(
+                context, command, "shared GDN convolution history commit",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encode_gdn_conv_commit(
+                        context, encoder, rows, buffers, encode_error);
+                },
+                err);
+        }, error);
+    if (!dispatched) return false;
+    const auto actual = typed<float>(history_buffer);
+    const bool exact =
+        std::memcmp(actual.data(), expected.data(),
+                    expected.size() * sizeof(float)) == 0;
+    check(exact, label + " exact three-tap history");
+    const std::array<twin::ByteRange, 1> written{{
+        {0u, expected.size() * sizeof(float)}}};
+    const auto changed = history_buffer.first_unwritten_change(written);
+    check(!changed, label + " history guards",
+          changed ? changed->reason : "");
+    check(!qkv_buffer.first_unwritten_change({}),
+          label + " qkv remains read-only");
+    return exact && !changed;
+}
+
+bool run_ab_case(Context& context, std::uint32_t rows,
+                 twin::InputSet set, const twin::Options& options,
+                 EdgeProfile edge_profile = EdgeProfile::regular,
+                 bool shared_encoder = false) {
+    const std::string label =
+        "GDN alpha/beta T=" + std::to_string(rows) +
+        " set=" + twin::input_set_name(set) + edge_profile_name(edge_profile) +
+        (shared_encoder ? " shared-encoder" : "");
+    std::mt19937_64 rng(options.seed ^ (std::uint64_t{rows} << 36u) ^
+                        (static_cast<std::uint64_t>(set) << 20u) ^
+                        0x414c504841424554ull);
+    std::vector<float> input(static_cast<std::size_t>(rows) * N_EMBD);
+    std::vector<std::uint16_t> alpha(
+        static_cast<std::size_t>(kHeads) * N_EMBD);
+    std::vector<std::uint16_t> beta_weights(alpha.size());
+    std::vector<float> dt(kHeads), a(kHeads);
+    for (std::uint32_t i = 0u; i < input.size(); ++i) {
+        input[i] = sample(set, rng, i, 0.25f);
+    }
+    for (std::uint32_t i = 0u; i < alpha.size(); ++i) {
+        alpha[i] = strata::kernels::bf16_from_f32(
+            sample(set, rng, i + 31u, 0.06f));
+        beta_weights[i] = strata::kernels::bf16_from_f32(
+            sample(set, rng, i + 97u, 0.06f));
+    }
+    for (std::uint32_t i = 0u; i < kHeads; ++i) {
+        dt[i] = sample(set, rng, i + 7u, 0.3f);
+        a[i] = -0.02f - std::fabs(sample(set, rng, i + 9u, 0.1f));
+    }
+    if (edge_profile == EdgeProfile::all_zero) {
+        std::fill(input.begin(), input.end(), 0.0f);
+        std::fill(alpha.begin(), alpha.end(), 0u);
+        std::fill(beta_weights.begin(), beta_weights.end(), 0u);
+        std::fill(dt.begin(), dt.end(), 0.0f);
+        std::fill(a.begin(), a.end(), 0.0f);
+    } else if (edge_profile == EdgeProfile::one_outlier) {
+        constexpr float base = 1.0f / 1024.0f;
+        std::fill(input.begin(), input.end(), base);
+        std::fill_n(input.begin() + N_EMBD, N_EMBD, 1.0f);
+        std::fill(alpha.begin(), alpha.end(),
+                  strata::kernels::bf16_from_f32(1.0f / 64.0f));
+        std::fill(beta_weights.begin(), beta_weights.end(),
+                  strata::kernels::bf16_from_f32(1.0f / 64.0f));
+        std::fill(dt.begin(), dt.end(), 0.0f);
+        std::fill(a.begin(), a.end(), -0.02f);
+    }
+    std::vector<twin::tf> expected_gate, expected_beta;
+    oracle::gdn_ab(input, alpha, beta_weights, dt, a, rows,
+                   expected_gate, expected_beta);
+
+    std::string error;
+    twin::GuardedBuffer input_buffer, alpha_buffer, beta_weight_buffer;
+    twin::GuardedBuffer dt_buffer, a_buffer, gate_buffer, beta_buffer;
+    check(input_buffer.allocate(context, label + " input",
+                                input.size() * sizeof(float), error),
+          label + " input allocation", error);
+    check(alpha_buffer.allocate(context, label + " alpha",
+                                alpha.size() * sizeof(std::uint16_t), error),
+          label + " alpha allocation", error);
+    check(beta_weight_buffer.allocate(
+              context, label + " beta weights",
+              beta_weights.size() * sizeof(std::uint16_t), error),
+          label + " beta weight allocation", error);
+    check(dt_buffer.allocate(context, label + " dt", dt.size() * sizeof(float),
+                             error),
+          label + " dt allocation", error);
+    check(a_buffer.allocate(context, label + " a", a.size() * sizeof(float),
+                            error),
+          label + " a allocation", error);
+    const std::size_t output_bytes =
+        static_cast<std::size_t>(rows) * kHeads * sizeof(float);
+    check(gate_buffer.allocate(context, label + " gate", output_bytes, error),
+          label + " gate allocation", error);
+    check(beta_buffer.allocate(context, label + " beta", output_bytes, error),
+          label + " beta allocation", error);
+    if (!input_buffer.view() || !alpha_buffer.view() ||
+        !beta_weight_buffer.view() || !dt_buffer.view() || !a_buffer.view() ||
+        !gate_buffer.view() || !beta_buffer.view()) {
+        return false;
+    }
+    std::memcpy(input_buffer.payload().data(), input.data(),
+                input.size() * sizeof(float));
+    std::memcpy(alpha_buffer.payload().data(), alpha.data(),
+                alpha.size() * sizeof(std::uint16_t));
+    std::memcpy(beta_weight_buffer.payload().data(), beta_weights.data(),
+                beta_weights.size() * sizeof(std::uint16_t));
+    std::memcpy(dt_buffer.payload().data(), dt.data(), dt.size() * sizeof(float));
+    std::memcpy(a_buffer.payload().data(), a.data(), a.size() * sizeof(float));
+    check(gate_buffer.poison_floats_against(
+              expected_gate, twin::Comparison::units, error),
+          label + " gate poison", error);
+    check(beta_buffer.poison_floats_against(
+              expected_beta, twin::Comparison::units, error),
+          label + " beta poison", error);
+    input_buffer.capture_before_dispatch();
+    alpha_buffer.capture_before_dispatch();
+    beta_weight_buffer.capture_before_dispatch();
+    dt_buffer.capture_before_dispatch();
+    a_buffer.capture_before_dispatch();
+    gate_buffer.capture_before_dispatch();
+    beta_buffer.capture_before_dispatch();
+
+    const GDNABBuffers buffers{
+        input_buffer.view(), alpha_buffer.view(), beta_weight_buffer.view(),
+        dt_buffer.view(), a_buffer.view(), gate_buffer.view(), beta_buffer.view()};
+    const bool dispatched = run_command(
+        context, label, [&](CommandBuffer& command, std::string& err) {
+            if (!shared_encoder) {
+                return encode_gdn_ab(context, command, rows, buffers, err);
+            }
+            return Encoder::encode(
+                context, command, "shared GDN alpha/beta gates",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encode_gdn_ab(context, encoder, rows, buffers,
+                                         encode_error);
+                },
+                err);
+        }, error);
+    if (!dispatched) return false;
+    bool passed = compare_units(typed<float>(gate_buffer), expected_gate, 256.0,
+                                label + " softplus gate", options, rows);
+    passed &= compare_units(typed<float>(beta_buffer), expected_beta, 128.0,
+                            label + " sigmoid beta", options, rows);
+    passed &= !input_buffer.first_unwritten_change({});
+    passed &= !alpha_buffer.first_unwritten_change({});
+    passed &= !beta_weight_buffer.first_unwritten_change({});
+    passed &= !dt_buffer.first_unwritten_change({});
+    passed &= !a_buffer.first_unwritten_change({});
+    const std::array<twin::ByteRange, 1> written{{{0u, output_bytes}}};
+    const auto gate_guard = gate_buffer.first_unwritten_change(written);
+    const auto beta_guard = beta_buffer.first_unwritten_change(written);
+    check(!gate_guard && !beta_guard, label + " output guards",
+          gate_guard ? gate_guard->reason
+                     : (beta_guard ? beta_guard->reason : ""));
+    return passed && !gate_guard && !beta_guard;
+}
+
+bool run_step_norm_set(Context& context, twin::InputSet set,
+                       const twin::Options& options,
+                       EdgeProfile edge_profile = EdgeProfile::regular,
+                       bool shared_encoder = false) {
+    const std::string set_label =
+        "GDN recurrence set=" + std::string(twin::input_set_name(set)) +
+        edge_profile_name(edge_profile) +
+        (shared_encoder ? " shared-encoder" : "");
+    constexpr std::size_t state_bytes =
+        static_cast<std::size_t>(kStateElements) * sizeof(float);
+    constexpr std::size_t h_max_bytes =
+        static_cast<std::size_t>(8u) * kChannels * sizeof(float);
+    constexpr std::size_t heads_max_bytes =
+        static_cast<std::size_t>(8u) * kHeads * sizeof(float);
+    constexpr std::size_t values_max_bytes =
+        static_cast<std::size_t>(8u) * kValueDim * sizeof(float);
+    constexpr std::size_t gamma_bytes =
+        static_cast<std::size_t>(kHeadDim) * sizeof(float);
+    std::string error;
+    std::array<twin::GuardedBuffer, 3> state_buffers;
+    twin::GuardedBuffer h_buffer, gate_buffer, beta_input_buffer, z_buffer;
+    twin::GuardedBuffer gamma_buffer, output_buffer;
+    for (std::uint32_t mode = 0u; mode < state_buffers.size(); ++mode) {
+        check(state_buffers[mode].allocate(
+                  context, set_label + " state " + std::to_string(mode),
+                  state_bytes, error),
+              set_label + " state allocation", error);
+    }
+    check(h_buffer.allocate(context, set_label + " h", h_max_bytes, error),
+          set_label + " h allocation", error);
+    check(gate_buffer.allocate(context, set_label + " gate", heads_max_bytes,
+                               error),
+          set_label + " gate allocation", error);
+    check(beta_input_buffer.allocate(context, set_label + " beta",
+                                     heads_max_bytes, error),
+          set_label + " beta allocation", error);
+    check(z_buffer.allocate(context, set_label + " z", values_max_bytes, error),
+          set_label + " z allocation", error);
+    check(gamma_buffer.allocate(context, set_label + " gamma", gamma_bytes,
+                                error),
+          set_label + " gamma allocation", error);
+    check(output_buffer.allocate(context, set_label + " output",
+                                 values_max_bytes, error),
+          set_label + " output allocation", error);
+    if (!state_buffers[0].view() || !state_buffers[1].view() ||
+        !state_buffers[2].view() || !h_buffer.view() || !gate_buffer.view() ||
+        !beta_input_buffer.view() || !z_buffer.view() ||
+        !gamma_buffer.view() || !output_buffer.view()) {
+        return false;
+    }
+
+    std::mt19937_64 rng(options.seed ^ 0x535445504e4f524dull ^
+                        (static_cast<std::uint64_t>(set) << 44u));
+    std::vector<float> initial_state(kStateElements);
+    for (std::uint32_t i = 0u; i < initial_state.size(); ++i) {
+        initial_state[i] = sample(set, rng, i, 0.02f);
+    }
+    std::vector<float> h(8u * kChannels);
+    std::vector<float> gates(8u * kHeads);
+    std::vector<float> betas(8u * kHeads);
+    std::vector<float> z(8u * kValueDim);
+    std::vector<float> gamma(kHeadDim);
+    for (std::uint32_t i = 0u; i < h.size(); ++i) {
+        h[i] = sample(set, rng, i + 31u, 0.3f);
+    }
+    for (std::uint32_t i = 0u; i < gates.size(); ++i) {
+        gates[i] = -2.5f + sample(set, rng, i + 53u, 0.6f);
+        betas[i] = 0.2f + 0.6f * std::fabs(sample(set, rng, i + 73u, 1.0f));
+        betas[i] = std::min(betas[i], 1.0f);
+    }
+    for (std::uint32_t i = 0u; i < z.size(); ++i) {
+        z[i] = sample(set, rng, i + 101u, 1.0f);
+    }
+    for (std::uint32_t i = 0u; i < gamma.size(); ++i) {
+        gamma[i] = 0.5f + sample(set, rng, i + 7u, 0.5f);
+    }
+    if (edge_profile == EdgeProfile::all_zero) {
+        std::fill(initial_state.begin(), initial_state.end(), 0.0f);
+        std::fill(h.begin(), h.end(), 0.0f);
+        std::fill(gates.begin(), gates.end(), 0.0f);
+        std::fill(betas.begin(), betas.end(), 0.0f);
+        std::fill(z.begin(), z.end(), 0.0f);
+        std::fill(gamma.begin(), gamma.end(), 0.0f);
+    } else if (edge_profile == EdgeProfile::one_outlier) {
+        constexpr float base = 1.0f / 1024.0f;
+        std::fill(initial_state.begin(), initial_state.end(), base);
+        std::fill(h.begin(), h.end(), base);
+        std::fill_n(h.begin() + kChannels, kChannels, 1.0f);
+        std::fill(gates.begin(), gates.end(), 0.0f);
+        std::fill(betas.begin(), betas.end(), 1.0f);
+        std::fill(z.begin(), z.end(), 0.0f);
+        std::fill(gamma.begin(), gamma.end(), 1.0f);
+    }
+    std::memcpy(h_buffer.payload().data(), h.data(), h.size() * sizeof(float));
+    std::memcpy(gate_buffer.payload().data(), gates.data(),
+                gates.size() * sizeof(float));
+    std::memcpy(beta_input_buffer.payload().data(), betas.data(),
+                betas.size() * sizeof(float));
+    std::memcpy(z_buffer.payload().data(), z.data(), z.size() * sizeof(float));
+    std::memcpy(gamma_buffer.payload().data(), gamma.data(),
+                gamma.size() * sizeof(float));
+
+    bool all_passed = true;
+    for (std::uint32_t rows = 1u; rows <= 8u; ++rows) {
+        if (shared_encoder && rows != 1u && rows != 8u) continue;
+        std::vector<float> oracle_window_state = initial_state;
+        std::vector<float> oracle_commit_state = initial_state;
+        std::vector<twin::tf> expected_output, unused_state;
+        std::vector<twin::tf> expected_state;
+        const auto h_rows = std::span<const float>(h).first(
+            static_cast<std::size_t>(rows) * kChannels);
+        const auto gate_rows = std::span<const float>(gates).first(
+            static_cast<std::size_t>(rows) * kHeads);
+        const auto beta_rows = std::span<const float>(betas).first(
+            static_cast<std::size_t>(rows) * kHeads);
+        const auto z_rows = std::span<const float>(z).first(
+            static_cast<std::size_t>(rows) * kValueDim);
+        oracle::gdn_step_norm(
+            oracle_window_state, h_rows, gate_rows, beta_rows, z_rows, gamma,
+            rows, GDNStateMode::window, expected_output, unused_state);
+        oracle::gdn_step_norm(
+            oracle_commit_state, h_rows, gate_rows, beta_rows, z_rows, gamma,
+            rows, GDNStateMode::commit, unused_state, expected_state);
+
+        std::vector<float> mode_states[3];
+        for (std::uint32_t mode_index = 0u; mode_index < 3u; ++mode_index) {
+            const auto mode = static_cast<GDNStateMode>(mode_index);
+            const std::string label =
+                set_label + " T=" + std::to_string(rows) + " mode=" +
+                std::to_string(mode_index);
+            std::memcpy(state_buffers[mode_index].payload().data(),
+                        initial_state.data(), state_bytes);
+            auto out = typed<float>(output_buffer);
+            std::fill(out.begin(), out.end(), -123.25f);
+            state_buffers[mode_index].capture_before_dispatch();
+            h_buffer.capture_before_dispatch();
+            gate_buffer.capture_before_dispatch();
+            beta_input_buffer.capture_before_dispatch();
+            z_buffer.capture_before_dispatch();
+            gamma_buffer.capture_before_dispatch();
+            output_buffer.capture_before_dispatch();
+
+            const GDNStepNormBuffers buffers{
+                state_buffers[mode_index].view(), h_buffer.view(),
+                gate_buffer.view(), beta_input_buffer.view(), z_buffer.view(),
+                gamma_buffer.view(), output_buffer.view()};
+            const bool dispatched = run_command(
+                context, label,
+                [&](CommandBuffer& command, std::string& err) {
+                    if (!shared_encoder) {
+                        return encode_gdn_step_norm(context, command, rows,
+                                                    mode, buffers, err);
+                    }
+                    return Encoder::encode(
+                        context, command, "shared GDN recurrent step norm",
+                        [&](Encoder& encoder, std::string& encode_error) {
+                            return encode_gdn_step_norm(
+                                context, encoder, rows, mode, buffers,
+                                encode_error);
+                        },
+                        err);
+                },
+                error);
+            if (!dispatched) {
+                all_passed = false;
+                continue;
+            }
+
+            const std::size_t output_count =
+                static_cast<std::size_t>(rows) * kValueDim;
+            const std::size_t active_output_bytes =
+                output_count * sizeof(float);
+            bool passed = true;
+            if (mode == GDNStateMode::commit) {
+                const auto changed =
+                    output_buffer.first_unwritten_change({});
+                check(!changed, label + " commit leaves output untouched",
+                      changed ? changed->reason : "");
+                passed &= !changed;
+            } else {
+                const auto actual =
+                    std::span<const float>(typed<float>(output_buffer))
+                        .first(output_count);
+                passed &= compare_units(actual, expected_output, 512.0,
+                                        label + " output", options, rows);
+                const std::array<twin::ByteRange, 1> written{{
+                    {0u, active_output_bytes}}};
+                const auto changed =
+                    output_buffer.first_unwritten_change(written);
+                check(!changed, label + " output guards",
+                      changed ? changed->reason : "");
+                passed &= !changed;
+            }
+
+            const auto actual_state = typed<float>(state_buffers[mode_index]);
+            if (mode == GDNStateMode::window) {
+                const bool unchanged =
+                    std::memcmp(actual_state.data(), initial_state.data(),
+                                state_bytes) == 0;
+                check(unchanged, label + " window leaves state untouched");
+                passed &= unchanged;
+                check(!state_buffers[mode_index].first_unwritten_change({}),
+                      label + " state guards");
+                mode_states[mode_index].assign(actual_state.begin(),
+                                               actual_state.end());
+            } else {
+                passed &= compare_units(actual_state, expected_state, 512.0,
+                                        label + " recurrent state", options,
+                                        rows);
+                const std::array<twin::ByteRange, 1> state_written{{
+                    {0u, state_bytes}}};
+                const auto changed =
+                    state_buffers[mode_index].first_unwritten_change(
+                        state_written);
+                check(!changed, label + " state guards",
+                      changed ? changed->reason : "");
+                passed &= !changed;
+                mode_states[mode_index].assign(actual_state.begin(),
+                                               actual_state.end());
+            }
+
+            passed &= !h_buffer.first_unwritten_change({});
+            passed &= !gate_buffer.first_unwritten_change({});
+            passed &= !beta_input_buffer.first_unwritten_change({});
+            passed &= !z_buffer.first_unwritten_change({});
+            passed &= !gamma_buffer.first_unwritten_change({});
+            check(passed, label + " input immutability");
+            all_passed &= passed;
+        }
+        if (mode_states[1].size() == kStateElements &&
+            mode_states[2].size() == kStateElements) {
+            const bool same_state =
+                std::memcmp(mode_states[1].data(), mode_states[2].data(),
+                            state_bytes) == 0;
+            check(same_state,
+                  set_label + " T=" + std::to_string(rows) +
+                      " commit and write-through states are bitwise equal");
+            all_passed &= same_state;
+        }
+    }
+    return all_passed;
+}
+
+bool test_encoder_validation(Context& context, Context& foreign_context) {
+    constexpr std::uint32_t rows = 2u;
+    constexpr std::size_t float_bytes = sizeof(float);
+    const std::size_t hist_bytes =
+        static_cast<std::size_t>(kHistoryElements) * float_bytes;
+    const std::size_t qkv_bytes =
+        static_cast<std::size_t>(rows) * kChannels * float_bytes;
+    const std::size_t conv_weight_bytes =
+        static_cast<std::size_t>(kChannels) * GDN_CONV_KERNEL * float_bytes;
+    const std::size_t ab_weight_bytes =
+        static_cast<std::size_t>(kHeads) * N_EMBD * sizeof(std::uint16_t);
+    const std::size_t gate_bytes =
+        static_cast<std::size_t>(rows) * kHeads * float_bytes;
+    const std::size_t state_bytes =
+        static_cast<std::size_t>(kStateElements) * float_bytes;
+    const std::size_t value_bytes =
+        static_cast<std::size_t>(rows) * kValueDim * float_bytes;
+    const std::size_t gamma_bytes =
+        static_cast<std::size_t>(kHeadDim) * float_bytes;
+    std::string error;
+    const auto alloc = [&](Context& ctx, const char* name, std::size_t bytes) {
+        return ctx.buffers().allocate(name, bytes, error);
+    };
+    BufferRef hist = alloc(context, "GDN validation history", hist_bytes);
+    BufferRef qkv = alloc(context, "GDN validation qkv", qkv_bytes);
+    BufferRef conv_weights =
+        alloc(context, "GDN validation convolution weights", conv_weight_bytes);
+    BufferRef conv_out = alloc(context, "GDN validation convolution output",
+                               qkv_bytes);
+    BufferRef input = alloc(context, "GDN validation input",
+                            rows * N_EMBD * float_bytes);
+    BufferRef alpha = alloc(context, "GDN validation alpha", ab_weight_bytes);
+    BufferRef beta_weights =
+        alloc(context, "GDN validation beta weights", ab_weight_bytes);
+    BufferRef dt = alloc(context, "GDN validation dt", kHeads * float_bytes);
+    BufferRef a = alloc(context, "GDN validation a", kHeads * float_bytes);
+    BufferRef gate = alloc(context, "GDN validation gate", gate_bytes);
+    BufferRef beta = alloc(context, "GDN validation beta", gate_bytes);
+    BufferRef state = alloc(context, "GDN validation state", state_bytes);
+    BufferRef z = alloc(context, "GDN validation z", value_bytes);
+    BufferRef gamma = alloc(context, "GDN validation gamma", gamma_bytes);
+    BufferRef output = alloc(context, "GDN validation output", value_bytes);
+    BufferRef h = conv_out;
+    BufferRef foreign_qkv =
+        alloc(foreign_context, "GDN foreign qkv", qkv_bytes);
+    if (!hist || !qkv || !conv_weights || !conv_out || !input || !alpha ||
+        !beta_weights || !dt || !a || !gate || !beta || !state || !z ||
+        !gamma || !output || !foreign_qkv) {
+        check(false, "GDN validation allocations", error);
+        return false;
+    }
+    auto command = context.make_command_buffer("GDN validation", error);
+    if (!command) {
+        check(false, "GDN validation command buffer", error);
+        return false;
+    }
+    bool passed = true;
+    const auto reject = [&](const std::string& label, auto&& call,
+                            const std::string& expected_error) {
+        error.clear();
+        const bool rejected =
+            !call() && error.find(expected_error) != std::string::npos;
+        check(rejected, label, error);
+        return rejected;
+    };
+
+    const GDNConvL2Buffers valid_conv{hist, qkv, conv_weights, conv_out};
+    passed &= reject("GDN conv_l2 rejects zero rows",
+                     [&] { return encode_gdn_conv_l2(
+                               context, *command, 0u, valid_conv, error); },
+                     "row count");
+    passed &= reject("GDN conv_l2 rejects rows above eight",
+                     [&] { return encode_gdn_conv_l2(
+                               context, *command, 9u, valid_conv, error); },
+                     "row count");
+    GDNConvL2Buffers short_qkv = valid_conv;
+    --short_qkv.qkv.length;
+    passed &= reject("GDN conv_l2 rejects a short qkv view",
+                     [&] { return encode_gdn_conv_l2(
+                               context, *command, rows, short_qkv, error); },
+                     "undersized");
+    GDNConvL2Buffers alias_conv = valid_conv;
+    alias_conv.output = qkv;
+    passed &= reject("GDN conv_l2 rejects output/qkv alias",
+                     [&] { return encode_gdn_conv_l2(
+                               context, *command, rows, alias_conv, error); },
+                     "overlap");
+    GDNConvL2Buffers foreign_conv = valid_conv;
+    foreign_conv.qkv = foreign_qkv;
+    passed &= reject("GDN conv_l2 rejects foreign buffers",
+                     [&] { return encode_gdn_conv_l2(
+                               context, *command, rows, foreign_conv, error); },
+                     "not owned");
+    GDNConvL2Buffers forged_cpu = valid_conv;
+    forged_cpu.conv_weights.contents =
+        static_cast<char*>(forged_cpu.conv_weights.contents) + sizeof(float);
+    passed &= reject("GDN conv_l2 rejects forged CPU metadata",
+                     [&] { return encode_gdn_conv_l2(
+                               context, *command, rows, forged_cpu, error); },
+                     "not owned by this Context");
+    GDNConvL2Buffers forged_gpu = valid_conv;
+    ++forged_gpu.history.gpu_address;
+    passed &= reject("GDN conv_l2 rejects forged GPU metadata",
+                     [&] { return encode_gdn_conv_l2(
+                               context, *command, rows, forged_gpu, error); },
+                     "not owned by this Context");
+
+    const GDNABBuffers valid_ab{
+        input, alpha, beta_weights, dt, a, gate, beta};
+    GDNABBuffers misaligned_alpha = valid_ab;
+    misaligned_alpha.alpha =
+        alpha.slice(1u, alpha.length - 1u);
+    passed &= reject("GDN ab rejects misaligned BF16 weights",
+                     [&] { return encode_gdn_ab(
+                               context, *command, rows, misaligned_alpha,
+                               error); },
+                     "misaligned");
+    GDNABBuffers alias_ab = valid_ab;
+    alias_ab.beta = gate;
+    passed &= reject("GDN ab rejects overlapping outputs",
+                     [&] { return encode_gdn_ab(
+                               context, *command, rows, alias_ab, error); },
+                     "overlap");
+    GDNABBuffers short_ab = valid_ab;
+    --short_ab.input.length;
+    passed &= reject("GDN ab rejects a short projection input",
+                     [&] { return encode_gdn_ab(
+                               context, *command, rows, short_ab, error); },
+                     "undersized");
+    passed &= reject("GDN ab rejects zero rows",
+                     [&] { return encode_gdn_ab(
+                               context, *command, 0u, valid_ab, error); },
+                     "row count");
+
+    const GDNStepNormBuffers valid_step{
+        state, h, gate, beta, z, gamma, output};
+    passed &= reject("GDN step rejects zero window rows",
+                     [&] { return encode_gdn_step_norm(
+                               context, *command, 0u, GDNStateMode::window,
+                               valid_step, error); },
+                     "row count");
+    passed &= reject("GDN step rejects invalid mode",
+                     [&] { return encode_gdn_step_norm(
+                               context, *command, 1u,
+                               static_cast<GDNStateMode>(7u), valid_step,
+                               error); },
+                     "state mode");
+    GDNStepNormBuffers alias_step = valid_step;
+    alias_step.output = state;
+    passed &= reject("GDN step rejects output/state alias",
+                     [&] { return encode_gdn_step_norm(
+                               context, *command, rows, GDNStateMode::window,
+                               alias_step, error); },
+                     "overlap");
+    GDNStepNormBuffers short_state = valid_step;
+    --short_state.state.length;
+    passed &= reject("GDN step rejects a short state",
+                     [&] { return encode_gdn_step_norm(
+                               context, *command, rows, GDNStateMode::window,
+                               short_state, error); },
+                     "undersized");
+    error.clear();
+    const bool zero_commit = encode_gdn_step_norm(
+        context, *command, 0u, GDNStateMode::commit, {}, error);
+    check(zero_commit, "GDN step accepts an empty commit as a no-op", error);
+    passed &= zero_commit;
+
+    const GDNConvCommitBuffers valid_commit{hist, qkv};
+    error.clear();
+    const bool zero_conv_commit =
+        encode_gdn_conv_commit(context, *command, 0u, {}, error);
+    check(zero_conv_commit,
+          "GDN conv_commit accepts zero rows as a no-op", error);
+    passed &= zero_conv_commit;
+    GDNConvCommitBuffers alias_commit{hist, hist};
+    passed &= reject("GDN conv_commit rejects history/qkv alias",
+                     [&] { return encode_gdn_conv_commit(
+                               context, *command, rows, alias_commit, error); },
+                     "overlap");
+    passed &= reject("GDN conv_commit rejects rows above eight",
+                     [&] { return encode_gdn_conv_commit(
+                               context, *command, 9u, valid_commit, error); },
+                     "row count");
+
+    auto foreign_command = foreign_context.make_command_buffer(
+        "GDN foreign command buffer", error);
+    if (!foreign_command) {
+        check(false, "GDN foreign command buffer allocation", error);
+        command->discard();
+        return false;
+    }
+    const bool rejected_foreign_command =
+        reject("GDN rejects a foreign command buffer",
+               [&] { return encode_gdn_conv_l2(
+                         context, *foreign_command, rows, valid_conv, error); },
+               "different Context");
+    passed &= rejected_foreign_command;
+    foreign_command->discard();
+
+    auto committed = context.make_command_buffer(
+        "GDN committed command buffer", error);
+    if (!committed || !committed->commit(error)) {
+        check(false, "GDN committed command buffer setup", error);
+        command->discard();
+        return false;
+    }
+    id<MTLCommandBuffer> committed_native =
+        (__bridge id<MTLCommandBuffer>)committed->unsafe_native_handle();
+    [committed_native waitUntilCompleted];
+    passed &= reject("GDN rejects a committed command buffer",
+                     [&] { return encode_gdn_conv_l2(
+                               context, *committed, rows, valid_conv, error); },
+                     "before command-buffer submission");
+
+    auto enqueued = context.make_command_buffer("GDN enqueued command buffer",
+                                                error);
+    if (!enqueued || !enqueued->enqueue(error)) {
+        check(false, "GDN enqueued command buffer setup", error);
+        command->discard();
+        return false;
+    }
+    passed &= reject("GDN rejects an enqueued command buffer",
+                     [&] { return encode_gdn_conv_l2(
+                               context, *enqueued, rows, valid_conv, error); },
+                     "before command-buffer submission");
+    if (!enqueued->commit(error)) {
+        check(false, "GDN enqueued command buffer drain", error);
+        command->discard();
+        return false;
+    }
+    id<MTLCommandBuffer> enqueued_native =
+        (__bridge id<MTLCommandBuffer>)enqueued->unsafe_native_handle();
+    [enqueued_native waitUntilCompleted];
+    passed &= enqueued_native.status == MTLCommandBufferStatusCompleted;
+    command->discard();
+    return passed;
+}
+
+bool test_conv_l2_shared_encoder_validation(
+    const ContextOptions& context_options, Context& foreign_context) {
+    std::string error;
+    auto validation_context = Context::open(context_options, error);
+    check(validation_context != nullptr,
+          "open isolated GDN conv_l2 shared-validation context", error);
+    if (!validation_context) return false;
+    Context& context = *validation_context;
+
+    constexpr std::size_t float_bytes = sizeof(float);
+    const std::size_t history_bytes =
+        static_cast<std::size_t>(kHistoryElements) * float_bytes;
+    const std::size_t qkv_bytes =
+        static_cast<std::size_t>(VERIFY_MAX_T) * kChannels * float_bytes;
+    const std::size_t weight_bytes =
+        static_cast<std::size_t>(kChannels) * GDN_CONV_KERNEL * float_bytes;
+    const std::size_t output_bytes = qkv_bytes;
+    const auto alloc = [&](Context& owner, const std::string& label,
+                           std::size_t bytes) {
+        return owner.buffers().allocate(label, bytes, error);
+    };
+    BufferRef history = alloc(context, "GDN shared validation history",
+                              history_bytes);
+    BufferRef qkv_storage = alloc(context, "GDN shared validation qkv",
+                                  qkv_bytes + 2u * float_bytes);
+    BufferRef weight_storage = alloc(
+        context, "GDN shared validation convolution weights",
+        weight_bytes + 2u * float_bytes);
+    BufferRef output = alloc(context, "GDN shared validation output",
+                             output_bytes);
+    BufferRef foreign_qkv = alloc(
+        foreign_context, "GDN shared validation foreign qkv", qkv_bytes);
+    if (!history || !qkv_storage || !weight_storage || !output ||
+        !foreign_qkv) {
+        check(false, "GDN conv_l2 shared-validation allocations", error);
+        return false;
+    }
+    const BufferRef qkv = qkv_storage.slice(0u, qkv_bytes);
+    const BufferRef weights = weight_storage.slice(0u, weight_bytes);
+    const GDNConvL2Buffers valid{history, qkv, weights, output};
+    const auto reject = [&](const std::string& label, std::uint32_t rows,
+                            const GDNConvL2Buffers& buffers,
+                            const std::string& expected_error) {
+        error.clear();
+        auto command = context.make_command_buffer(label, error);
+        if (!command) {
+            check(false, label + " command buffer", error);
+            return false;
+        }
+        const bool rejected =
+            !Encoder::encode(
+                context, *command, label,
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encode_gdn_conv_l2(
+                        context, encoder, rows, buffers, encode_error);
+                },
+                error) &&
+            error.find(expected_error) != std::string::npos;
+        check(rejected, label, error);
+        return rejected;
+    };
+
+    bool passed = true;
+    const GDNConvL2Buffers empty{};
+    passed &= reject("GDN conv_l2 shared Encoder rejects zero rows", 0u,
+                     empty, "row count");
+    passed &= reject("GDN conv_l2 shared Encoder rejects rows above eight",
+                     9u, empty, "row count");
+    GDNConvL2Buffers foreign = valid;
+    foreign.qkv = foreign_qkv;
+    passed &= reject(
+        "GDN conv_l2 shared Encoder rejects a foreign Context view", 1u,
+        foreign, "not owned by this Context");
+
+    const auto reject_short = [&](const std::string& label,
+                                  GDNConvL2Buffers buffers,
+                                  BufferRef GDNConvL2Buffers::*member) {
+        (buffers.*member).length = float_bytes;
+        return reject(label, 1u, buffers, "undersized");
+    };
+    passed &= reject_short("GDN conv_l2 shared Encoder rejects short history",
+                           valid, &GDNConvL2Buffers::history);
+    passed &= reject_short("GDN conv_l2 shared Encoder rejects short qkv",
+                           valid, &GDNConvL2Buffers::qkv);
+    passed &= reject_short(
+        "GDN conv_l2 shared Encoder rejects short convolution weights",
+        valid, &GDNConvL2Buffers::conv_weights);
+    passed &= reject_short("GDN conv_l2 shared Encoder rejects short output",
+                           valid, &GDNConvL2Buffers::output);
+
+    GDNConvL2Buffers one_row_for_two = valid;
+    one_row_for_two.qkv.length =
+        static_cast<std::size_t>(kChannels) * float_bytes;
+    passed &= reject(
+        "GDN conv_l2 shared Encoder rejects one-row qkv for T=2", 2u,
+        one_row_for_two, "undersized");
+    one_row_for_two = valid;
+    one_row_for_two.output.length =
+        static_cast<std::size_t>(kChannels) * float_bytes;
+    passed &= reject(
+        "GDN conv_l2 shared Encoder rejects one-row output for T=2", 2u,
+        one_row_for_two, "undersized");
+
+    GDNConvL2Buffers misaligned = valid;
+    misaligned.qkv = qkv_storage.slice(float_bytes / 2u, qkv_bytes);
+    passed &= reject("GDN conv_l2 shared Encoder rejects misaligned qkv", 1u,
+                     misaligned, "misaligned");
+    misaligned = valid;
+    misaligned.conv_weights =
+        weight_storage.slice(float_bytes / 2u, weight_bytes);
+    passed &= reject(
+        "GDN conv_l2 shared Encoder rejects misaligned convolution weights",
+        1u, misaligned, "misaligned");
+
+    GDNConvL2Buffers out_of_range = valid;
+    out_of_range.qkv =
+        qkv_storage.slice(qkv_storage.length - float_bytes, 2u * float_bytes);
+    passed &= reject(
+        "GDN conv_l2 shared Encoder rejects an out-of-range qkv view", 1u,
+        out_of_range, "not owned by this Context");
+
+    GDNConvL2Buffers alias = valid;
+    alias.output = alias.history;
+    passed &= reject(
+        "GDN conv_l2 shared Encoder rejects history/output overlap", 1u,
+        alias, "overlap");
+    alias = valid;
+    alias.output = alias.qkv;
+    passed &= reject("GDN conv_l2 shared Encoder rejects qkv/output overlap",
+                     1u, alias, "overlap");
+    alias = valid;
+    alias.output = alias.conv_weights;
+    passed &= reject(
+        "GDN conv_l2 shared Encoder rejects weight/output overlap", 1u,
+        alias, "overlap");
+
+    BufferRef partial_storage = alloc(
+        context, "GDN shared validation partial-alias backing",
+        qkv_bytes + float_bytes);
+    if (!partial_storage) {
+        check(false, "GDN conv_l2 shared partial-alias allocation", error);
+        return false;
+    }
+    GDNConvL2Buffers partial = valid;
+    partial.qkv = partial_storage.slice(0u, qkv_bytes);
+    partial.output = partial_storage.slice(float_bytes, qkv_bytes);
+    passed &= reject(
+        "GDN conv_l2 shared Encoder rejects partial qkv/output overlap", 1u,
+        partial, "overlap");
+
+    GDNConvL2Buffers readonly_overlap = valid;
+    readonly_overlap.history = readonly_overlap.qkv;
+    error.clear();
+    auto command = context.make_command_buffer(
+        "GDN conv_l2 shared read-only overlap", error);
+    if (!command) {
+        check(false, "GDN conv_l2 shared read-only overlap command buffer",
+              error);
+        return false;
+    }
+    const bool accepts_readonly_overlap = Encoder::encode(
+        context, *command, "GDN conv_l2 shared read-only overlap",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_gdn_conv_l2(context, encoder, 1u, readonly_overlap,
+                                      encode_error);
+        },
+        error);
+    check(accepts_readonly_overlap,
+          "GDN conv_l2 shared Encoder accepts overlapping read-only inputs",
+          error);
+    passed &= accepts_readonly_overlap;
+    if (accepts_readonly_overlap) command->discard();
+    return passed;
+}
+
+bool test_ab_shared_encoder_validation(
+    const ContextOptions& context_options, Context& foreign_context) {
+    std::string error;
+    auto validation_context = Context::open(context_options, error);
+    check(validation_context != nullptr,
+          "open isolated GDN alpha/beta shared-validation context", error);
+    if (!validation_context) return false;
+    Context& context = *validation_context;
+
+    constexpr std::size_t float_bytes = sizeof(float);
+    constexpr std::size_t weight_bytes =
+        static_cast<std::size_t>(kHeads) * N_EMBD * sizeof(std::uint16_t);
+    constexpr std::size_t head_bytes =
+        static_cast<std::size_t>(kHeads) * float_bytes;
+    const std::size_t input_bytes =
+        static_cast<std::size_t>(VERIFY_MAX_T) * N_EMBD * float_bytes;
+    const std::size_t output_bytes =
+        static_cast<std::size_t>(VERIFY_MAX_T) * kHeads * float_bytes;
+    const auto alloc = [&](Context& owner, const std::string& label,
+                           std::size_t bytes) {
+        return owner.buffers().allocate(label, bytes, error);
+    };
+    BufferRef input_storage = alloc(
+        context, "GDN alpha/beta shared validation input",
+        input_bytes + 2u * float_bytes);
+    BufferRef alpha_storage = alloc(
+        context, "GDN alpha/beta shared validation alpha",
+        weight_bytes + 32u);
+    BufferRef beta_weight_storage = alloc(
+        context, "GDN alpha/beta shared validation beta weights",
+        weight_bytes + 32u);
+    BufferRef dt_bias = alloc(context, "GDN alpha/beta shared validation dt",
+                              head_bytes);
+    BufferRef a = alloc(context, "GDN alpha/beta shared validation a",
+                        head_bytes);
+    BufferRef gate_storage = alloc(
+        context, "GDN alpha/beta shared validation gate",
+        output_bytes + 2u * float_bytes);
+    BufferRef beta_storage = alloc(
+        context, "GDN alpha/beta shared validation beta",
+        output_bytes + 2u * float_bytes);
+    BufferRef foreign_input = alloc(
+        foreign_context, "GDN alpha/beta shared foreign input", input_bytes);
+    if (!input_storage || !alpha_storage || !beta_weight_storage ||
+        !dt_bias || !a || !gate_storage || !beta_storage || !foreign_input) {
+        check(false, "GDN alpha/beta shared-validation allocations", error);
+        return false;
+    }
+    const BufferRef input = input_storage.slice(0u, input_bytes);
+    const BufferRef alpha = alpha_storage.slice(0u, weight_bytes);
+    const BufferRef beta_weights =
+        beta_weight_storage.slice(0u, weight_bytes);
+    const BufferRef gate = gate_storage.slice(0u, output_bytes);
+    const BufferRef beta = beta_storage.slice(0u, output_bytes);
+    const GDNABBuffers valid{
+        input, alpha, beta_weights, dt_bias, a, gate, beta};
+    const auto reject = [&](const std::string& label, std::uint32_t rows,
+                            const GDNABBuffers& buffers,
+                            const std::string& expected_error) {
+        error.clear();
+        auto command = context.make_command_buffer(label, error);
+        if (!command) {
+            check(false, label + " command buffer", error);
+            return false;
+        }
+        const bool rejected =
+            !Encoder::encode(
+                context, *command, label,
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encode_gdn_ab(context, encoder, rows, buffers,
+                                         encode_error);
+                },
+                error) &&
+            error.find(expected_error) != std::string::npos;
+        check(rejected, label, error);
+        return rejected;
+    };
+    bool passed = true;
+    const GDNABBuffers empty{};
+    passed &= reject("GDN alpha/beta shared Encoder rejects zero rows", 0u,
+                     empty, "row count");
+    passed &= reject("GDN alpha/beta shared Encoder rejects rows above eight",
+                     9u, empty, "row count");
+    GDNABBuffers foreign = valid;
+    foreign.input = foreign_input;
+    passed &= reject(
+        "GDN alpha/beta shared Encoder rejects a foreign Context view", 1u,
+        foreign, "not owned by this Context");
+
+    const auto reject_short = [&](const std::string& label,
+                                  GDNABBuffers buffers,
+                                  BufferRef GDNABBuffers::*member) {
+        (buffers.*member).length = 1u;
+        return reject(label, 1u, buffers, "undersized");
+    };
+    passed &= reject_short("GDN alpha/beta shared rejects short input",
+                           valid, &GDNABBuffers::input);
+    passed &= reject_short("GDN alpha/beta shared rejects short alpha",
+                           valid, &GDNABBuffers::alpha);
+    passed &= reject_short(
+        "GDN alpha/beta shared rejects short beta weights",
+        valid, &GDNABBuffers::beta_weights);
+    passed &= reject_short("GDN alpha/beta shared rejects short dt bias",
+                           valid, &GDNABBuffers::dt_bias);
+    passed &= reject_short("GDN alpha/beta shared rejects short a",
+                           valid, &GDNABBuffers::a);
+    passed &= reject_short("GDN alpha/beta shared rejects short gate output",
+                           valid, &GDNABBuffers::gate);
+    passed &= reject_short("GDN alpha/beta shared rejects short beta output",
+                           valid, &GDNABBuffers::beta);
+
+    GDNABBuffers one_row_for_two = valid;
+    one_row_for_two.input.length =
+        static_cast<std::size_t>(N_EMBD) * float_bytes;
+    passed &= reject(
+        "GDN alpha/beta shared rejects one-row input for T=2", 2u,
+        one_row_for_two, "undersized");
+    one_row_for_two = valid;
+    one_row_for_two.gate.length = head_bytes;
+    passed &= reject(
+        "GDN alpha/beta shared rejects one-row gate output for T=2", 2u,
+        one_row_for_two, "undersized");
+    one_row_for_two = valid;
+    one_row_for_two.beta.length = head_bytes;
+    passed &= reject(
+        "GDN alpha/beta shared rejects one-row beta output for T=2", 2u,
+        one_row_for_two, "undersized");
+
+    GDNABBuffers misaligned = valid;
+    misaligned.input = input_storage.slice(1u, input_bytes);
+    passed &= reject("GDN alpha/beta shared rejects misaligned input", 1u,
+                     misaligned, "misaligned");
+    misaligned = valid;
+    misaligned.alpha = alpha_storage.slice(sizeof(std::uint16_t), weight_bytes);
+    passed &= reject("GDN alpha/beta shared rejects misaligned alpha", 1u,
+                     misaligned, "misaligned");
+    misaligned = valid;
+    misaligned.beta_weights =
+        beta_weight_storage.slice(sizeof(std::uint16_t), weight_bytes);
+    passed &= reject(
+        "GDN alpha/beta shared rejects misaligned beta weights", 1u,
+        misaligned, "misaligned");
+    misaligned = valid;
+    misaligned.gate = gate_storage.slice(1u, output_bytes);
+    passed &= reject("GDN alpha/beta shared rejects misaligned gate output",
+                     1u, misaligned, "misaligned");
+
+    GDNABBuffers out_of_range = valid;
+    out_of_range.input = input_storage.slice(
+        input_storage.length - sizeof(std::uint16_t),
+        2u * sizeof(std::uint16_t));
+    passed &= reject(
+        "GDN alpha/beta shared rejects an out-of-range input view", 1u,
+        out_of_range, "not owned by this Context");
+
+    const std::array gate_aliases{
+        std::pair{"input", valid.input},
+        std::pair{"alpha", valid.alpha},
+        std::pair{"beta weights", valid.beta_weights},
+        std::pair{"dt bias", valid.dt_bias},
+        std::pair{"a", valid.a},
+        std::pair{"beta output", valid.beta},
+    };
+    for (const auto& [name, view] : gate_aliases) {
+        GDNABBuffers alias = valid;
+        alias.gate = view;
+        passed &= reject(
+            "GDN alpha/beta shared rejects gate/" + std::string(name) +
+                " overlap",
+            1u, alias, "overlap");
+    }
+    const std::array beta_aliases{
+        std::pair{"input", valid.input},
+        std::pair{"alpha", valid.alpha},
+        std::pair{"beta weights", valid.beta_weights},
+        std::pair{"dt bias", valid.dt_bias},
+        std::pair{"a", valid.a},
+    };
+    for (const auto& [name, view] : beta_aliases) {
+        GDNABBuffers alias = valid;
+        alias.beta = view;
+        passed &= reject(
+            "GDN alpha/beta shared rejects beta/" + std::string(name) +
+                " overlap",
+            1u, alias, "overlap");
+    }
+
+    BufferRef partial_storage = alloc(
+        context, "GDN alpha/beta shared partial-alias backing",
+        input_bytes + output_bytes);
+    if (!partial_storage) {
+        check(false, "GDN alpha/beta shared partial-alias allocation", error);
+        return false;
+    }
+    GDNABBuffers partial = valid;
+    partial.input = partial_storage.slice(0u, input_bytes);
+    partial.gate = partial_storage.slice(float_bytes, output_bytes);
+    passed &= reject(
+        "GDN alpha/beta shared rejects partial input/gate overlap", 1u,
+        partial, "overlap");
+
+    GDNABBuffers readonly_overlap = valid;
+    readonly_overlap.alpha = readonly_overlap.beta_weights;
+    error.clear();
+    auto command = context.make_command_buffer(
+        "GDN alpha/beta shared read-only overlap", error);
+    if (!command) {
+        check(false, "GDN alpha/beta shared read-only overlap command buffer",
+              error);
+        return false;
+    }
+    const bool accepts_readonly_overlap = Encoder::encode(
+        context, *command, "GDN alpha/beta shared read-only overlap",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_gdn_ab(context, encoder, 1u, readonly_overlap,
+                                 encode_error);
+        },
+        error);
+    check(accepts_readonly_overlap,
+          "GDN alpha/beta shared accepts overlapping read-only inputs",
+          error);
+    passed &= accepts_readonly_overlap;
+    if (accepts_readonly_overlap) command->discard();
+    return passed;
+}
+
+bool test_step_norm_shared_encoder_validation(
+    const ContextOptions& context_options, Context& foreign_context) {
+    std::string error;
+    auto validation_context = Context::open(context_options, error);
+    check(validation_context != nullptr,
+          "open isolated GDN step-norm shared-validation context", error);
+    if (!validation_context) return false;
+    Context& context = *validation_context;
+
+    constexpr std::size_t float_bytes = sizeof(float);
+    constexpr std::size_t state_bytes =
+        static_cast<std::size_t>(kStateElements) * float_bytes;
+    constexpr std::size_t h_bytes =
+        static_cast<std::size_t>(VERIFY_MAX_T) * kChannels * float_bytes;
+    constexpr std::size_t heads_bytes =
+        static_cast<std::size_t>(VERIFY_MAX_T) * kHeads * float_bytes;
+    constexpr std::size_t values_bytes =
+        static_cast<std::size_t>(VERIFY_MAX_T) * kValueDim * float_bytes;
+    constexpr std::size_t gamma_bytes =
+        static_cast<std::size_t>(kHeadDim) * float_bytes;
+    const auto alloc = [&](Context& owner, const std::string& label,
+                           std::size_t bytes) {
+        return owner.buffers().allocate(label, bytes, error);
+    };
+    BufferRef state_storage = alloc(
+        context, "GDN step shared validation state",
+        state_bytes + 2u * float_bytes);
+    BufferRef h_storage = alloc(
+        context, "GDN step shared validation h",
+        h_bytes + 2u * float_bytes);
+    BufferRef gate_storage = alloc(
+        context, "GDN step shared validation gate",
+        heads_bytes + 2u * float_bytes);
+    BufferRef beta_storage = alloc(
+        context, "GDN step shared validation beta",
+        heads_bytes + 2u * float_bytes);
+    BufferRef z_storage = alloc(
+        context, "GDN step shared validation z",
+        values_bytes + 2u * float_bytes);
+    BufferRef gamma_storage = alloc(
+        context, "GDN step shared validation gamma",
+        gamma_bytes + 2u * float_bytes);
+    BufferRef output_storage = alloc(
+        context, "GDN step shared validation output",
+        values_bytes + 2u * float_bytes);
+    BufferRef foreign_h =
+        alloc(foreign_context, "GDN step shared foreign h", h_bytes);
+    if (!state_storage || !h_storage || !gate_storage || !beta_storage ||
+        !z_storage || !gamma_storage || !output_storage || !foreign_h) {
+        check(false, "GDN step shared-validation allocations", error);
+        return false;
+    }
+    const BufferRef state = state_storage.slice(0u, state_bytes);
+    const BufferRef h = h_storage.slice(0u, h_bytes);
+    const BufferRef gate = gate_storage.slice(0u, heads_bytes);
+    const BufferRef beta = beta_storage.slice(0u, heads_bytes);
+    const BufferRef z = z_storage.slice(0u, values_bytes);
+    const BufferRef gamma = gamma_storage.slice(0u, gamma_bytes);
+    const BufferRef output = output_storage.slice(0u, values_bytes);
+    const GDNStepNormBuffers valid{state, h, gate, beta, z, gamma, output};
+    const auto reject = [&](const std::string& label, std::uint32_t rows,
+                            GDNStateMode mode,
+                            const GDNStepNormBuffers& buffers,
+                            const std::string& expected_error) {
+        error.clear();
+        auto command = context.make_command_buffer(label, error);
+        if (!command) {
+            check(false, label + " command buffer", error);
+            return false;
+        }
+        const bool rejected =
+            !Encoder::encode(
+                context, *command, label,
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encode_gdn_step_norm(
+                        context, encoder, rows, mode, buffers, encode_error);
+                },
+                error) &&
+            error.find(expected_error) != std::string::npos;
+        check(rejected, label, error);
+        return rejected;
+    };
+    bool passed = true;
+    const GDNStepNormBuffers empty{};
+    passed &= reject("GDN step shared Encoder rejects invalid mode", 1u,
+                     static_cast<GDNStateMode>(7u), empty, "state mode");
+    passed &= reject("GDN step shared Encoder rejects zero window rows", 0u,
+                     GDNStateMode::window, empty, "1..8");
+    passed &= reject("GDN step shared Encoder rejects rows above eight", 9u,
+                     GDNStateMode::commit, empty, "0..8");
+
+    error.clear();
+    auto zero_commit = context.make_command_buffer(
+        "GDN step shared zero-row commit", error);
+    if (!zero_commit) {
+        check(false, "GDN step shared zero-row commit command buffer", error);
+        return false;
+    }
+    const bool accepts_zero_commit = Encoder::encode(
+        context, *zero_commit, "GDN step shared zero-row commit",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_gdn_step_norm(
+                context, encoder, 0u, GDNStateMode::commit, {}, encode_error);
+        },
+        error);
+    check(accepts_zero_commit,
+          "GDN step shared Encoder accepts empty commit without buffers",
+          error);
+    passed &= accepts_zero_commit;
+    if (accepts_zero_commit) zero_commit->discard();
+
+    GDNStateMode mode = GDNStateMode::window;
+    const auto reject_short = [&](const std::string& label,
+                                  GDNStepNormBuffers buffers,
+                                  BufferRef GDNStepNormBuffers::*member) {
+        (buffers.*member).length = 1u;
+        return reject(label, 1u, mode, buffers, "undersized");
+    };
+    passed &= reject_short("GDN step shared rejects short state", valid,
+                           &GDNStepNormBuffers::state);
+    passed &= reject_short("GDN step shared rejects short h", valid,
+                           &GDNStepNormBuffers::h);
+    passed &= reject_short("GDN step shared rejects short gate", valid,
+                           &GDNStepNormBuffers::gate);
+    passed &= reject_short("GDN step shared rejects short beta", valid,
+                           &GDNStepNormBuffers::beta);
+    passed &= reject_short("GDN step shared rejects short z", valid,
+                           &GDNStepNormBuffers::z);
+    passed &= reject_short("GDN step shared rejects short gamma", valid,
+                           &GDNStepNormBuffers::gamma);
+    passed &= reject_short("GDN step shared rejects short output", valid,
+                           &GDNStepNormBuffers::output);
+    GDNStepNormBuffers short_h = valid;
+    short_h.h.length = 1u;
+    passed &= reject("GDN step shared identifies the rejected h view", 1u,
+                     GDNStateMode::window, short_h, "GDN h buffer");
+
+    GDNStepNormBuffers foreign = valid;
+    foreign.h = foreign_h;
+    passed &= reject("GDN step shared rejects a foreign Context view", 1u,
+                     GDNStateMode::window, foreign,
+                     "not owned by this Context");
+
+    GDNStepNormBuffers one_row_for_two = valid;
+    one_row_for_two.h.length =
+        static_cast<std::size_t>(kChannels) * float_bytes;
+    passed &= reject("GDN step shared rejects one-row h for T=2", 2u,
+                     GDNStateMode::window, one_row_for_two, "undersized");
+    one_row_for_two = valid;
+    one_row_for_two.gate.length =
+        static_cast<std::size_t>(kHeads) * float_bytes;
+    passed &= reject("GDN step shared rejects one-row gate for T=2", 2u,
+                     GDNStateMode::window, one_row_for_two, "undersized");
+    one_row_for_two = valid;
+    one_row_for_two.beta.length =
+        static_cast<std::size_t>(kHeads) * float_bytes;
+    passed &= reject("GDN step shared rejects one-row beta for T=2", 2u,
+                     GDNStateMode::window, one_row_for_two, "undersized");
+    one_row_for_two = valid;
+    one_row_for_two.z.length =
+        static_cast<std::size_t>(kValueDim) * float_bytes;
+    passed &= reject("GDN step shared rejects one-row z for T=2", 2u,
+                     GDNStateMode::window, one_row_for_two, "undersized");
+    one_row_for_two = valid;
+    one_row_for_two.output.length =
+        static_cast<std::size_t>(kValueDim) * float_bytes;
+    passed &= reject("GDN step shared rejects one-row output for T=2", 2u,
+                     GDNStateMode::window, one_row_for_two, "undersized");
+
+    GDNStepNormBuffers misaligned = valid;
+    misaligned.state = state_storage.slice(1u, state_bytes);
+    passed &= reject("GDN step shared rejects misaligned state", 1u,
+                     GDNStateMode::window, misaligned, "misaligned");
+    misaligned = valid;
+    misaligned.h = h_storage.slice(1u, h_bytes);
+    passed &= reject("GDN step shared rejects misaligned h", 1u,
+                     GDNStateMode::window, misaligned, "misaligned");
+    misaligned = valid;
+    misaligned.output = output_storage.slice(1u, values_bytes);
+    passed &= reject("GDN step shared rejects misaligned output", 1u,
+                     GDNStateMode::window, misaligned, "misaligned");
+
+    GDNStepNormBuffers out_of_range = valid;
+    out_of_range.h =
+        h_storage.slice(h_storage.length - sizeof(std::uint16_t),
+                        2u * sizeof(std::uint16_t));
+    passed &= reject("GDN step shared rejects an out-of-range h view", 1u,
+                     GDNStateMode::window, out_of_range,
+                     "not owned by this Context");
+
+    GDNStepNormBuffers alias = valid;
+    alias.output = alias.state;
+    passed &= reject("GDN step shared rejects output/state overlap", 1u,
+                     GDNStateMode::window, alias, "overlap");
+    alias = valid;
+    alias.output = alias.h;
+    passed &= reject("GDN step shared rejects output/h overlap", 1u,
+                     GDNStateMode::window, alias, "overlap");
+    alias = valid;
+    alias.output = alias.z;
+    passed &= reject("GDN step shared rejects output/z overlap", 1u,
+                     GDNStateMode::window, alias, "overlap");
+    alias = valid;
+    alias.gate = alias.output;
+    passed &= reject("GDN step shared rejects gate/output overlap", 1u,
+                     GDNStateMode::window, alias, "overlap");
+    alias = valid;
+    alias.beta = alias.output;
+    passed &= reject("GDN step shared rejects beta/output overlap", 1u,
+                     GDNStateMode::window, alias, "overlap");
+    alias = valid;
+    alias.gamma = alias.output;
+    passed &= reject("GDN step shared rejects gamma/output overlap", 1u,
+                     GDNStateMode::window, alias, "overlap");
+
+    BufferRef state_alias_storage = alloc(
+        context, "GDN step shared partial state-alias backing",
+        state_bytes + float_bytes + h_bytes);
+    if (!state_alias_storage) {
+        check(false, "GDN step shared state-alias allocation", error);
+        return false;
+    }
+    GDNStepNormBuffers state_alias = valid;
+    state_alias.state = state_alias_storage.slice(0u, state_bytes);
+    state_alias.h = state_alias_storage.slice(
+        float_bytes, h_bytes);
+    passed &= reject("GDN step shared rejects state/h overlap", 1u,
+                     GDNStateMode::window, state_alias, "state must not overlap");
+
+    GDNStepNormBuffers readonly_overlap = valid;
+    readonly_overlap.gate = readonly_overlap.h;
+    error.clear();
+    auto command = context.make_command_buffer(
+        "GDN step shared read-only overlap", error);
+    if (!command) {
+        check(false, "GDN step shared read-only overlap command buffer", error);
+        return false;
+    }
+    const bool accepts_readonly_overlap = Encoder::encode(
+        context, *command, "GDN step shared read-only overlap",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_gdn_step_norm(
+                context, encoder, 1u, GDNStateMode::window,
+                readonly_overlap, encode_error);
+        },
+        error);
+    check(accepts_readonly_overlap,
+          "GDN step shared Encoder accepts overlapping read-only inputs",
+          error);
+    passed &= accepts_readonly_overlap;
+    if (accepts_readonly_overlap) command->discard();
+    return passed;
+}
+
+bool test_conv_commit_shared_encoder_validation(
+    const ContextOptions& context_options, Context& foreign_context) {
+    std::string error;
+    auto validation_context = Context::open(context_options, error);
+    check(validation_context != nullptr,
+          "open isolated GDN conv_commit shared-validation context", error);
+    if (!validation_context) return false;
+    Context& context = *validation_context;
+
+    constexpr std::size_t float_bytes = sizeof(float);
+    constexpr std::size_t history_bytes =
+        static_cast<std::size_t>(kHistoryElements) * float_bytes;
+    constexpr std::size_t qkv_bytes =
+        static_cast<std::size_t>(VERIFY_MAX_T) * kChannels * float_bytes;
+    const auto alloc = [&](Context& owner, const std::string& label,
+                           std::size_t bytes) {
+        return owner.buffers().allocate(label, bytes, error);
+    };
+    BufferRef history = alloc(context, "GDN conv_commit shared history",
+                              history_bytes);
+    BufferRef qkv_storage = alloc(
+        context, "GDN conv_commit shared qkv",
+        qkv_bytes + 2u * float_bytes);
+    BufferRef foreign_qkv = alloc(
+        foreign_context, "GDN conv_commit shared foreign qkv", qkv_bytes);
+    if (!history || !qkv_storage || !foreign_qkv) {
+        check(false, "GDN conv_commit shared-validation allocations", error);
+        return false;
+    }
+    const BufferRef qkv = qkv_storage.slice(0u, qkv_bytes);
+    const GDNConvCommitBuffers valid{history, qkv};
+    const auto reject = [&](const std::string& label, std::uint32_t rows,
+                            const GDNConvCommitBuffers& buffers,
+                            const std::string& expected_error) {
+        error.clear();
+        auto command = context.make_command_buffer(label, error);
+        if (!command) {
+            check(false, label + " command buffer", error);
+            return false;
+        }
+        const bool rejected =
+            !Encoder::encode(
+                context, *command, label,
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encode_gdn_conv_commit(
+                        context, encoder, rows, buffers, encode_error);
+                },
+                error) &&
+            error.find(expected_error) != std::string::npos;
+        check(rejected, label, error);
+        return rejected;
+    };
+
+    bool passed = true;
+    passed &= reject("GDN conv_commit shared rejects rows above eight", 9u,
+                     {}, "row count");
+    GDNConvCommitBuffers foreign = valid;
+    foreign.qkv = foreign_qkv;
+    passed &= reject("GDN conv_commit shared rejects a foreign Context view",
+                     1u, foreign, "not owned by this Context");
+
+    GDNConvCommitBuffers short_view = valid;
+    short_view.history.length = float_bytes;
+    passed &= reject("GDN conv_commit shared rejects short history", 1u,
+                     short_view, "undersized");
+    short_view = valid;
+    short_view.qkv.length = float_bytes;
+    passed &= reject("GDN conv_commit shared rejects short qkv", 1u,
+                     short_view, "undersized");
+    GDNConvCommitBuffers one_row_for_two = valid;
+    one_row_for_two.qkv.length =
+        static_cast<std::size_t>(kChannels) * float_bytes;
+    passed &= reject("GDN conv_commit shared rejects one-row qkv for T=2",
+                     2u, one_row_for_two, "undersized");
+
+    GDNConvCommitBuffers misaligned = valid;
+    misaligned.qkv = qkv_storage.slice(1u, qkv_bytes);
+    passed &= reject("GDN conv_commit shared rejects misaligned qkv", 1u,
+                     misaligned, "misaligned");
+    GDNConvCommitBuffers out_of_range = valid;
+    out_of_range.qkv = qkv_storage.slice(
+        qkv_storage.length - float_bytes, 2u * float_bytes);
+    passed &= reject("GDN conv_commit shared rejects out-of-range qkv", 1u,
+                     out_of_range, "not owned by this Context");
+
+    const GDNConvCommitBuffers alias{qkv, qkv};
+    passed &= reject("GDN conv_commit shared rejects history/qkv alias", 1u,
+                     alias, "overlap");
+    BufferRef partial_storage = alloc(
+        context, "GDN conv_commit shared partial alias backing",
+        qkv_bytes + float_bytes);
+    if (!partial_storage) {
+        check(false, "GDN conv_commit shared partial-alias allocation", error);
+        return false;
+    }
+    const GDNConvCommitBuffers partial{
+        partial_storage.slice(0u, history_bytes),
+        partial_storage.slice(float_bytes, qkv_bytes)};
+    passed &= reject("GDN conv_commit shared rejects partial history/qkv alias",
+                     1u, partial, "overlap");
+
+    error.clear();
+    auto zero_commit = context.make_command_buffer(
+        "GDN conv_commit shared zero-row no-op", error);
+    if (!zero_commit) {
+        check(false, "GDN conv_commit shared zero-row command buffer", error);
+        return false;
+    }
+    const bool accepts_zero_rows = Encoder::encode(
+        context, *zero_commit, "GDN conv_commit shared zero-row no-op",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_gdn_conv_commit(
+                context, encoder, 0u, {}, encode_error);
+        },
+        error);
+    check(accepts_zero_rows,
+          "GDN conv_commit shared accepts empty zero-row no-op", error);
+    passed &= accepts_zero_rows;
+    if (accepts_zero_rows) zero_commit->discard();
+    return passed;
+}
+
+bool run_set(Context& context, twin::InputSet set,
+             const twin::Options& options) {
+    bool passed = true;
+    for (std::uint32_t rows = 1u; rows <= 8u; ++rows) {
+        passed &= run_conv_l2_case(context, rows, set, options);
+        passed &= run_ab_case(context, rows, set, options);
+    }
+    if (set == twin::InputSet::fixture) {
+        passed &= run_conv_l2_case(context, 1u, set, options,
+                                   EdgeProfile::regular, true);
+        passed &= run_conv_l2_case(context, 8u, set, options,
+                                   EdgeProfile::regular, true);
+        passed &= run_ab_case(context, 1u, set, options,
+                              EdgeProfile::regular, true);
+        passed &= run_ab_case(context, 8u, set, options,
+                              EdgeProfile::regular, true);
+        passed &= run_conv_commit_case(context, 1u, options,
+                                       EdgeProfile::regular, true);
+        passed &= run_conv_commit_case(context, 8u, options,
+                                       EdgeProfile::regular, true);
+    }
+    for (std::uint32_t rows = 0u; rows <= 8u; ++rows) {
+        passed &= run_conv_commit_case(context, rows, options);
+    }
+    passed &= run_step_norm_set(context, set, options);
+    if (set == twin::InputSet::edge) {
+        passed &= run_conv_l2_case(context, 1u, set, options,
+                                   EdgeProfile::all_zero);
+        passed &= run_conv_l2_case(context, 2u, set, options,
+                                   EdgeProfile::one_outlier);
+        passed &= run_ab_case(context, 1u, set, options,
+                              EdgeProfile::all_zero);
+        passed &= run_ab_case(context, 2u, set, options,
+                              EdgeProfile::one_outlier);
+        passed &= run_conv_commit_case(context, 1u, options,
+                                       EdgeProfile::all_zero);
+        passed &= run_conv_commit_case(context, 8u, options,
+                                       EdgeProfile::one_outlier);
+        passed &= run_step_norm_set(context, set, options,
+                                    EdgeProfile::all_zero);
+        passed &= run_step_norm_set(context, set, options,
+                                    EdgeProfile::one_outlier);
+    }
+    if (set == twin::InputSet::fixture) {
+        passed &= run_step_norm_set(context, set, options,
+                                    EdgeProfile::regular, true);
+    }
+    return passed;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (argc < 2) {
+        std::fprintf(stderr,
+                     "usage: metal_gdn_test strata.metallib "
+                     "[--seed N] [--input-set random|edge|fixture]\n");
+        return 2;
+    }
+    twin::Options options;
+    std::string error;
+    if (!twin::parse_options(argc, argv, 2, options, error)) {
+        std::fprintf(stderr, "%s\n", error.c_str());
+        return 2;
+    }
+    if (options.input_set == twin::InputSet::real) {
+        std::fprintf(stderr,
+                     "metal_gdn_test has no model-backed real input set\n");
+        return 77;
+    }
+
+    ContextOptions context_options;
+    context_options.metallib = argv[1];
+    context_options.metallib_sha256 = STRATA_METALLIB_SHA256;
+    auto context = Context::open(context_options, error);
+    check(context != nullptr, "open Metal context", error);
+    if (!context) return 1;
+    ContextOptions foreign_options = context_options;
+    foreign_options.pipelines = false;
+    auto foreign_context = Context::open(foreign_options, error);
+    check(foreign_context != nullptr, "open foreign validation context",
+          error);
+    if (!foreign_context) return 1;
+
+    bool passed = test_encoder_validation(*context, *foreign_context);
+    passed &= test_conv_l2_shared_encoder_validation(
+        context_options, *foreign_context);
+    passed &= test_ab_shared_encoder_validation(context_options,
+                                                *foreign_context);
+    passed &= test_step_norm_shared_encoder_validation(
+        context_options, *foreign_context);
+    passed &= test_conv_commit_shared_encoder_validation(
+        context_options, *foreign_context);
+    if (options.input_set_explicit) {
+        passed &= run_set(*context, options.input_set, options);
+    } else {
+        constexpr std::array sets{twin::InputSet::random,
+                                  twin::InputSet::edge,
+                                  twin::InputSet::fixture};
+        for (const auto set : sets) {
+            std::printf("GDN input set: %s\n", twin::input_set_name(set));
+            passed &= run_set(*context, set, options);
+        }
+    }
+    check(passed && g_failures == 0,
+          "GDN conv_l2/ab/step_norm/conv_commit encoder twins");
+    std::printf("metal_gdn_test: %d failures\n", g_failures);
+    return g_failures == 0 ? 0 : 1;
+}

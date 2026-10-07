@@ -1,0 +1,546 @@
+{
+  "schema": 1,
+  "tests": {
+    "bf16_bits_test": {
+      "label": "host",
+      "origin": "09 9.1"
+    },
+    "codebooks": {
+      "label": "host",
+      "origin": "04 L1"
+    },
+    "controller_test": {
+      "label": "host",
+      "origin": "09 9.1"
+    },
+    "conv_cache_test": {
+      "label": "host",
+      "origin": "09 9.1"
+    },
+    "conversation_cache_test": {
+      "label": "host",
+      "origin": "09 9.1"
+    },
+    "coupled_draft_test": {
+      "label": "host",
+      "origin": "09 9.1"
+    },
+    "dequant_oracle_test": {
+      "label": "host",
+      "origin": "08 6.4"
+    },
+    "direct_file_async_test": {
+      "label": "host",
+      "origin": "09 9.1"
+    },
+    "draft_policy_test": {
+      "label": "host",
+      "origin": "09 9.1"
+    },
+    "expert_address_test": {
+      "label": "host",
+      "origin": "03 R2-R8",
+      "planned": "R8"
+    },
+    "gguf_reader_test": {
+      "label": "host",
+      "origin": "09 9.1"
+    },
+    "gguf_split_test": {
+      "label": "host",
+      "origin": "09 9.1"
+    },
+    "kernel_env_dispositions_test": {
+      "label": "host",
+      "origin": "04 L14",
+      "planned": "L14"
+    },
+    "metal_manifest_test": {
+      "label": "host",
+      "origin": "08 6.4"
+    },
+    "metal_list_devices_test": {
+      "label": "metal",
+      "origin": "06 H3"
+    },
+    "metal_self_test": {
+      "label": "metal",
+      "origin": "06 H4"
+    },
+    "metal_plan_test": {
+      "label": "host",
+      "origin": "05 U1"
+    },
+    "metal_kv_layout_test": {
+      "label": "host",
+      "origin": "04 4.5-4.6, 5.11"
+    },
+    "metal_kv_store_test": {
+      "label": "metal",
+      "origin": "04 4.5-4.6"
+    },
+    "metal_session_state_test": {
+      "label": "metal",
+      "origin": "06 1.5, D-IMPL-180, L9 prerequisite"
+    },
+    "metal_window_scratch_storage_test": {
+      "label": "metal",
+      "origin": "04 4.4, D-IMPL-183"
+    },
+    "metal_mtp_kv_store_test": {
+      "label": "metal",
+      "origin": "06 10.3"
+    },
+    "metal_mtp_bind_layout_test": {
+      "label": "host",
+      "origin": "04 5.11, 05 2.3"
+    },
+    "metal_weight_store_test": {
+      "label": "host",
+      "origin": "06 H5"
+    },
+    "metal_mtp_storage_fixture": {
+      "label": "host",
+      "origin": "06 10.3"
+    },
+    "metal_mtp_storage_test": {
+      "label": "metal",
+      "origin": "06 10.3"
+    },
+    "metal_weight_store_cli_test": {
+      "label": "host",
+      "origin": "06 H5"
+    },
+    "oneshot_output_test": {
+      "label": "host",
+      "origin": "06 H7"
+    },
+    "metal_window_test": {
+      "label": "host",
+      "origin": "05 U2"
+    },
+    "metal_window_scratch_layout_test": {
+      "label": "host",
+      "origin": "04 4.4, D-IMPL-182"
+    },
+    "metal_window_ple_rows_test": {
+      "label": "host",
+      "origin": "04 5.1, D-IMPL-185"
+    },
+    "metal_tiered_layout_test": {
+      "label": "host",
+      "origin": "05 U5"
+    },
+    "metal_window_storage_test": {
+      "label": "metal",
+      "origin": "05 U3"
+    },
+    "metal_model_storage_owner_test": {
+      "label": "metal",
+      "origin": "05 U3"
+    },
+    "model_metadata_test": {
+      "label": "host",
+      "origin": "03 R2-R8",
+      "planned": "R2"
+    },
+    "model_types_test": {
+      "label": "host",
+      "origin": "03 R2-R8",
+      "planned": "R3"
+    },
+    "native_experts_reader_test": {
+      "label": "host",
+      "origin": "03 R2-R8",
+      "planned": "R6"
+    },
+    "options_dispositions_test": {
+      "label": "host",
+      "origin": "06 H4"
+    },
+    "metal_cli_modes_test": {
+      "label": "host",
+      "origin": "06 H4"
+    },
+    "metal_geometry_plan_cli_test": {
+      "label": "host",
+      "origin": "06 H5"
+    },
+    "pack_index_test": {
+      "label": "host",
+      "origin": "03 R2-R8",
+      "planned": "R7"
+    },
+    "platform_memory_test": {
+      "label": "host",
+      "origin": "08 6.4"
+    },
+    "ple_constants_test": {
+      "label": "host",
+      "origin": "03 R2-R8",
+      "planned": "R4"
+    },
+    "ple_reader_selftest": {
+      "label": "host",
+      "origin": "08 6.4"
+    },
+    "prefill_chunk_test": {
+      "label": "host",
+      "origin": "06 1.5"
+    },
+    "prompts_manifest_test": {
+      "label": "host",
+      "origin": "09 2.2",
+      "planned": "T1"
+    },
+    "serve_transcript_test": {
+      "label": "host",
+      "origin": "06 H6"
+    },
+    "strata_version": {
+      "label": "host",
+      "origin": "08 6.4"
+    },
+    "suffix_drafter_test": {
+      "label": "host",
+      "origin": "09 9.1"
+    },
+    "test_map": {
+      "label": "host",
+      "origin": "09 9.4"
+    },
+    "idx_batch_eq_sequential": {
+      "label": "metal",
+      "origin": "04 10.4",
+      "planned": "L6"
+    },
+    "metal_attn_test": {
+      "label": "metal",
+      "origin": "09 9.1"
+    },
+    "metal_attn_test_concurrent": {
+      "label": "metal",
+      "origin": "09 9.1"
+    },
+    "metal_context_test": {
+      "label": "metal",
+      "origin": "08 6.4"
+    },
+    "metal_buffers_test": {
+      "label": "metal",
+      "origin": "06 H3"
+    },
+    "metal_events_test": {
+      "label": "metal",
+      "origin": "06 H3"
+    },
+    "metal_encoder_test": {
+      "label": "metal",
+      "origin": "04 8.2"
+    },
+    "metal_embed_test": {
+      "label": "metal",
+      "origin": "09 9.1"
+    },
+    "metal_embed_test_concurrent": {
+      "label": "metal",
+      "origin": "09 9.1"
+    },
+    "metal_fault_test": {
+      "label": "metal",
+      "origin": "06 H3"
+    },
+    "metal_gdn_test": {
+      "label": "metal",
+      "origin": "04 10.5"
+    },
+    "metal_gr_test": {
+      "label": "metal",
+      "origin": "09 9.1"
+    },
+    "metal_gr_test_concurrent": {
+      "label": "metal",
+      "origin": "09 9.1"
+    },
+    "metal_math_test": {
+      "label": "metal",
+      "origin": "09 9.1"
+    },
+    "metal_moe_real_inputs_unavailable": {
+      "label": "host",
+      "origin": "04 10.5"
+    },
+    "metal_moe_test": {
+      "label": "metal",
+      "origin": "09 9.1"
+    },
+    "metal_mtp_test": {
+      "label": "metal",
+      "origin": "09 9.1",
+      "planned": "L11"
+    },
+    "metal_mv_test": {
+      "label": "metal",
+      "origin": "09 9.1"
+    },
+    "metal_mv_test_concurrent": {
+      "label": "metal",
+      "origin": "09 9.1"
+    },
+    "metal_never_wrap_test": {
+      "label": "metal",
+      "origin": "05 U4"
+    },
+    "metal_ple_test": {
+      "label": "metal",
+      "origin": "09 9.1"
+    },
+    "metal_ple_test_concurrent": {
+      "label": "metal",
+      "origin": "09 9.1"
+    },
+    "metal_prefill_test": {
+      "label": "metal",
+      "origin": "04 6.3 / 09 9.1"
+    },
+    "metal_prefill_test_concurrent": {
+      "label": "metal",
+      "origin": "04 6.3 / 09 9.1"
+    },
+    "metal_qsa_test": {
+      "label": "metal",
+      "origin": "04 10.5"
+    },
+    "metal_qsa_test_concurrent": {
+      "label": "metal",
+      "origin": "04 10.5"
+    },
+    "metal_qsa_selection_test": {
+      "label": "metal",
+      "origin": "04 10.5"
+    },
+    "metal_qsa_selection_test_concurrent": {
+      "label": "metal",
+      "origin": "04 10.5"
+    },
+    "metal_sampler_parity_test": {
+      "label": "metal",
+      "origin": "04 L8"
+    },
+    "metal_sampler_parity_test_concurrent": {
+      "label": "metal",
+      "origin": "04 L8"
+    },
+    "sampler_tail_test": {
+      "label": "host",
+      "origin": "04 L8"
+    },
+    "metal_slot_pool_test": {
+      "label": "metal",
+      "origin": "05 U6"
+    },
+    "metal_tiered_copy_test": {
+      "label": "metal",
+      "origin": "05 U5"
+    },
+    "metal_twin_selftest": {
+      "label": "metal",
+      "origin": "04 L2"
+    },
+    "metal_util_test": {
+      "label": "metal",
+      "origin": "09 9.1",
+      "planned": "L3"
+    },
+    "mv_multi_eq_single": {
+      "label": "metal",
+      "origin": "04 10.4",
+      "planned": "L3"
+    },
+    "pf_gdn_eq_step_norm": {
+      "label": "metal",
+      "origin": "04 10.4",
+      "planned": "L13"
+    },
+    "pf_sort_eq_host_grouping": {
+      "label": "metal",
+      "origin": "04 10.4",
+      "planned": "L13"
+    },
+    "ple_batch_eq_sequential": {
+      "label": "metal",
+      "origin": "04 10.4",
+      "planned": "L4"
+    },
+    "samp_coupled_eq_host": {
+      "label": "metal",
+      "origin": "04 10.4"
+    },
+    "cvec_off_eq_stock": {
+      "label": "model",
+      "origin": "04 10.4",
+      "planned": "L10"
+    },
+    "dense_vs_gguf_test": {
+      "label": "model",
+      "origin": "03 R5",
+      "planned": "R5"
+    },
+    "dump_eq_nodump": {
+      "label": "model",
+      "origin": "04 10.4",
+      "planned": "R11"
+    },
+    "dump_formats_test": {
+      "label": "model",
+      "origin": "03 R11",
+      "planned": "R11"
+    },
+    "metal_alloc_fail_test": {
+      "label": "model",
+      "origin": "06 2.3",
+      "planned": "T13"
+    },
+    "metal_attn_model_test": {
+      "label": "model",
+      "origin": "04 10.1",
+      "planned": "L6"
+    },
+    "metal_dispatch_modes_test": {
+      "label": "model",
+      "origin": "04 10.4",
+      "planned": "L14"
+    },
+    "metal_embed_model_test": {
+      "label": "model",
+      "origin": "04 10.1",
+      "planned": "L4"
+    },
+    "metal_full_vs_tiered": {
+      "label": "model",
+      "origin": "05 13",
+      "planned": "H10"
+    },
+    "metal_gdn_model_test": {
+      "label": "model",
+      "origin": "04 10.1",
+      "planned": "L5"
+    },
+    "metal_gpu_time_test": {
+      "label": "model",
+      "origin": "09 5.5",
+      "planned": "T13"
+    },
+    "metal_gr_model_test": {
+      "label": "model",
+      "origin": "04 10.1",
+      "planned": "L4"
+    },
+    "metal_moe_model_test": {
+      "label": "model",
+      "origin": "04 10.1",
+      "planned": "L7"
+    },
+    "metal_mtp_model_test": {
+      "label": "model",
+      "origin": "04 10.1",
+      "planned": "L11"
+    },
+    "metal_mv_model_test": {
+      "label": "model",
+      "origin": "04 10.1",
+      "planned": "L3"
+    },
+    "metal_ple_model_test": {
+      "label": "model",
+      "origin": "04 10.1",
+      "planned": "L4"
+    },
+    "metal_prefill_model_test": {
+      "label": "model",
+      "origin": "04 10.1",
+      "planned": "L13"
+    },
+    "metal_qsa_model_test": {
+      "label": "model",
+      "origin": "04 10.1",
+      "planned": "L6"
+    },
+    "metal_router_replay": {
+      "label": "model",
+      "origin": "09 4.1",
+      "planned": "T6"
+    },
+    "metal_watchdog_test": {
+      "label": "model",
+      "origin": "06 H11",
+      "planned": "T13"
+    },
+    "mtp_kv_t_independent": {
+      "label": "model",
+      "origin": "04 10.4",
+      "planned": "L11"
+    },
+    "mtp_reader_test": {
+      "label": "model",
+      "origin": "03 R10",
+      "planned": "R10"
+    },
+    "ple_oracle_model_test": {
+      "label": "model",
+      "origin": "03 R9",
+      "planned": "R9"
+    },
+    "prefill_chunk_independent": {
+      "label": "model",
+      "origin": "04 10.4",
+      "planned": "L13"
+    },
+    "state_after_commit_eq_decode": {
+      "label": "model",
+      "origin": "04 10.4",
+      "planned": "L10"
+    },
+    "tiered_eq_full": {
+      "label": "model",
+      "origin": "09 9.1",
+      "planned": "L12"
+    },
+    "window_eq_decode": {
+      "label": "model",
+      "origin": "04 10.4",
+      "planned": "L9"
+    },
+    "window_params_ring_test": {
+      "label": "metal",
+      "origin": "04 4.2"
+    },
+    "window_params_test": {
+      "label": "host",
+      "origin": "04 4.2"
+    },
+    "write_through_eq_commit": {
+      "label": "model",
+      "origin": "04 10.4",
+      "planned": "L10"
+    }
+  },
+  "runs": [
+    "c1",
+    "c2",
+    "c3",
+    "c4",
+    "pp",
+    "needle",
+    "server",
+    "bench",
+    "pf",
+    "g1",
+    "g2",
+    "g3",
+    "nightly",
+    "weekly",
+    "release",
+    "family"
+  ]
+}

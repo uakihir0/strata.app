@@ -1,0 +1,144 @@
+==================== swift-IQ2_XS-s1.json+swift-IQ2_XS-s2.json
+  s1: tensors 342 data_start 10967808 tensor bytes 39,777,505,536 kv 75
+     non-block: [('output.weight', 'IQ4_XS'), ('output_hc_down.weight', 'BF16'), ('output_hc_norm.weight', 'F32'), ('output_hc_up.weight', 'BF16'), ('per_layer_token_embd.weight', 'IQ4_NL'), ('token_embd.weight', 'IQ4_XS')]
+     layers present: 0 - 13 count 14
+     expert layers here: [0, 1, 2] ... [10, 11, 12] 13
+     dense layers here: ([0, 1, 2], [11, 12, 13], 14)
+  s2: tensors 882 data_start 56320 tensor bytes 28,363,637,504 kv 3
+     non-block: []
+     layers present: 13 - 47 count 35
+     expert layers here: [13, 14, 15] ... [45, 46, 47] 35
+     dense layers here: ([13, 14, 15], [45, 46, 47], 35)
+============================== /var/folders/5j/qyfs1nqs6clb80cjb9t9rp500000gn/T/swift-merged.json tensors 1224 data_start 0 total 68141143040
+experts 512 512x56B
+  attn_gate.weight             n=36 ne=[2560, 6144] {'IQ3_S': 11, 'IQ4_XS': 22, 'Q6_K': 3}
+  attn_k.weight                n=12 ne=[2560, 512] {'Q6_K': 3, 'IQ4_XS': 8, 'IQ3_S': 1}
+  attn_k_norm.weight           n=12 ne=[256] {'F32': 12}
+  attn_output.weight           n=12 ne=[6144, 2560] {'IQ3_S': 1, 'IQ4_XS': 10, 'Q6_K': 1}
+  attn_q.weight                n=12 ne=[2560, 12288] {'IQ4_XS': 11, 'IQ3_S': 1}
+  attn_q_norm.weight           n=12 ne=[256] {'F32': 12}
+  attn_qkv.weight              n=36 ne=[2560, 10240] {'IQ4_XS': 35, 'IQ3_S': 1}
+  attn_v.weight                n=12 ne=[2560, 512] {'IQ4_XS': 7, 'Q6_K': 5}
+  ffn_down_exps.weight         n=48 ne=[640, 2560, 512] {'Q2_0': 48}
+  ffn_down_shexp.weight        n=48 ne=[640, 2560] {'IQ4_NL': 36, 'Q8_0': 7, 'Q2_0': 5}
+  ffn_gate_exps.weight         n=48 ne=[2560, 640, 512] {'IQ2_S': 34, 'IQ2_XXS': 11, 'IQ1_M': 3}
+  ffn_gate_inp.weight          n=48 ne=[2560, 512] {'F32': 48}
+  ffn_gate_inp_shexp.weight    n=48 ne=[2560] {'F32': 48}
+  ffn_gate_shexp.weight        n=48 ne=[2560, 640] {'IQ3_S': 9, 'Q6_K': 8, 'IQ4_XS': 31}
+  ffn_up_exps.weight           n=48 ne=[2560, 640, 512] {'IQ2_S': 34, 'IQ2_XXS': 11, 'IQ1_M': 3}
+  ffn_up_shexp.weight          n=48 ne=[2560, 640] {'IQ4_XS': 26, 'IQ3_S': 14, 'Q6_K': 8}
+  hc_attn_down.weight          n=48 ne=[10240, 320] {'BF16': 48}
+  hc_attn_inject.weight        n=48 ne=[10240, 4] {'BF16': 48}
+  hc_attn_norm.weight          n=48 ne=[10240] {'F32': 48}
+  hc_attn_up.weight            n=48 ne=[320, 10240] {'BF16': 48}
+  hc_ffn_down.weight           n=48 ne=[10240, 320] {'BF16': 48}
+  hc_ffn_inject.weight         n=48 ne=[10240, 4] {'BF16': 48}
+  hc_ffn_norm.weight           n=48 ne=[10240] {'F32': 48}
+  hc_ffn_up.weight             n=48 ne=[320, 10240] {'BF16': 48}
+  indexer.k_norm.weight        n=12 ne=[128] {'F32': 12}
+  indexer.k_proj.weight        n=12 ne=[2560, 128] {'BF16': 12}
+  indexer.q_norm.weight        n=12 ne=[128] {'F32': 12}
+  indexer.q_proj.weight        n=12 ne=[2560, 512] {'BF16': 12}
+  ple_conv1d.weight            n= 1 ne=[4, 10240] {'F16': 1}
+  ple_key.weight               n= 1 ne=[2560, 10240] {'BF16': 1}
+  ple_norm_conv.weight         n= 1 ne=[10240] {'F32': 1}
+  ple_norm_key.weight          n= 1 ne=[10240] {'F32': 1}
+  ple_norm_query.weight        n= 1 ne=[10240] {'F32': 1}
+  ple_value.weight             n= 1 ne=[2560, 2560] {'BF16': 1}
+  ssm_a                        n=36 ne=[48] {'F32': 36}
+  ssm_alpha.weight             n=36 ne=[2560, 48] {'BF16': 36}
+  ssm_beta.weight              n=36 ne=[2560, 48] {'BF16': 36}
+  ssm_conv1d.weight            n=36 ne=[4, 10240] {'F32': 36}
+  ssm_dt.bias                  n=36 ne=[48] {'F32': 36}
+  ssm_norm.weight              n=36 ne=[128] {'F32': 36}
+  ssm_out.weight               n=36 ne=[6144, 2560] {'IQ4_XS': 29, 'IQ3_S': 6, 'Q6_K': 1}
+  G output.weight              ne=[2560, 248320] IQ4_XS 337715200
+  G output_hc_down.weight      ne=[10240, 320] BF16 6553600
+  G output_hc_norm.weight      ne=[10240] F32 40960
+  G output_hc_up.weight        ne=[320, 10240] BF16 6553600
+  G per_layer_token_embd.weight ne=[160, 320001536] IQ4_NL 28800138240
+  G token_embd.weight          ne=[2560, 248320] IQ4_XS 337715200
+  routed experts total 35454976000 per-layer combos {('IQ2_S', 'IQ2_S', 'Q2_0'): 34, ('IQ2_XXS', 'IQ2_XXS', 'Q2_0'): 11, ('IQ1_M', 'IQ1_M', 'Q2_0'): 3}
+  blob min/mean/max 1177600 1442666.6666666667 1510400 per token top-10: 692480000
+  pass GDN projections (attn_qkv, attn_gate, ssm_out)                          1,091,338,240
+  pass GDN small (ssm_alpha, ssm_beta, ssm_conv1d, ssm_a, ssm_dt.bias, ssm_norm)     23,625,216
+  pass QSA projections (attn_q, attn_k, attn_v, attn_output)                     320,174,080
+  pass QSA indexer (k_proj, q_proj) and norms                                     39,358,464
+  pass GR mixers (hc_attn_*, hc_ffn_*)                                         1,270,087,680
+  pass Routers (ffn_gate_inp, ffn_gate_inp_shexp)                                252,149,760
+  pass Shared experts (ffn_{gate,up,down}_shexp)                                 134,976,000
+  pass PLE block, layer 1 (ple_key, ple_value, norms, conv)                       65,740,800
+  pass Head (output.weight, output_hc_*)                                         350,863,360
+  pass total (dense, excluding token_embd rows) 3,548,313,600; token_embd IQ4_XS 337,715,200; row 1360
+==================== swift-IQ3_XXS-s1.json+swift-IQ3_XXS-s2.json
+  s1: tensors 317 data_start 10966240 tensor bytes 39,774,824,320 kv 75
+     non-block: [('output.weight', 'Q5_K'), ('output_hc_down.weight', 'BF16'), ('output_hc_norm.weight', 'F32'), ('output_hc_up.weight', 'BF16'), ('per_layer_token_embd.weight', 'IQ4_NL'), ('token_embd.weight', 'IQ3_S')]
+     layers present: 0 - 12 count 13
+     expert layers here: [0, 1, 2] ... [9, 10, 11] 12
+     dense layers here: ([0, 1, 2], [10, 11, 12], 13)
+  s2: tensors 907 data_start 57920 tensor bytes 36,180,224,640 kv 3
+     non-block: []
+     layers present: 12 - 47 count 36
+     expert layers here: [12, 13, 14] ... [45, 46, 47] 36
+     dense layers here: ([12, 13, 14], [45, 46, 47], 36)
+============================== /var/folders/5j/qyfs1nqs6clb80cjb9t9rp500000gn/T/swift-merged.json tensors 1224 data_start 0 total 75955048960
+experts 512 512x56B
+  attn_gate.weight             n=36 ne=[2560, 6144] {'IQ3_S': 10, 'Q6_K': 5, 'IQ4_XS': 11, 'Q4_K': 7, 'Q5_K': 3}
+  attn_k.weight                n=12 ne=[2560, 512] {'IQ4_XS': 2, 'Q4_K': 2, 'Q6_K': 6, 'Q5_K': 1, 'IQ3_S': 1}
+  attn_k_norm.weight           n=12 ne=[256] {'F32': 12}
+  attn_output.weight           n=12 ne=[6144, 2560] {'Q6_K': 10, 'Q5_K': 1, 'Q4_K': 1}
+  attn_q.weight                n=12 ne=[2560, 12288] {'IQ4_XS': 4, 'Q4_K': 3, 'Q6_K': 4, 'IQ3_S': 1}
+  attn_q_norm.weight           n=12 ne=[256] {'F32': 12}
+  attn_qkv.weight              n=36 ne=[2560, 10240] {'IQ4_XS': 11, 'Q6_K': 14, 'Q4_K': 8, 'Q5_K': 3}
+  attn_v.weight                n=12 ne=[2560, 512] {'Q6_K': 9, 'Q4_K': 1, 'IQ4_XS': 2}
+  ffn_down_exps.weight         n=48 ne=[640, 2560, 512] {'IQ4_NL': 18, 'Q2_0': 30}
+  ffn_down_shexp.weight        n=48 ne=[640, 2560] {'IQ4_NL': 40, 'Q2_0': 8}
+  ffn_gate_exps.weight         n=48 ne=[2560, 640, 512] {'IQ2_XS': 10, 'IQ2_XXS': 9, 'IQ3_S': 13, 'IQ2_S': 10, 'IQ3_XXS': 6}
+  ffn_gate_inp.weight          n=48 ne=[2560, 512] {'F32': 48}
+  ffn_gate_inp_shexp.weight    n=48 ne=[2560] {'F32': 48}
+  ffn_gate_shexp.weight        n=48 ne=[2560, 640] {'IQ4_XS': 21, 'Q4_K': 12, 'IQ3_S': 13, 'Q5_K': 1, 'Q6_K': 1}
+  ffn_up_exps.weight           n=48 ne=[2560, 640, 512] {'IQ2_XS': 10, 'IQ2_XXS': 9, 'IQ3_S': 13, 'IQ2_S': 10, 'IQ3_XXS': 6}
+  ffn_up_shexp.weight          n=48 ne=[2560, 640] {'IQ3_S': 27, 'Q5_K': 1, 'Q4_K': 7, 'Q6_K': 3, 'IQ4_XS': 10}
+  hc_attn_down.weight          n=48 ne=[10240, 320] {'BF16': 48}
+  hc_attn_inject.weight        n=48 ne=[10240, 4] {'BF16': 48}
+  hc_attn_norm.weight          n=48 ne=[10240] {'F32': 48}
+  hc_attn_up.weight            n=48 ne=[320, 10240] {'BF16': 48}
+  hc_ffn_down.weight           n=48 ne=[10240, 320] {'BF16': 48}
+  hc_ffn_inject.weight         n=48 ne=[10240, 4] {'BF16': 48}
+  hc_ffn_norm.weight           n=48 ne=[10240] {'F32': 48}
+  hc_ffn_up.weight             n=48 ne=[320, 10240] {'BF16': 48}
+  indexer.k_norm.weight        n=12 ne=[128] {'F32': 12}
+  indexer.k_proj.weight        n=12 ne=[2560, 128] {'BF16': 12}
+  indexer.q_norm.weight        n=12 ne=[128] {'F32': 12}
+  indexer.q_proj.weight        n=12 ne=[2560, 512] {'BF16': 12}
+  ple_conv1d.weight            n= 1 ne=[4, 10240] {'F16': 1}
+  ple_key.weight               n= 1 ne=[2560, 10240] {'BF16': 1}
+  ple_norm_conv.weight         n= 1 ne=[10240] {'F32': 1}
+  ple_norm_key.weight          n= 1 ne=[10240] {'F32': 1}
+  ple_norm_query.weight        n= 1 ne=[10240] {'F32': 1}
+  ple_value.weight             n= 1 ne=[2560, 2560] {'BF16': 1}
+  ssm_a                        n=36 ne=[48] {'F32': 36}
+  ssm_alpha.weight             n=36 ne=[2560, 48] {'BF16': 36}
+  ssm_beta.weight              n=36 ne=[2560, 48] {'BF16': 36}
+  ssm_conv1d.weight            n=36 ne=[4, 10240] {'F32': 36}
+  ssm_dt.bias                  n=36 ne=[48] {'F32': 36}
+  ssm_norm.weight              n=36 ne=[128] {'F32': 36}
+  ssm_out.weight               n=36 ne=[6144, 2560] {'IQ4_XS': 6, 'IQ3_S': 3, 'Q4_K': 4, 'Q5_K': 4, 'Q6_K': 19}
+  G output.weight              ne=[2560, 248320] Q5_K 437043200
+  G output_hc_down.weight      ne=[10240, 320] BF16 6553600
+  G output_hc_norm.weight      ne=[10240] F32 40960
+  G output_hc_up.weight        ne=[320, 10240] BF16 6553600
+  G per_layer_token_embd.weight ne=[160, 320001536] IQ4_NL 28800138240
+  G token_embd.weight          ne=[2560, 248320] IQ3_S 273152000
+  routed experts total 42912972800 per-layer combos {('IQ2_XS', 'IQ2_XS', 'IQ4_NL'): 4, ('IQ2_XXS', 'IQ2_XXS', 'Q2_0'): 8, ('IQ2_XS', 'IQ2_XS', 'Q2_0'): 6, ('IQ3_S', 'IQ3_S', 'Q2_0'): 7, ('IQ2_S', 'IQ2_S', 'Q2_0'): 6, ('IQ3_S', 'IQ3_S', 'IQ4_NL'): 6, ('IQ2_S', 'IQ2_S', 'IQ4_NL'): 4, ('IQ2_XXS', 'IQ2_XXS', 'IQ4_NL'): 1, ('IQ3_XXS', 'IQ3_XXS', 'IQ4_NL'): 3, ('IQ3_XXS', 'IQ3_XXS', 'Q2_0'): 3}
+  blob min/mean/max 1305600 1746133.3333333333 2329600 per token top-10: 838144000
+  pass GDN projections (attn_qkv, attn_gate, ssm_out)                          1,338,859,520
+  pass GDN small (ssm_alpha, ssm_beta, ssm_conv1d, ssm_a, ssm_dt.bias, ssm_norm)     23,625,216
+  pass QSA projections (attn_q, attn_k, attn_v, attn_output)                     407,941,120
+  pass QSA indexer (k_proj, q_proj) and norms                                     39,358,464
+  pass GR mixers (hc_attn_*, hc_ffn_*)                                         1,270,087,680
+  pass Routers (ffn_gate_inp, ffn_gate_inp_shexp)                                252,149,760
+  pass Shared experts (ffn_{gate,up,down}_shexp)                                 120,832,000
+  pass PLE block, layer 1 (ple_key, ple_value, norms, conv)                       65,740,800
+  pass Head (output.weight, output_hc_*)                                         450,191,360
+  pass total (dense, excluding token_embd rows) 3,968,785,920; token_embd IQ3_S 273,152,000; row 1100

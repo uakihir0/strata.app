@@ -1,0 +1,54 @@
+// Host-side construction of one Metal Prefill chunk (docs/mac/04 §6.1).
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <string>
+#include <vector>
+
+namespace strata::metal {
+
+inline constexpr std::uint32_t kPrefillBatchSlotCount = 6u;
+inline constexpr std::uint32_t kPrefillImageTokenFlag = 0x80000000u;
+inline constexpr std::uint32_t kPrefillMaxShaderRows = 419'430u;
+
+/// Mirrors StepRow in src/metal/kernels/common/types.h.
+struct PrefillStepRow {
+    std::int32_t pos = 0;
+    std::int32_t n_kv = 0;
+    std::int32_t n_bid = 0;
+    std::int32_t width = 0;
+};
+
+/// Mirrors PrefillParams in src/metal/kernels/common/types.h.
+struct PrefillParams {
+    std::uint32_t T = 0;
+    std::uint32_t p0 = 0;
+    std::uint32_t idx_f = 0;
+    std::uint32_t idx_e = 0;
+};
+
+struct PrefillChunkMetadata {
+    PrefillParams params;
+    // Query batch sizes for slots 0..5; each slot is written into its own
+    // 256-byte arena slot by the eventual Prefill executor.
+    std::array<std::uint32_t, kPrefillBatchSlotCount> batch_rows{};
+    std::vector<std::uint32_t> tokens;
+    std::vector<PrefillStepRow> steps;
+    bool has_image_rows = false;
+};
+
+/// Build the host inputs for one non-empty chunk.
+///
+/// Tokens are copied verbatim, including bit 31 on image rows. Position
+/// metadata must fit the signed StepRow fields, and rows must fit every
+/// embedding/broadcast shader's 32-bit flattened index. On failure, `output`
+/// is unchanged.
+bool build_prefill_chunk_metadata(std::uint32_t pos0,
+                                  std::span<const std::uint32_t> tokens,
+                                  PrefillChunkMetadata& output,
+                                  std::string& error);
+
+}  // namespace strata::metal
