@@ -47,6 +47,22 @@ struct WindowT1AttentionGDNFFNBuffers {
     GRReadBuffers ffn;
 };
 
+/// Layer 0 followed by the T=1 router projection, top-10 routing and MoE
+/// input quantization. The router reads the FFN `mixed` output; its logits
+/// feed `route_ids`/`route_weights`; the final Q8_1 row reuses `gdn.xq` after
+/// the GDN dispatches have finished. `router_matvec_sink` is separate scratch.
+/// The router tensor is a read-only BF16 [experts, 2560] view; `experts` is
+/// 256 for Coder or 512 otherwise. This prefix stops before MoePlan or expert
+/// execution.
+struct WindowT1MoeRouterPrefixBuffers {
+    WindowT1AttentionGDNFFNBuffers layer0;
+    ReadOnlyBufferRef router_tensor;
+    BufferRef router_logits;
+    BufferRef route_ids;
+    BufferRef route_weights;
+    BufferRef router_matvec_sink;
+};
+
 /// Encode the T=1 input stem: gather the token from WindowParams, then
 /// broadcast the embedding into the four initial GR streams. The views must
 /// remain alive and the parameter block must remain unchanged until GPU
@@ -95,5 +111,22 @@ bool encode_window_t1_attention_gdn_ffn(
     Context& context, CommandBuffer& command_buffer,
     std::uint32_t vocabulary_size,
     const WindowT1AttentionGDNFFNBuffers& buffers, std::string& error);
+
+/// Encode the T=1 layer-0 attention/GDN/FFN-read chain, BF16 router, top-10
+/// Window route (`divide_weights=false`), then Q8_1 quantization of `mixed`
+/// into the GDN `xq` scratch after GDN has consumed it. All stages are
+/// ordered in one segment and reject an open concurrent group. The caller
+/// must propagate false from its enclosing Encoder::encode body so the full
+/// segment is discarded on failure.
+bool encode_window_t1_moe_router_prefix(
+    Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
+    std::uint32_t experts,
+    const WindowT1MoeRouterPrefixBuffers& buffers, std::string& error);
+/// Standalone transactional form. A late validation failure discards every
+/// earlier stage in the prefix.
+bool encode_window_t1_moe_router_prefix(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size, std::uint32_t experts,
+    const WindowT1MoeRouterPrefixBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal

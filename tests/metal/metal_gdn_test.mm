@@ -1,11 +1,14 @@
 // Metal twins for the GDN block and its validated encoders (docs/mac/04 §5.5).
 #include "metallib_sha256.inc"
+#include "oracles/bf16_mv.hpp"
 #include "oracles/gdn.hpp"
+#include "oracles/moe_route.hpp"
 #include "oracles/q8_0_mv.hpp"
 #include "oracles/q8_1.hpp"
 #include "strata/metal/context.hpp"
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/gdn_dispatch.hpp"
+#include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/mv_dispatch.hpp"
 #include "strata/metal/window_dispatch.hpp"
 #include "strata/metal/window_gdn_dispatch.hpp"
@@ -3071,6 +3074,406 @@ bool test_window_t1_attention_gdn(Context& context) {
     check(layer0_state_unchanged,
           label + " full layer-0 coordinator keeps GDN state and history speculative");
 
+    constexpr std::uint32_t kRouterExperts = 512u;
+    constexpr std::size_t kRouterInputWidth = N_EMBD;
+    constexpr std::size_t kRouterWeightCount =
+        static_cast<std::size_t>(kRouterExperts) * kRouterInputWidth;
+    constexpr std::size_t kRouteTopK = 10u;
+    const std::size_t router_weight_bytes =
+        kRouterWeightCount * sizeof(std::uint16_t);
+    twin::GuardedBuffer router_tensor_storage;
+    twin::GuardedBuffer router_logits_storage;
+    twin::GuardedBuffer route_ids_storage;
+    twin::GuardedBuffer route_weights_storage;
+    twin::GuardedBuffer router_matvec_sink_storage;
+    const bool router_storage_allocated =
+        router_tensor_storage.allocate(
+            context, label + " BF16 router tensor", router_weight_bytes,
+            error) &&
+        router_logits_storage.allocate(
+            context, label + " router logits",
+            kRouterExperts * sizeof(float), error) &&
+        route_ids_storage.allocate(
+            context, label + " route IDs",
+            kRouteTopK * sizeof(std::int32_t), error) &&
+        route_weights_storage.allocate(
+            context, label + " route weights", kRouteTopK * sizeof(float),
+            error) &&
+        router_matvec_sink_storage.allocate(
+            context, label + " router mat-vec sink", sizeof(float), error);
+    check(router_storage_allocated, label + " router prefix scratch allocation",
+          error);
+    if (!router_storage_allocated) return false;
+
+    std::vector<std::uint16_t> router_weight_values(kRouterWeightCount);
+    for (std::size_t index = 0u; index < router_weight_values.size(); ++index) {
+        const std::int32_t code =
+            static_cast<std::int32_t>((index * 17u + 31u) % 251u) - 125;
+        router_weight_values[index] = strata::kernels::bf16_from_f32(
+            static_cast<float>(code) * 0.00003125f);
+    }
+    std::memcpy(router_tensor_storage.payload().data(),
+                router_weight_values.data(), router_weight_bytes);
+    std::vector<float> expected_mixed(kRouterInputWidth);
+    std::memcpy(expected_mixed.data(), layer0_expected_outputs[4].data(),
+                expected_mixed.size() * sizeof(float));
+
+    const WindowT1MoeRouterPrefixBuffers router_prefix_buffers{
+        layer0_buffers,
+        context.buffers().read_only(router_tensor_storage.view()),
+        router_logits_storage.view(), route_ids_storage.view(),
+        route_weights_storage.view(), router_matvec_sink_storage.view()};
+    const auto exercise_router_prefix = [&](std::uint32_t experts) {
+        std::string prefix_error;
+        std::vector<float> expected_logits;
+        const auto expert_weights =
+            std::span<const std::uint16_t>(router_weight_values).first(
+                static_cast<std::size_t>(experts) * kRouterInputWidth);
+        const bool logits_oracle = twin::bf16_matvec_reference(
+            expert_weights, expected_mixed, N_EMBD, experts, 1u, 1u, 256u,
+            expected_logits, prefix_error);
+        check(logits_oracle,
+              label + " router BF16 oracle experts=" +
+                  std::to_string(experts),
+              prefix_error);
+        if (!logits_oracle) return false;
+
+        std::vector<std::int32_t> expected_ids;
+        std::vector<twin::tf> expected_route_weights;
+        const bool route_oracle = twin::moe_route_reference(
+            expected_logits, 1u, experts, false, expected_ids,
+            expected_route_weights, prefix_error);
+        check(route_oracle,
+              label + " route oracle experts=" + std::to_string(experts),
+              prefix_error);
+        if (!route_oracle) return false;
+
+        std::vector<Q81> expected_q8_1;
+        const bool q8_oracle = twin::quantize_q8_1_reference(
+            expected_mixed, N_EMBD, 1u, expected_q8_1, prefix_error);
+        check(q8_oracle,
+              label + " Q8_1 oracle experts=" + std::to_string(experts),
+              prefix_error);
+        if (!q8_oracle) return false;
+
+        prepare_layer0_chain(true);
+        const auto poison_route_outputs = [&] {
+            for (twin::GuardedBuffer* output :
+                 {&router_logits_storage, &route_ids_storage,
+                  &route_weights_storage, &router_matvec_sink_storage}) {
+                std::fill(output->payload().begin(), output->payload().end(),
+                          poison);
+                output->capture_before_dispatch();
+            }
+        };
+        poison_route_outputs();
+        router_tensor_storage.capture_before_dispatch();
+
+        const bool completed = run_command(
+            context, label + " router route Q8_1 experts=" +
+                         std::to_string(experts),
+            [&](CommandBuffer& command, std::string& command_error) {
+                return encode_window_t1_moe_router_prefix(
+                    context, command, vocabulary_size, experts,
+                    router_prefix_buffers, command_error);
+            },
+            prefix_error);
+        check(completed,
+              label + " ordered router route Q8_1 prefix experts=" +
+                  std::to_string(experts),
+              prefix_error);
+        if (!completed) return false;
+
+        const auto expected_logit_bytes = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(expected_logits.data()),
+            expected_logits.size() * sizeof(float));
+        const auto actual_logit_bytes =
+            router_logits_storage.payload().first(expected_logit_bytes.size());
+        const auto logit_mismatch =
+            twin::compare_bytes(actual_logit_bytes, expected_logit_bytes);
+        check(!logit_mismatch,
+              label + " exact router logits experts=" + std::to_string(experts),
+              logit_mismatch ? logit_mismatch->reason : std::string{});
+
+        const auto expected_id_bytes = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(expected_ids.data()),
+            expected_ids.size() * sizeof(std::int32_t));
+        const auto id_mismatch = twin::compare_bytes(
+            route_ids_storage.payload(), expected_id_bytes);
+        check(!id_mismatch,
+              label + " exact top-10 route IDs experts=" +
+                  std::to_string(experts),
+              id_mismatch ? id_mismatch->reason : std::string{});
+
+        const auto actual_route_weights =
+            typed<const float>(route_weights_storage).first(kRouteTopK);
+        const std::vector<float> prefix_route_weights(
+            actual_route_weights.begin(), actual_route_weights.end());
+        const auto actual_route_ids =
+            typed<const std::int32_t>(route_ids_storage).first(kRouteTopK);
+        const std::vector<std::int32_t> prefix_route_ids(
+            actual_route_ids.begin(), actual_route_ids.end());
+        const twin::Tolerance route_tolerance{
+            twin::Comparison::units, 16.0, 0.0, 0u};
+        const auto route_weight_mismatch = twin::compare_floats(
+            actual_route_weights, expected_route_weights, route_tolerance);
+        check(!route_weight_mismatch,
+              label + " top-10 route weights U(16) experts=" +
+                  std::to_string(experts),
+              route_weight_mismatch ? route_weight_mismatch->reason
+                                    : std::string{});
+
+        const auto expected_q8_1_bytes = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(expected_q8_1.data()),
+            expected_q8_1.size() * sizeof(Q81));
+        const auto actual_q8_1_bytes = storage[kXq].payload().first(
+            expected_q8_1_bytes.size());
+        const auto q8_1_mismatch =
+            twin::compare_bytes(actual_q8_1_bytes, expected_q8_1_bytes);
+        check(!q8_1_mismatch,
+              label + " exact MoE input Q8_1 row experts=" +
+                  std::to_string(experts),
+              q8_1_mismatch ? q8_1_mismatch->reason : std::string{});
+
+        const auto expected_mixed_bytes = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(expected_mixed.data()),
+            expected_mixed.size() * sizeof(float));
+        const auto actual_mixed_mismatch = twin::compare_bytes(
+            storage[kMixed].payload(), expected_mixed_bytes);
+        check(!actual_mixed_mismatch,
+              label + " router and Q8_1 preserve FFN mixed input experts=" +
+                  std::to_string(experts),
+              actual_mixed_mismatch ? actual_mixed_mismatch->reason
+                                    : std::string{});
+
+        const std::array<twin::ByteRange, 1u> logits_written{{{
+            0u, expected_logit_bytes.size()}}};
+        const auto logits_guard =
+            router_logits_storage.first_unwritten_change(logits_written);
+        const std::array<twin::ByteRange, 1u> ids_written{{{
+            0u, expected_id_bytes.size()}}};
+        const auto ids_guard =
+            route_ids_storage.first_unwritten_change(ids_written);
+        const std::array<twin::ByteRange, 1u> weights_written{{{
+            0u, expected_route_weights.size() * sizeof(float)}}};
+        const auto weights_guard =
+            route_weights_storage.first_unwritten_change(weights_written);
+        const std::array<twin::ByteRange, 1u> q8_1_written{{{
+            0u, expected_q8_1_bytes.size()}}};
+        const auto q8_1_guard = storage[kXq].first_unwritten_change(q8_1_written);
+        const auto sink_guard = router_matvec_sink_storage.first_unwritten_change({});
+        const auto router_tensor_guard =
+            router_tensor_storage.first_unwritten_change({});
+        const bool guards_ok = !logits_guard && !ids_guard && !weights_guard &&
+            !q8_1_guard && !sink_guard && !router_tensor_guard;
+        check(guards_ok,
+              label + " router prefix guards and read-only weights experts=" +
+                  std::to_string(experts),
+              logits_guard ? logits_guard->reason :
+                  ids_guard ? ids_guard->reason :
+                  weights_guard ? weights_guard->reason :
+                  q8_1_guard ? q8_1_guard->reason :
+                  sink_guard ? sink_guard->reason :
+                  router_tensor_guard ? router_tensor_guard->reason :
+                  std::string{});
+
+        const auto run_route_mode = [&](bool divide_weights,
+                                        std::vector<std::int32_t>& output_ids,
+                                        std::vector<float>& output_weights) {
+            std::fill(route_ids_storage.payload().begin(),
+                      route_ids_storage.payload().end(), poison);
+            std::fill(route_weights_storage.payload().begin(),
+                      route_weights_storage.payload().end(), poison);
+            const bool dispatched = run_command(
+                context, label + " route mode negative control experts=" +
+                             std::to_string(experts) + " divide=" +
+                             std::to_string(divide_weights ? 1 : 0),
+                [&](CommandBuffer& command, std::string& command_error) {
+                    return encode_moe_route(
+                        context, command, 1u, experts, divide_weights,
+                        {context.buffers().read_only(
+                             router_logits_storage.view()),
+                         route_ids_storage.view(), route_weights_storage.view()},
+                        command_error);
+                },
+                prefix_error);
+            if (dispatched) {
+                const auto ids =
+                    typed<const std::int32_t>(route_ids_storage).first(kRouteTopK);
+                const auto weights =
+                    typed<const float>(route_weights_storage).first(kRouteTopK);
+                output_ids.assign(ids.begin(), ids.end());
+                output_weights.assign(weights.begin(), weights.end());
+            }
+            return dispatched;
+        };
+        std::vector<std::int32_t> reciprocal_ids;
+        std::vector<float> reciprocal_weights;
+        std::vector<std::int32_t> division_ids;
+        std::vector<float> division_weights;
+        const bool reciprocal_completed =
+            run_route_mode(false, reciprocal_ids, reciprocal_weights);
+        const bool division_completed =
+            run_route_mode(true, division_ids, division_weights);
+        const bool prefix_matches_reciprocal = reciprocal_completed &&
+            prefix_route_ids == reciprocal_ids &&
+            prefix_route_weights == reciprocal_weights;
+        bool mode_negative_control_differs = division_completed &&
+            division_ids == reciprocal_ids &&
+            division_weights.size() == reciprocal_weights.size();
+        if (mode_negative_control_differs) {
+            mode_negative_control_differs = false;
+            for (std::size_t index = 0u; index < reciprocal_weights.size();
+                 ++index) {
+                if (std::bit_cast<std::uint32_t>(reciprocal_weights[index]) !=
+                    std::bit_cast<std::uint32_t>(division_weights[index])) {
+                    mode_negative_control_differs = true;
+                    break;
+                }
+            }
+        }
+        const bool route_mode_ok = prefix_matches_reciprocal &&
+                                   mode_negative_control_differs;
+        check(route_mode_ok,
+              label + " prefix selects reciprocal route mode experts=" +
+                  std::to_string(experts),
+              prefix_route_weights.empty() ? prefix_error : std::string{});
+        return !logit_mismatch && !id_mismatch && !route_weight_mismatch &&
+               !q8_1_mismatch && !actual_mixed_mismatch && guards_ok &&
+               reciprocal_completed && division_completed && route_mode_ok;
+    };
+    const bool standard_router_prefix = exercise_router_prefix(512u);
+    const bool coder_router_prefix = exercise_router_prefix(256u);
+
+    WindowT1MoeRouterPrefixBuffers short_router_sink = router_prefix_buffers;
+    short_router_sink.router_matvec_sink =
+        router_matvec_sink_storage.view().slice(0u, sizeof(float) - 1u);
+    prepare_layer0_chain(true);
+    std::fill(router_logits_storage.payload().begin(),
+              router_logits_storage.payload().end(), poison);
+    std::fill(route_ids_storage.payload().begin(), route_ids_storage.payload().end(),
+              poison);
+    std::fill(route_weights_storage.payload().begin(),
+              route_weights_storage.payload().end(), poison);
+    std::fill(router_matvec_sink_storage.payload().begin(),
+              router_matvec_sink_storage.payload().end(), poison);
+    auto short_sink_command = context.make_command_buffer(
+        label + " short router sink", error);
+    check(short_sink_command != nullptr,
+          label + " short-router-sink command buffer", error);
+    if (!short_sink_command) return false;
+    const bool short_sink_rejected = !encode_window_t1_moe_router_prefix(
+        context, *short_sink_command, vocabulary_size, 512u,
+        short_router_sink, error);
+    const bool short_sink_discarded =
+        short_sink_command->unsafe_native_handle() == nullptr;
+    const bool short_sink_untouched = outputs_are_poisoned() &&
+        std::equal(gr_residual_before.begin(), gr_residual_before.end(),
+                   storage[kGrResidual].payload().begin(),
+                   storage[kGrResidual].payload().end()) &&
+        std::all_of(router_logits_storage.payload().begin(),
+                    router_logits_storage.payload().end(),
+                    [=](std::uint8_t value) { return value == poison; }) &&
+        std::all_of(route_ids_storage.payload().begin(),
+                    route_ids_storage.payload().end(),
+                    [=](std::uint8_t value) { return value == poison; }) &&
+        std::all_of(route_weights_storage.payload().begin(),
+                    route_weights_storage.payload().end(),
+                    [=](std::uint8_t value) { return value == poison; });
+    check(short_sink_rejected && short_sink_discarded && short_sink_untouched &&
+              error.find("router mat-vec sink") != std::string::npos,
+          label + " undersized router sink rejects before dispatch", error);
+
+    WindowT1MoeRouterPrefixBuffers aliased_router_logits =
+        router_prefix_buffers;
+    aliased_router_logits.router_logits = storage[kGrResidual].view();
+    prepare_layer0_chain(true);
+    auto alias_command = context.make_command_buffer(
+        label + " router logits alias", error);
+    check(alias_command != nullptr,
+          label + " router-logits-alias command buffer", error);
+    if (!alias_command) return false;
+    const bool alias_rejected = !Encoder::encode(
+        context, *alias_command, "Window router-prefix alias rollback",
+        [&](Encoder& encoder, std::string& body_error) {
+            return encode_window_t1_moe_router_prefix(
+                context, encoder, vocabulary_size, 512u,
+                aliased_router_logits, body_error);
+        },
+        error);
+    const bool alias_discarded =
+        alias_command->unsafe_native_handle() == nullptr;
+    const bool alias_untouched = outputs_are_poisoned() &&
+        std::equal(gr_residual_before.begin(), gr_residual_before.end(),
+                   storage[kGrResidual].payload().begin(),
+                   storage[kGrResidual].payload().end()) &&
+        std::all_of(route_ids_storage.payload().begin(),
+                    route_ids_storage.payload().end(),
+                    [=](std::uint8_t value) { return value == poison; }) &&
+        std::all_of(route_weights_storage.payload().begin(),
+                    route_weights_storage.payload().end(),
+                    [=](std::uint8_t value) { return value == poison; });
+    check(alias_rejected && alias_discarded && alias_untouched &&
+              error.find("overlaps a layer-0 stage buffer") != std::string::npos,
+          label + " caller-owned router alias failure discards the segment",
+          error);
+
+    twin::GuardedBuffer router_tensor_param_alias_storage;
+    const bool router_tensor_param_alias_allocated =
+        router_tensor_param_alias_storage.allocate(
+            context, label + " router tensor and parameter overlap",
+            router_weight_bytes, error);
+    check(router_tensor_param_alias_allocated,
+          label + " router-tensor/parameter alias allocation", error);
+    if (!router_tensor_param_alias_allocated) return false;
+    std::fill(router_tensor_param_alias_storage.payload().begin(),
+              router_tensor_param_alias_storage.payload().end(), poison);
+    std::memcpy(router_tensor_param_alias_storage.payload().data(),
+                &valid_params, sizeof(valid_params));
+    WindowT1MoeRouterPrefixBuffers aliased_router_tensor_params =
+        router_prefix_buffers;
+    aliased_router_tensor_params.layer0.params =
+        router_tensor_param_alias_storage.view();
+    aliased_router_tensor_params.router_tensor = context.buffers().read_only(
+        router_tensor_param_alias_storage.view());
+    prepare_layer0_chain(true);
+    std::fill(router_logits_storage.payload().begin(),
+              router_logits_storage.payload().end(), poison);
+    std::fill(route_ids_storage.payload().begin(), route_ids_storage.payload().end(),
+              poison);
+    std::fill(route_weights_storage.payload().begin(),
+              route_weights_storage.payload().end(), poison);
+    auto router_param_alias_command = context.make_command_buffer(
+        label + " router tensor parameter alias", error);
+    check(router_param_alias_command != nullptr,
+          label + " router-tensor/parameter-alias command buffer", error);
+    if (!router_param_alias_command) return false;
+    const bool router_param_alias_rejected =
+        !encode_window_t1_moe_router_prefix(
+            context, *router_param_alias_command, vocabulary_size, 512u,
+            aliased_router_tensor_params, error);
+    const bool router_param_alias_discarded =
+        router_param_alias_command->unsafe_native_handle() == nullptr;
+    const bool router_param_alias_untouched = outputs_are_poisoned() &&
+        std::equal(gr_residual_before.begin(), gr_residual_before.end(),
+                   storage[kGrResidual].payload().begin(),
+                   storage[kGrResidual].payload().end()) &&
+        std::all_of(router_logits_storage.payload().begin(),
+                    router_logits_storage.payload().end(),
+                    [=](std::uint8_t value) { return value == poison; }) &&
+        std::all_of(route_ids_storage.payload().begin(),
+                    route_ids_storage.payload().end(),
+                    [=](std::uint8_t value) { return value == poison; }) &&
+        std::all_of(route_weights_storage.payload().begin(),
+                    route_weights_storage.payload().end(),
+                    [=](std::uint8_t value) { return value == poison; });
+    check(router_param_alias_rejected && router_param_alias_discarded &&
+              router_param_alias_untouched &&
+              error.find("router tensor overlaps its parameters") !=
+                  std::string::npos,
+          label + " router tensor overlapping WindowParams rejects before dispatch",
+          error);
+
     const auto reject_layer0_params = [&](const std::string& case_name,
                                           const std::string& expected_error,
                                           auto mutate) {
@@ -3225,7 +3628,12 @@ bool test_window_t1_attention_gdn(Context& context) {
            component_state_unchanged && layer0_completed &&
            layer0_outputs_match && layer0_residual_matches &&
            layer0_inject2_matches && !residual_guard && !inject2_guard &&
-           layer0_state_unchanged && layer0_n_keep_rejected &&
+           layer0_state_unchanged && standard_router_prefix &&
+           coder_router_prefix && short_sink_rejected &&
+           short_sink_discarded && short_sink_untouched && alias_rejected &&
+           alias_discarded && alias_untouched &&
+           router_param_alias_rejected && router_param_alias_discarded &&
+           router_param_alias_untouched && layer0_n_keep_rejected &&
            layer0_bad_nc_rejected && split_injection_rejected &&
            split_injection_discarded && shared_weights_rejected &&
            shared_weights_discarded && partial_weights_rejected &&

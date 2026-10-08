@@ -3,6 +3,8 @@
 
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/gr_dispatch.hpp"
+#include "strata/metal/moe_dispatch.hpp"
+#include "strata/metal/mv_dispatch.hpp"
 #include "strata/metal/window_dispatch.hpp"
 
 #include <algorithm>
@@ -42,6 +44,48 @@ bool buffer_views_overlap(BufferRef left, BufferRef right) {
         ranges_overlap(left.gpu_address, left.length, right.gpu_address,
                        right.length);
     return same_buffer_overlap || cpu_backing_overlap || gpu_backing_overlap;
+}
+
+bool buffer_views_overlap(ReadOnlyBufferRef left, BufferRef right) {
+    const void* left_contents = left.contents();
+    const bool cpu_backing_overlap =
+        left_contents != nullptr && right.contents != nullptr &&
+        ranges_overlap(reinterpret_cast<std::uintptr_t>(left_contents),
+                       left.length(),
+                       reinterpret_cast<std::uintptr_t>(right.contents),
+                       right.length);
+    const std::uint64_t left_gpu_address = left.gpu_address();
+    const bool gpu_backing_overlap =
+        left_gpu_address != 0u && right.gpu_address != 0u &&
+        ranges_overlap(left_gpu_address, left.length(), right.gpu_address,
+                       right.length);
+    return cpu_backing_overlap || gpu_backing_overlap;
+}
+
+bool validate_prefix_buffer(Context& context, BufferRef buffer,
+                            std::size_t required_bytes,
+                            std::size_t alignment, std::string_view name,
+                            std::string& error) {
+    if (!buffer || !context.buffers().owns(buffer) ||
+        buffer.length < required_bytes || buffer.offset % alignment != 0u) {
+        error = "Window T=1 MoE prefix " + std::string(name) +
+                " is stale, foreign, undersized or misaligned";
+        return false;
+    }
+    return true;
+}
+
+bool validate_prefix_buffer(Context& context, ReadOnlyBufferRef buffer,
+                            std::size_t required_bytes,
+                            std::size_t alignment, std::string_view name,
+                            std::string& error) {
+    if (!buffer || !context.buffers().owns(buffer) ||
+        buffer.length() < required_bytes || buffer.offset() % alignment != 0u) {
+        error = "Window T=1 MoE prefix " + std::string(name) +
+                " is stale, foreign, undersized or misaligned";
+        return false;
+    }
+    return true;
 }
 
 bool validate_window_params(Context& context, BufferRef params_buffer,
@@ -321,6 +365,112 @@ bool validate_window_t1_attention_gdn(
     return true;
 }
 
+bool validate_window_t1_moe_router_prefix(
+    Context& context, std::uint32_t vocabulary_size, std::uint32_t experts,
+    const WindowT1MoeRouterPrefixBuffers& buffers, std::string& error) {
+    if (experts != 256u && experts != 512u) {
+        error = "Window T=1 MoE prefix requires 256 or 512 experts";
+        return false;
+    }
+    if (!validate_window_t1_attention_gdn_ffn(
+            context, vocabulary_size, buffers.layer0, error)) {
+        return false;
+    }
+
+    constexpr std::size_t kRouterInputWidth = N_EMBD;
+    constexpr std::size_t kRouteTopK = 10u;
+    const std::size_t router_weight_bytes =
+        static_cast<std::size_t>(experts) * kRouterInputWidth *
+        sizeof(std::uint16_t);
+    const std::size_t router_logit_bytes =
+        static_cast<std::size_t>(experts) * sizeof(float);
+    const std::size_t route_id_bytes = kRouteTopK * sizeof(std::int32_t);
+    const std::size_t route_weight_bytes = kRouteTopK * sizeof(float);
+
+    if (!validate_prefix_buffer(context, buffers.router_tensor,
+                                router_weight_bytes, alignof(std::uint32_t),
+                                "BF16 router tensor", error) ||
+        !validate_prefix_buffer(context, buffers.router_logits,
+                                router_logit_bytes, alignof(float),
+                                "router logits", error) ||
+        !validate_prefix_buffer(context, buffers.route_ids, route_id_bytes,
+                                alignof(std::int32_t), "route IDs", error) ||
+        !validate_prefix_buffer(context, buffers.route_weights,
+                                route_weight_bytes, alignof(float),
+                                "route weights", error) ||
+        !validate_prefix_buffer(context, buffers.router_matvec_sink,
+                                sizeof(float), alignof(float),
+                                "router mat-vec sink", error)) {
+        return false;
+    }
+
+    const std::array<BufferRef, 4u> prefix_outputs{
+        buffers.router_logits, buffers.route_ids, buffers.route_weights,
+        buffers.router_matvec_sink};
+    for (std::size_t left = 0u; left < prefix_outputs.size(); ++left) {
+        for (std::size_t right = left + 1u; right < prefix_outputs.size();
+             ++right) {
+            if (buffer_views_overlap(prefix_outputs[left],
+                                     prefix_outputs[right])) {
+                error = "Window T=1 MoE prefix scratch outputs overlap";
+                return false;
+            }
+        }
+    }
+
+    const auto disjoint_from_prefix = [&](const auto& views) {
+        for (const BufferRef& view : views) {
+            if (buffer_views_overlap(buffers.layer0.params, view)) {
+                error = "Window T=1 MoE prefix scratch overlaps its parameters";
+                return false;
+            }
+            if (buffer_views_overlap(buffers.router_tensor, view)) {
+                error = "Window T=1 MoE prefix scratch overlaps the router tensor";
+                return false;
+            }
+            for (const BufferRef& output : prefix_outputs) {
+                if (buffer_views_overlap(view, output)) {
+                    error = "Window T=1 MoE prefix scratch overlaps a layer-0 stage buffer";
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+    const auto attention_views = gr_read_views(buffers.layer0.attention);
+    const auto gdn_views = gdn_block_views(buffers.layer0.gdn);
+    const auto ffn_views = gr_read_views(buffers.layer0.ffn);
+    if (!disjoint_from_prefix(attention_views) ||
+        !disjoint_from_prefix(gdn_views) ||
+        !disjoint_from_prefix(ffn_views)) {
+        return false;
+    }
+
+    for (const BufferRef& output : prefix_outputs) {
+        if (buffer_views_overlap(buffers.layer0.params, output) ||
+            buffer_views_overlap(buffers.router_tensor, output)) {
+            error = "Window T=1 MoE prefix output overlaps parameters or router weights";
+            return false;
+        }
+    }
+    if (buffer_views_overlap(buffers.router_tensor,
+                             buffers.layer0.params)) {
+        error = "Window T=1 MoE router tensor overlaps its parameters";
+        return false;
+    }
+    const ReadOnlyBufferRef read_only_params =
+        context.buffers().read_only(buffers.layer0.params);
+    const ReadOnlyBufferRef active_rows = read_only_params.slice(
+        offsetof(WindowParams, nc), sizeof(std::uint32_t));
+    if (!active_rows) {
+        error = "Window T=1 active-row count is not a live read-only parameter view";
+        return false;
+    }
+
+    error.clear();
+    return true;
+}
+
 }  // namespace
 
 bool encode_window_t1_attention_gdn(
@@ -384,6 +534,71 @@ bool encode_window_t1_attention_gdn_ffn(
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_window_t1_attention_gdn_ffn(
                 context, encoder, vocabulary_size, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_window_t1_moe_router_prefix(
+    Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
+    std::uint32_t experts,
+    const WindowT1MoeRouterPrefixBuffers& buffers, std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "Window T=1 MoE router prefix requires ordered dispatch boundaries";
+        return false;
+    }
+    if (!validate_window_t1_moe_router_prefix(
+            context, vocabulary_size, experts, buffers, error)) {
+        return false;
+    }
+
+    const ReadOnlyBufferRef active_rows = context.buffers()
+        .read_only(buffers.layer0.params)
+        .slice(offsetof(WindowParams, nc), sizeof(std::uint32_t));
+    const ReadOnlyBufferRef router_activations =
+        context.buffers().read_only(buffers.layer0.ffn.mixed);
+    const ReadOnlyBufferRef router_logits =
+        context.buffers().read_only(buffers.router_logits);
+    if (!active_rows || !router_activations || !router_logits) {
+        error = "Window T=1 MoE router prefix could not form live read-only input views";
+        return false;
+    }
+
+    if (!encode_window_t1_attention_gdn_ffn(
+            context, encoder, vocabulary_size, buffers.layer0, error)) {
+        return false;
+    }
+
+    const ReadOnlyBF16MatVecBuffers router_buffers{
+        router_activations, buffers.router_tensor, active_rows,
+        buffers.router_logits, buffers.router_matvec_sink};
+    if (!encode_bf16_matvec(context, encoder, N_EMBD, experts, 1u, 1u,
+                            router_buffers, error)) {
+        return false;
+    }
+
+    const MoeRouteBuffers route_buffers{
+        router_logits, buffers.route_ids, buffers.route_weights};
+    if (!encode_moe_route(context, encoder, 1u, experts, false, route_buffers,
+                          error)) {
+        return false;
+    }
+
+    return encode_q8_1(context, encoder, 1u, N_EMBD,
+                       {buffers.layer0.ffn.mixed, buffers.layer0.gdn.xq},
+                       error);
+}
+
+bool encode_window_t1_moe_router_prefix(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size, std::uint32_t experts,
+    const WindowT1MoeRouterPrefixBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Window T=1 layer-0 MoE router prefix",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_t1_moe_router_prefix(
+                context, encoder, vocabulary_size, experts, buffers,
+                encode_error);
         },
         error);
 }

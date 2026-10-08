@@ -2189,9 +2189,11 @@ encode Q8_1 and its mat-vec in the same serial segment, with the wrapper discard
 later-stage validation fails. `encode_bf16_matvec` additionally accepts F32 activations, BF16 weights
 and the active-row count as `ReadOnlyBufferRef`; read-only inputs may overlap each other, while both
 outputs must be disjoint from every input and one another. This supports the const full-mode router
-weight view without changing the existing mutable mat-vec API. The indexed draft-head API remains a
-standalone wrapper. Router → route → Q8_1 Window composition and production Window/Prefill dispatch
-remain pending.
+weight view without changing the existing mutable mat-vec API. The T=1 Window prefix now orders the
+layer-0 attention/GDN/FFN read, 256/512-expert BF16 router, multiply-by-reciprocal top-10 route and
+Q8_1 quantization of `mixed` in one segment. It slices the live-row count from `WindowParams.nc`
+and reuses GDN's `xq` only after the GDN reads finish. It stops before `MoePlan` and expert execution;
+the indexed draft-head API remains standalone, and production Window/Prefill dispatch remains pending.
 
 ### 5.10 MoE: router, plan, experts, shared expert and combine
 
