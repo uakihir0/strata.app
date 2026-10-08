@@ -23,6 +23,14 @@ struct EmbedRowsBuffers {
     BufferRef embedding;
 };
 
+/// Encoder-only form with input buffers that cannot be written through these
+/// views. The output remains writable and must not overlap either input.
+struct EmbedRowsReadOnlyBuffers {
+    ReadOnlyBufferRef table;
+    ReadOnlyBufferRef tokens;
+    BufferRef embedding;
+};
+
 struct EmbedImageBuffers {
     BufferRef tokens;
     BufferRef image;
@@ -43,6 +51,13 @@ bool encode_embed_rows(Context& context, Encoder& encoder,
                        std::uint32_t rows, std::uint32_t vocabulary_size,
                        EmbedRowsFormat format,
                        const EmbedRowsBuffers& buffers, std::string& error);
+/// Add embedding gathers using explicit read-only table and token views.
+/// This form is used by Window encoding with mapped model weights.
+bool encode_embed_rows(Context& context, Encoder& encoder,
+                       std::uint32_t rows, std::uint32_t vocabulary_size,
+                       EmbedRowsFormat format,
+                       const EmbedRowsReadOnlyBuffers& buffers,
+                       std::string& error);
 
 /// Encode image-row copies for a prefill chunk with a positive, shader-index-safe
 /// row count. The embedding output must not overlap either input; the two

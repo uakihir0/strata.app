@@ -508,6 +508,78 @@ bool encode_gr_broadcast(Context& context, Encoder& encoder,
         threadgroup_memory, error);
 }
 
+bool encode_gr_broadcast(Context& context, Encoder& encoder,
+                         std::uint32_t rows,
+                         const GRBroadcastReadOnlyBuffers& buffers,
+                         std::string& error) {
+    error.clear();
+    if (rows == 0u || rows > kBroadcastMaxRows) {
+        error = "GR broadcast row count is outside the 32-bit shader index range";
+        return false;
+    }
+
+    const std::size_t embedding_bytes =
+        static_cast<std::size_t>(rows) * N_EMBD * sizeof(float);
+    const std::size_t streams_bytes =
+        static_cast<std::size_t>(rows) * HC_DIM * sizeof(float);
+    if (!validate_pipeline(context, "strata_gr_broadcast", "GR broadcast",
+                           kBroadcastThreads, kBroadcastThreads, 1u, 1u,
+                           error)) {
+        return false;
+    }
+    if (!buffers.embedding || !context.buffers().owns(buffers.embedding)) {
+        error = "GR broadcast embedding buffer is not owned by this Context";
+        return false;
+    }
+    if (buffers.embedding.length() < embedding_bytes ||
+        buffers.embedding.offset() % alignof(std::uint32_t) != 0u ||
+        buffers.embedding.contents() == nullptr) {
+        error = "GR broadcast embedding buffer is undersized or misaligned";
+        return false;
+    }
+    if (!validate_buffer(context, buffers.streams, streams_bytes,
+                         alignof(std::uint32_t), "streams", "GR broadcast",
+                         error) ||
+        !validate_cpu_backing(buffers.streams, "streams", "GR broadcast",
+                              error)) {
+        return false;
+    }
+    const bool cpu_overlap =
+        buffers.embedding.contents() != nullptr &&
+        buffers.streams.contents != nullptr &&
+        broadcast_ranges_overlap(
+            reinterpret_cast<std::uintptr_t>(buffers.embedding.contents()),
+            buffers.embedding.length(),
+            reinterpret_cast<std::uintptr_t>(buffers.streams.contents),
+            buffers.streams.length);
+    const bool gpu_overlap =
+        buffers.embedding.gpu_address() != 0u &&
+        buffers.streams.gpu_address != 0u &&
+        broadcast_ranges_overlap(buffers.embedding.gpu_address(),
+                                 buffers.embedding.length(),
+                                 buffers.streams.gpu_address,
+                                 buffers.streams.length);
+    if (cpu_overlap || gpu_overlap) {
+        error = "GR broadcast input and output views must not overlap";
+        return false;
+    }
+
+    const std::array writable_bindings{
+        EncoderBufferBinding{buffers.streams, 1u, streams_bytes,
+                             alignof(float)},
+    };
+    const std::array read_only_bindings{
+        EncoderReadOnlyBufferBinding{buffers.embedding, 0u, embedding_bytes,
+                                    alignof(float)},
+    };
+    constexpr std::array<EncoderBytesBinding, 0> bytes{};
+    constexpr std::array<EncoderThreadgroupMemory, 0> threadgroup_memory{};
+    return encoder.dispatch(
+        "strata_gr_broadcast", {kBroadcastGroupsX, rows, 1u},
+        {kBroadcastThreads, 1u, 1u}, writable_bindings, read_only_bindings,
+        bytes, threadgroup_memory, error);
+}
+
 bool encode_gr_cvec(Context& context, CommandBuffer& command_buffer,
                     std::uint32_t rows, std::uint32_t layer,
                     GRControlMode mode, bool write,

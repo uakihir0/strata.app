@@ -5,6 +5,8 @@
 #include "strata/metal/embed_dispatch.hpp"
 #include "strata/metal/gr_dispatch.hpp"
 #include "strata/metal/prefill_dispatch.hpp"
+#include "strata/metal/window_dispatch.hpp"
+#include "strata/metal/window_params.hpp"
 #include "twin.hpp"
 
 #include <ggml.h>
@@ -275,7 +277,55 @@ bool test_embed_format(Context& context, const Format& format, std::uint32_t row
     const auto changed = output_buffer.first_unwritten_change(written);
     check(!changed, label + " image row and output guards remain unchanged",
           changed ? changed->reason : "");
-    return !mismatch && !changed;
+
+    bool read_only_matches = true;
+    if (set == twin::InputSet::fixture && rows == 1u) {
+        const ReadOnlyBufferRef read_only_table =
+            context.buffers().read_only(table_buffer.view());
+        const ReadOnlyBufferRef read_only_tokens =
+            context.buffers().read_only(token_buffer.view());
+        check(static_cast<bool>(read_only_table) &&
+                  static_cast<bool>(read_only_tokens),
+              label + " create read-only table and token views");
+        if (!read_only_table || !read_only_tokens) return false;
+
+        std::fill(output_buffer.payload().begin(), output_buffer.payload().end(),
+                  static_cast<std::uint8_t>(kPoisonByte));
+        auto read_only_command = context.make_command_buffer(
+            label + " read-only encoder", err);
+        check(read_only_command != nullptr,
+              label + " read-only command buffer", err);
+        if (!read_only_command) return false;
+        const EmbedRowsReadOnlyBuffers read_only_buffers{
+            read_only_table, read_only_tokens, output_buffer.view()};
+        const bool read_only_encoded = Encoder::encode(
+            context, *read_only_command, label + " read-only gather",
+            [&](Encoder& encoder, std::string& body_error) {
+                return encode_embed_rows(context, encoder, rows, kTableRows,
+                                         format.encoder_format, read_only_buffers,
+                                         body_error);
+            },
+            err);
+        check(read_only_encoded, label + " read-only gather encode", err);
+        if (!read_only_encoded) return false;
+        const bool read_only_completed =
+            submit_and_wait(*read_only_command, label + " read-only gather", err);
+        check(read_only_completed, label + " read-only gather dispatch", err);
+        if (!read_only_completed) return false;
+        read_only_matches = !twin::compare_bytes(output_buffer.payload(), expected);
+        check(read_only_matches,
+              label + " read-only gather matches exact ggml CPU bytes");
+        check(!table_buffer.first_unwritten_change({}),
+              label + " read-only table remains unchanged");
+        check(!token_buffer.first_unwritten_change({}),
+              label + " read-only token ids remain unchanged");
+        const auto read_only_guard = output_buffer.first_unwritten_change(written);
+        check(!read_only_guard,
+              label + " read-only gather output guards remain unchanged",
+              read_only_guard ? read_only_guard->reason : "");
+        read_only_matches = read_only_matches && !read_only_guard;
+    }
+    return !mismatch && !changed && read_only_matches;
 }
 
 bool test_embed_rows_encoder_validation(Context& context,
@@ -1446,6 +1496,250 @@ bool test_prefill_embedding_stage(Context& context, bool with_image) {
     return true;
 }
 
+bool test_window_t1_embedding_stage(Context& context) {
+    constexpr std::uint32_t vocabulary_size = kTableRows;
+    constexpr std::uint32_t token = 5u;
+    constexpr std::uint32_t position = 17u;
+    constexpr std::size_t embedding_bytes =
+        kEmbeddingWidth * sizeof(float);
+    constexpr std::size_t streams_bytes = kStreamWidth * sizeof(float);
+    constexpr std::uint8_t poison = 0xa5u;
+    std::string error;
+
+    const ggml_type_traits* const traits =
+        ggml_get_type_traits(GGML_TYPE_BF16);
+    check(traits != nullptr, "resolve Window BF16 embedding oracle");
+    if (traits == nullptr) return false;
+    std::vector<std::uint8_t> table;
+    std::size_t row_bytes = 0u;
+    check(fill_table(kFormats[3], *traits, twin::InputSet::fixture, 0x5a17u,
+                     table, row_bytes, error),
+          "prepare T=1 Window embedding table", error);
+    if (table.empty()) return false;
+
+    twin::GuardedBuffer table_storage;
+    twin::GuardedBuffer embedding_storage;
+    twin::GuardedBuffer streams_storage;
+    check(table_storage.allocate(context, "Window T=1 embedding table",
+                                 table.size(), error),
+          "allocate T=1 Window embedding table", error);
+    check(embedding_storage.allocate(context, "Window T=1 embedding output",
+                                     embedding_bytes + 16u, error),
+          "allocate T=1 Window embedding output", error);
+    check(streams_storage.allocate(context, "Window T=1 GR streams",
+                                   streams_bytes + 16u, error),
+          "allocate T=1 Window GR streams", error);
+    if (!table_storage.view() || !embedding_storage.view() ||
+        !streams_storage.view()) {
+        return false;
+    }
+    std::memcpy(table_storage.payload().data(), table.data(), table.size());
+
+    auto params_ring = WindowParamsRing::open(context, error);
+    check(params_ring != nullptr, "open T=1 Window parameter ring", error);
+    if (!params_ring) return false;
+    const std::array<std::uint32_t, 1> tokens{token};
+    const std::array<WindowSamplerSettings, 1> samplers{};
+    BufferRef params = params_ring->build_slot(
+        0u, position, tokens, samplers, 0u, 0x1234u, 0x5678u, error);
+    check(static_cast<bool>(params), "build T=1 Window parameter block", error);
+    if (!params) return false;
+    strata::metal::WindowParams params_before{};
+    std::memcpy(&params_before, params.contents, sizeof(params_before));
+
+    const ReadOnlyBufferRef table_view =
+        context.buffers().read_only(table_storage.view());
+    check(static_cast<bool>(table_view),
+          "promote model table to a read-only Window view");
+    if (!table_view) return false;
+
+    std::vector<float> decoded(kEmbeddingWidth);
+    traits->to_float(table.data() + static_cast<std::size_t>(token) * row_bytes,
+                     decoded.data(), kEmbeddingWidth);
+    std::vector<float> expected_streams(kStreamWidth);
+    for (std::uint32_t stream = 0u; stream < kStreamCount; ++stream) {
+        std::copy(decoded.begin(), decoded.end(),
+                  expected_streams.begin() +
+                      static_cast<std::ptrdiff_t>(stream * kEmbeddingWidth));
+    }
+    const auto expected_embedding_bytes = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(decoded.data()), embedding_bytes);
+    const auto expected_stream_bytes = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(expected_streams.data()),
+        streams_bytes);
+
+    std::fill(embedding_storage.payload().begin(),
+              embedding_storage.payload().end(), poison);
+    std::fill(streams_storage.payload().begin(),
+              streams_storage.payload().end(), poison);
+    table_storage.capture_before_dispatch();
+    embedding_storage.capture_before_dispatch();
+    streams_storage.capture_before_dispatch();
+
+    const WindowEmbeddingBuffers valid_buffers{
+        params, table_view, embedding_storage.view(), streams_storage.view()};
+    auto command = context.make_command_buffer("Window T=1 input stage", error);
+    check(command != nullptr, "create T=1 Window input command", error);
+    if (!command) return false;
+    const bool encoded = encode_window_embedding(
+        context, *command, vocabulary_size, EmbedRowsFormat::bf16,
+        valid_buffers, error);
+    check(encoded, "encode T=1 Window gather and GR broadcast", error);
+    if (!encoded) return false;
+    const bool completed = submit_and_wait(*command, "Window T=1 input", error);
+    check(completed, "complete T=1 Window input stage", error);
+    if (!completed) return false;
+
+    const bool embedding_matches =
+        !twin::compare_bytes(embedding_storage.payload().first(embedding_bytes),
+                             expected_embedding_bytes);
+    const bool streams_match =
+        !twin::compare_bytes(streams_storage.payload().first(streams_bytes),
+                             expected_stream_bytes);
+    check(embedding_matches, "T=1 Window embedding matches ggml BF16 oracle");
+    check(streams_match, "T=1 Window GR streams match broadcast oracle");
+    check(!table_storage.first_unwritten_change({}),
+          "T=1 Window model table remains read-only");
+    const std::array<twin::ByteRange, 1> embedding_written{{
+        {0u, embedding_bytes}}};
+    const std::array<twin::ByteRange, 1> streams_written{{
+        {0u, streams_bytes}}};
+    const auto embedding_guard =
+        embedding_storage.first_unwritten_change(embedding_written);
+    const auto streams_guard =
+        streams_storage.first_unwritten_change(streams_written);
+    check(!embedding_guard, "T=1 Window embedding scratch guards",
+          embedding_guard ? embedding_guard->reason : "");
+    check(!streams_guard, "T=1 Window stream scratch guards",
+          streams_guard ? streams_guard->reason : "");
+    strata::metal::WindowParams params_after{};
+    std::memcpy(&params_after, params.contents, sizeof(params_after));
+    const bool params_unchanged =
+        std::memcmp(&params_before, &params_after, sizeof(params_before)) == 0;
+    check(params_unchanged, "T=1 Window parameter ring remains unchanged");
+    if (!embedding_matches || !streams_match || embedding_guard ||
+        streams_guard || !params_unchanged) {
+        return false;
+    }
+
+    const auto outputs_are_poisoned = [&] {
+        return std::all_of(embedding_storage.payload().begin(),
+                          embedding_storage.payload().end(),
+                          [=](std::uint8_t value) { return value == poison; }) &&
+               std::all_of(streams_storage.payload().begin(),
+                           streams_storage.payload().end(),
+                           [=](std::uint8_t value) { return value == poison; });
+    };
+    const auto reset_outputs = [&] {
+        std::fill(embedding_storage.payload().begin(),
+                  embedding_storage.payload().end(), poison);
+        std::fill(streams_storage.payload().begin(),
+                  streams_storage.payload().end(), poison);
+    };
+
+    const std::array<std::uint32_t, 2> two_tokens{token, token};
+    const std::array<WindowSamplerSettings, 2> two_samplers{};
+    params = params_ring->build_slot(1u, position, two_tokens, two_samplers,
+                                     0u, 0x1234u, 0x5678u, error);
+    check(static_cast<bool>(params), "build non-T=1 Window test parameters",
+          error);
+    if (!params) return false;
+    reset_outputs();
+    auto wrong_rows_command =
+        context.make_command_buffer("reject non-T=1 Window input", error);
+    check(wrong_rows_command != nullptr,
+          "create non-T=1 Window rejection command", error);
+    if (!wrong_rows_command) return false;
+    WindowEmbeddingBuffers wrong_rows_buffers{
+        params, table_view, embedding_storage.view(), streams_storage.view()};
+    const bool wrong_rows_rejected = !encode_window_embedding(
+        context, *wrong_rows_command, vocabulary_size, EmbedRowsFormat::bf16,
+        wrong_rows_buffers, error);
+    check(wrong_rows_rejected && error.find("T=1") != std::string::npos,
+          "reject non-T=1 Window parameter block", error);
+    check(outputs_are_poisoned(),
+          "non-T=1 rejection leaves Window scratch untouched");
+    if (!wrong_rows_rejected || !outputs_are_poisoned()) return false;
+
+    const std::array<std::uint32_t, 1> invalid_tokens{vocabulary_size};
+    const std::array<WindowSamplerSettings, 1> one_sampler{};
+    params = params_ring->build_slot(1u, position, invalid_tokens, one_sampler,
+                                     0u, 0x1234u, 0x5678u, error);
+    check(static_cast<bool>(params), "build out-of-vocabulary Window params",
+          error);
+    if (!params) return false;
+    reset_outputs();
+    auto invalid_token_command = context.make_command_buffer(
+        "reject out-of-vocabulary Window token", error);
+    check(invalid_token_command != nullptr,
+          "create invalid-token Window command", error);
+    if (!invalid_token_command) return false;
+    WindowEmbeddingBuffers invalid_token_buffers{
+        params, table_view, embedding_storage.view(), streams_storage.view()};
+    const bool invalid_token_rejected = !encode_window_embedding(
+        context, *invalid_token_command, vocabulary_size,
+        EmbedRowsFormat::bf16, invalid_token_buffers, error);
+    check(invalid_token_rejected &&
+              error.find("outside the text vocabulary") != std::string::npos,
+          "reject out-of-vocabulary Window token", error);
+    check(outputs_are_poisoned(),
+          "out-of-vocabulary rejection leaves Window scratch untouched");
+    if (!invalid_token_rejected || !outputs_are_poisoned()) return false;
+
+    params = params_ring->build_slot(0u, position, tokens, samplers, 0u,
+                                     0x1234u, 0x5678u, error);
+    check(static_cast<bool>(params), "rebuild T=1 Window test parameters",
+          error);
+    if (!params) return false;
+    reset_outputs();
+    auto late_failure_command = context.make_command_buffer(
+        "discard late Window broadcast failure", error);
+    check(late_failure_command != nullptr,
+          "create late-failure Window command", error);
+    if (!late_failure_command) return false;
+    const BufferRef short_streams = streams_storage.view().slice(
+        0u, streams_bytes - sizeof(float));
+    WindowEmbeddingBuffers late_failure_buffers{
+        params, table_view, embedding_storage.view(), short_streams};
+    const bool late_failure_rejected = !encode_window_embedding(
+        context, *late_failure_command, vocabulary_size,
+        EmbedRowsFormat::bf16, late_failure_buffers, error);
+    check(late_failure_rejected && error.find("undersized") != std::string::npos,
+          "reject short GR stream output after encoding gather", error);
+    const bool standalone_discarded =
+        late_failure_command->unsafe_native_handle() == nullptr;
+    check(standalone_discarded,
+          "standalone late broadcast failure discards its command buffer");
+    const bool late_failure_rolled_back = outputs_are_poisoned();
+    check(late_failure_rolled_back,
+          "standalone late failure leaves Window outputs untouched");
+
+    reset_outputs();
+    auto caller_owned_command = context.make_command_buffer(
+        "discard caller-owned Window input segment", error);
+    check(caller_owned_command != nullptr,
+          "create caller-owned Window late-failure command", error);
+    if (!caller_owned_command) return false;
+    const bool caller_owned_rejected = !Encoder::encode(
+        context, *caller_owned_command, "caller-owned Window input stage",
+        [&](Encoder& encoder, std::string& body_error) {
+            return encode_window_embedding(context, encoder, vocabulary_size,
+                                           EmbedRowsFormat::bf16,
+                                           late_failure_buffers, body_error);
+        },
+        error);
+    const bool caller_owned_discarded =
+        caller_owned_command->unsafe_native_handle() == nullptr;
+    const bool caller_owned_outputs_untouched = outputs_are_poisoned();
+    check(caller_owned_rejected && caller_owned_discarded &&
+              caller_owned_outputs_untouched,
+          "caller propagating a late Window failure discards the whole segment",
+          error);
+    return late_failure_rejected && standalone_discarded &&
+           late_failure_rolled_back && caller_owned_rejected &&
+           caller_owned_discarded && caller_owned_outputs_untouched;
+}
+
 bool test_prefill_embedding_stage_discards_partial_work(Context& context) {
     enum class FailureStage { token_mismatch, missing_image, broadcast_alias };
     constexpr std::array cases{
@@ -2266,6 +2560,7 @@ int main(int argc, char** argv) {
     passed &= test_embed_rows_encoder_validation(*context, argv[1]);
     passed &= test_embed_image_encoder_validation(*context, argv[1]);
     passed &= test_gr_broadcast_encoder_validation(*context, argv[1]);
+    passed &= test_window_t1_embedding_stage(*context);
     passed &= test_prefill_embedding_stage(*context, false);
     passed &= test_prefill_embedding_stage(*context, true);
     passed &= test_prefill_embedding_stage_discards_partial_work(*context);

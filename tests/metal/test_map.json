@@ -242,11 +242,11 @@
     },
     "metal_embed_test": {
       "label": "metal",
-      "origin": "09 9.1"
+      "origin": "04 §5.1, 09 9.1, L9 T=1 input stem"
     },
     "metal_embed_test_concurrent": {
       "label": "metal",
-      "origin": "09 9.1"
+      "origin": "04 §5.1, 09 9.1, L9 T=1 input stem"
     },
     "metal_fault_test": {
       "label": "metal",

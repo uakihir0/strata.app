@@ -83,6 +83,12 @@ struct GRBroadcastBuffers {
     BufferRef streams;
 };
 
+/// Encoder form with a const embedding input and a writable stream output.
+struct GRBroadcastReadOnlyBuffers {
+    ReadOnlyBufferRef embedding;
+    BufferRef streams;
+};
+
 /// Broadcast each 2,560-value embedding row into four GR streams for
 /// shader-index-safe row counts. The input and output views must be disjoint
 /// and owned by `context`; the command buffer must be unsubmitted.
@@ -94,6 +100,11 @@ bool encode_gr_broadcast(Context& context, CommandBuffer& command_buffer,
 bool encode_gr_broadcast(Context& context, Encoder& encoder,
                          std::uint32_t rows,
                          const GRBroadcastBuffers& buffers,
+                         std::string& error);
+/// Add stream broadcast from a read-only embedding view.
+bool encode_gr_broadcast(Context& context, Encoder& encoder,
+                         std::uint32_t rows,
+                         const GRBroadcastReadOnlyBuffers& buffers,
                          std::string& error);
 
 /// Encode the native GR post write for rows in 1..8. Buffer views and the
