@@ -761,8 +761,9 @@ window (section 8.5) and a prefill chunk (section 6.4) do.
   after tracked GPU uses are complete without adding bytes to the Metal allocation.
   Seed it only from token IDs already applied to model state. In the prompt path, the last prompt token is the
   first T=1 decode window ([section 6.1](#61-the-chunk-loop-and-the-arena)); do not include it in the initial
-  suffix until that window commits. This token-ID suffix is separate from the floating-point `hist` above and
-  `Window::run` does not consume it yet.
+  suffix until that window commits. `prepare_window_t1_input` uses the session-owned suffix to stage the PLE
+  rows with the T=1 parameters, without advancing token history. This token-ID suffix is separate from the
+  floating-point `hist` above; production `Window::run` still does not consume the prepared input.
 
 ### 4.9 RoPE table
 
@@ -2259,9 +2260,11 @@ in one ordered segment using a sparse 256-expert GGUF fixture. It checks the pro
 nonzero routed/shared output, consumer outputs against a direct GR-read reference, and exactly-once
 residual application. `metal_fullmode_ple_handoff_test` exercises that producer with the typed PLE
 entry in one ordered segment, then compares its PLE outputs and residual against a direct GR-post
-plus PLE-entry reference. It builds row IDs from the test token and committed history, then stages
-the sixteen IQ4_NL rows from the synthetic FullMode GGUF's mapped PLE table through
-`stage_window_ple_input`. It resolves the PLE projection, normalization and
+plus PLE-entry reference. `prepare_window_t1_input` builds the T=1 `WindowParams` ring slot and, for
+PLE, builds row IDs from the test token and committed history, then stages the sixteen IQ4_NL rows
+from the synthetic FullMode GGUF's mapped table. An uninitialized session is rejected without
+changing the ring slot or PLE scratch. The test compares staged values against a direct table gather
+and verifies preparation leaves token history unchanged. It resolves the PLE projection, normalization and
 convolution weights from deterministic, correctly typed tensors in that sparse
 GGUF fixture and binds them through `ReadOnlyBufferRef`. These branch-specific
 tests do not select a production scheduler branch or establish parity against a

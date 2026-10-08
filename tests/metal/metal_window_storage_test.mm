@@ -11,6 +11,7 @@
 #include "strata/metal/window_pending_dispatch.hpp"
 #include "strata/metal/ple_dispatch.hpp"
 #include "strata/metal/window_ple_stage.hpp"
+#include "strata/metal/window_t1_input.hpp"
 #include "strata/metal/window_scratch.hpp"
 #include "strata/metal/session_state.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -3007,13 +3008,129 @@ void run_fullmode_handoff_test(Context& context,
     require(params_ring != nullptr,
             "open full-mode handoff WindowParamsRing: " + error);
     const std::array<std::uint32_t, kRows> tokens{0u};
-    const std::array<WindowSamplerSettings, kRows> samplers{};
-    const BufferRef params = params_ring->build_slot(
-        0u, 1u, tokens, samplers, 0u, 0x11223344u, 0x55667788u, error);
-    require(static_cast<bool>(params),
-            "build ordinary T=1 handoff parameters: " + error);
-
+    WindowSamplerSettings sampler_settings{};
+    sampler_settings.temperature = 0.7f;
+    sampler_settings.top_p = 0.85f;
+    sampler_settings.min_p = 0.03f;
+    sampler_settings.penalty_repeat = 1.2f;
+    sampler_settings.penalty_freq = 0.25f;
+    sampler_settings.penalty_present = 0.35f;
+    sampler_settings.top_k = 23;
+    sampler_settings.min_keep = 4;
+    sampler_settings.greedy = 0;
+    sampler_settings.hist_off = 17u;
+    sampler_settings.hist_len = 29u;
+    const std::array<WindowSamplerSettings, kRows> samplers{
+        sampler_settings};
     const WindowScratchLayout& layout = scratch->layout();
+    const std::array<std::uint32_t, 2u> committed_tokens{5u, 0u};
+    WindowT1PreparedInput prepared_input;
+    if (use_ple_entry) {
+        const BufferRef ple_input_storage =
+            require_scratch_view(context, *scratch, layout.ple_input,
+                                 "uninitialized PLE input sentinel");
+        std::memset(ple_input_storage.contents, 0x5bu,
+                    ple_input_storage.length);
+        std::vector<std::uint8_t> ple_input_before(
+            static_cast<const std::uint8_t*>(ple_input_storage.contents),
+            static_cast<const std::uint8_t*>(ple_input_storage.contents) +
+                ple_input_storage.length);
+        WindowT1PreparedInput invalid_token_input;
+        require(!prepare_window_t1_input(
+                    *session, runtime_geometry, *full_mode, *params_ring,
+                    *scratch, 0u, 1u, runtime_geometry.vocab, samplers[0],
+                    0x11223344u, 0x55667788u, true, invalid_token_input,
+                    error) &&
+                    error.find("outside the model vocabulary") !=
+                        std::string::npos &&
+                    !invalid_token_input.params &&
+                    !invalid_token_input.ple_input &&
+                    !params_ring->view(0u) &&
+                    std::equal(ple_input_before.begin(),
+                               ple_input_before.end(),
+                               static_cast<const std::uint8_t*>(
+                                   ple_input_storage.contents)),
+                "invalid T=1 token must not mutate prepared input storage");
+        WindowT1PreparedInput invalid_position_input;
+        require(!prepare_window_t1_input(
+                    *session, runtime_geometry, *full_mode, *params_ring,
+                    *scratch, 0u,
+                    static_cast<std::uint32_t>(std::numeric_limits<
+                        std::int32_t>::max()),
+                    tokens[0], samplers[0], 0x11223344u, 0x55667788u,
+                    true, invalid_position_input, error) &&
+                    error.find("positions exceed") != std::string::npos &&
+                    !invalid_position_input.params &&
+                    !invalid_position_input.ple_input &&
+                    !params_ring->view(0u) &&
+                    std::equal(ple_input_before.begin(),
+                               ple_input_before.end(),
+                               static_cast<const std::uint8_t*>(
+                                   ple_input_storage.contents)),
+                "invalid T=1 position must not mutate prepared input storage");
+        WindowT1PreparedInput rejected_input;
+        require(!prepare_window_t1_input(
+                    *session, runtime_geometry, *full_mode, *params_ring,
+                    *scratch, 0u, 1u, tokens[0], samplers[0],
+                    0x11223344u, 0x55667788u, true, rejected_input, error) &&
+                    error.find("must be initialized") != std::string::npos &&
+                    !rejected_input.params && !rejected_input.ple_input &&
+                    !params_ring->view(0u) &&
+                    std::equal(ple_input_before.begin(),
+                               ple_input_before.end(),
+                               static_cast<const std::uint8_t*>(
+                                   ple_input_storage.contents)),
+                "uninitialized PLE preparation must preserve scratch and the parameter slot");
+        require(session->initialize_ple_token_ids(
+                    committed_tokens, runtime_geometry, error),
+                "initialize PLE token history for T=1 input preparation: " +
+                    error);
+    }
+    require(prepare_window_t1_input(
+                *session, runtime_geometry, *full_mode, *params_ring,
+                *scratch, 0u, 1u, tokens[0], samplers[0], 0x11223344u,
+                0x55667788u, use_ple_entry, prepared_input, error),
+            "prepare T=1 Window inputs: " + error);
+    const BufferRef params = prepared_input.params;
+    require(static_cast<bool>(params),
+            "prepared T=1 input publishes its parameter block");
+    const auto* prepared_params =
+        static_cast<const strata::metal::WindowParams*>(params.contents);
+    require(prepared_params->T == 1u && prepared_params->nc == 1u &&
+                prepared_params->pos0 == 1u &&
+                prepared_params->n_keep == 0u &&
+                prepared_params->tokens[0] == tokens[0] &&
+                prepared_params->step[0].pos == 1 &&
+                prepared_params->step[0].n_kv == 2 &&
+                prepared_params->step[0].n_bid == 0 &&
+                prepared_params->step[0].width == 2 &&
+                prepared_params->samp[0].temperature ==
+                    sampler_settings.temperature &&
+                prepared_params->samp[0].top_p == sampler_settings.top_p &&
+                prepared_params->samp[0].min_p == sampler_settings.min_p &&
+                prepared_params->samp[0].penalty_repeat ==
+                    sampler_settings.penalty_repeat &&
+                prepared_params->samp[0].penalty_freq ==
+                    sampler_settings.penalty_freq &&
+                prepared_params->samp[0].penalty_present ==
+                    sampler_settings.penalty_present &&
+                prepared_params->samp[0].top_k == sampler_settings.top_k &&
+                prepared_params->samp[0].min_keep == sampler_settings.min_keep &&
+                prepared_params->samp[0].greedy == sampler_settings.greedy &&
+                prepared_params->samp[0].counter == 1u &&
+                prepared_params->samp[0].hist_off ==
+                    sampler_settings.hist_off &&
+                prepared_params->samp[0].hist_len ==
+                    sampler_settings.hist_len &&
+                prepared_params->seed_lo == 0x11223344u &&
+                prepared_params->seed_hi == 0x55667788u,
+            "prepared T=1 parameters must match the token, position and seed");
+    if (!use_ple_entry) {
+        require(!prepared_input.ple_input &&
+                    session->ple_token_id_suffix().empty(),
+                "no-PLE T=1 preparation must not need or mutate token history");
+    }
+
     const BufferRef residual =
         require_scratch_view(context, *scratch, layout.residual, "residual");
     const BufferRef mixed =
@@ -3340,22 +3457,31 @@ void run_fullmode_handoff_test(Context& context,
     WindowMoePLEEntryBuffers ple_entry{};
     std::vector<std::uint8_t> ple_history_initial;
     if (use_ple_entry) {
-        const std::array<std::uint32_t, 2u> committed_tokens{5u, 0u};
         WindowPleRows ple_rows;
-        require(build_window_ple_rows(tokens, committed_tokens,
-                                      runtime_geometry, ple_rows, error),
-                "build layer-1 PLE row IDs: " + error);
+        require(session->build_ple_rows(tokens, runtime_geometry, ple_rows,
+                                        error),
+                "build session-owned layer-1 PLE row IDs: " + error);
         strata::kernels::PleTableReader* ple_reader =
             full_mode->ple_reader();
         require(ple_reader != nullptr && ple_reader->is_open(),
                 "resolve FullMode's mapped PLE reader");
-        BufferRef ple_input;
-        require(stage_window_ple_input(*ple_reader, ple_rows, *scratch,
-                                       ple_input, error),
-                "stage mapped FullMode PLE rows into Window scratch: " + error);
+        const BufferRef ple_input = prepared_input.ple_input;
         require(ple_input.length ==
                     static_cast<std::size_t>(kRows) * N_EMBD * sizeof(float),
-                "staged PLE input exposes exactly the active T=1 rows");
+                "prepared PLE input exposes exactly the active T=1 rows");
+        std::vector<float> expected_ple_input(
+            static_cast<std::size_t>(kRows) * N_EMBD);
+        require(ple_reader->gather_batch(ple_rows.all_rows().data(), kRows,
+                                         expected_ple_input.data(), error),
+                "gather direct reference rows for prepared PLE input: " +
+                    error);
+        require(std::memcmp(ple_input.contents, expected_ple_input.data(),
+                            expected_ple_input.size() * sizeof(float)) == 0,
+                "prepared PLE input matches the session-owned committed suffix rows");
+        const auto prepared_suffix = session->ple_token_id_suffix();
+        require(std::equal(prepared_suffix.begin(), prepared_suffix.end(),
+                           committed_tokens.begin(), committed_tokens.end()),
+                "preparing PLE rows must not advance committed token history");
         const BufferRef ple_key =
             require_scratch_view(context, *scratch, layout.ple_key,
                                  "PLE key");
@@ -3423,7 +3549,7 @@ void run_fullmode_handoff_test(Context& context,
                                 [](float value) {
                                     return std::abs(value) > 1.0e-7f;
                                 }),
-                "mapped PLE rows stage finite nonzero table values");
+                "mapped PLE rows prepare finite nonzero table values");
         ple_block = {
             ple_input,
             ple_key_q8_1,

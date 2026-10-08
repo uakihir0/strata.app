@@ -136,19 +136,19 @@
     },
     "metal_fullmode_handoff_test": {
       "label": "metal",
-      "origin": "06 L9; D-IMPL-294; D-IMPL-296; REV-091; REV-093; D-IMPL-297; REV-094; D-IMPL-298; REV-095; D-IMPL-299; REV-096"
+      "origin": "06 L9; D-IMPL-294; D-IMPL-296; REV-091; REV-093; D-IMPL-297; REV-094; D-IMPL-298; REV-095; D-IMPL-299; REV-096; D-IMPL-303; REV-100"
     },
     "metal_fullmode_ple_handoff_test": {
       "label": "metal",
-      "origin": "06 L9; D-IMPL-295; D-IMPL-296; REV-092; REV-093; D-IMPL-297; REV-094; D-IMPL-298; REV-095; D-IMPL-299; REV-096"
+      "origin": "06 L9; D-IMPL-295; D-IMPL-296; REV-092; REV-093; D-IMPL-297; REV-094; D-IMPL-298; REV-095; D-IMPL-299; REV-096; D-IMPL-303; REV-100"
     },
     "metal_fullmode_ple_q8_handoff_test": {
       "label": "metal",
-      "origin": "06 L9; D-IMPL-300; REV-097"
+      "origin": "06 L9; D-IMPL-300; REV-097; D-IMPL-303; REV-100"
     },
     "metal_fullmode_ple_bf16_handoff_test": {
       "label": "metal",
-      "origin": "06 L9; D-IMPL-300; REV-097"
+      "origin": "06 L9; D-IMPL-300; REV-097; D-IMPL-303; REV-100"
     },
     "metal_model_storage_owner_test": {
       "label": "metal",
