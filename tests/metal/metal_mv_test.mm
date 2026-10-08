@@ -9496,7 +9496,7 @@ bool run_engine_quantized_numeric_case(
     std::uint32_t n_in, std::uint32_t weight_block_values,
     std::uint32_t n_out, std::uint32_t compiled_columns,
     std::uint32_t active_columns, InitializeWeights initialize_weights,
-    Reference reference) {
+    Reference reference, bool use_read_only_encoder = false) {
     if (weight_block_values == 0u || n_in % weight_block_values != 0u) {
         return false;
     }
@@ -9586,12 +9586,37 @@ bool run_engine_quantized_numeric_case(
     auto command = context.make_command_buffer(label, error);
     check(command != nullptr, label + " command-buffer allocation", error);
     if (!command) return false;
-    const MatVecBuffers buffers{
-        activation_buffer.view(), weight_buffer.view(), output_buffer.view(),
-        sink_buffer.view(), active_rows_buffer.view()};
-    const bool encoded =
-        encode_matvec(context, *command, format, n_in, n_out, active_columns,
-                      compiled_columns, buffers, error);
+    bool encoded = false;
+    if (use_read_only_encoder) {
+        const ReadOnlyMatVecBuffers buffers{
+            context.buffers().read_only(activation_buffer.view()),
+            context.buffers().read_only(weight_buffer.view()),
+            context.buffers().read_only(active_rows_buffer.view()),
+            output_buffer.view(), sink_buffer.view()};
+        if (format == MatVecWeightFormat::q6_k) {
+            encoded = Encoder::encode(
+                context, *command, label + " caller-owned read-only segment",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encode_read_only_matvec(
+                        context, encoder, format, n_in, n_out,
+                        active_columns, compiled_columns, buffers,
+                        encode_error);
+                },
+                error);
+        } else {
+            encoded = encode_read_only_matvec(
+                context, *command, format, n_in, n_out, active_columns,
+                compiled_columns, buffers, error);
+        }
+    } else {
+        const MatVecBuffers buffers{
+            activation_buffer.view(), weight_buffer.view(),
+            output_buffer.view(), sink_buffer.view(),
+            active_rows_buffer.view()};
+        encoded = encode_matvec(context, *command, format, n_in, n_out,
+                                active_columns, compiled_columns, buffers,
+                                error);
+    }
     check(encoded, label + " production encoder", error);
     if (!encoded) return false;
     const bool completed =
@@ -9631,7 +9656,72 @@ bool run_engine_quantized_numeric_case(
           label + " output guards remain unchanged");
     check(!sink_buffer.first_unwritten_change(sink_written),
           label + " sink guards remain unchanged");
-    return !output_mismatch;
+    bool late_failure_discarded = true;
+    if (use_read_only_encoder && format == MatVecWeightFormat::q6_k) {
+        const ReadOnlyMatVecBuffers valid_buffers{
+            context.buffers().read_only(activation_buffer.view()),
+            context.buffers().read_only(weight_buffer.view()),
+            context.buffers().read_only(active_rows_buffer.view()),
+            output_buffer.view(), sink_buffer.view()};
+        ReadOnlyMatVecBuffers aliased_output = valid_buffers;
+        aliased_output.output =
+            weight_buffer.view().slice(0u, output_bytes);
+        auto alias_command =
+            context.make_command_buffer(label + " read-only alias", error);
+        check(alias_command != nullptr,
+              label + " read-only alias command buffer", error);
+        if (!alias_command) return false;
+        const bool alias_rejected =
+            !encode_read_only_matvec(
+                context, *alias_command, format, n_in, n_out,
+                active_columns, compiled_columns, aliased_output, error) &&
+            error.find("overlap") != std::string::npos &&
+            alias_command->unsafe_native_handle() == nullptr;
+        check(alias_rejected,
+              label + " rejects output alias with read-only weights", error);
+
+        std::memset(output_buffer.payload().data(), 0xa5, output_bytes);
+        std::memset(sink_buffer.payload().data(), 0xa5, sink_bytes);
+        ReadOnlyMatVecBuffers short_weights = valid_buffers;
+        short_weights.weights =
+            valid_buffers.weights.slice(0u, weight_bytes - 1u);
+        auto rollback =
+            context.make_command_buffer(label + " late failure", error);
+        check(rollback != nullptr, label + " late-failure command buffer",
+              error);
+        if (!rollback) return false;
+        const bool accepted = Encoder::encode(
+            context, *rollback, label + " late-failure segment",
+            [&](Encoder& encoder, std::string& encode_error) {
+                if (!encode_read_only_matvec(
+                        context, encoder, format, n_in, n_out,
+                        active_columns, compiled_columns, valid_buffers,
+                        encode_error)) {
+                    return false;
+                }
+                return encode_read_only_matvec(
+                    context, encoder, format, n_in, n_out, active_columns,
+                    compiled_columns, short_weights, encode_error);
+            },
+            error);
+        const bool outputs_unchanged =
+            std::all_of(output_buffer.payload().begin(),
+                        output_buffer.payload().end(),
+                        [](std::uint8_t value) { return value == 0xa5u; }) &&
+            std::all_of(sink_buffer.payload().begin(),
+                        sink_buffer.payload().end(),
+                        [](std::uint8_t value) { return value == 0xa5u; });
+        late_failure_discarded =
+            !accepted &&
+            rollback->unsafe_native_handle() == nullptr &&
+            error.find("undersized or misaligned") != std::string::npos &&
+            outputs_unchanged;
+        check(late_failure_discarded,
+              label + " late failure discards prior read-only dispatches",
+              error);
+        late_failure_discarded &= alias_rejected;
+    }
+    return !output_mismatch && late_failure_discarded;
 }
 
 bool run_engine_bf16_numeric_case(
@@ -12132,7 +12222,8 @@ bool run_matvec_engine_encoders(Context& context) {
                 return twin::iq4_xs_matvec_reference(
                     weights, activations, n_in, n_out, nc, live_rows,
                     expected, error);
-            });
+            },
+            true);
     const bool iq3_s_nc4 =
         run_engine_quantized_numeric_case<block_iq3_s>(
             context, "engine IQ3_S NC=4 numeric",
@@ -12200,7 +12291,8 @@ bool run_matvec_engine_encoders(Context& context) {
                 return twin::q5_k_matvec_reference(
                     weights, activations, n_in, n_out, nc, live_rows,
                     expected, error);
-            });
+            },
+            true);
     const bool q3_k_nc4 =
         run_engine_quantized_numeric_case<block_q3_K>(
             context, "engine Q3_K NC=4 numeric", MatVecWeightFormat::q3_k,
@@ -12240,7 +12332,8 @@ bool run_matvec_engine_encoders(Context& context) {
                 return twin::q6_k_matvec_reference(
                     weights, activations, n_in, n_out, nc, live_rows,
                     expected, error);
-            });
+            },
+            true);
     const bool bf16_nc8_large_k = run_engine_bf16_numeric_case(
         context, 2'560u, 7u, 8u, 5u, 256u, "engine BF16 large-K NC=8");
     const bool bf16_160_thread = run_engine_bf16_numeric_case(
@@ -12640,6 +12733,50 @@ bool run_indexed_head_engine_encoders(Context& context) {
     check(foreign_context != nullptr,
           "open Context for indexed-head ownership tests", error);
     if (!foreign_context) return false;
+
+    constexpr std::uint32_t read_only_n_in = 256u;
+    constexpr std::size_t read_only_activation_bytes =
+        (read_only_n_in / 32u) * sizeof(Q81);
+    const BufferRef foreign_activations = foreign_context->buffers().allocate(
+        "foreign read-only mat-vec activations",
+        read_only_activation_bytes, error);
+    const BufferRef foreign_weights = foreign_context->buffers().allocate(
+        "foreign read-only mat-vec weights", sizeof(block_q5_K), error);
+    const BufferRef foreign_active_rows = foreign_context->buffers().allocate(
+        "foreign read-only mat-vec active rows", sizeof(std::uint32_t),
+        error);
+    const BufferRef local_output = context.buffers().allocate(
+        "read-only mat-vec foreign output", sizeof(float), error);
+    const BufferRef local_sink = context.buffers().allocate(
+        "read-only mat-vec foreign sink", sizeof(float), error);
+    check(foreign_activations && foreign_weights && foreign_active_rows &&
+              local_output && local_sink,
+          "read-only mat-vec ownership-test allocations", error);
+    if (!foreign_activations || !foreign_weights || !foreign_active_rows ||
+        !local_output || !local_sink) {
+        return false;
+    }
+    const std::uint32_t one_live_row = 1u;
+    std::memcpy(foreign_active_rows.contents, &one_live_row,
+                sizeof(one_live_row));
+    const ReadOnlyMatVecBuffers foreign_buffers{
+        foreign_context->buffers().read_only(foreign_activations),
+        foreign_context->buffers().read_only(foreign_weights),
+        foreign_context->buffers().read_only(foreign_active_rows),
+        local_output, local_sink};
+    auto foreign_command =
+        context.make_command_buffer("read-only mat-vec foreign input", error);
+    check(foreign_command != nullptr,
+          "read-only mat-vec foreign command buffer", error);
+    if (!foreign_command) return false;
+    const bool foreign_rejected =
+        !encode_read_only_matvec(
+            context, *foreign_command, MatVecWeightFormat::q5_k,
+            read_only_n_in, 1u, 1u, 1u, foreign_buffers, error) &&
+        error.find("not owned by this Context") != std::string::npos &&
+        foreign_command->unsafe_native_handle() == nullptr;
+    check(foreign_rejected,
+          "read-only mat-vec rejects foreign Context model views", error);
 
     const bool q5 = run_indexed_head_engine_case<block_q5_K>(
         context, *foreign_context, "Q5_K", MatVecWeightFormat::q5_k,

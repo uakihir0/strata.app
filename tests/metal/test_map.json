@@ -307,11 +307,11 @@
     },
     "metal_mv_test": {
       "label": "metal",
-      "origin": "09 9.1, D-IMPL-271, D-IMPL-299, REV-096"
+      "origin": "09 9.1, D-IMPL-271, D-IMPL-299, REV-096, D-IMPL-305, REV-102"
     },
     "metal_mv_test_concurrent": {
       "label": "metal",
-      "origin": "09 9.1, D-IMPL-271, D-IMPL-299, REV-096"
+      "origin": "09 9.1, D-IMPL-271, D-IMPL-299, REV-096, D-IMPL-305, REV-102"
     },
     "metal_never_wrap_test": {
       "label": "metal",

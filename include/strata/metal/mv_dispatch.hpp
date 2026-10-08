@@ -88,6 +88,18 @@ struct ReadOnlyQ2_0MatVecBuffers {
     BufferRef sink;
 };
 
+struct ReadOnlyMatVecBuffers {
+    // Q8_1 rows for quantized formats; row-major F32 activations for BF16.
+    ReadOnlyBufferRef activations;
+    // Packed model weights. This remains a read-only view for every format.
+    ReadOnlyBufferRef weights;
+    // Host-visible uint32 value equal to active_columns.
+    ReadOnlyBufferRef active_rows;
+    // Active output columns are packed row-major; padded columns go to sink.
+    BufferRef output;
+    BufferRef sink;
+};
+
 struct IndexedHeadMatVecBuffers {
     MatVecBuffers matvec;
     // Host-visible int32 row indices: output row -> full-head weight row.
@@ -173,6 +185,28 @@ bool encode_q2_0_matvec(Context& context, Encoder& encoder,
                         std::uint32_t compiled_columns,
                         const ReadOnlyQ2_0MatVecBuffers& buffers,
                         std::string& error);
+
+/// Encode a dense projection for any safe mat-vec weight format while keeping
+/// activations, model weights, and active-row metadata read-only. Output and
+/// sink must not overlap each other or any read-only input. Keep every
+/// read-only input unchanged until command completion, including through any
+/// mutable alias to the same backing allocation. Propagate false from a
+/// caller-owned Encoder body so earlier dispatches are discarded.
+bool encode_read_only_matvec(Context& context,
+                             CommandBuffer& command_buffer,
+                             MatVecWeightFormat format,
+                             std::uint32_t n_in, std::uint32_t n_out,
+                             std::uint32_t active_columns,
+                             std::uint32_t compiled_columns,
+                             const ReadOnlyMatVecBuffers& buffers,
+                             std::string& error);
+bool encode_read_only_matvec(Context& context, Encoder& encoder,
+                             MatVecWeightFormat format,
+                             std::uint32_t n_in, std::uint32_t n_out,
+                             std::uint32_t active_columns,
+                             std::uint32_t compiled_columns,
+                             const ReadOnlyMatVecBuffers& buffers,
+                             std::string& error);
 
 /// Encode the indexed draft-vocabulary head for Q5_K, Q6_K or IQ4_XS.
 /// `weight_rows` is the full head row count; `output_rows` is the row-map

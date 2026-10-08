@@ -1104,6 +1104,198 @@ bool encode_matvec_impl(Context& context, void* command_handle,
     return true;
 }
 
+bool encode_read_only_matvec_impl(
+    Context& context, Encoder& encoder, MatVecWeightFormat format,
+    std::uint32_t n_in, std::uint32_t n_out,
+    std::uint32_t active_columns, std::uint32_t compiled_columns,
+    const ReadOnlyMatVecBuffers& buffers, std::string& error) {
+    constexpr std::string_view operation = "read-only mat-vec";
+    error.clear();
+    FormatInfo info;
+    if (!format_info(format, info)) {
+        error = std::string(operation) + " weight format is unsupported";
+        return false;
+    }
+    if (n_in == 0u || n_in > kMaxMatVecWidth || n_out == 0u) {
+        error = std::string(operation) +
+                " dimensions must have n_in in 1..16640 and positive n_out";
+        return false;
+    }
+    if (compiled_columns != 1u && compiled_columns != 2u &&
+        compiled_columns != 4u && compiled_columns != 8u) {
+        error = std::string(operation) +
+                " compiled column width must be 1, 2, 4 or 8";
+        return false;
+    }
+    if (active_columns == 0u || active_columns > compiled_columns) {
+        error = std::string(operation) +
+                " active columns must be in 1..compiled column width";
+        return false;
+    }
+    if (info.bf16) {
+        if (n_in != 320u && n_in != 2'560u && n_in != 10'240u) {
+            error = std::string(operation) +
+                    " BF16 n_in must be 320, 2560 or 10240";
+            return false;
+        }
+    } else if (n_in % info.block_values != 0u) {
+        error = std::string(operation) +
+                " n_in is not divisible by the weight block width";
+        return false;
+    }
+
+    const std::uint64_t blocks_per_row =
+        info.bf16 ? n_in : n_in / info.block_values;
+    const std::uint64_t row_bytes =
+        info.bf16 ? static_cast<std::uint64_t>(n_in) * info.block_bytes
+                  : blocks_per_row * info.block_bytes;
+    std::uint64_t weight_count = 0u;
+    std::uint64_t output_count = 0u;
+    std::uint64_t input_count = 0u;
+    std::uint64_t weight_byte_count = 0u;
+    if (!checked_mul(n_out, blocks_per_row, weight_count) ||
+        !checked_mul(n_out, row_bytes, weight_byte_count) ||
+        !checked_mul(active_columns, n_out, output_count) ||
+        !checked_mul(active_columns,
+                     info.bf16 ? n_in : n_in / kQ8_1BlockValues,
+                     input_count) ||
+        weight_count > kShaderIndexCapacity ||
+        static_cast<std::uint64_t>(compiled_columns) * n_out >
+            kShaderIndexCapacity ||
+        input_count > kShaderIndexCapacity) {
+        error = std::string(operation) +
+                " flattened index exceeds the 32-bit shader range";
+        return false;
+    }
+
+    std::size_t activation_bytes = 0u;
+    std::size_t weight_bytes = 0u;
+    std::size_t output_bytes = 0u;
+    std::size_t sink_bytes = 0u;
+    const std::uint64_t sink_count =
+        static_cast<std::uint64_t>(compiled_columns - active_columns) *
+        n_out;
+    const std::uint64_t required_sink_count =
+        sink_count == 0u ? 1u : sink_count;
+    const std::uint64_t activation_element_bytes =
+        info.bf16 ? sizeof(float) : kQ8_1BlockBytes;
+    if (!checked_bytes(input_count, activation_element_bytes,
+                       activation_bytes) ||
+        !checked_bytes(weight_byte_count, 1u, weight_bytes) ||
+        !checked_bytes(output_count, sizeof(float), output_bytes) ||
+        !checked_bytes(required_sink_count, sizeof(float), sink_bytes)) {
+        error = std::string(operation) +
+                " buffer size overflows the host byte range";
+        return false;
+    }
+
+    std::uint32_t rows_per_group = 1u;
+    std::uint32_t threads_x = kMatVecThreadsX;
+    std::uint32_t threads_y = kMatVecThreadsY;
+    std::uint32_t block_size = 0u;
+    std::string kernel_name = "strata_mv_";
+    kernel_name += info.name;
+    if (info.bf16) {
+        block_size = n_in == 320u ? 160u : 256u;
+        threads_x = block_size;
+        threads_y = 1u;
+        kernel_name += "_b" + std::to_string(block_size);
+    } else if (info.row_family) {
+        rows_per_group = 4u;
+    } else if (blocks_per_row < info.small_k_threshold) {
+        rows_per_group = 4u;
+    }
+    kernel_name += "_n" + std::to_string(compiled_columns);
+
+    const std::uint32_t grid_x =
+        info.bf16
+            ? n_out
+            : static_cast<std::uint32_t>(
+                  (static_cast<std::uint64_t>(n_out) + rows_per_group - 1u) /
+                  rows_per_group);
+    id<MTLComputePipelineState> pipeline = nil;
+    if (!validate_pipeline(context, kernel_name.c_str(), threads_x,
+                           threads_y, operation, pipeline, error) ||
+        pipeline == nil) {
+        return false;
+    }
+
+    const std::size_t activation_alignment =
+        info.bf16 ? alignof(float) * 2u : 256u;
+    const std::size_t weight_alignment =
+        info.bf16 ? alignof(std::uint32_t) : alignof(std::uint16_t);
+    if (!validate_read_only_buffer(
+            context, buffers.activations, activation_bytes,
+            activation_alignment, "activations", operation, error) ||
+        !validate_read_only_buffer(context, buffers.weights, weight_bytes,
+                                   weight_alignment, "weights", operation,
+                                   error) ||
+        !validate_read_only_buffer(context, buffers.active_rows,
+                                   sizeof(std::uint32_t),
+                                   alignof(std::uint32_t), "active-row count",
+                                   operation, error) ||
+        !validate_buffer(context, buffers.output, output_bytes,
+                         alignof(float), "output", error) ||
+        !validate_buffer(context, buffers.sink, sink_bytes,
+                         alignof(float), "sink", error)) {
+        return false;
+    }
+
+    std::uint32_t live_rows = 0u;
+    std::memcpy(&live_rows, buffers.active_rows.contents(), sizeof(live_rows));
+    if (live_rows != active_columns) {
+        error = std::string(operation) +
+                " active-row count does not match active columns";
+        return false;
+    }
+
+    if (read_only_buffer_ranges_overlap(buffers.activations,
+                                        activation_bytes, buffers.output,
+                                        output_bytes) ||
+        read_only_buffer_ranges_overlap(buffers.weights, weight_bytes,
+                                        buffers.output, output_bytes) ||
+        read_only_buffer_ranges_overlap(buffers.active_rows,
+                                        sizeof(std::uint32_t), buffers.output,
+                                        output_bytes) ||
+        read_only_buffer_ranges_overlap(buffers.activations,
+                                        activation_bytes, buffers.sink,
+                                        sink_bytes) ||
+        read_only_buffer_ranges_overlap(buffers.weights, weight_bytes,
+                                        buffers.sink, sink_bytes) ||
+        read_only_buffer_ranges_overlap(buffers.active_rows,
+                                        sizeof(std::uint32_t), buffers.sink,
+                                        sink_bytes) ||
+        buffer_ranges_overlap(buffers.output, output_bytes, buffers.sink,
+                              sink_bytes)) {
+        error = std::string(operation) +
+                " outputs must not overlap an input or each other";
+        return false;
+    }
+
+    const MatVecParams params{n_in, n_out};
+    const std::array writable_bindings{
+        EncoderBufferBinding{buffers.output, 2u, output_bytes,
+                             alignof(float)},
+        EncoderBufferBinding{buffers.sink, 3u, sink_bytes, alignof(float)},
+    };
+    const std::array read_only_bindings{
+        EncoderReadOnlyBufferBinding{buffers.activations, 0u,
+                                     activation_bytes,
+                                     activation_alignment},
+        EncoderReadOnlyBufferBinding{buffers.weights, 1u, weight_bytes,
+                                     weight_alignment},
+        EncoderReadOnlyBufferBinding{buffers.active_rows, 4u,
+                                     sizeof(std::uint32_t),
+                                     alignof(std::uint32_t)},
+    };
+    const std::array inline_bytes{
+        EncoderBytesBinding{&params, sizeof(params), 5u},
+    };
+    return encoder.dispatch(
+        kernel_name, {grid_x, 1u, 1u}, {threads_x, threads_y, 1u},
+        writable_bindings, read_only_bindings, inline_bytes, {}, error);
+}
+
 }  // namespace
 
 bool encode_q8_1(Context& context, CommandBuffer& command_buffer,
@@ -1229,6 +1421,31 @@ bool encode_q2_0_matvec(Context& context, Encoder& encoder,
     return encode_q2_0_matvec_impl(context, encoder, n_in, n_out,
                                     active_columns, compiled_columns, buffers,
                                     error);
+}
+
+bool encode_read_only_matvec(
+    Context& context, CommandBuffer& command_buffer,
+    MatVecWeightFormat format, std::uint32_t n_in, std::uint32_t n_out,
+    std::uint32_t active_columns, std::uint32_t compiled_columns,
+    const ReadOnlyMatVecBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "read-only dense mat-vec",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_read_only_matvec(
+                context, encoder, format, n_in, n_out, active_columns,
+                compiled_columns, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_read_only_matvec(
+    Context& context, Encoder& encoder, MatVecWeightFormat format,
+    std::uint32_t n_in, std::uint32_t n_out,
+    std::uint32_t active_columns, std::uint32_t compiled_columns,
+    const ReadOnlyMatVecBuffers& buffers, std::string& error) {
+    return encode_read_only_matvec_impl(
+        context, encoder, format, n_in, n_out, active_columns,
+        compiled_columns, buffers, error);
 }
 
 bool encode_indexed_head_matvec(
