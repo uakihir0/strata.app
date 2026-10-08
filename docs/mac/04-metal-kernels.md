@@ -2507,6 +2507,19 @@ fully validate GPU-produced plan arrays. It does not include the shared
 expert, combine, later Window layers or state commit, and does not establish
 end-to-end MoE inference.
 
+`encode_moe_routed_shared_ffn_write` composes the routed expert FFN, shared
+expert FFN, routed/shared combine and GR residual write in one ordered
+T=1..8 Encoder segment. It preflights both component chains and their
+cross-stage aliases before the first dispatch, comparing the active byte
+extents consumed or written at each stage. The shared Q8_1 input and routed
+parts must start at the routed producer's corresponding views; other routed
+outputs must be disjoint from active shared inputs, outputs, residual and
+injection ranges. Full-mode callers may encode plan production before this
+composition in the same ordered segment. Tiered callers must wait for
+successful `ExpertStore` resolution before submitting it. The compositor does
+not build routes or plans, resolve misses, or integrate the production Window
+scheduler, and its synthetic tests do not establish end-to-end inference.
+
 **What the FFN reads per layer, T = 1:** the router (2.6 MB for 512 experts), 10 experts (13.8 MB for Q2_0, three
 slabs of 460,800 B each), and the shared expert. For T > 1, rows that share an expert share its read, which is why
 the groups exist.
