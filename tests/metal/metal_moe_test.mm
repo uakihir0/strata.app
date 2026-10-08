@@ -227,6 +227,41 @@ bool dispatch_grouped_down(
     return true;
 }
 
+bool dispatch_moe_combine(
+    Context& context, std::uint32_t rows,
+    const twin::GuardedBuffer& parts_buffer,
+    const twin::GuardedBuffer& weights_buffer,
+    const twin::GuardedBuffer& shared_buffer,
+    const twin::GuardedBuffer& gate_buffer,
+    const twin::GuardedBuffer& output_buffer, std::string& error,
+    bool caller_owned = false) {
+    const MoeCombineBuffers buffers{
+        context.buffers().read_only(parts_buffer.view()),
+        context.buffers().read_only(weights_buffer.view()),
+        context.buffers().read_only(shared_buffer.view()),
+        context.buffers().read_only(gate_buffer.view()),
+        output_buffer.view(),
+    };
+    auto command_buffer =
+        context.make_command_buffer("MoE combine twin", error);
+    if (!command_buffer) return false;
+    const bool encoded = caller_owned
+        ? Encoder::encode(
+              context, *command_buffer, "MoE combine twin",
+              [&](Encoder& encoder, std::string& encode_error) {
+                  return encode_moe_combine(context, encoder, rows, buffers,
+                                            encode_error);
+              },
+              error)
+        : encode_moe_combine(context, *command_buffer, rows, buffers, error);
+    if (!encoded || !command_buffer->commit(error) ||
+        !command_buffer->wait_until_completed(error)) {
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
 std::vector<float> make_logits(std::uint32_t experts, twin::InputSet set,
                                std::uint64_t seed) {
     std::vector<float> logits(static_cast<std::size_t>(kRows) * experts);
@@ -2090,6 +2125,235 @@ bool test_moe_down_dispatch_validation(Context& context) {
            concurrent_boundary_ok;
 }
 
+bool test_moe_combine_dispatch_validation(Context& context) {
+    constexpr std::uint32_t rows = 2u;
+    constexpr std::size_t entries =
+        static_cast<std::size_t>(rows) * kTopK;
+    constexpr std::size_t parts_bytes =
+        entries * kMoeDownWidth * sizeof(float);
+    constexpr std::size_t weights_bytes = entries * sizeof(float);
+    constexpr std::size_t shared_bytes =
+        static_cast<std::size_t>(rows) * kMoeDownWidth * sizeof(float);
+    constexpr std::size_t gate_bytes =
+        static_cast<std::size_t>(rows) * sizeof(float);
+    constexpr std::size_t output_bytes = shared_bytes;
+    const std::string label = "MoE combine dispatch validation";
+    std::string err;
+    twin::GuardedBuffer parts;
+    twin::GuardedBuffer weights;
+    twin::GuardedBuffer shared;
+    twin::GuardedBuffer gate;
+    twin::GuardedBuffer output;
+    check(parts.allocate(context, label + " parts", parts_bytes + 32u, err),
+          label + " parts allocation", err);
+    check(weights.allocate(context, label + " weights",
+                           weights_bytes + 32u, err),
+          label + " weights allocation", err);
+    check(shared.allocate(context, label + " shared",
+                          shared_bytes + 32u, err),
+          label + " shared allocation", err);
+    check(gate.allocate(context, label + " gate", gate_bytes + 32u, err),
+          label + " gate allocation", err);
+    check(output.allocate(context, label + " output",
+                          output_bytes + 32u, err),
+          label + " output allocation", err);
+    if (!parts.view() || !weights.view() || !shared.view() ||
+        !gate.view() || !output.view()) {
+        return false;
+    }
+
+    const ReadOnlyBufferRef parts_view =
+        context.buffers().read_only(parts.view().slice(0u, parts_bytes));
+    const ReadOnlyBufferRef weights_view =
+        context.buffers().read_only(weights.view().slice(0u, weights_bytes));
+    const ReadOnlyBufferRef shared_view =
+        context.buffers().read_only(shared.view().slice(0u, shared_bytes));
+    const ReadOnlyBufferRef gate_view =
+        context.buffers().read_only(gate.view().slice(0u, gate_bytes));
+    const BufferRef output_view = output.view().slice(0u, output_bytes);
+    const MoeCombineBuffers valid{
+        parts_view, weights_view, shared_view, gate_view, output_view};
+    const std::vector<std::uint8_t> output_before(
+        output.payload().begin(), output.payload().end());
+
+    const auto reject = [&](const std::string& case_label,
+                            std::uint32_t case_rows,
+                            const MoeCombineBuffers& buffers,
+                            std::string_view expected_error) {
+        auto command = context.make_command_buffer(case_label, err);
+        const bool rejected = command && !encode_moe_combine(
+            context, *command, case_rows, buffers, err);
+        const bool discarded =
+            command && command->unsafe_native_handle() == nullptr;
+        const bool unchanged = std::equal(
+            output_before.begin(), output_before.end(), output.payload().begin(),
+            output.payload().end());
+        const bool error_matches =
+            err.find(expected_error) != std::string::npos;
+        check(rejected && discarded && unchanged && error_matches,
+              case_label + " rejects before dispatch and discards", err);
+        return rejected && discarded && unchanged && error_matches;
+    };
+
+    const bool zero_rows =
+        reject(label + " zero rows", 0u, valid, "1..8 rows");
+    const bool too_many_rows =
+        reject(label + " too many rows", 9u, valid, "1..8 rows");
+    const bool short_parts = reject(
+        label + " short parts", rows,
+        {parts_view.slice(0u, parts_bytes - sizeof(float)), weights_view,
+         shared_view, gate_view, output_view},
+        "routed parts");
+    const bool short_weights = reject(
+        label + " short weights", rows,
+        {parts_view,
+         weights_view.slice(0u, weights_bytes - sizeof(float)),
+         shared_view, gate_view, output_view},
+        "route weights");
+    const bool short_shared = reject(
+        label + " short shared output", rows,
+        {parts_view, weights_view,
+         shared_view.slice(0u, shared_bytes - sizeof(float)),
+         gate_view, output_view},
+        "shared output");
+    const bool short_gate = reject(
+        label + " short gate logits", rows,
+        {parts_view, weights_view, shared_view,
+         gate_view.slice(0u, gate_bytes - sizeof(float)), output_view},
+        "shared gate logits");
+    const bool short_output = reject(
+        label + " short output", rows,
+        {parts_view, weights_view, shared_view, gate_view,
+         output.view().slice(0u, output_bytes - sizeof(float))},
+        "output");
+    const bool misaligned_parts = reject(
+        label + " misaligned parts", rows,
+        {context.buffers().read_only(parts.view().slice(1u, parts_bytes)),
+         weights_view, shared_view, gate_view, output_view},
+        "misaligned");
+    const bool misaligned_weights = reject(
+        label + " misaligned weights", rows,
+        {parts_view,
+         context.buffers().read_only(weights.view().slice(1u, weights_bytes)),
+         shared_view, gate_view, output_view},
+        "misaligned");
+    const bool misaligned_shared = reject(
+        label + " misaligned shared output", rows,
+        {parts_view, weights_view,
+         context.buffers().read_only(shared.view().slice(1u, shared_bytes)),
+         gate_view, output_view},
+        "misaligned");
+    const bool misaligned_gate = reject(
+        label + " misaligned gate logits", rows,
+        {parts_view, weights_view, shared_view,
+         context.buffers().read_only(gate.view().slice(1u, gate_bytes)),
+         output_view},
+        "misaligned");
+    const bool misaligned_output = reject(
+        label + " misaligned output", rows,
+        {parts_view, weights_view, shared_view, gate_view,
+         output.view().slice(1u, output_bytes)},
+        "misaligned");
+
+    const ReadOnlyBufferRef output_as_input =
+        context.buffers().read_only(output_view);
+    const bool parts_alias = reject(
+        label + " parts/output alias", rows,
+        {context.buffers().read_only(
+             parts.view().slice(0u, parts_bytes)),
+         weights_view, shared_view, gate_view,
+         parts.view().slice(0u, output_bytes)},
+        "overlap");
+    const bool weights_alias = reject(
+        label + " weights/output alias", rows,
+        {parts_view,
+         context.buffers().read_only(
+             output.view().slice(0u, weights_bytes)),
+         shared_view, gate_view, output_view},
+        "overlap");
+    const bool shared_alias = reject(
+        label + " shared/output alias", rows,
+        {parts_view, weights_view, output_as_input, gate_view, output_view},
+        "overlap");
+    const bool gate_alias = reject(
+        label + " gate/output alias", rows,
+        {parts_view, weights_view, shared_view, output_as_input, output_view},
+        "overlap");
+
+    auto late_failure_command =
+        context.make_command_buffer(label + " late failure", err);
+    check(late_failure_command != nullptr,
+          label + " late-failure command buffer", err);
+    if (!late_failure_command) return false;
+    const bool late_failure_rejected = !Encoder::encode(
+        context, *late_failure_command, "MoE combine late failure",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_moe_combine(context, encoder, rows, valid,
+                                    encode_error)) {
+                return false;
+            }
+            return encode_moe_combine(context, encoder, 0u, valid,
+                                      encode_error);
+        },
+        err);
+    const bool late_failure_discarded =
+        late_failure_command->unsafe_native_handle() == nullptr;
+    const bool late_failure_untouched = std::equal(
+        output_before.begin(), output_before.end(), output.payload().begin(),
+        output.payload().end());
+    check(late_failure_rejected && late_failure_discarded &&
+              late_failure_untouched &&
+              err.find("1..8 rows") != std::string::npos,
+          label + " caller-owned late failure rolls back its dispatch", err);
+
+    bool concurrent_boundary_ok = true;
+    const char* const dispatch_mode = std::getenv("STRATA_METAL_DISPATCH");
+    if (dispatch_mode != nullptr &&
+        std::string_view(dispatch_mode) == "concurrent") {
+        auto command =
+            context.make_command_buffer(label + " open group", err);
+        check(command != nullptr, label + " open-group command buffer", err);
+        if (!command) return false;
+        bool saw_open_group = false;
+        bool rejected_open_group = false;
+        const bool encoded = Encoder::encode(
+            context, *command, "MoE combine open-group boundary",
+            [&](Encoder& encoder, std::string& encode_error) {
+                if (!encoder.group_begin(encode_error)) return false;
+                saw_open_group = encoder.concurrent_group_open();
+                if (saw_open_group) {
+                    std::string boundary_error;
+                    rejected_open_group = !encode_moe_combine(
+                        context, encoder, rows, valid, boundary_error) &&
+                        boundary_error.find("ordered dispatch boundary") !=
+                            std::string::npos;
+                }
+                if (!encoder.group_end(encode_error)) return false;
+                if (!saw_open_group || !rejected_open_group) {
+                    encode_error =
+                        "MoE combine did not reject an open concurrent group";
+                    return false;
+                }
+                return true;
+            },
+            err);
+        command->discard();
+        concurrent_boundary_ok =
+            encoded && saw_open_group && rejected_open_group &&
+            command->unsafe_native_handle() == nullptr;
+        check(concurrent_boundary_ok,
+              label + " rejects an open concurrent group", err);
+    }
+
+    return zero_rows && too_many_rows && short_parts && short_weights &&
+           short_shared && short_gate && short_output && misaligned_parts &&
+           misaligned_weights && misaligned_shared && misaligned_gate &&
+           misaligned_output && parts_alias && weights_alias &&
+           shared_alias && gate_alias && late_failure_rejected &&
+           late_failure_discarded && late_failure_untouched &&
+           concurrent_boundary_ok;
+}
+
 bool test_shared_swiglu_inputs(Context& context, twin::InputSet set,
                                const twin::Options& options) {
     bool completed = true;
@@ -2633,17 +2897,9 @@ bool dispatch_shared_combine(
     gate_buffer.capture_before_dispatch();
     output_buffer.capture_before_dispatch();
 
-    twin::Dispatch work;
-    work.grid_mode = twin::GridMode::threadgroups;
-    work.grid = {10u, rows, 1u};
-    work.threads_per_group = {256u, 1u, 1u};
-    work.buffers = {{0u, parts_buffer.view()},
-                    {1u, weights_buffer.view()},
-                    {2u, shared_buffer.view()},
-                    {3u, gate_buffer.view()},
-                    {4u, output_buffer.view()}};
-    const bool dispatched =
-        twin::dispatch_manifest(context, "strata_moe_combine", work, err);
+    const bool dispatched = dispatch_moe_combine(
+        context, rows, parts_buffer, weights_buffer, shared_buffer,
+        gate_buffer, output_buffer, err);
     check(dispatched, label + " Metal dispatch", err);
     if (!dispatched) return false;
 
@@ -2993,17 +3249,9 @@ bool test_moe_combine_case(Context& context, std::uint32_t rows,
     gate_buffer.capture_before_dispatch();
     output_buffer.capture_before_dispatch();
 
-    twin::Dispatch work;
-    work.grid_mode = twin::GridMode::threadgroups;
-    work.grid = {10u, rows, 1u};
-    work.threads_per_group = {256u, 1u, 1u};
-    work.buffers = {{0u, parts_buffer.view()},
-                    {1u, weights_buffer.view()},
-                    {2u, shared_buffer.view()},
-                    {3u, gate_buffer.view()},
-                    {4u, output_buffer.view()}};
-    const bool dispatched =
-        twin::dispatch_manifest(context, "strata_moe_combine", work, err);
+    const bool dispatched = dispatch_moe_combine(
+        context, rows, parts_buffer, weights_buffer, shared_buffer,
+        gate_buffer, output_buffer, err, rows == 8u);
     check(dispatched, label + " Metal dispatch", err);
     if (!dispatched) return false;
 
@@ -8452,6 +8700,7 @@ int main(int argc, char** argv) {
     if (!test_grouped_expert_dispatch_validation(*context)) ++g_failures;
     if (!test_swiglu_dispatch_validation(*context)) ++g_failures;
     if (!test_moe_down_dispatch_validation(*context)) ++g_failures;
+    if (!test_moe_combine_dispatch_validation(*context)) ++g_failures;
 
     std::vector<twin::InputSet> sets;
     if (options.input_set_explicit) {

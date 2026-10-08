@@ -636,6 +636,102 @@ bool encode_moe_swiglu_impl(Context& context, Encoder& encoder,
                             error);
 }
 
+bool encode_moe_combine_impl(Context& context, Encoder& encoder,
+                             std::uint32_t rows,
+                             const MoeCombineBuffers& buffers,
+                             std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "MoE combine requires an ordered dispatch boundary";
+        return false;
+    }
+    if (rows == 0u || rows > 8u) {
+        error = "MoE combine requires 1..8 rows";
+        return false;
+    }
+
+    const std::uint64_t entry_count =
+        static_cast<std::uint64_t>(rows) * kMoeTopK;
+    std::size_t parts_bytes = 0u;
+    std::size_t weights_bytes = 0u;
+    std::size_t shared_bytes = 0u;
+    std::size_t gate_bytes = 0u;
+    std::size_t output_bytes = 0u;
+    if (!checked_bytes(entry_count * kMoeDownOutputWidth, sizeof(float),
+                       parts_bytes) ||
+        !checked_bytes(entry_count, sizeof(float), weights_bytes) ||
+        !checked_bytes(static_cast<std::uint64_t>(rows) *
+                           kMoeDownOutputWidth,
+                       sizeof(float), shared_bytes) ||
+        !checked_bytes(rows, sizeof(float), gate_bytes) ||
+        !checked_bytes(static_cast<std::uint64_t>(rows) *
+                           kMoeDownOutputWidth,
+                       sizeof(float), output_bytes)) {
+        error = "MoE combine shape exceeds the host byte range";
+        return false;
+    }
+
+    if (!buffers.parts || !context.buffers().owns(buffers.parts) ||
+        buffers.parts.length() < parts_bytes ||
+        buffers.parts.offset() % alignof(float) != 0u) {
+        error = "MoE combine routed parts are stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (!buffers.route_weights ||
+        !context.buffers().owns(buffers.route_weights) ||
+        buffers.route_weights.length() < weights_bytes ||
+        buffers.route_weights.offset() % alignof(float) != 0u) {
+        error = "MoE combine route weights are stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (!buffers.shared_output ||
+        !context.buffers().owns(buffers.shared_output) ||
+        buffers.shared_output.length() < shared_bytes ||
+        buffers.shared_output.offset() % alignof(float) != 0u) {
+        error = "MoE combine shared output is stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (!buffers.shared_gate_logits ||
+        !context.buffers().owns(buffers.shared_gate_logits) ||
+        buffers.shared_gate_logits.length() < gate_bytes ||
+        buffers.shared_gate_logits.offset() % alignof(float) != 0u) {
+        error = "MoE combine shared gate logits are stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (!buffers.output || !context.buffers().owns(buffers.output) ||
+        buffers.output.length < output_bytes ||
+        buffers.output.offset % alignof(float) != 0u) {
+        error = "MoE combine output is stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (views_overlap(buffers.parts, buffers.output) ||
+        views_overlap(buffers.route_weights, buffers.output) ||
+        views_overlap(buffers.shared_output, buffers.output) ||
+        views_overlap(buffers.shared_gate_logits, buffers.output)) {
+        error = "MoE combine output must not overlap any input";
+        return false;
+    }
+
+    const std::array writable{
+        EncoderBufferBinding{buffers.output, 4u, output_bytes,
+                             alignof(float)},
+    };
+    const std::array read_only{
+        EncoderReadOnlyBufferBinding{buffers.parts, 0u, parts_bytes,
+                                     alignof(float)},
+        EncoderReadOnlyBufferBinding{buffers.route_weights, 1u,
+                                     weights_bytes, alignof(float)},
+        EncoderReadOnlyBufferBinding{buffers.shared_output, 2u,
+                                     shared_bytes, alignof(float)},
+        EncoderReadOnlyBufferBinding{buffers.shared_gate_logits, 3u,
+                                     gate_bytes, alignof(float)},
+    };
+    return encoder.dispatch("strata_moe_combine",
+                           {kMoeTopK, rows, 1u},
+                           {256u, 1u, 1u}, writable, read_only, {}, {},
+                           error);
+}
+
 }  // namespace
 
 bool encode_moe_route(Context& context, Encoder& encoder,
@@ -746,6 +842,26 @@ bool encode_moe_swiglu(Context& context, CommandBuffer& command_buffer,
             return encode_moe_swiglu_impl(context, encoder, rows,
                                           shared_expert, buffers,
                                           encode_error);
+        },
+        error);
+}
+
+bool encode_moe_combine(Context& context, Encoder& encoder,
+                        std::uint32_t rows,
+                        const MoeCombineBuffers& buffers,
+                        std::string& error) {
+    return encode_moe_combine_impl(context, encoder, rows, buffers, error);
+}
+
+bool encode_moe_combine(Context& context, CommandBuffer& command_buffer,
+                        std::uint32_t rows,
+                        const MoeCombineBuffers& buffers,
+                        std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "MoE combine",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_moe_combine_impl(context, encoder, rows, buffers,
+                                           encode_error);
         },
         error);
 }

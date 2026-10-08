@@ -2450,6 +2450,13 @@ bo[t*2560 + d] = s + sh;
 - `g` is computed by every thread from the same `gl[t]`, so all threads use the same value.
 - `bo` is the FFN block output that the FFN write of section 5.4 adds to the residual.
 
+The validated engine `encode_moe_combine` binds the routed parts, route weights,
+shared-expert output and gate logits as read-only inputs for T=1..8. It validates
+Context ownership, extents, alignment and output/input overlap, and requires an
+ordered dispatch boundary. The typed encoder and scalar oracle cover the
+standalone combine and the composed shared-expert chain; production Window
+scheduling remains unfinished.
+
 **What the FFN reads per layer, T = 1:** the router (2.6 MB for 512 experts), 10 experts (13.8 MB for Q2_0, three
 slabs of 460,800 B each), and the shared expert. For T > 1, rows that share an expert share its read, which is why
 the groups exist.

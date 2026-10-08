@@ -68,6 +68,19 @@ struct MoeSwiGLUBuffers {
     BufferRef output;
 };
 
+struct MoeCombineBuffers {
+    /// Routed down-projection parts in `[rows, 10, 2560]` order.
+    ReadOnlyBufferRef parts;
+    /// Top-10 route weights in `[rows, 10]` order.
+    ReadOnlyBufferRef route_weights;
+    /// Shared-expert down output in `[rows, 2560]` order.
+    ReadOnlyBufferRef shared_output;
+    /// Shared-expert gate logits, one F32 per row.
+    ReadOnlyBufferRef shared_gate_logits;
+    /// Combined model output in `[rows, 2560]` order.
+    BufferRef output;
+};
+
 /// Encode the stable top-10 route selection for 256 or 512 experts.
 /// `divide_weights` selects the prompt-path division mode; Window decode must
 /// pass false to match the model's multiply-by-reciprocal path. The views must
@@ -157,5 +170,18 @@ bool encode_moe_swiglu(Context& context, CommandBuffer& command_buffer,
                        std::uint32_t rows, bool shared_expert,
                        const MoeSwiGLUBuffers& buffers,
                        std::string& error);
+
+/// Combine ten routed expert parts with the shared-expert output for 1..8
+/// rows. Inputs are read-only, the output must be disjoint from every input,
+/// and all views must remain alive until command completion.
+bool encode_moe_combine(Context& context, Encoder& encoder,
+                        std::uint32_t rows,
+                        const MoeCombineBuffers& buffers,
+                        std::string& error);
+/// Standalone transactional form. A validation failure discards the segment.
+bool encode_moe_combine(Context& context, CommandBuffer& command_buffer,
+                        std::uint32_t rows,
+                        const MoeCombineBuffers& buffers,
+                        std::string& error);
 
 }  // namespace strata::metal
