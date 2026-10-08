@@ -2186,8 +2186,11 @@ if (tid == 0) for (j) ycol(j)[row] = acc[j];
 The engine exposes Q8_1 quantization and dense quantized/BF16 mat-vecs through both standalone
 `CommandBuffer` wrappers and caller-owned `Encoder` overloads. A dependent projection can therefore
 encode Q8_1 and its mat-vec in the same serial segment, with the wrapper discarding that segment if a
-later-stage validation fails. These overloads preserve the kernel arithmetic and buffer contracts;
-the indexed draft-head API remains a standalone wrapper. Production Window and Prefill dispatch
+later-stage validation fails. `encode_bf16_matvec` additionally accepts F32 activations, BF16 weights
+and the active-row count as `ReadOnlyBufferRef`; read-only inputs may overlap each other, while both
+outputs must be disjoint from every input and one another. This supports the const full-mode router
+weight view without changing the existing mutable mat-vec API. The indexed draft-head API remains a
+standalone wrapper. Router → route → Q8_1 Window composition and production Window/Prefill dispatch
 remain pending.
 
 ### 5.10 MoE: router, plan, experts, shared expert and combine

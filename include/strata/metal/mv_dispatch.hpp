@@ -55,6 +55,17 @@ struct MatVecBuffers {
     BufferRef active_rows;
 };
 
+struct ReadOnlyBF16MatVecBuffers {
+    // F32 activations and packed BF16 weights are MSL const inputs.
+    ReadOnlyBufferRef activations;
+    ReadOnlyBufferRef weights;
+    // Host-visible uint32 value equal to active_columns.
+    ReadOnlyBufferRef active_rows;
+    // Active output columns are packed row-major; padded columns go to sink.
+    BufferRef output;
+    BufferRef sink;
+};
+
 struct IndexedHeadMatVecBuffers {
     MatVecBuffers matvec;
     // Host-visible int32 row indices: output row -> full-head weight row.
@@ -79,6 +90,26 @@ bool encode_matvec(Context& context, Encoder& encoder,
                    std::uint32_t n_out, std::uint32_t active_columns,
                    std::uint32_t compiled_columns,
                    const MatVecBuffers& buffers, std::string& error);
+
+/// Encode a BF16 projection whose activations, weights and active-row count
+/// remain read-only through the dispatch. Supported widths match the BF16
+/// kernel catalogue (320, 2560 or 10240). Read-only inputs may alias each
+/// other; output and sink must not overlap any input or each other. The
+/// caller-owned form can fail after earlier work was encoded, so its enclosing
+/// Encoder::encode body must propagate false. The CommandBuffer form discards
+/// the unsubmitted command buffer on failure.
+bool encode_bf16_matvec(Context& context, CommandBuffer& command_buffer,
+                        std::uint32_t n_in, std::uint32_t n_out,
+                        std::uint32_t active_columns,
+                        std::uint32_t compiled_columns,
+                        const ReadOnlyBF16MatVecBuffers& buffers,
+                        std::string& error);
+bool encode_bf16_matvec(Context& context, Encoder& encoder,
+                        std::uint32_t n_in, std::uint32_t n_out,
+                        std::uint32_t active_columns,
+                        std::uint32_t compiled_columns,
+                        const ReadOnlyBF16MatVecBuffers& buffers,
+                        std::string& error);
 
 /// Encode the indexed draft-vocabulary head for Q5_K, Q6_K or IQ4_XS.
 /// `weight_rows` is the full head row count; `output_rows` is the row-map

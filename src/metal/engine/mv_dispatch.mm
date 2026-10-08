@@ -11,6 +11,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -165,6 +166,39 @@ bool validate_buffer(Context& context, BufferRef buffer,
     return true;
 }
 
+bool validate_read_only_buffer(Context& context, ReadOnlyBufferRef buffer,
+                               std::size_t required_bytes,
+                               std::size_t alignment, std::string_view name,
+                               std::string& error) {
+    if (!buffer || !context.buffers().owns(buffer)) {
+        error = "read-only BF16 mat-vec " + std::string(name) +
+                " buffer is not owned by this Context";
+        return false;
+    }
+    if (alignment == 0u || buffer.length() < required_bytes ||
+        buffer.offset() % alignment != 0u) {
+        error = "read-only BF16 mat-vec " + std::string(name) +
+                " buffer is undersized or misaligned";
+        return false;
+    }
+    const auto* const contents = buffer.contents();
+    const std::uintptr_t cpu_address =
+        reinterpret_cast<std::uintptr_t>(contents);
+    const std::uint64_t gpu_address = buffer.gpu_address();
+    if (contents == nullptr || cpu_address % alignment != 0u ||
+        (gpu_address != 0u && gpu_address % alignment != 0u) ||
+        required_bytes >
+            std::numeric_limits<std::uintptr_t>::max() - cpu_address ||
+        (gpu_address != 0u &&
+         required_bytes >
+             std::numeric_limits<std::uint64_t>::max() - gpu_address)) {
+        error = "read-only BF16 mat-vec " + std::string(name) +
+                " buffer has invalid or misaligned backing metadata";
+        return false;
+    }
+    return true;
+}
+
 template <class Address>
 bool address_ranges_overlap(Address left, std::size_t left_bytes,
                             Address right, std::size_t right_bytes) {
@@ -188,6 +222,25 @@ bool buffer_ranges_overlap(BufferRef left, std::size_t left_bytes,
         address_ranges_overlap(left.gpu_address, left_bytes,
                                right.gpu_address, right_bytes);
     return same_buffer_overlap || cpu_backing_overlap || gpu_backing_overlap;
+}
+
+// ReadOnlyBufferRef intentionally hides its MTLBuffer handle. Its immutable
+// CPU/GPU view addresses are enough to detect aliasing with writable outputs.
+bool read_only_buffer_ranges_overlap(ReadOnlyBufferRef input,
+                                     std::size_t input_bytes,
+                                     BufferRef output,
+                                     std::size_t output_bytes) {
+    const auto* const input_contents = input.contents();
+    const bool cpu_backing_overlap =
+        address_ranges_overlap(
+            reinterpret_cast<std::uintptr_t>(input_contents), input_bytes,
+            reinterpret_cast<std::uintptr_t>(output.contents), output_bytes);
+    const std::uint64_t input_gpu_address = input.gpu_address();
+    const bool gpu_backing_overlap =
+        input_gpu_address != 0u && output.gpu_address != 0u &&
+        address_ranges_overlap(input_gpu_address, input_bytes,
+                               output.gpu_address, output_bytes);
+    return cpu_backing_overlap || gpu_backing_overlap;
 }
 
 const KernelInfo* find_kernel_info(const char* kernel_name) {
@@ -343,6 +396,139 @@ bool encode_q8_1_impl(Context& context, void* command_handle,
     }
     error.clear();
     return true;
+}
+
+bool encode_bf16_matvec_impl(
+    Context& context, Encoder& encoder, std::uint32_t n_in,
+    std::uint32_t n_out, std::uint32_t active_columns,
+    std::uint32_t compiled_columns,
+    const ReadOnlyBF16MatVecBuffers& buffers, std::string& error) {
+    error.clear();
+    if (n_in != 320u && n_in != 2'560u && n_in != 10'240u) {
+        error = "read-only BF16 mat-vec n_in must be 320, 2560 or 10240";
+        return false;
+    }
+    if (n_out == 0u) {
+        error = "read-only BF16 mat-vec n_out must be positive";
+        return false;
+    }
+    if (compiled_columns != 1u && compiled_columns != 2u &&
+        compiled_columns != 4u && compiled_columns != 8u) {
+        error = "read-only BF16 mat-vec compiled column width must be 1, 2, 4 or 8";
+        return false;
+    }
+    if (active_columns == 0u || active_columns > compiled_columns) {
+        error = "read-only BF16 mat-vec active columns must be in 1..compiled column width";
+        return false;
+    }
+
+    std::uint64_t weight_count = 0u;
+    std::uint64_t input_count = 0u;
+    std::uint64_t output_count = 0u;
+    std::uint64_t padded_count = 0u;
+    if (!checked_mul(n_out, n_in, weight_count) ||
+        !checked_mul(active_columns, n_in, input_count) ||
+        !checked_mul(active_columns, n_out, output_count) ||
+        !checked_mul(compiled_columns - active_columns, n_out,
+                     padded_count) ||
+        weight_count > kShaderIndexCapacity ||
+        input_count > kShaderIndexCapacity ||
+        static_cast<std::uint64_t>(compiled_columns) * n_out >
+            kShaderIndexCapacity) {
+        error = "read-only BF16 mat-vec flattened index exceeds the 32-bit shader range";
+        return false;
+    }
+
+    std::size_t activation_bytes = 0u;
+    std::size_t weight_bytes = 0u;
+    std::size_t output_bytes = 0u;
+    std::size_t sink_bytes = 0u;
+    const std::uint64_t required_sink_count =
+        padded_count == 0u ? 1u : padded_count;
+    if (!checked_bytes(input_count, sizeof(float), activation_bytes) ||
+        !checked_bytes(weight_count, sizeof(std::uint16_t), weight_bytes) ||
+        !checked_bytes(output_count, sizeof(float), output_bytes) ||
+        !checked_bytes(required_sink_count, sizeof(float), sink_bytes)) {
+        error = "read-only BF16 mat-vec buffer size overflows the host byte range";
+        return false;
+    }
+
+    const std::uint32_t block_size = n_in == 320u ? 160u : 256u;
+    const std::size_t activation_alignment = 2u * alignof(float);
+    constexpr std::size_t weight_alignment = alignof(std::uint32_t);
+    if (!validate_read_only_buffer(context, buffers.activations,
+                                   activation_bytes, activation_alignment,
+                                   "activations", error) ||
+        !validate_read_only_buffer(context, buffers.weights, weight_bytes,
+                                   weight_alignment, "weights", error) ||
+        !validate_read_only_buffer(context, buffers.active_rows,
+                                   sizeof(std::uint32_t),
+                                   alignof(std::uint32_t), "active-row count",
+                                   error) ||
+        !validate_buffer(context, buffers.output, output_bytes,
+                         alignof(float), "read-only BF16 output", error) ||
+        !validate_buffer(context, buffers.sink, sink_bytes, alignof(float),
+                         "read-only BF16 sink", error)) {
+        return false;
+    }
+
+    std::uint32_t live_rows = 0u;
+    std::memcpy(&live_rows, buffers.active_rows.contents(), sizeof(live_rows));
+    if (live_rows != active_columns) {
+        error = "read-only BF16 mat-vec active-row count does not match active columns";
+        return false;
+    }
+
+    if (read_only_buffer_ranges_overlap(buffers.activations, activation_bytes,
+                                        buffers.output, output_bytes) ||
+        read_only_buffer_ranges_overlap(buffers.weights, weight_bytes,
+                                        buffers.output, output_bytes) ||
+        read_only_buffer_ranges_overlap(buffers.active_rows,
+                                        sizeof(std::uint32_t), buffers.output,
+                                        output_bytes) ||
+        read_only_buffer_ranges_overlap(buffers.activations, activation_bytes,
+                                        buffers.sink, sink_bytes) ||
+        read_only_buffer_ranges_overlap(buffers.weights, weight_bytes,
+                                        buffers.sink, sink_bytes) ||
+        read_only_buffer_ranges_overlap(buffers.active_rows,
+                                        sizeof(std::uint32_t), buffers.sink,
+                                        sink_bytes) ||
+        buffer_ranges_overlap(buffers.output, output_bytes, buffers.sink,
+                              sink_bytes)) {
+        error = "read-only BF16 mat-vec outputs must not overlap an input or each other";
+        return false;
+    }
+
+    const std::string kernel_name =
+        "strata_mv_bf16_b" + std::to_string(block_size) + "_n" +
+        std::to_string(compiled_columns);
+    id<MTLComputePipelineState> pipeline = nil;
+    if (!validate_pipeline(context, kernel_name.c_str(), block_size, 1u,
+                           "read-only BF16 mat-vec", pipeline, error) ||
+        pipeline == nil) {
+        return false;
+    }
+
+    const MatVecParams params{n_in, n_out};
+    const std::array writable_bindings{
+        EncoderBufferBinding{buffers.output, 2u, output_bytes, alignof(float)},
+        EncoderBufferBinding{buffers.sink, 3u, sink_bytes, alignof(float)},
+    };
+    const std::array read_only_bindings{
+        EncoderReadOnlyBufferBinding{buffers.activations, 0u,
+                                    activation_bytes, activation_alignment},
+        EncoderReadOnlyBufferBinding{buffers.weights, 1u, weight_bytes,
+                                    weight_alignment},
+        EncoderReadOnlyBufferBinding{buffers.active_rows, 4u,
+                                    sizeof(std::uint32_t),
+                                    alignof(std::uint32_t)},
+    };
+    const std::array inline_bytes{
+        EncoderBytesBinding{&params, sizeof(params), 5u},
+    };
+    return encoder.dispatch(kernel_name, {n_out, 1u, 1u},
+                            {block_size, 1u, 1u}, writable_bindings,
+                            read_only_bindings, inline_bytes, {}, error);
 }
 
 bool encode_matvec_impl(Context& context, void* command_handle,
@@ -658,6 +844,33 @@ bool encode_matvec(Context& context, Encoder& encoder,
     return encode_matvec_impl(
         context, nullptr, nullptr, &encoder, format, n_in, n_out,
         active_columns, compiled_columns, buffers, nullptr, n_out, error);
+}
+
+bool encode_bf16_matvec(Context& context, CommandBuffer& command_buffer,
+                        std::uint32_t n_in, std::uint32_t n_out,
+                        std::uint32_t active_columns,
+                        std::uint32_t compiled_columns,
+                        const ReadOnlyBF16MatVecBuffers& buffers,
+                        std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "read-only BF16 mat-vec",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_bf16_matvec(context, encoder, n_in, n_out,
+                                      active_columns, compiled_columns,
+                                      buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_bf16_matvec(Context& context, Encoder& encoder,
+                        std::uint32_t n_in, std::uint32_t n_out,
+                        std::uint32_t active_columns,
+                        std::uint32_t compiled_columns,
+                        const ReadOnlyBF16MatVecBuffers& buffers,
+                        std::string& error) {
+    return encode_bf16_matvec_impl(context, encoder, n_in, n_out,
+                                    active_columns, compiled_columns,
+                                    buffers, error);
 }
 
 bool encode_indexed_head_matvec(

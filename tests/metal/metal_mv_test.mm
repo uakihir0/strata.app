@@ -9806,6 +9806,542 @@ bool run_engine_bf16_numeric_case(
            !sink_buffer.first_unwritten_change(sink_written);
 }
 
+bool run_readonly_bf16_router_width(Context& context) {
+    constexpr std::uint32_t n_in = 2'560u;
+    constexpr std::uint32_t n_out = 512u;
+    constexpr std::uint32_t active_columns = 1u;
+    constexpr std::uint32_t compiled_columns = 1u;
+    constexpr std::uint32_t block_size = 256u;
+    constexpr std::size_t input_bytes = n_in * sizeof(float);
+    constexpr std::size_t weight_bytes =
+        static_cast<std::size_t>(n_out) * n_in * sizeof(std::uint16_t);
+    constexpr std::size_t output_bytes = n_out * sizeof(float);
+    constexpr std::size_t sink_bytes = sizeof(float);
+    const std::string label = "read-only BF16 router width";
+    std::string error;
+
+    std::vector<float> inputs(n_in);
+    for (std::size_t index = 0u; index < inputs.size(); ++index) {
+        const int code = static_cast<int>((index * 23u + 3u) % 67u) - 33;
+        inputs[index] = static_cast<float>(code) * 0.0078125f;
+    }
+    std::vector<std::uint16_t> weights(
+        static_cast<std::size_t>(n_out) * n_in);
+    for (std::size_t index = 0u; index < weights.size(); ++index) {
+        const int code = static_cast<int>((index * 19u + 1u) % 43u) - 21;
+        weights[index] = strata::kernels::bf16_from_f32(
+            static_cast<float>(code) * 0.00390625f);
+    }
+    std::vector<float> expected;
+    check(twin::bf16_matvec_reference(
+              weights, inputs, n_in, n_out, compiled_columns,
+              active_columns, block_size, expected, error),
+          label + " scalar oracle", error);
+    if (expected.size() != n_out) return false;
+
+    twin::GuardedBuffer input_buffer;
+    twin::GuardedBuffer weight_buffer;
+    twin::GuardedBuffer output_buffer;
+    twin::GuardedBuffer sink_buffer;
+    twin::GuardedBuffer active_rows_buffer;
+    check(input_buffer.allocate(context, label + " activations", input_bytes,
+                                error),
+          label + " activation allocation", error);
+    check(weight_buffer.allocate(context, label + " weights", weight_bytes,
+                                 error),
+          label + " weight allocation", error);
+    check(output_buffer.allocate(context, label + " output", output_bytes,
+                                 error),
+          label + " output allocation", error);
+    check(sink_buffer.allocate(context, label + " sink", sink_bytes, error),
+          label + " sink allocation", error);
+    check(active_rows_buffer.allocate(context, label + " active rows",
+                                      sizeof(active_columns), error),
+          label + " active-row allocation", error);
+    if (!input_buffer.view() || !weight_buffer.view() ||
+        !output_buffer.view() || !sink_buffer.view() ||
+        !active_rows_buffer.view()) {
+        return false;
+    }
+    std::memcpy(input_buffer.payload().data(), inputs.data(), input_bytes);
+    std::memcpy(weight_buffer.payload().data(), weights.data(), weight_bytes);
+    std::memset(output_buffer.payload().data(), 0xa5, output_bytes);
+    std::memset(sink_buffer.payload().data(), 0xa5, sink_bytes);
+    const std::uint32_t live_rows = active_columns;
+    std::memcpy(active_rows_buffer.payload().data(), &live_rows,
+                sizeof(live_rows));
+    input_buffer.capture_before_dispatch();
+    weight_buffer.capture_before_dispatch();
+    output_buffer.capture_before_dispatch();
+    sink_buffer.capture_before_dispatch();
+    active_rows_buffer.capture_before_dispatch();
+
+    const ReadOnlyBF16MatVecBuffers buffers{
+        context.buffers().read_only(input_buffer.view()),
+        context.buffers().read_only(weight_buffer.view()),
+        context.buffers().read_only(active_rows_buffer.view()),
+        output_buffer.view(), sink_buffer.view()};
+    auto command = context.make_command_buffer(label, error);
+    check(command != nullptr, label + " command-buffer allocation", error);
+    if (!command) return false;
+    const bool encoded = Encoder::encode(
+        context, *command, label + " segment",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_bf16_matvec(
+                context, encoder, n_in, n_out, active_columns,
+                compiled_columns, buffers, encode_error);
+        },
+        error);
+    check(encoded, label + " 256-thread production-shape encoding", error);
+    if (!encoded) return false;
+    const bool completed = wait_for_engine_command(*command, label, error);
+    check(completed, label + " completion", error);
+    if (!completed) return false;
+
+    const auto expected_bytes = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(expected.data()), output_bytes);
+    const auto mismatch =
+        twin::compare_bytes(output_buffer.payload(), expected_bytes);
+    check(!mismatch, label + " exact 512-expert output",
+          mismatch ? mismatch->reason : std::string{});
+    const std::array<twin::ByteRange, 1> written = {{{0u, output_bytes}}};
+    const bool inputs_unchanged =
+        !input_buffer.first_unwritten_change({}) &&
+        !weight_buffer.first_unwritten_change({}) &&
+        !active_rows_buffer.first_unwritten_change({});
+    const bool output_guards =
+        !output_buffer.first_unwritten_change(written) &&
+        !sink_buffer.first_unwritten_change({});
+    check(inputs_unchanged,
+          label + " const input and active-row bytes remain unchanged");
+    check(output_guards, label + " output and sink guards remain unchanged");
+    return !mismatch && inputs_unchanged && output_guards;
+}
+
+bool run_readonly_bf16_matvec_encoder(Context& context) {
+    constexpr std::uint32_t n_in = 320u;
+    constexpr std::uint32_t n_out = 7u;
+    constexpr std::uint32_t active_columns = 3u;
+    constexpr std::uint32_t compiled_columns = 4u;
+    constexpr std::uint32_t block_size = 160u;
+    constexpr std::size_t input_count =
+        static_cast<std::size_t>(compiled_columns) * n_in;
+    constexpr std::size_t output_count =
+        static_cast<std::size_t>(active_columns) * n_out;
+    constexpr std::size_t output_bytes = output_count * sizeof(float);
+    constexpr std::size_t sink_written_bytes =
+        static_cast<std::size_t>(compiled_columns - active_columns) * n_out *
+        sizeof(float);
+    constexpr std::size_t sink_bytes = sink_written_bytes;
+
+    const std::string label = "read-only BF16 mat-vec";
+    std::string error;
+    std::vector<float> input_values(input_count);
+    for (std::size_t index = 0u; index < input_values.size(); ++index) {
+        const int code = static_cast<int>((index * 17u + 9u) % 47u) - 23;
+        input_values[index] = static_cast<float>(code) * 0.015625f;
+    }
+    std::vector<float> weight_values(
+        static_cast<std::size_t>(n_out) * n_in);
+    for (std::size_t index = 0u; index < weight_values.size(); ++index) {
+        const int code = static_cast<int>((index * 11u + 5u) % 41u) - 20;
+        weight_values[index] = static_cast<float>(code) * 0.0078125f;
+    }
+    std::vector<std::uint16_t> weights(weight_values.size());
+    std::transform(weight_values.begin(), weight_values.end(), weights.begin(),
+                   strata::kernels::bf16_from_f32);
+    std::vector<float> expected;
+    check(twin::bf16_matvec_reference(
+              weights, input_values, n_in, n_out, compiled_columns,
+              active_columns, block_size, expected, error),
+          label + " scalar oracle", error);
+    if (expected.size() !=
+        static_cast<std::size_t>(compiled_columns) * n_out) {
+        return false;
+    }
+
+    const std::size_t activation_bytes =
+        input_values.size() * sizeof(float);
+    const std::size_t weight_bytes = weights.size() * sizeof(std::uint16_t);
+    const std::size_t active_rows_storage_bytes =
+        std::max({output_bytes, sink_bytes, sizeof(active_columns)}) + 4u;
+    twin::GuardedBuffer input_buffer;
+    twin::GuardedBuffer weight_buffer;
+    twin::GuardedBuffer output_buffer;
+    twin::GuardedBuffer sink_buffer;
+    twin::GuardedBuffer active_rows_buffer;
+    check(input_buffer.allocate(context, label + " activations",
+                                activation_bytes, error),
+          label + " activation allocation", error);
+    check(weight_buffer.allocate(context, label + " weights",
+                                 weight_bytes + 4u, error),
+          label + " weight allocation", error);
+    check(output_buffer.allocate(context, label + " output", output_bytes,
+                                 error),
+          label + " output allocation", error);
+    check(sink_buffer.allocate(context, label + " sink", sink_bytes, error),
+          label + " sink allocation", error);
+    check(active_rows_buffer.allocate(context, label + " active rows",
+                                      active_rows_storage_bytes, error),
+          label + " active-row allocation", error);
+    if (!input_buffer.view() || !weight_buffer.view() ||
+        !output_buffer.view() || !sink_buffer.view() ||
+        !active_rows_buffer.view()) {
+        return false;
+    }
+
+    std::memcpy(input_buffer.payload().data(), input_values.data(),
+                activation_bytes);
+    std::memcpy(weight_buffer.payload().data(), weights.data(), weight_bytes);
+    std::memset(weight_buffer.payload().data() + weight_bytes, 0xa5, 4u);
+    const std::uint32_t live_rows = active_columns;
+    std::memcpy(active_rows_buffer.payload().data(), &live_rows,
+                sizeof(live_rows));
+    std::memset(active_rows_buffer.payload().data() + sizeof(live_rows), 0xa5,
+                active_rows_storage_bytes - sizeof(live_rows));
+
+    const std::vector<std::uint8_t> output_poison(output_bytes, 0xa5u);
+    const std::vector<std::uint8_t> sink_poison(sink_bytes, 0xa5u);
+    const auto reset_outputs = [&] {
+        std::memcpy(output_buffer.payload().data(), output_poison.data(),
+                    output_bytes);
+        std::memcpy(sink_buffer.payload().data(), sink_poison.data(),
+                    sink_bytes);
+    };
+    reset_outputs();
+    input_buffer.capture_before_dispatch();
+    weight_buffer.capture_before_dispatch();
+    active_rows_buffer.capture_before_dispatch();
+    output_buffer.capture_before_dispatch();
+    sink_buffer.capture_before_dispatch();
+
+    const ReadOnlyBF16MatVecBuffers buffers{
+        context.buffers().read_only(input_buffer.view()),
+        context.buffers().read_only(weight_buffer.view()),
+        context.buffers().read_only(active_rows_buffer.view()),
+        output_buffer.view(), sink_buffer.view()};
+    const auto expected_output = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(expected.data()), output_bytes);
+    const auto expected_sink = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(expected.data() + output_count),
+        sink_written_bytes);
+    const std::array<twin::ByteRange, 1> output_written =
+        {{{0u, output_bytes}}};
+    const std::array<twin::ByteRange, 1> sink_written =
+        {{{0u, sink_written_bytes}}};
+
+    auto standalone = context.make_command_buffer(label + " standalone", error);
+    check(standalone != nullptr, label + " standalone command buffer", error);
+    if (!standalone) return false;
+    const bool standalone_encoded = encode_bf16_matvec(
+        context, *standalone, n_in, n_out, active_columns, compiled_columns,
+        buffers, error);
+    check(standalone_encoded, label + " standalone encoding", error);
+    if (!standalone_encoded) return false;
+    const bool standalone_completed =
+        wait_for_engine_command(*standalone, label + " standalone", error);
+    check(standalone_completed, label + " standalone completion", error);
+    if (!standalone_completed) return false;
+    const auto standalone_output_mismatch =
+        twin::compare_bytes(output_buffer.payload(), expected_output);
+    const auto standalone_sink_mismatch =
+        twin::compare_bytes(
+            std::span<const std::uint8_t>(sink_buffer.payload().data(),
+                                          sink_written_bytes),
+            expected_sink);
+    check(!standalone_output_mismatch,
+          label + " standalone exact output",
+          standalone_output_mismatch ? standalone_output_mismatch->reason
+                                     : std::string{});
+    check(!standalone_sink_mismatch,
+          label + " standalone exact padded output",
+          standalone_sink_mismatch ? standalone_sink_mismatch->reason
+                                   : std::string{});
+
+    reset_outputs();
+    auto shared = context.make_command_buffer(label + " shared", error);
+    check(shared != nullptr, label + " shared command buffer", error);
+    if (!shared) return false;
+    const bool shared_encoded = Encoder::encode(
+        context, *shared, label + " shared segment",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_bf16_matvec(
+                context, encoder, n_in, n_out, active_columns,
+                compiled_columns, buffers, encode_error);
+        },
+        error);
+    check(shared_encoded, label + " caller-owned Encoder encoding", error);
+    if (!shared_encoded) return false;
+    const bool shared_completed =
+        wait_for_engine_command(*shared, label + " shared", error);
+    check(shared_completed, label + " caller-owned completion", error);
+    if (!shared_completed) return false;
+    const auto shared_output_mismatch =
+        twin::compare_bytes(output_buffer.payload(), expected_output);
+    const auto shared_sink_mismatch = twin::compare_bytes(
+        std::span<const std::uint8_t>(sink_buffer.payload().data(),
+                                      sink_written_bytes),
+        expected_sink);
+    check(!shared_output_mismatch,
+          label + " caller-owned exact output",
+          shared_output_mismatch ? shared_output_mismatch->reason
+                                 : std::string{});
+    check(!shared_sink_mismatch,
+          label + " caller-owned exact padded output",
+          shared_sink_mismatch ? shared_sink_mismatch->reason
+                               : std::string{});
+
+    // Full-mode inputs may share one read-only arena; the encoder must allow
+    // read-only/read-only overlap while still separating outputs.
+    std::vector<std::uint16_t> aliased_weights(weight_bytes / sizeof(std::uint16_t));
+    std::memcpy(aliased_weights.data(), input_values.data(), weight_bytes);
+    std::vector<float> aliased_expected;
+    check(twin::bf16_matvec_reference(
+              aliased_weights, input_values, n_in, n_out, compiled_columns,
+              active_columns, block_size, aliased_expected, error),
+          label + " aliased-read-only scalar oracle", error);
+    reset_outputs();
+    auto aliased_command =
+        context.make_command_buffer(label + " read-only input alias", error);
+    check(aliased_command != nullptr,
+          label + " read-only input alias command buffer", error);
+    if (!aliased_command) return false;
+    ReadOnlyBF16MatVecBuffers aliased_inputs = buffers;
+    aliased_inputs.weights = aliased_inputs.activations;
+    const bool aliased_encoded = encode_bf16_matvec(
+        context, *aliased_command, n_in, n_out, active_columns,
+        compiled_columns, aliased_inputs, error);
+    check(aliased_encoded,
+          label + " permits overlapping read-only inputs", error);
+    if (!aliased_encoded) return false;
+    const bool aliased_completed = wait_for_engine_command(
+        *aliased_command, label + " read-only input alias", error);
+    check(aliased_completed,
+          label + " read-only input alias completion", error);
+    if (!aliased_completed) return false;
+    const auto aliased_output_bytes = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(aliased_expected.data()),
+        output_bytes);
+    const auto aliased_sink_bytes = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(aliased_expected.data() +
+                                              output_count),
+        sink_written_bytes);
+    const auto aliased_output_mismatch =
+        twin::compare_bytes(output_buffer.payload(), aliased_output_bytes);
+    const auto aliased_sink_mismatch = twin::compare_bytes(
+        std::span<const std::uint8_t>(sink_buffer.payload().data(),
+                                      sink_written_bytes),
+        aliased_sink_bytes);
+    check(!aliased_output_mismatch,
+          label + " overlapping read-only output matches oracle",
+          aliased_output_mismatch ? aliased_output_mismatch->reason
+                                  : std::string{});
+    check(!aliased_sink_mismatch,
+          label + " overlapping read-only sink matches oracle",
+          aliased_sink_mismatch ? aliased_sink_mismatch->reason
+                                : std::string{});
+
+    const auto expect_rejected = [&](
+        const std::string& case_label,
+        const ReadOnlyBF16MatVecBuffers& candidate,
+        std::uint32_t candidate_n_in,
+        std::string_view error_fragment) {
+        auto command = context.make_command_buffer(case_label, error);
+        check(command != nullptr, case_label + " command buffer", error);
+        if (!command) return false;
+        const bool encoded = encode_bf16_matvec(
+            context, *command, candidate_n_in, n_out, active_columns,
+            compiled_columns, candidate, error);
+        const bool rejected = !encoded;
+        const bool discarded = command->unsafe_native_handle() == nullptr;
+        const bool expected_error = error.find(error_fragment) != std::string::npos;
+        check(rejected && expected_error,
+              case_label + " rejects at the intended validation", error);
+        check(discarded, case_label + " discards its unsubmitted command");
+        return rejected && discarded && expected_error;
+    };
+
+    bool rejected_cases = true;
+    rejected_cases &= expect_rejected(
+        label + " invalid width", buffers, n_in + 1u, "n_in must be");
+    ReadOnlyBF16MatVecBuffers short_weights = buffers;
+    short_weights.weights = buffers.weights.slice(0u, weight_bytes - 2u);
+    rejected_cases &= expect_rejected(
+        label + " undersized weights", short_weights, n_in, "undersized");
+    ReadOnlyBF16MatVecBuffers misaligned_weights = buffers;
+    misaligned_weights.weights = context.buffers().read_only(
+        weight_buffer.view().slice(2u, weight_bytes));
+    rejected_cases &= expect_rejected(
+        label + " misaligned weights", misaligned_weights, n_in,
+        "misaligned");
+    ReadOnlyBF16MatVecBuffers misaligned_activations = buffers;
+    misaligned_activations.activations = context.buffers().read_only(
+        input_buffer.view().slice(sizeof(float),
+                                  activation_bytes - sizeof(float)));
+    rejected_cases &= expect_rejected(
+        label + " misaligned activations", misaligned_activations, n_in,
+        "misaligned");
+    ReadOnlyBF16MatVecBuffers misaligned_rows = buffers;
+    misaligned_rows.active_rows = context.buffers().read_only(
+        active_rows_buffer.view().slice(1u,
+                                        active_rows_storage_bytes - 1u));
+    rejected_cases &= expect_rejected(
+        label + " misaligned active rows", misaligned_rows, n_in,
+        "misaligned");
+
+    const std::uint32_t wrong_rows = active_columns - 1u;
+    std::memcpy(active_rows_buffer.payload().data(), &wrong_rows,
+                sizeof(wrong_rows));
+    rejected_cases &= expect_rejected(
+        label + " wrong active-row value", buffers, n_in,
+        "does not match active columns");
+    std::memcpy(active_rows_buffer.payload().data(), &live_rows,
+                sizeof(live_rows));
+
+    ReadOnlyBF16MatVecBuffers empty_weights = buffers;
+    empty_weights.weights = {};
+    rejected_cases &= expect_rejected(
+        label + " unowned weights", empty_weights, n_in,
+        "not owned by this Context");
+
+    ReadOnlyBF16MatVecBuffers activation_output_alias = buffers;
+    activation_output_alias.output = input_buffer.view().slice(0u, output_bytes);
+    rejected_cases &= expect_rejected(
+        label + " activation/output alias", activation_output_alias, n_in,
+        "overlap");
+    ReadOnlyBF16MatVecBuffers activation_sink_alias = buffers;
+    activation_sink_alias.sink = input_buffer.view().slice(0u, sink_bytes);
+    rejected_cases &= expect_rejected(
+        label + " activation/sink alias", activation_sink_alias, n_in,
+        "overlap");
+    ReadOnlyBF16MatVecBuffers weight_output_alias = buffers;
+    weight_output_alias.output = weight_buffer.view().slice(0u, output_bytes);
+    rejected_cases &= expect_rejected(
+        label + " weight/output alias", weight_output_alias, n_in, "overlap");
+    ReadOnlyBF16MatVecBuffers weight_sink_alias = buffers;
+    weight_sink_alias.sink = weight_buffer.view().slice(0u, sink_bytes);
+    rejected_cases &= expect_rejected(
+        label + " weight/sink alias", weight_sink_alias, n_in, "overlap");
+    ReadOnlyBF16MatVecBuffers rows_output_alias = buffers;
+    rows_output_alias.output =
+        active_rows_buffer.view().slice(0u, output_bytes);
+    rejected_cases &= expect_rejected(
+        label + " active-row/output alias", rows_output_alias, n_in,
+        "overlap");
+    ReadOnlyBF16MatVecBuffers rows_sink_alias = buffers;
+    rows_sink_alias.sink = active_rows_buffer.view().slice(0u, sink_bytes);
+    rejected_cases &= expect_rejected(
+        label + " active-row/sink alias", rows_sink_alias, n_in, "overlap");
+    ReadOnlyBF16MatVecBuffers output_sink_alias = buffers;
+    output_sink_alias.sink = output_buffer.view().slice(0u, sink_bytes);
+    rejected_cases &= expect_rejected(
+        label + " output/sink alias", output_sink_alias, n_in, "overlap");
+
+    const long page_size = getpagesize();
+    void* alias_memory = nullptr;
+    if (page_size <= 0 ||
+        posix_memalign(&alias_memory, static_cast<std::size_t>(page_size),
+                       static_cast<std::size_t>(page_size)) != 0) {
+        check(false, label + " cross-handle alias allocation");
+        return false;
+    }
+    const std::size_t alias_bytes = static_cast<std::size_t>(page_size);
+    std::shared_ptr<void> alias_lifetime(alias_memory, std::free);
+    std::memset(alias_memory, 0xa5, alias_bytes);
+    std::memcpy(alias_memory, input_values.data(), activation_bytes);
+    const std::vector<std::uint8_t> alias_before(
+        static_cast<const std::uint8_t*>(alias_memory),
+        static_cast<const std::uint8_t*>(alias_memory) + alias_bytes);
+    const BufferRef alias_input = context.buffers().wrap_no_copy(
+        label + " cross-handle input", alias_memory, alias_bytes,
+        alias_lifetime, error);
+    const BufferRef alias_output = context.buffers().wrap_no_copy(
+        label + " cross-handle output", alias_memory, alias_bytes,
+        alias_lifetime, error);
+    const bool distinct_handles = alias_input && alias_output &&
+                                 alias_input.handle != alias_output.handle;
+    check(distinct_handles,
+          label + " uses distinct no-copy Metal handles", error);
+    if (!distinct_handles) return false;
+    ReadOnlyBF16MatVecBuffers cross_handle_alias = buffers;
+    cross_handle_alias.activations = context.buffers()
+                                        .read_only(alias_input)
+                                        .slice(0u, activation_bytes);
+    cross_handle_alias.output = alias_output.slice(64u, output_bytes);
+    auto cross_handle_command =
+        context.make_command_buffer(label + " cross-handle alias", error);
+    check(cross_handle_command != nullptr,
+          label + " cross-handle command buffer", error);
+    if (!cross_handle_command) return false;
+    const bool cross_handle_rejected =
+        !encode_bf16_matvec(context, *cross_handle_command, n_in, n_out,
+                            active_columns, compiled_columns,
+                            cross_handle_alias, error) &&
+        error.find("overlap") != std::string::npos &&
+        cross_handle_command->unsafe_native_handle() == nullptr;
+    check(cross_handle_rejected,
+          label + " rejects partial CPU-backing overlap across handles",
+          error);
+    const bool alias_bytes_unchanged = std::equal(
+        alias_before.begin(), alias_before.end(),
+        static_cast<const std::uint8_t*>(alias_memory));
+    check(alias_bytes_unchanged,
+          label + " rejected cross-handle views leave backing bytes unchanged");
+
+    // A valid first dispatch followed by a rejected one must discard the
+    // caller-owned command buffer instead of allowing the first write through.
+    reset_outputs();
+    ReadOnlyBF16MatVecBuffers late_failure = buffers;
+    late_failure.weights = buffers.weights.slice(0u, weight_bytes - 2u);
+    auto rollback = context.make_command_buffer(label + " late failure", error);
+    check(rollback != nullptr, label + " rollback command buffer", error);
+    if (!rollback) return false;
+    const bool rollback_accepted = Encoder::encode(
+        context, *rollback, label + " rollback segment",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_bf16_matvec(context, encoder, n_in, n_out,
+                                    active_columns, compiled_columns, buffers,
+                                    encode_error)) {
+                return false;
+            }
+            return encode_bf16_matvec(
+                context, encoder, n_in, n_out, active_columns,
+                compiled_columns, late_failure, encode_error);
+        },
+        error);
+    const bool rollback_discarded =
+        !rollback_accepted && rollback->unsafe_native_handle() == nullptr &&
+        error.find("undersized") != std::string::npos;
+    check(rollback_discarded,
+          label + " caller-owned late failure discards its first dispatch",
+          error);
+    const bool outputs_unchanged =
+        std::equal(output_poison.begin(), output_poison.end(),
+                   output_buffer.payload().begin()) &&
+        std::equal(sink_poison.begin(), sink_poison.end(),
+                   sink_buffer.payload().begin());
+    check(outputs_unchanged,
+          label + " discarded caller segment leaves output bytes untouched");
+
+    const bool inputs_unchanged =
+        !input_buffer.first_unwritten_change({}) &&
+        !weight_buffer.first_unwritten_change({}) &&
+        !active_rows_buffer.first_unwritten_change({});
+    const bool output_guards =
+        !output_buffer.first_unwritten_change(output_written) &&
+        !sink_buffer.first_unwritten_change(sink_written);
+    check(inputs_unchanged,
+          label + " read-only inputs and row metadata remain unchanged");
+    check(output_guards, label + " output and sink guards remain unchanged");
+
+    return !standalone_output_mismatch && !standalone_sink_mismatch &&
+           !shared_output_mismatch && !shared_sink_mismatch &&
+           !aliased_output_mismatch && !aliased_sink_mismatch &&
+           rejected_cases && cross_handle_rejected && alias_bytes_unchanged &&
+           rollback_discarded && outputs_unchanged &&
+           inputs_unchanged && output_guards;
+}
+
 bool run_q8_1_engine_encoder(Context& context) {
     constexpr std::uint32_t width = 640u;
     constexpr std::uint32_t rows = 3u;
@@ -11311,6 +11847,8 @@ int main(int argc, char** argv) {
     if (!run_q8_1_buffer_alias_contract(*context)) ++g_failures;
     if (!run_engine_cross_handle_alias_contract(*context)) ++g_failures;
     if (!run_matvec_engine_encoders(*context)) ++g_failures;
+    if (!run_readonly_bf16_matvec_encoder(*context)) ++g_failures;
+    if (!run_readonly_bf16_router_width(*context)) ++g_failures;
     if (!run_indexed_head_engine_encoders(*context)) ++g_failures;
     if (!run_q8_1_to_q2_0_engine_chain(*context)) ++g_failures;
     std::printf("metal_mv_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
