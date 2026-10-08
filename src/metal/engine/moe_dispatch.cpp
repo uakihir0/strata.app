@@ -2,6 +2,7 @@
 #include "strata/metal/moe_dispatch.hpp"
 
 #include "strata/metal/encoder.hpp"
+#include "strata/metal/mv_dispatch.hpp"
 #include "strata/metal/tiered.hpp"
 
 #include "../kernels/common/types.h"
@@ -732,6 +733,152 @@ bool encode_moe_combine_impl(Context& context, Encoder& encoder,
                            error);
 }
 
+bool encode_moe_routed_ffn_impl(Context& context, Encoder& encoder,
+                                std::uint32_t rows,
+                                std::uint32_t experts,
+                                std::uint32_t layer,
+                                MoeExpertFormat gate_up_format,
+                                MoeDownFormat down_format,
+                                const MoeRoutedFFNBuffers& buffers,
+                                std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "routed MoE FFN requires ordered dispatch boundaries";
+        return false;
+    }
+    if (rows == 0u || rows > 8u || experts == 0u ||
+        experts > kTieredMaxExperts || layer >= kTieredMaxLayers) {
+        error = "routed MoE FFN requires 1..8 rows, 1..512 experts, and a valid layer";
+        return false;
+    }
+    if (moe_expert_kernel(gate_up_format) == nullptr ||
+        moe_down_kernel(down_format) == nullptr) {
+        error = "routed MoE FFN weight format is unsupported";
+        return false;
+    }
+
+    const std::uint64_t entries =
+        static_cast<std::uint64_t>(rows) * kMoeTopK;
+    const std::uint64_t address_count =
+        (static_cast<std::uint64_t>(layer) + 1u) * experts;
+    const std::uint64_t plan_count =
+        static_cast<std::uint64_t>(layer) + 1u;
+    std::size_t addresses_bytes = 0u;
+    std::size_t input_bytes = 0u;
+    std::size_t plans_bytes = 0u;
+    std::size_t f32_bytes = 0u;
+    std::size_t down_activations_bytes = 0u;
+    std::size_t parts_bytes = 0u;
+    if (entries > std::numeric_limits<std::uint32_t>::max() ||
+        !checked_bytes(address_count, sizeof(MoeExpertAddress),
+                       addresses_bytes) ||
+        !checked_bytes(static_cast<std::uint64_t>(rows) *
+                           kMoeInputBlocksPerRow,
+                       sizeof(Q81), input_bytes) ||
+        !checked_bytes(plan_count, sizeof(TieredMoePlan), plans_bytes) ||
+        !checked_bytes(entries * kMoeExpertOutputWidth, sizeof(float),
+                       f32_bytes) ||
+        !checked_bytes(entries * kMoeDownInputBlocksPerEntry, sizeof(Q81),
+                       down_activations_bytes) ||
+        !checked_bytes(entries * kMoeDownOutputWidth, sizeof(float),
+                       parts_bytes)) {
+        error = "routed MoE FFN shape exceeds the host byte range";
+        return false;
+    }
+
+    if (!buffers.addresses || !context.buffers().owns(buffers.addresses) ||
+        buffers.addresses.length() < addresses_bytes ||
+        buffers.addresses.offset() % alignof(MoeExpertAddress) != 0u) {
+        error = "routed MoE FFN address table is stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (!buffers.input_activations ||
+        !context.buffers().owns(buffers.input_activations) ||
+        buffers.input_activations.length() < input_bytes ||
+        buffers.input_activations.offset() % alignof(Q81) != 0u) {
+        error = "routed MoE FFN input activations are stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (!buffers.plans || !context.buffers().owns(buffers.plans) ||
+        buffers.plans.length() < plans_bytes ||
+        buffers.plans.offset() % alignof(TieredMoePlan) != 0u) {
+        error = "routed MoE FFN plan table is stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (views_overlap(buffers.addresses, buffers.input_activations) ||
+        views_overlap(buffers.addresses, buffers.plans) ||
+        views_overlap(buffers.input_activations, buffers.plans)) {
+        error = "routed MoE FFN read-only inputs must be disjoint";
+        return false;
+    }
+    const std::array writable{
+        std::pair{buffers.gate, f32_bytes},
+        std::pair{buffers.up, f32_bytes},
+        std::pair{buffers.hidden, f32_bytes},
+        std::pair{buffers.down_activations, down_activations_bytes},
+        std::pair{buffers.parts, parts_bytes},
+    };
+    for (std::size_t i = 0; i < writable.size(); ++i) {
+        const BufferRef output = writable[i].first;
+        if (!output || !context.buffers().owns(output) ||
+            output.length < writable[i].second) {
+            error = "routed MoE FFN scratch output is stale, foreign or undersized";
+            return false;
+        }
+        const std::size_t alignment =
+            i == 3u ? alignof(Q81) : alignof(float);
+        if (output.offset % alignment != 0u) {
+            error = "routed MoE FFN scratch output is misaligned";
+            return false;
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (views_overlap(output, writable[j].first)) {
+                error = "routed MoE FFN scratch outputs must be disjoint";
+                return false;
+            }
+        }
+        if (views_overlap(buffers.addresses, output) ||
+            views_overlap(buffers.input_activations, output) ||
+            views_overlap(buffers.plans, output)) {
+            error = "routed MoE FFN scratch outputs must be disjoint from inputs";
+            return false;
+        }
+    }
+
+    const MoeGroupedExpertBuffers gate_up{
+        buffers.addresses, buffers.input_activations, buffers.plans,
+        buffers.gate, buffers.up};
+    if (!encode_moe_experts_impl(context, encoder, rows, experts, layer,
+                                 gate_up_format, gate_up, error)) {
+        return false;
+    }
+
+    const MoeSwiGLUBuffers swiglu{
+        context.buffers().read_only(buffers.gate),
+        context.buffers().read_only(buffers.up),
+        buffers.hidden};
+    if (!encode_moe_swiglu_impl(context, encoder, rows, false, swiglu,
+                                error)) {
+        return false;
+    }
+
+    const Q8_1Buffers quantized_hidden{
+        buffers.hidden, buffers.down_activations};
+    if (!encode_q8_1(context, encoder,
+                     static_cast<std::uint32_t>(entries),
+                     kMoeExpertOutputWidth, quantized_hidden, error)) {
+        return false;
+    }
+
+    const MoeGroupedDownBuffers down{
+        buffers.addresses,
+        context.buffers().read_only(buffers.down_activations),
+        buffers.plans,
+        buffers.parts};
+    return encode_moe_down_impl(context, encoder, rows, experts, layer,
+                                down_format, down, error);
+}
+
 }  // namespace
 
 bool encode_moe_route(Context& context, Encoder& encoder,
@@ -862,6 +1009,35 @@ bool encode_moe_combine(Context& context, CommandBuffer& command_buffer,
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_moe_combine_impl(context, encoder, rows, buffers,
                                            encode_error);
+        },
+        error);
+}
+
+bool encode_moe_routed_ffn(Context& context, Encoder& encoder,
+                           std::uint32_t rows, std::uint32_t experts,
+                           std::uint32_t layer,
+                           MoeExpertFormat gate_up_format,
+                           MoeDownFormat down_format,
+                           const MoeRoutedFFNBuffers& buffers,
+                           std::string& error) {
+    return encode_moe_routed_ffn_impl(
+        context, encoder, rows, experts, layer, gate_up_format, down_format,
+        buffers, error);
+}
+
+bool encode_moe_routed_ffn(Context& context, CommandBuffer& command_buffer,
+                           std::uint32_t rows, std::uint32_t experts,
+                           std::uint32_t layer,
+                           MoeExpertFormat gate_up_format,
+                           MoeDownFormat down_format,
+                           const MoeRoutedFFNBuffers& buffers,
+                           std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "routed MoE FFN",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_moe_routed_ffn_impl(
+                context, encoder, rows, experts, layer, gate_up_format,
+                down_format, buffers, encode_error);
         },
         error);
 }

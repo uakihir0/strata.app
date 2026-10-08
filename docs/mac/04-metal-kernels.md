@@ -2457,6 +2457,23 @@ ordered dispatch boundary. The typed encoder and scalar oracle cover the
 standalone combine and the composed shared-expert chain; production Window
 scheduling remains unfinished.
 
+`encode_moe_routed_ffn` composes the routed path for T=1..8 in this order:
+grouped gate/up, routed SwiGLU, Q8_1 quantization of the 640-wide hidden rows,
+then grouped down projection into original route order. It validates every
+scratch extent and alignment, Context ownership, and scratch/input and
+scratch/scratch disjointness before encoding, and requires the address,
+activation and plan input views to be mutually disjoint. Full-mode callers may
+place the plan dispatch and this composition in the same ordered Encoder
+segment. A tiered caller must wait for successful `ExpertStore` resolution
+before submitting this consumer; it must not queue the consumer behind an
+unresolved plan. Propagate caller-owned failures through the enclosing
+`Encoder::encode` callback so prior dispatches are discarded. This composition
+requires the plan partition and selected expert addresses to come from trusted
+engine outputs and remain valid until GPU completion; it does not read back or
+fully validate GPU-produced plan arrays. It does not include the shared
+expert, combine, later Window layers or state commit, and does not establish
+end-to-end MoE inference.
+
 **What the FFN reads per layer, T = 1:** the router (2.6 MB for 512 experts), 10 experts (13.8 MB for Q2_0, three
 slabs of 460,800 B each), and the shared expert. For T > 1, rows that share an expert share its read, which is why
 the groups exist.

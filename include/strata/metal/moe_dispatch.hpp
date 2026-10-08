@@ -62,6 +62,23 @@ struct MoeGroupedDownBuffers {
     BufferRef parts;
 };
 
+struct MoeRoutedFFNBuffers {
+    /// Row-major `[layer, expert, gate/up/down]` GPU-address table.
+    ReadOnlyBufferRef addresses;
+    /// Q8_1 rows of the FFN input, with 80 blocks for each token.
+    ReadOnlyBufferRef input_activations;
+    /// `TieredMoePlan` table containing the matching layer plan.
+    ReadOnlyBufferRef plans;
+    /// Routed gate, up and SwiGLU scratch: `[rows * 10, 640]` F32.
+    BufferRef gate;
+    BufferRef up;
+    BufferRef hidden;
+    /// Q8_1 quantization of `hidden`: `[rows * 10, 20]` blocks.
+    BufferRef down_activations;
+    /// Routed down results in original route order: `[rows * 10, 2560]`.
+    BufferRef parts;
+};
+
 struct MoeSwiGLUBuffers {
     ReadOnlyBufferRef gate;
     ReadOnlyBufferRef up;
@@ -156,6 +173,31 @@ bool encode_moe_down(Context& context, CommandBuffer& command_buffer,
                      std::uint32_t layer, MoeDownFormat format,
                      const MoeGroupedDownBuffers& buffers,
                      std::string& error);
+
+/// Encode the routed expert FFN in order: grouped gate/up, SwiGLU, Q8_1 and
+/// grouped down projection. The supplied plan must have been produced for the
+/// same rows, experts and layer. In tiered mode, call this only after successful
+/// plan resolution; in full mode it may follow the plan dispatch in the same
+/// ordered segment. The address, activation and plan inputs must be disjoint.
+/// Scratch outputs must be mutually disjoint and disjoint from every input.
+/// Plan contents and selected role addresses must come from trusted engine
+/// outputs and remain valid until command completion; this encoder does not
+/// read back or fully validate GPU-produced plan arrays.
+bool encode_moe_routed_ffn(Context& context, Encoder& encoder,
+                           std::uint32_t rows, std::uint32_t experts,
+                           std::uint32_t layer,
+                           MoeExpertFormat gate_up_format,
+                           MoeDownFormat down_format,
+                           const MoeRoutedFFNBuffers& buffers,
+                           std::string& error);
+/// Standalone transactional form. A failure discards every earlier stage.
+bool encode_moe_routed_ffn(Context& context, CommandBuffer& command_buffer,
+                           std::uint32_t rows, std::uint32_t experts,
+                           std::uint32_t layer,
+                           MoeExpertFormat gate_up_format,
+                           MoeDownFormat down_format,
+                           const MoeRoutedFFNBuffers& buffers,
+                           std::string& error);
 
 /// Encode SwiGLU for routed MoE entries (rows * 10) or shared-expert rows.
 /// Gate and up are read-only F32 arrays of 640 values per entry. The output

@@ -4484,6 +4484,479 @@ bool test_moe_gu_q2_0_inputs(Context& context, twin::InputSet set,
     return completed;
 }
 
+bool test_moe_routed_ffn_composition(Context& context, std::uint32_t rows,
+                                    const twin::Options& options) {
+    constexpr std::uint32_t experts = 512u;
+    constexpr std::uint32_t layer = kMoeGroupedLayer;
+    constexpr twin::InputSet set = twin::InputSet::fixture;
+    const std::string label =
+        "MoE routed FFN composition rows=" + std::to_string(rows);
+    const std::vector<std::uint32_t> active_experts =
+        make_moe_q2_experts(experts);
+    std::vector<std::int32_t> expert_slots(experts, -1);
+    for (std::uint32_t slot = 0u; slot < active_experts.size(); ++slot) {
+        expert_slots[active_experts[slot]] = static_cast<std::int32_t>(slot);
+    }
+
+    std::vector<std::int32_t> ids(
+        static_cast<std::size_t>(rows) * kTopK);
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        for (std::uint32_t rank = 0u; rank < kTopK; ++rank) {
+            ids[static_cast<std::size_t>(row) * kTopK + rank] =
+                static_cast<std::int32_t>(
+                    active_experts[(rank + row) % active_experts.size()]);
+        }
+    }
+    const std::size_t table_entries =
+        static_cast<std::size_t>(layer + 1u) * experts;
+    std::vector<std::int32_t> resident(table_entries, 1);
+    std::vector<float> initial_usage(table_entries);
+    for (std::size_t index = 0u; index < initial_usage.size(); ++index) {
+        initial_usage[index] =
+            0.25f + static_cast<float>(index % 31u) * 0.0625f;
+    }
+    TieredMoePlan expected_plan{};
+    std::vector<float> expected_usage;
+    std::string err;
+    check(twin::moe_plan_reference(
+              ids, rows, experts, false, layer, resident, initial_usage,
+              expected_plan, expected_usage, err),
+          std::string(label) + " CPU plan oracle", err);
+    if (expected_usage.size() != initial_usage.size()) return false;
+
+    std::vector<block_q2_0> gate_weights;
+    std::vector<block_q2_0> up_weights;
+    std::vector<block_q2_0> down_weights;
+    const std::uint64_t seed =
+        options.seed ^ (static_cast<std::uint64_t>(experts) << 32u) ^
+        static_cast<std::uint64_t>(set);
+    make_moe_q2_weights(set, seed, gate_weights, up_weights);
+    make_moe_down_q2_0_weights(set, seed ^ 0x9e3779b97f4a7c15ull,
+                               down_weights);
+
+    std::vector<Q81> input_activations;
+    check(make_moe_q2_activations(rows, set, seed ^ 0x51f15eull,
+                                  input_activations, err),
+          std::string(label) + " input Q8_1 oracle", err);
+    std::vector<twin::tf> expected_gate;
+    std::vector<twin::tf> expected_up;
+    check(twin::moe_gu_q2_0_reference(
+              gate_weights, up_weights, input_activations, expert_slots,
+              expected_plan, rows, expected_gate, expected_up, err),
+          std::string(label) + " gate/up oracle", err);
+    if (expected_gate.size() !=
+            static_cast<std::size_t>(rows) * kTopK * kMoeExpertWidth ||
+        expected_up.size() != expected_gate.size()) {
+        check(false, std::string(label) + " gate/up oracle shape");
+        return false;
+    }
+
+    std::vector<float> expected_gate_f32(expected_gate.size());
+    std::vector<float> expected_up_f32(expected_up.size());
+    for (std::size_t index = 0u; index < expected_gate.size(); ++index) {
+        expected_gate_f32[index] = expected_gate[index].value;
+        expected_up_f32[index] = expected_up[index].value;
+    }
+    std::vector<twin::tf> expected_hidden;
+    check(twin::moe_swiglu_reference(expected_gate_f32, expected_up_f32,
+                                     expected_hidden, err),
+          std::string(label) + " SwiGLU oracle", err);
+    if (expected_hidden.size() != expected_gate.size()) {
+        check(false, std::string(label) + " SwiGLU oracle shape");
+        return false;
+    }
+    std::vector<float> hidden_f32(expected_hidden.size());
+    for (std::size_t index = 0u; index < expected_hidden.size(); ++index) {
+        hidden_f32[index] = expected_hidden[index].value;
+    }
+    std::vector<Q81> expected_down_activations;
+    check(twin::quantize_q8_1_reference(
+              hidden_f32, kMoeExpertWidth, rows * kTopK,
+              expected_down_activations, err),
+          std::string(label) + " hidden Q8_1 oracle", err);
+    std::vector<twin::tf> expected_parts;
+    check(twin::moe_down_q2_0_reference(
+              down_weights, expected_down_activations, expert_slots,
+              expected_plan, rows, expected_parts, err),
+          std::string(label) + " down oracle", err);
+    if (expected_parts.size() !=
+        static_cast<std::size_t>(rows) * kTopK * kMoeDownWidth) {
+        check(false, std::string(label) + " down oracle shape");
+        return false;
+    }
+
+    std::vector<MoeExpertAddress> addresses(table_entries);
+    const std::size_t gate_up_bytes_per_expert =
+        static_cast<std::size_t>(kMoeExpertWidth) *
+        kMoeQ2BlocksPerRow * sizeof(block_q2_0);
+    const std::size_t down_bytes_per_expert =
+        static_cast<std::size_t>(kMoeDownWidth) *
+        kMoeDownQ2BlocksPerRow * sizeof(block_q2_0);
+    twin::GuardedBuffer gate_weight_buffer;
+    twin::GuardedBuffer up_weight_buffer;
+    twin::GuardedBuffer down_weight_buffer;
+    twin::GuardedBuffer address_buffer;
+    twin::GuardedBuffer ids_buffer;
+    twin::GuardedBuffer resident_buffer;
+    twin::GuardedBuffer usage_buffer;
+    twin::GuardedBuffer plans_buffer;
+    twin::GuardedBuffer input_buffer;
+    twin::GuardedBuffer gate_buffer;
+    twin::GuardedBuffer up_buffer;
+    twin::GuardedBuffer hidden_buffer;
+    twin::GuardedBuffer down_activations_buffer;
+    twin::GuardedBuffer parts_buffer;
+    const std::size_t f32_bytes =
+        expected_gate.size() * sizeof(float);
+    const std::size_t down_activations_bytes =
+        expected_down_activations.size() * sizeof(Q81);
+    const std::size_t parts_bytes = expected_parts.size() * sizeof(float);
+    std::array<TieredMoePlan, layer + 1u> expected_plans{};
+    expected_plans[layer] = expected_plan;
+    const std::size_t plans_bytes =
+        expected_plans.size() * sizeof(TieredMoePlan);
+    const std::size_t input_bytes =
+        input_activations.size() * sizeof(Q81);
+    const auto allocated =
+        gate_weight_buffer.allocate(context, "routed FFN gate weights",
+                                    gate_weights.size() * sizeof(block_q2_0),
+                                    err) &&
+        up_weight_buffer.allocate(context, "routed FFN up weights",
+                                  up_weights.size() * sizeof(block_q2_0),
+                                  err) &&
+        down_weight_buffer.allocate(context, "routed FFN down weights",
+                                    down_weights.size() * sizeof(block_q2_0),
+                                    err) &&
+        address_buffer.allocate(context, "routed FFN expert addresses",
+                                addresses.size() * sizeof(MoeExpertAddress),
+                                err) &&
+        ids_buffer.allocate(context, "routed FFN route IDs",
+                            ids.size() * sizeof(std::int32_t), err) &&
+        resident_buffer.allocate(context, "routed FFN resident table",
+                                 resident.size() * sizeof(std::int32_t), err) &&
+        usage_buffer.allocate(context, "routed FFN usage table",
+                              initial_usage.size() * sizeof(float), err) &&
+        plans_buffer.allocate(context, "routed FFN plan table", plans_bytes,
+                              err) &&
+        input_buffer.allocate(context, "routed FFN input activations",
+                              input_bytes, err) &&
+        gate_buffer.allocate(context, "routed FFN gate", f32_bytes, err) &&
+        up_buffer.allocate(context, "routed FFN up", f32_bytes, err) &&
+        hidden_buffer.allocate(context, "routed FFN hidden", f32_bytes, err) &&
+        down_activations_buffer.allocate(
+            context, "routed FFN down activations", down_activations_bytes,
+            err) &&
+        parts_buffer.allocate(context, "routed FFN parts", parts_bytes, err);
+    check(allocated, std::string(label) + " allocate fixture buffers", err);
+    if (!allocated) return false;
+
+    std::memcpy(gate_weight_buffer.payload().data(), gate_weights.data(),
+                gate_weights.size() * sizeof(block_q2_0));
+    std::memcpy(up_weight_buffer.payload().data(), up_weights.data(),
+                up_weights.size() * sizeof(block_q2_0));
+    std::memcpy(down_weight_buffer.payload().data(), down_weights.data(),
+                down_weights.size() * sizeof(block_q2_0));
+    for (std::uint32_t slot = 0u; slot < active_experts.size(); ++slot) {
+        const std::size_t address_index =
+            static_cast<std::size_t>(layer) * experts + active_experts[slot];
+        addresses[address_index].role[0] =
+            gate_weight_buffer.view().gpu_address +
+            slot * gate_up_bytes_per_expert;
+        addresses[address_index].role[1] =
+            up_weight_buffer.view().gpu_address +
+            slot * gate_up_bytes_per_expert;
+        addresses[address_index].role[2] =
+            down_weight_buffer.view().gpu_address +
+            slot * down_bytes_per_expert;
+    }
+    std::memcpy(address_buffer.payload().data(), addresses.data(),
+                addresses.size() * sizeof(MoeExpertAddress));
+    std::memcpy(ids_buffer.payload().data(), ids.data(),
+                ids.size() * sizeof(std::int32_t));
+    std::memcpy(resident_buffer.payload().data(), resident.data(),
+                resident.size() * sizeof(std::int32_t));
+    std::memcpy(usage_buffer.payload().data(), initial_usage.data(),
+                initial_usage.size() * sizeof(float));
+    std::vector<std::uint8_t> poisoned_plans(plans_bytes, 0u);
+    const std::size_t selected_plan_offset =
+        static_cast<std::size_t>(layer) * sizeof(TieredMoePlan);
+    const auto* expected_plan_bytes =
+        reinterpret_cast<const std::uint8_t*>(&expected_plan);
+    for (std::size_t byte = 0u; byte < sizeof(expected_plan); ++byte) {
+        poisoned_plans[selected_plan_offset + byte] =
+            static_cast<std::uint8_t>(expected_plan_bytes[byte] ^ 0xffu);
+    }
+    std::memcpy(plans_buffer.payload().data(), poisoned_plans.data(),
+                plans_bytes);
+    std::memcpy(input_buffer.payload().data(), input_activations.data(),
+                input_bytes);
+    for (twin::GuardedBuffer* output :
+         {&gate_buffer, &up_buffer, &hidden_buffer,
+          &down_activations_buffer, &parts_buffer}) {
+        std::fill(output->payload().begin(), output->payload().end(), 0x5au);
+    }
+    const bool residency_ready = context.buffers().commit_residency(err);
+    check(residency_ready, std::string(label) + " expert residency", err);
+    if (!residency_ready) return false;
+
+    for (twin::GuardedBuffer* buffer :
+         {&address_buffer, &ids_buffer, &resident_buffer, &usage_buffer,
+          &plans_buffer, &input_buffer, &gate_buffer, &up_buffer,
+          &hidden_buffer, &down_activations_buffer, &parts_buffer}) {
+        buffer->capture_before_dispatch();
+    }
+    const ReadOnlyBufferRef addresses_view =
+        context.buffers().read_only(address_buffer.view());
+    const ReadOnlyBufferRef ids_view =
+        context.buffers().read_only(ids_buffer.view());
+    const ReadOnlyBufferRef resident_view =
+        context.buffers().read_only(resident_buffer.view());
+    const ReadOnlyBufferRef input_view =
+        context.buffers().read_only(input_buffer.view());
+    const ReadOnlyBufferRef plans_view =
+        context.buffers().read_only(plans_buffer.view());
+    if (!addresses_view || !ids_view || !resident_view || !input_view ||
+        !plans_view) {
+        check(false, std::string(label) + " read-only views", err);
+        return false;
+    }
+    const MoeRoutedFFNBuffers ffn_buffers{
+        addresses_view, input_view, plans_view,
+        gate_buffer.view(), up_buffer.view(), hidden_buffer.view(),
+        down_activations_buffer.view(), parts_buffer.view()};
+    const auto outputs_unchanged = [&] {
+        return gate_buffer.first_unwritten_change({}) == std::nullopt &&
+               up_buffer.first_unwritten_change({}) == std::nullopt &&
+               hidden_buffer.first_unwritten_change({}) == std::nullopt &&
+               down_activations_buffer.first_unwritten_change({}) ==
+                   std::nullopt &&
+               parts_buffer.first_unwritten_change({}) == std::nullopt;
+    };
+    const auto reject = [&](std::string case_label,
+                            const MoeRoutedFFNBuffers& bad_buffers,
+                            std::string_view expected_error) {
+        auto command = context.make_command_buffer(case_label, err);
+        const bool rejected = command && !encode_moe_routed_ffn(
+            context, *command, rows, experts, layer,
+            MoeExpertFormat::q2_0, MoeDownFormat::q2_0, bad_buffers, err);
+        const bool discarded =
+            command && command->unsafe_native_handle() == nullptr;
+        const bool error_matches =
+            err.find(expected_error) != std::string::npos;
+        const bool unchanged = outputs_unchanged();
+        check(rejected && discarded && error_matches && unchanged,
+              case_label + " rejects before encoding and discards", err);
+        return rejected && discarded && error_matches && unchanged;
+    };
+    const bool short_parts = reject(
+        std::string(label) + " short parts",
+        {addresses_view, input_view, plans_view, gate_buffer.view(),
+         up_buffer.view(), hidden_buffer.view(),
+         down_activations_buffer.view(),
+         parts_buffer.view().slice(0u, parts_bytes - sizeof(float))},
+        "scratch output");
+    const bool output_input_alias = reject(
+        std::string(label) + " output/input alias",
+        {addresses_view, context.buffers().read_only(gate_buffer.view()),
+         plans_view, gate_buffer.view(), up_buffer.view(),
+         hidden_buffer.view(), down_activations_buffer.view(),
+         parts_buffer.view()},
+        "disjoint from inputs");
+    const bool scratch_output_alias = reject(
+        std::string(label) + " scratch output alias",
+        {addresses_view, input_view, plans_view, gate_buffer.view(),
+         gate_buffer.view(), hidden_buffer.view(),
+         down_activations_buffer.view(), parts_buffer.view()},
+        "scratch outputs must be disjoint");
+    const bool readonly_input_alias = reject(
+        std::string(label) + " read-only input alias",
+        {addresses_view, input_view,
+         addresses_view.slice(0u, plans_bytes),
+         gate_buffer.view(), up_buffer.view(), hidden_buffer.view(),
+         down_activations_buffer.view(), parts_buffer.view()},
+        "read-only inputs must be disjoint");
+    auto invalid_rows_command =
+        context.make_command_buffer("routed FFN invalid rows", err);
+    const bool invalid_rows = invalid_rows_command &&
+        !encode_moe_routed_ffn(
+            context, *invalid_rows_command, 0u, experts, layer,
+            MoeExpertFormat::q2_0, MoeDownFormat::q2_0, ffn_buffers, err);
+    const bool invalid_rows_discarded = invalid_rows_command &&
+        invalid_rows_command->unsafe_native_handle() == nullptr;
+    check(invalid_rows && invalid_rows_discarded &&
+              err.find("1..8 rows") != std::string::npos &&
+              outputs_unchanged(),
+          std::string(label) + " rejects invalid rows transactionally", err);
+
+    const char* const dispatch_mode = std::getenv("STRATA_METAL_DISPATCH");
+    const bool concurrent_mode = dispatch_mode != nullptr &&
+        std::string_view(dispatch_mode) == "concurrent";
+    bool open_group_rejected = true;
+    if (concurrent_mode) {
+        auto group_command =
+            context.make_command_buffer("routed FFN open group", err);
+        const bool encoded = group_command && !Encoder::encode(
+            context, *group_command, "routed FFN open group",
+            [&](Encoder& encoder, std::string& body_error) {
+                return encoder.group_begin(body_error) &&
+                    encode_moe_routed_ffn(
+                        context, encoder, rows, experts, layer,
+                        MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
+                        ffn_buffers, body_error);
+            },
+            err);
+        const bool discarded = group_command &&
+            group_command->unsafe_native_handle() == nullptr;
+        open_group_rejected = encoded && discarded &&
+            err.find("ordered dispatch boundaries") != std::string::npos &&
+            outputs_unchanged();
+        check(open_group_rejected,
+              std::string(label) + " rejects an open concurrent group", err);
+    }
+
+    auto late_failure_command =
+        context.make_command_buffer("routed FFN late caller failure", err);
+    const bool late_failure = late_failure_command && !Encoder::encode(
+        context, *late_failure_command, "routed FFN late caller failure",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_moe_routed_ffn(
+                    context, encoder, rows, experts, layer,
+                    MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
+                    ffn_buffers, encode_error)) {
+                return false;
+            }
+            return encode_moe_down(
+                context, encoder, 9u, experts, layer, MoeDownFormat::q2_0,
+                {addresses_view,
+                 context.buffers().read_only(down_activations_buffer.view()),
+                 plans_view, parts_buffer.view()},
+                encode_error);
+        },
+        err);
+    const bool late_discarded = late_failure_command &&
+        late_failure_command->unsafe_native_handle() == nullptr;
+    check(late_failure && late_discarded && outputs_unchanged() &&
+              err.find("1..8 rows") != std::string::npos,
+          std::string(label) +
+              " caller-owned late failure discards all routed FFN stages",
+          err);
+
+    const bool encoded_and_completed = [&] {
+        auto command = context.make_command_buffer(
+            "routed FFN plan and composition", err);
+        if (!command) return false;
+        const bool encoded = Encoder::encode(
+            context, *command, "routed FFN plan and composition",
+            [&](Encoder& encoder, std::string& encode_error) {
+                const MoePlanBuffers plan_buffers{
+                    ids_view, resident_view, usage_buffer.view(),
+                    plans_buffer.view()};
+                return encode_moe_plan(context, encoder, rows, experts,
+                                       false, layer, plan_buffers,
+                                       encode_error) &&
+                       encode_moe_routed_ffn(
+                           context, encoder, rows, experts, layer,
+                           MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
+                           ffn_buffers, encode_error);
+            },
+            err);
+        return encoded && command->commit(err) &&
+               command->wait_until_completed(err);
+    }();
+    check(encoded_and_completed,
+          std::string(label) + " GPU plan plus routed stages", err);
+    if (!encoded_and_completed) return false;
+
+    const auto* actual_plans =
+        reinterpret_cast<const std::uint8_t*>(plans_buffer.payload().data());
+    const std::span<const std::uint8_t> expected_plans_span(
+        reinterpret_cast<const std::uint8_t*>(expected_plans.data()),
+        plans_bytes);
+    const auto plan_failure =
+        twin::compare_bytes(std::span<const std::uint8_t>(
+                                actual_plans, plans_bytes),
+                            expected_plans_span);
+    check(!plan_failure, std::string(label) + " exact GPU plan bytes");
+    const auto usage_failure = twin::compare_bytes(
+        usage_buffer.payload(),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(expected_usage.data()),
+            expected_usage.size() * sizeof(float)));
+    check(!usage_failure,
+          std::string(label) + " full mode preserves usage bytes");
+
+    const twin::Tolerance tolerance{twin::Comparison::units, 16.0, 0.0, 0u};
+    const auto compare_output = [&](const twin::GuardedBuffer& buffer,
+                                    std::span<const twin::tf> expected,
+                                    std::string output_label) {
+        const auto* actual =
+            reinterpret_cast<const float*>(buffer.payload().data());
+        const auto failure = twin::compare_floats(
+            std::span<const float>(actual, expected.size()), expected,
+            tolerance);
+        if (failure) {
+            twin::report_failure(output_label.c_str(), options, rows,
+                                 *failure);
+        }
+        check(!failure, std::string(label) + " " + output_label + " U(16)");
+        return !failure;
+    };
+    const bool gate_matches = compare_output(
+        gate_buffer, expected_gate, "gate");
+    const bool up_matches = compare_output(up_buffer, expected_up, "up");
+    const bool hidden_matches = compare_output(
+        hidden_buffer, expected_hidden, "SwiGLU");
+    const bool parts_matches = compare_output(
+        parts_buffer, expected_parts, "down parts");
+    const auto* actual_down_activations =
+        reinterpret_cast<const std::uint8_t*>(
+            down_activations_buffer.payload().data());
+    const auto down_activations_failure = twin::compare_bytes(
+        std::span<const std::uint8_t>(
+            actual_down_activations, down_activations_bytes),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(
+                expected_down_activations.data()),
+            down_activations_bytes));
+    check(!down_activations_failure,
+          std::string(label) + " exact hidden Q8_1 bytes");
+
+    check(!address_buffer.first_unwritten_change({}),
+          std::string(label) + " addresses and guards unchanged");
+    check(!ids_buffer.first_unwritten_change({}),
+          std::string(label) + " IDs and guards unchanged");
+    check(!resident_buffer.first_unwritten_change({}),
+          std::string(label) + " resident table and guards unchanged");
+    check(!input_buffer.first_unwritten_change({}),
+          std::string(label) + " input Q8_1 and guards unchanged");
+    check(!usage_buffer.first_unwritten_change({}),
+          std::string(label) + " usage and guards unchanged");
+    const std::array<twin::ByteRange, 1> plan_written = {
+        {{selected_plan_offset, sizeof(TieredMoePlan)}}};
+    check(!plans_buffer.first_unwritten_change(plan_written),
+          std::string(label) + " plan writes stay within selected layer");
+    const std::array<twin::ByteRange, 1> gate_up_written = {{{0u, f32_bytes}}};
+    const std::array<twin::ByteRange, 1> down_q_written = {
+        {{0u, down_activations_bytes}}};
+    const std::array<twin::ByteRange, 1> parts_written = {{{0u, parts_bytes}}};
+    check(!gate_buffer.first_unwritten_change(gate_up_written),
+          std::string(label) + " gate writes stay within the output");
+    check(!up_buffer.first_unwritten_change(gate_up_written),
+          std::string(label) + " up writes stay within the output");
+    check(!hidden_buffer.first_unwritten_change(gate_up_written),
+          std::string(label) + " SwiGLU writes stay within the output");
+    check(!down_activations_buffer.first_unwritten_change(down_q_written),
+          std::string(label) + " hidden Q8_1 writes stay within the output");
+    check(!parts_buffer.first_unwritten_change(parts_written),
+          std::string(label) + " down writes stay within original route order");
+    return short_parts && output_input_alias && scratch_output_alias &&
+           readonly_input_alias && invalid_rows &&
+           invalid_rows_discarded && open_group_rejected && late_failure &&
+           late_discarded && !plan_failure && !usage_failure &&
+           gate_matches && up_matches && hidden_matches && parts_matches &&
+           !down_activations_failure;
+}
+
 bool test_moe_gu_iq1_m_case(
     Context& context, std::uint32_t experts, std::uint32_t rows,
     twin::InputSet set, const twin::Options& options,
@@ -8701,6 +9174,11 @@ int main(int argc, char** argv) {
     if (!test_swiglu_dispatch_validation(*context)) ++g_failures;
     if (!test_moe_down_dispatch_validation(*context)) ++g_failures;
     if (!test_moe_combine_dispatch_validation(*context)) ++g_failures;
+    for (const std::uint32_t rows : {1u, 8u}) {
+        if (!test_moe_routed_ffn_composition(*context, rows, options)) {
+            ++g_failures;
+        }
+    }
 
     std::vector<twin::InputSet> sets;
     if (options.input_set_explicit) {
