@@ -165,6 +165,111 @@ bool same_view(BufferRef left, BufferRef right) {
            left.length == right.length && left.offset == right.offset;
 }
 
+template <std::size_t LeftCount, std::size_t RightCount, class Allowed>
+bool validate_cross_stage_views(
+    const std::array<BufferRef, LeftCount>& left,
+    const std::array<BufferRef, RightCount>& right, Allowed allowed,
+    std::string_view stage_pair, std::string& error) {
+    for (std::size_t left_index = 0u; left_index < left.size(); ++left_index) {
+        for (std::size_t right_index = 0u; right_index < right.size();
+             ++right_index) {
+            if (!buffer_views_overlap(left[left_index], right[right_index])) {
+                continue;
+            }
+            if (allowed(left_index, right_index) &&
+                same_view(left[left_index], right[right_index])) {
+                continue;
+            }
+            error = "Window T=1 layer-0 buffers overlap across " +
+                    std::string(stage_pair) + " outside an exact scratch handoff";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool validate_window_t1_attention_gdn_ffn(
+    Context& context, std::uint32_t vocabulary_size,
+    const WindowT1AttentionGDNFFNBuffers& buffers, std::string& error) {
+    WindowParams params{};
+    if (!validate_window_params(context, buffers.params, vocabulary_size,
+                                params, error)) {
+        return false;
+    }
+    if (params.n_keep != 0u) {
+        error = "Window T=1 attention/GDN/FFN stage requires n_keep=0";
+        return false;
+    }
+
+    const auto attention_views = gr_read_views(buffers.attention);
+    const auto gdn_views = gdn_block_views(buffers.gdn);
+    const auto ffn_views = gr_read_views(buffers.ffn);
+    const GRReadBuffers& attention = buffers.attention;
+    const GRReadBuffers& ffn = buffers.ffn;
+    if (!same_view(attention.mixed, buffers.gdn.mixed) ||
+        !same_view(buffers.gdn.mixed, ffn.mixed) ||
+        !same_view(buffers.gdn.block_out, ffn.block_out)) {
+        error = "Window T=1 layer-0 mixed and GDN block-output handoffs must reuse exact views";
+        return false;
+    }
+    if (!same_view(attention.residual, ffn.residual) ||
+        !same_view(attention.inject_out, ffn.inject_prev) ||
+        !same_view(attention.inject_prev, ffn.inject_out) ||
+        !same_view(attention.normalized, ffn.normalized) ||
+        !same_view(attention.rs, ffn.rs) ||
+        !same_view(attention.lo, ffn.lo)) {
+        error = "Window T=1 layer-0 GR reads must reuse residual, scratch and swapped injection views";
+        return false;
+    }
+
+    const auto parameters_are_disjoint = [&](const auto& views) {
+        for (const BufferRef& view : views) {
+            if (buffer_views_overlap(buffers.params, view)) return false;
+        }
+        return true;
+    };
+    if (!parameters_are_disjoint(attention_views) ||
+        !parameters_are_disjoint(gdn_views) ||
+        !parameters_are_disjoint(ffn_views)) {
+        error = "Window T=1 parameters overlap a layer-0 stage buffer";
+        return false;
+    }
+
+    const auto attention_gdn_handoff = [](std::size_t left,
+                                          std::size_t right) {
+        return left == 11u && right == 0u;
+    };
+    const auto gdn_ffn_handoffs = [](std::size_t left, std::size_t right) {
+        return (left == 0u && right == 11u) ||
+               (left == 20u && right == 1u);
+    };
+    const auto attention_ffn_handoffs = [](std::size_t left,
+                                           std::size_t right) {
+        switch (left) {
+            case 0u: return right == 0u;
+            case 2u: return right == 9u;
+            case 4u: return right == 4u;
+            case 5u: return right == 5u;
+            case 8u: return right == 8u;
+            case 9u: return right == 2u;
+            case 11u: return right == 11u;
+            default: return false;
+        }
+    };
+    if (!validate_cross_stage_views(attention_views, gdn_views,
+                                    attention_gdn_handoff, "attention/GDN",
+                                    error) ||
+        !validate_cross_stage_views(gdn_views, ffn_views, gdn_ffn_handoffs,
+                                    "GDN/FFN", error) ||
+        !validate_cross_stage_views(attention_views, ffn_views,
+                                    attention_ffn_handoffs, "attention/FFN",
+                                    error)) {
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
 bool validate_window_t1_attention_gdn(
     Context& context, std::uint32_t vocabulary_size,
     const WindowT1AttentionGDNBuffers& buffers, std::string& error) {
@@ -245,6 +350,39 @@ bool encode_window_t1_attention_gdn(
         context, command_buffer, "Window T=1 layer-0 attention and GDN",
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_window_t1_attention_gdn(
+                context, encoder, vocabulary_size, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_window_t1_attention_gdn_ffn(
+    Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
+    const WindowT1AttentionGDNFFNBuffers& buffers, std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "Window T=1 layer-0 GR/GDN chain requires ordered dispatch boundaries";
+        return false;
+    }
+    if (!validate_window_t1_attention_gdn_ffn(context, vocabulary_size,
+                                              buffers, error)) {
+        return false;
+    }
+    if (!encode_gr_read(context, encoder, 1u, false, buffers.attention,
+                        error) ||
+        !encode_window_gdn_block(context, encoder, 1u, buffers.gdn, error)) {
+        return false;
+    }
+    return encode_gr_read(context, encoder, 1u, true, buffers.ffn, error);
+}
+
+bool encode_window_t1_attention_gdn_ffn(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size,
+    const WindowT1AttentionGDNFFNBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Window T=1 layer-0 attention, GDN and FFN read",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_t1_attention_gdn_ffn(
                 context, encoder, vocabulary_size, buffers, encode_error);
         },
         error);

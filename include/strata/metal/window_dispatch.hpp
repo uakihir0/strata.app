@@ -30,6 +30,23 @@ struct WindowT1AttentionGDNBuffers {
     WindowGDNBlockBuffers gdn;
 };
 
+/// Layer 0's complete attention-read, speculative GDN, then FFN-read chain.
+/// All three `mixed` roles share one exact view. `gdn.block_out` and
+/// `ffn.block_out` share one exact view; the attention `block_out` is a
+/// separate, unused placeholder because `pending(0) == 0`. The two GR reads
+/// share residual and `normalized`/`rs`/`lo`/`mixed` scratch. Their injection
+/// views swap (`attention.inject_out == ffn.inject_prev` and
+/// `attention.inject_prev == ffn.inject_out`). Attention and FFN model weights
+/// are distinct layer-0 tensors and must not alias. All other cross-stage
+/// overlaps are rejected. The FFN roles must use the layer-0 `hc_ffn_*`
+/// weights; the attention roles use `hc_attn_*`.
+struct WindowT1AttentionGDNFFNBuffers {
+    BufferRef params;
+    GRReadBuffers attention;
+    WindowGDNBlockBuffers gdn;
+    GRReadBuffers ffn;
+};
+
 /// Encode the T=1 input stem: gather the token from WindowParams, then
 /// broadcast the embedding into the four initial GR streams. The views must
 /// remain alive and the parameter block must remain unchanged until GPU
@@ -63,5 +80,20 @@ bool encode_window_t1_attention_gdn(
     Context& context, CommandBuffer& command_buffer,
     std::uint32_t vocabulary_size,
     const WindowT1AttentionGDNBuffers& buffers, std::string& error);
+
+/// Encode the layer-0 attention read (`apply=false`), speculative GDN block,
+/// and FFN read (`apply=true`) in one ordered segment. The FFN read consumes
+/// the GDN block output and attention injection, then writes the swapped
+/// injection buffer. This does not route experts or perform the FFN write.
+/// Propagate false from a caller-owned Encoder body to discard all prior work.
+bool encode_window_t1_attention_gdn_ffn(
+    Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
+    const WindowT1AttentionGDNFFNBuffers& buffers, std::string& error);
+/// Standalone transactional form. A late FFN validation failure discards the
+/// attention and GDN dispatches too.
+bool encode_window_t1_attention_gdn_ffn(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size,
+    const WindowT1AttentionGDNFFNBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal

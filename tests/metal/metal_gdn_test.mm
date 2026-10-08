@@ -2526,6 +2526,32 @@ bool test_window_t1_attention_gdn(Context& context) {
                   storage[index].payload().end(), 0u);
     }
 
+    twin::GuardedBuffer ffn_norm_storage;
+    twin::GuardedBuffer ffn_down_storage;
+    twin::GuardedBuffer ffn_inject_storage;
+    twin::GuardedBuffer ffn_up_storage;
+    const std::array<std::pair<twin::GuardedBuffer*, std::size_t>, 4u>
+        ffn_weight_allocations{{
+            {&ffn_norm_storage, gr_rows * sizeof(float)},
+            {&ffn_down_storage,
+             gr_low_rank_rows * gr_rows * sizeof(std::uint16_t)},
+            {&ffn_inject_storage,
+             gr_inject_rows * gr_rows * sizeof(std::uint16_t)},
+            {&ffn_up_storage,
+             gr_rows * gr_low_rank_rows * sizeof(std::uint16_t)},
+        }};
+    const std::array<const char*, 4u> ffn_weight_names{
+        "FFN GR norm", "FFN GR down weights", "FFN GR injection weights",
+        "FFN GR up weights"};
+    for (std::size_t index = 0u; index < ffn_weight_allocations.size(); ++index) {
+        if (!ffn_weight_allocations[index].first->allocate(
+                context, label + " " + ffn_weight_names[index],
+                ffn_weight_allocations[index].second, error)) {
+            check(false, label + " allocate " + ffn_weight_names[index], error);
+            return false;
+        }
+    }
+
     std::mt19937_64 rng(0x57494e444f574731ull);
     auto residual = typed<float>(storage[kGrResidual]);
     for (std::size_t index = 0u; index < residual.size(); ++index) {
@@ -2546,6 +2572,15 @@ bool test_window_t1_attention_gdn(Context& context) {
     for (const std::size_t index : {kGrDown, kGrInject, kGrUp}) {
         std::fill(typed<std::uint16_t>(storage[index]).begin(),
                   typed<std::uint16_t>(storage[index]).end(), gr_weight);
+    }
+    std::fill(typed<float>(ffn_norm_storage).begin(),
+              typed<float>(ffn_norm_storage).end(), 0.875f);
+    const std::uint16_t ffn_weight =
+        strata::kernels::bf16_from_f32(0.000375f);
+    for (twin::GuardedBuffer* weight :
+         {&ffn_down_storage, &ffn_inject_storage, &ffn_up_storage}) {
+        std::fill(typed<std::uint16_t>(*weight).begin(),
+                  typed<std::uint16_t>(*weight).end(), ffn_weight);
     }
     for (std::size_t index = 0u; index < typed<float>(storage[kHistory]).size();
          ++index) {
@@ -2603,6 +2638,10 @@ bool test_window_t1_attention_gdn(Context& context) {
     };
     poison_outputs();
     for (auto& buffer : storage) buffer.capture_before_dispatch();
+    ffn_norm_storage.capture_before_dispatch();
+    ffn_down_storage.capture_before_dispatch();
+    ffn_inject_storage.capture_before_dispatch();
+    ffn_up_storage.capture_before_dispatch();
 
     auto params_ring = WindowParamsRing::open(context, error);
     check(params_ring != nullptr, label + " open parameter ring", error);
@@ -2634,6 +2673,22 @@ bool test_window_t1_attention_gdn(Context& context) {
         storage[kBlockOut].view(), storage[kSink].view(),
         storage[kActiveRows].view()};
     const WindowT1AttentionGDNBuffers buffers{params, attention, gdn};
+    const GRReadBuffers ffn{
+        storage[kGrResidual].view(), storage[kBlockOut].view(),
+        storage[kGrInjectOut].view(), ffn_norm_storage.view(),
+        storage[kGrNormalized].view(), storage[kGrRs].view(),
+        ffn_down_storage.view(), ffn_inject_storage.view(),
+        storage[kGrLo].view(), storage[kGrInjectPrev].view(),
+        ffn_up_storage.view(), storage[kMixed].view()};
+    const WindowT1AttentionGDNFFNBuffers layer0_buffers{
+        params, attention, gdn, ffn};
+    const std::vector<std::uint8_t> gr_inject2_before(
+        storage[kGrInjectPrev].payload().begin(),
+        storage[kGrInjectPrev].payload().end());
+    const std::vector<std::uint8_t> history_before(
+        storage[kHistory].payload().begin(), storage[kHistory].payload().end());
+    const std::vector<std::uint8_t> state_before(
+        storage[kState].payload().begin(), storage[kState].payload().end());
 
     const auto run_reference = [&] {
         return run_command(
@@ -2659,11 +2714,6 @@ bool test_window_t1_attention_gdn(Context& context) {
         mixed_payload.begin(), mixed_payload.end(),
         [](std::uint8_t value) { return value != 0u; });
     check(mixed_is_nonzero, label + " GR read produces a nonzero mixed row");
-
-    const std::vector<std::uint8_t> history_before(
-        storage[kHistory].payload().begin(), storage[kHistory].payload().end());
-    const std::vector<std::uint8_t> state_before(
-        storage[kState].payload().begin(), storage[kState].payload().end());
 
     poison_outputs();
     const bool window_completed = run_command(
@@ -2882,12 +2932,307 @@ bool test_window_t1_attention_gdn(Context& context) {
               error.find("undersized") != std::string::npos && outputs_are_poisoned(),
           label + " caller-owned late failure discards the segment", error);
 
+    const auto prepare_layer0_chain = [&](bool poison_inject2) {
+        std::memcpy(storage[kGrResidual].payload().data(),
+                    gr_residual_before.data(), gr_residual_before.size());
+        std::memcpy(storage[kGrInjectPrev].payload().data(),
+                    gr_inject2_before.data(), gr_inject2_before.size());
+        poison_outputs();
+        if (poison_inject2) {
+            std::fill(storage[kGrInjectPrev].payload().begin(),
+                      storage[kGrInjectPrev].payload().end(), poison);
+        }
+    };
+
+    prepare_layer0_chain(false);
+    const bool layer0_apply_control_completed = run_command(
+        context, label + " layer-0 apply=true control",
+        [&](CommandBuffer& command, std::string& command_error) {
+            return encode_gr_read(context, command, rows, true, attention,
+                                  command_error);
+        },
+        error);
+    check(layer0_apply_control_completed,
+          label + " layer-0 apply=true control executes", error);
+    if (!layer0_apply_control_completed) return false;
+    const bool layer0_apply_control_writes_residual = !std::equal(
+        gr_residual_before.begin(), gr_residual_before.end(),
+        storage[kGrResidual].payload().begin(),
+        storage[kGrResidual].payload().end());
+    check(layer0_apply_control_writes_residual,
+          label + " nonzero attention placeholder makes apply=true observable");
+
+    prepare_layer0_chain(true);
+    const bool layer0_reference_completed = run_command(
+        context, label + " attention-GDN-FFN component chain",
+        [&](CommandBuffer& command, std::string& command_error) {
+            return Encoder::encode(
+                context, command, "Window layer-0 component chain",
+                [&](Encoder& encoder, std::string& body_error) {
+                    return encode_gr_read(context, encoder, rows, false,
+                                          attention, body_error) &&
+                           encode_window_gdn_block(context, encoder, rows, gdn,
+                                                   body_error) &&
+                           encode_gr_read(context, encoder, rows, true, ffn,
+                                          body_error);
+                },
+                command_error);
+        },
+        error);
+    check(layer0_reference_completed,
+          label + " attention-GDN-FFN component chain executes", error);
+    if (!layer0_reference_completed) return false;
+    std::array<std::vector<std::uint8_t>, output_indices.size()>
+        layer0_expected_outputs;
+    for (std::size_t output = 0u; output < output_indices.size(); ++output) {
+        const auto payload = storage[output_indices[output]].payload();
+        layer0_expected_outputs[output].assign(payload.begin(), payload.end());
+    }
+    const std::vector<std::uint8_t> layer0_expected_residual(
+        storage[kGrResidual].payload().begin(),
+        storage[kGrResidual].payload().end());
+    const std::vector<std::uint8_t> layer0_expected_inject2(
+        storage[kGrInjectPrev].payload().begin(),
+        storage[kGrInjectPrev].payload().end());
+    const bool layer0_ffn_applies_pending_write = !std::equal(
+        layer0_expected_residual.begin(), layer0_expected_residual.end(),
+        gr_residual_before.begin(), gr_residual_before.end());
+    check(layer0_ffn_applies_pending_write,
+          label + " FFN read applies the GDN block output to residual");
+    const bool component_state_unchanged =
+        std::equal(history_before.begin(), history_before.end(),
+                   storage[kHistory].payload().begin(),
+                   storage[kHistory].payload().end()) &&
+        std::equal(state_before.begin(), state_before.end(),
+                   storage[kState].payload().begin(),
+                   storage[kState].payload().end());
+    check(component_state_unchanged,
+          label + " component chain keeps GDN state and history speculative");
+
+    prepare_layer0_chain(true);
+    const bool layer0_completed = run_command(
+        context, label + " full layer-0 coordinator",
+        [&](CommandBuffer& command, std::string& command_error) {
+            return encode_window_t1_attention_gdn_ffn(
+                context, command, vocabulary_size, layer0_buffers,
+                command_error);
+        },
+        error);
+    check(layer0_completed, label + " full layer-0 coordinator executes", error);
+    if (!layer0_completed) return false;
+    bool layer0_outputs_match = true;
+    for (std::size_t output = 0u; output < output_indices.size(); ++output) {
+        const auto payload = storage[output_indices[output]].payload();
+        const bool matches = std::equal(
+            layer0_expected_outputs[output].begin(),
+            layer0_expected_outputs[output].end(), payload.begin(), payload.end());
+        check(matches, label + " layer-0 output " + std::to_string(output) +
+                           " matches component chain");
+        layer0_outputs_match &= matches;
+        const std::array<twin::ByteRange, 1u> written{{{0u, payload.size()}}};
+        const auto guard = storage[output_indices[output]].first_unwritten_change(
+            written);
+        check(!guard, label + " layer-0 output guard " +
+                           std::to_string(output),
+              guard ? guard->reason : "");
+        layer0_outputs_match &= !guard;
+    }
+    const bool layer0_residual_matches = std::equal(
+        layer0_expected_residual.begin(), layer0_expected_residual.end(),
+        storage[kGrResidual].payload().begin(),
+        storage[kGrResidual].payload().end());
+    const bool layer0_inject2_matches = std::equal(
+        layer0_expected_inject2.begin(), layer0_expected_inject2.end(),
+        storage[kGrInjectPrev].payload().begin(),
+        storage[kGrInjectPrev].payload().end());
+    check(layer0_residual_matches,
+          label + " FFN residual fold matches component chain");
+    check(layer0_inject2_matches,
+          label + " FFN injection output matches component chain");
+    const std::array<twin::ByteRange, 1u> residual_written{{{
+        0u, storage[kGrResidual].payload().size()}}};
+    const auto residual_guard =
+        storage[kGrResidual].first_unwritten_change(residual_written);
+    check(!residual_guard, label + " layer-0 residual guard",
+          residual_guard ? residual_guard->reason : "");
+    const std::array<twin::ByteRange, 1u> inject2_written{{{
+        0u, storage[kGrInjectPrev].payload().size()}}};
+    const auto inject2_guard =
+        storage[kGrInjectPrev].first_unwritten_change(inject2_written);
+    check(!inject2_guard, label + " layer-0 inject2 guard",
+          inject2_guard ? inject2_guard->reason : "");
+    const bool layer0_state_unchanged =
+        std::equal(history_before.begin(), history_before.end(),
+                   storage[kHistory].payload().begin(),
+                   storage[kHistory].payload().end()) &&
+        std::equal(state_before.begin(), state_before.end(),
+                   storage[kState].payload().begin(),
+                   storage[kState].payload().end());
+    check(layer0_state_unchanged,
+          label + " full layer-0 coordinator keeps GDN state and history speculative");
+
+    const auto reject_layer0_params = [&](const std::string& case_name,
+                                          const std::string& expected_error,
+                                          auto mutate) {
+        strata::metal::WindowParams malformed{};
+        std::memcpy(&malformed, params.contents, sizeof(malformed));
+        mutate(malformed);
+        std::memcpy(params.contents, &malformed, sizeof(malformed));
+        auto command = context.make_command_buffer(
+            label + " reject layer-0 " + case_name, error);
+        if (!command) {
+            std::memcpy(params.contents, &valid_params, sizeof(valid_params));
+            check(false, label + " layer-0 " + case_name + " command buffer",
+                  error);
+            return false;
+        }
+        prepare_layer0_chain(true);
+        const bool rejected = !encode_window_t1_attention_gdn_ffn(
+            context, *command, vocabulary_size, layer0_buffers, error);
+        const bool discarded = command->unsafe_native_handle() == nullptr;
+        const bool untouched = outputs_are_poisoned() &&
+            std::equal(gr_residual_before.begin(), gr_residual_before.end(),
+                       storage[kGrResidual].payload().begin(),
+                       storage[kGrResidual].payload().end());
+        std::memcpy(params.contents, &valid_params, sizeof(valid_params));
+        const bool correct = rejected && discarded && untouched &&
+            error.find(expected_error) != std::string::npos;
+        check(correct, label + " layer-0 rejects " + case_name, error);
+        return correct;
+    };
+    const bool layer0_n_keep_rejected = reject_layer0_params(
+        "nonzero n_keep", "n_keep=0", [](strata::metal::WindowParams& value) {
+            value.n_keep = 1u;
+        });
+    const bool layer0_bad_nc_rejected = reject_layer0_params(
+        "T=1 with invalid nc", "T=1", [](strata::metal::WindowParams& value) {
+            value.nc = 2u;
+        });
+
+    WindowT1AttentionGDNFFNBuffers split_injection = layer0_buffers;
+    split_injection.ffn.inject_prev = separate_mixed_storage.view();
+    auto split_injection_command = context.make_command_buffer(
+        label + " reject split injection handoff", error);
+    check(split_injection_command != nullptr,
+          label + " split-injection command buffer", error);
+    if (!split_injection_command) return false;
+    prepare_layer0_chain(true);
+    const bool split_injection_rejected =
+        !encode_window_t1_attention_gdn_ffn(
+            context, *split_injection_command, vocabulary_size,
+            split_injection, error);
+    const bool split_injection_discarded =
+        split_injection_command->unsafe_native_handle() == nullptr;
+    check(split_injection_rejected && split_injection_discarded &&
+              outputs_are_poisoned() &&
+              error.find("swapped injection views") != std::string::npos,
+          label + " rejects a split injection handoff", error);
+
+    WindowT1AttentionGDNFFNBuffers shared_attention_ffn_weights = layer0_buffers;
+    shared_attention_ffn_weights.ffn.norm = attention.norm;
+    auto shared_weights_command = context.make_command_buffer(
+        label + " reject aliased attention and FFN weights", error);
+    check(shared_weights_command != nullptr,
+          label + " shared-weight command buffer", error);
+    if (!shared_weights_command) return false;
+    prepare_layer0_chain(true);
+    const bool shared_weights_rejected =
+        !encode_window_t1_attention_gdn_ffn(
+            context, *shared_weights_command, vocabulary_size,
+            shared_attention_ffn_weights, error);
+    const bool shared_weights_discarded =
+        shared_weights_command->unsafe_native_handle() == nullptr;
+    check(shared_weights_rejected && shared_weights_discarded &&
+              outputs_are_poisoned() &&
+              error.find("outside an exact scratch handoff") !=
+                  std::string::npos,
+          label + " rejects reusing attention weights for FFN", error);
+
+    WindowT1AttentionGDNFFNBuffers partial_attention_ffn_weights = layer0_buffers;
+    partial_attention_ffn_weights.ffn.norm = attention.norm.slice(
+        sizeof(float), attention.norm.length - sizeof(float));
+    auto partial_weights_command = context.make_command_buffer(
+        label + " reject partially aliased attention and FFN weights", error);
+    check(partial_weights_command != nullptr,
+          label + " partial-weight command buffer", error);
+    if (!partial_weights_command) return false;
+    prepare_layer0_chain(true);
+    const bool partial_weights_rejected =
+        !encode_window_t1_attention_gdn_ffn(
+            context, *partial_weights_command, vocabulary_size,
+            partial_attention_ffn_weights, error);
+    const bool partial_weights_discarded =
+        partial_weights_command->unsafe_native_handle() == nullptr;
+    check(partial_weights_rejected && partial_weights_discarded &&
+              outputs_are_poisoned() &&
+              error.find("outside an exact scratch handoff") !=
+                  std::string::npos,
+          label + " rejects partial attention/FFN weight overlap", error);
+
+    auto short_ffn_up = ffn_up_storage.view().slice(0u, 16u);
+    WindowT1AttentionGDNFFNBuffers late_ffn_failure = layer0_buffers;
+    late_ffn_failure.ffn.hc_up = short_ffn_up;
+    auto late_ffn_command = context.make_command_buffer(
+        label + " late FFN validation failure", error);
+    check(late_ffn_command != nullptr,
+          label + " late-FFN command buffer", error);
+    if (!late_ffn_command) return false;
+    prepare_layer0_chain(true);
+    const bool late_ffn_rejected = !encode_window_t1_attention_gdn_ffn(
+        context, *late_ffn_command, vocabulary_size, late_ffn_failure, error);
+    const bool late_ffn_discarded =
+        late_ffn_command->unsafe_native_handle() == nullptr;
+    const bool late_ffn_untouched = outputs_are_poisoned() &&
+        std::equal(gr_residual_before.begin(), gr_residual_before.end(),
+                   storage[kGrResidual].payload().begin(),
+                   storage[kGrResidual].payload().end());
+    check(late_ffn_rejected && late_ffn_discarded && late_ffn_untouched &&
+              error.find("undersized") != std::string::npos,
+          label + " late FFN failure discards attention and GDN work", error);
+
+    auto shared_late_ffn_command = context.make_command_buffer(
+        label + " shared late FFN validation failure", error);
+    check(shared_late_ffn_command != nullptr,
+          label + " shared late-FFN command buffer", error);
+    if (!shared_late_ffn_command) return false;
+    prepare_layer0_chain(true);
+    const bool shared_late_ffn_rejected = !Encoder::encode(
+        context, *shared_late_ffn_command, "Window layer-0 shared late failure",
+        [&](Encoder& encoder, std::string& body_error) {
+            return encode_window_t1_attention_gdn_ffn(
+                context, encoder, vocabulary_size, late_ffn_failure, body_error);
+        },
+        error);
+    const bool shared_late_ffn_discarded =
+        shared_late_ffn_command->unsafe_native_handle() == nullptr;
+    const bool shared_late_ffn_untouched = outputs_are_poisoned() &&
+        std::equal(gr_residual_before.begin(), gr_residual_before.end(),
+                   storage[kGrResidual].payload().begin(),
+                   storage[kGrResidual].payload().end());
+    check(shared_late_ffn_rejected && shared_late_ffn_discarded &&
+              shared_late_ffn_untouched &&
+              error.find("undersized") != std::string::npos,
+          label + " caller-owned late FFN failure discards the segment", error);
+
     return wrong_handoff_rejected && wrong_handoff_discarded &&
            wrong_rows_rejected && wrong_rows_discarded && invalid_nc_rejected &&
            nonzero_keep_rejected && invalid_token_rejected &&
            invalid_step_rejected && overlap_rejected && overlap_discarded &&
            late_failure_rejected && late_failure_discarded &&
-           shared_failure_rejected && shared_failure_discarded;
+           shared_failure_rejected && shared_failure_discarded &&
+           layer0_apply_control_writes_residual &&
+           layer0_reference_completed && layer0_ffn_applies_pending_write &&
+           component_state_unchanged && layer0_completed &&
+           layer0_outputs_match && layer0_residual_matches &&
+           layer0_inject2_matches && !residual_guard && !inject2_guard &&
+           layer0_state_unchanged && layer0_n_keep_rejected &&
+           layer0_bad_nc_rejected && split_injection_rejected &&
+           split_injection_discarded && shared_weights_rejected &&
+           shared_weights_discarded && partial_weights_rejected &&
+           partial_weights_discarded && late_ffn_rejected &&
+           late_ffn_discarded && late_ffn_untouched &&
+           shared_late_ffn_rejected && shared_late_ffn_discarded &&
+           shared_late_ffn_untouched;
 }
 
 bool test_window_gdn_block_contract(Context& context) {
