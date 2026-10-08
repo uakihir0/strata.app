@@ -63,4 +63,13 @@ bool encode_window_t1_full_mode_step(
     bool ple_enabled, const WindowT1FullModeStepBuffers& buffers,
     std::string& error);
 
+/// Standalone transactional form for a fresh command buffer. Any validation
+/// failure discards the entire embedding/producer/consumer segment.
+bool encode_window_t1_full_mode_step(
+    Context& context, const FullModeStorage& full_mode,
+    CommandBuffer& command_buffer, std::uint32_t vocabulary_size,
+    std::uint32_t experts, MoeExpertFormat gate_up_format,
+    MoeDownFormat down_format, bool ple_enabled,
+    const WindowT1FullModeStepBuffers& buffers, std::string& error);
+
 }  // namespace strata::metal

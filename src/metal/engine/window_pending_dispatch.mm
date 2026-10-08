@@ -323,4 +323,21 @@ bool encode_window_t1_full_mode_step(
         context, encoder, 1u, ple_enabled, buffers.consumer, error);
 }
 
+bool encode_window_t1_full_mode_step(
+    Context& context, const FullModeStorage& full_mode,
+    CommandBuffer& command_buffer, std::uint32_t vocabulary_size,
+    std::uint32_t experts, MoeExpertFormat gate_up_format,
+    MoeDownFormat down_format, bool ple_enabled,
+    const WindowT1FullModeStepBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Window T=1 FullMode token-to-consumer step",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_t1_full_mode_step(
+                context, full_mode, encoder, vocabulary_size, experts,
+                gate_up_format, down_format, ple_enabled, buffers,
+                encode_error);
+        },
+        error);
+}
+
 }  // namespace strata::metal

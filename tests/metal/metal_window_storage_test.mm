@@ -3467,17 +3467,14 @@ void run_fullmode_handoff_test(Context& context,
         "Discard failed FullMode T=1 step", error);
     require(late_failure_command != nullptr,
             "create late-failure FullMode step command: " + error);
-    const bool late_failure_encoded = Encoder::encode(
-        context, *late_failure_command, "late-failure FullMode T=1 step",
-        [&](Encoder& encoder, std::string& encode_error) {
-            return encode_window_t1_full_mode_step(
-                context, *full_mode, encoder, kVocabulary, kExperts,
-                MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
-                use_ple_entry, late_failure, encode_error);
-        },
-        error);
+    const bool late_failure_encoded = encode_window_t1_full_mode_step(
+        context, *full_mode, *late_failure_command, kVocabulary, kExperts,
+        MoeExpertFormat::q2_0, MoeDownFormat::q2_0, use_ple_entry,
+        late_failure, error);
     require(!late_failure_encoded,
             "T=1 FullMode step must propagate a late consumer validation error");
+    require(late_failure_command->unsafe_native_handle() == nullptr,
+            "standalone T=1 FullMode step must discard earlier dispatches after late failure");
     require(std::equal(
                 residual_before_late_failure.begin(),
                 residual_before_late_failure.end(),
@@ -3530,17 +3527,10 @@ void run_fullmode_handoff_test(Context& context,
                         initial_residual.begin() + kActiveResidualBytes,
                         residual_sentinel.begin()),
             "the reference input stem differs from the integrated residual sentinel");
-    const bool encoded = Encoder::encode(
-        context, *command,
-        use_ple_entry ? "FullMode producer and pending PLE consumer"
-                      : "FullMode producer and pending attention consumer",
-        [&](Encoder& encoder, std::string& encode_error) {
-            return encode_window_t1_full_mode_step(
-                context, *full_mode, encoder, kVocabulary, kExperts,
-                MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
-                use_ple_entry, full_step_buffers, encode_error);
-        },
-        error);
+    const bool encoded = encode_window_t1_full_mode_step(
+        context, *full_mode, *command, kVocabulary, kExperts,
+        MoeExpertFormat::q2_0, MoeDownFormat::q2_0, use_ple_entry,
+        full_step_buffers, error);
     require(encoded,
             "encode FullMode token embedding, producer and selected consumer in one segment: " +
                 error);
