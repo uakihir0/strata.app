@@ -7,6 +7,7 @@
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/gdn_dispatch.hpp"
 #include "strata/metal/mv_dispatch.hpp"
+#include "strata/metal/window_dispatch.hpp"
 #include "strata/metal/window_gdn_dispatch.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -2408,6 +2409,487 @@ bool run_window_gdn_block(Context& context, std::uint32_t rows,
     return passed;
 }
 
+bool test_window_t1_attention_gdn(Context& context) {
+    constexpr std::uint32_t rows = 1u;
+    constexpr std::uint32_t vocabulary_size = 8u;
+    constexpr std::uint32_t position = 17u;
+    constexpr std::size_t kGrResidual = 0u;
+    constexpr std::size_t kGrBlockOut = 1u;
+    constexpr std::size_t kGrInjectPrev = 2u;
+    constexpr std::size_t kGrNorm = 3u;
+    constexpr std::size_t kGrNormalized = 4u;
+    constexpr std::size_t kGrRs = 5u;
+    constexpr std::size_t kGrDown = 6u;
+    constexpr std::size_t kGrInject = 7u;
+    constexpr std::size_t kGrLo = 8u;
+    constexpr std::size_t kGrInjectOut = 9u;
+    constexpr std::size_t kGrUp = 10u;
+    constexpr std::size_t kMixed = 11u;
+    constexpr std::size_t kHistory = 12u;
+    constexpr std::size_t kState = 13u;
+    constexpr std::size_t kQkvWeights = 14u;
+    constexpr std::size_t kConvWeights = 15u;
+    constexpr std::size_t kAlpha = 16u;
+    constexpr std::size_t kBetaWeights = 17u;
+    constexpr std::size_t kDtBias = 18u;
+    constexpr std::size_t kA = 19u;
+    constexpr std::size_t kGateWeights = 20u;
+    constexpr std::size_t kGamma = 21u;
+    constexpr std::size_t kOutputWeights = 22u;
+    constexpr std::size_t kXq = 23u;
+    constexpr std::size_t kQkv = 24u;
+    constexpr std::size_t kH = 25u;
+    constexpr std::size_t kGate = 26u;
+    constexpr std::size_t kBeta = 27u;
+    constexpr std::size_t kZ = 28u;
+    constexpr std::size_t kY = 29u;
+    constexpr std::size_t kYq = 30u;
+    constexpr std::size_t kBlockOut = 31u;
+    constexpr std::size_t kSink = 32u;
+    constexpr std::size_t kActiveRows = 33u;
+    constexpr std::size_t kViewCount = 34u;
+    constexpr std::uint8_t poison = 0xa5u;
+    const std::string label = "Window T=1 attention and GDN";
+    std::string error;
+
+    const std::size_t gr_rows = HC_DIM;
+    const std::size_t gr_inject_rows = HC;
+    const std::size_t gr_low_rank_rows = HC_LOW_RANK;
+    const std::size_t gdn_mixed_count = N_EMBD;
+    const std::size_t qkv_count = kChannels;
+    const std::size_t gate_count = kHeads;
+    const std::size_t value_count = kValueDim;
+    const std::size_t qkv_weight_count =
+        static_cast<std::size_t>(kChannels) * (N_EMBD / 32u);
+    const std::size_t gate_weight_count =
+        static_cast<std::size_t>(kValueDim) * (N_EMBD / 32u);
+    const std::size_t output_weight_count =
+        static_cast<std::size_t>(N_EMBD) * (kValueDim / 32u);
+    const std::size_t ab_weight_count =
+        static_cast<std::size_t>(N_EMBD) * kHeads;
+
+    std::array<std::size_t, kViewCount> byte_sizes{};
+    byte_sizes[kGrResidual] = gr_rows * sizeof(float);
+    byte_sizes[kGrBlockOut] = N_EMBD * sizeof(float);
+    byte_sizes[kGrInjectPrev] = gr_inject_rows * sizeof(float);
+    byte_sizes[kGrNorm] = gr_rows * sizeof(float);
+    byte_sizes[kGrNormalized] = gr_rows * sizeof(float);
+    byte_sizes[kGrRs] = gr_inject_rows * sizeof(float);
+    byte_sizes[kGrDown] = gr_low_rank_rows * gr_rows * sizeof(std::uint16_t);
+    byte_sizes[kGrInject] = gr_inject_rows * gr_rows * sizeof(std::uint16_t);
+    byte_sizes[kGrLo] = gr_low_rank_rows * sizeof(float);
+    byte_sizes[kGrInjectOut] = gr_inject_rows * sizeof(float);
+    byte_sizes[kGrUp] = gr_rows * gr_low_rank_rows * sizeof(std::uint16_t);
+    byte_sizes[kMixed] = gdn_mixed_count * sizeof(float);
+    byte_sizes[kHistory] = kHistoryElements * sizeof(float);
+    byte_sizes[kState] = kStateElements * sizeof(float);
+    byte_sizes[kQkvWeights] = qkv_weight_count * sizeof(block_q8_0);
+    byte_sizes[kConvWeights] =
+        static_cast<std::size_t>(kChannels) * GDN_CONV_KERNEL * sizeof(float);
+    byte_sizes[kAlpha] = ab_weight_count * sizeof(std::uint16_t);
+    byte_sizes[kBetaWeights] = ab_weight_count * sizeof(std::uint16_t);
+    byte_sizes[kDtBias] = kHeads * sizeof(float);
+    byte_sizes[kA] = kHeads * sizeof(float);
+    byte_sizes[kGateWeights] = gate_weight_count * sizeof(block_q8_0);
+    byte_sizes[kGamma] = kHeadDim * sizeof(float);
+    byte_sizes[kOutputWeights] = output_weight_count * sizeof(block_q8_0);
+    byte_sizes[kXq] = (gdn_mixed_count / 32u) * sizeof(Q81);
+    byte_sizes[kQkv] = qkv_count * sizeof(float);
+    byte_sizes[kH] = qkv_count * sizeof(float);
+    byte_sizes[kGate] = gate_count * sizeof(float);
+    byte_sizes[kBeta] = gate_count * sizeof(float);
+    byte_sizes[kZ] = value_count * sizeof(float);
+    byte_sizes[kY] = value_count * sizeof(float);
+    byte_sizes[kYq] = (value_count / 32u) * sizeof(Q81);
+    byte_sizes[kBlockOut] = gdn_mixed_count * sizeof(float);
+    byte_sizes[kSink] = sizeof(float);
+    byte_sizes[kActiveRows] = sizeof(std::uint32_t);
+
+    const std::array<const char*, kViewCount> names{
+        "GR residual", "GR block output", "GR injection input", "GR norm",
+        "GR normalized", "GR rs", "GR down weights", "GR injection weights",
+        "GR low rank", "GR injection output", "GR up weights", "shared mixed",
+        "GDN history", "GDN state", "GDN QKV weights", "GDN convolution weights",
+        "GDN alpha", "GDN beta weights", "GDN dt bias", "GDN A",
+        "GDN gate weights", "GDN gamma", "GDN output weights", "GDN mixed Q8_1",
+        "GDN QKV", "GDN H", "GDN gate", "GDN beta", "GDN Z", "GDN Y",
+        "GDN Y Q8_1", "GDN block output", "GDN matvec sink", "GDN active rows",
+    };
+    std::array<twin::GuardedBuffer, kViewCount> storage;
+    for (std::size_t index = 0u; index < storage.size(); ++index) {
+        if (!storage[index].allocate(context, label + " " + names[index],
+                                     byte_sizes[index], error)) {
+            check(false, label + " allocate " + names[index], error);
+            return false;
+        }
+        std::fill(storage[index].payload().begin(),
+                  storage[index].payload().end(), 0u);
+    }
+
+    std::mt19937_64 rng(0x57494e444f574731ull);
+    auto residual = typed<float>(storage[kGrResidual]);
+    for (std::size_t index = 0u; index < residual.size(); ++index) {
+        residual[index] = 0.01f + static_cast<float>(index % 13u) * 0.0001f;
+    }
+    std::fill(typed<float>(storage[kGrNorm]).begin(),
+              typed<float>(storage[kGrNorm]).end(), 1.0f);
+    auto gr_block_out = typed<float>(storage[kGrBlockOut]);
+    for (std::size_t index = 0u; index < gr_block_out.size(); ++index) {
+        gr_block_out[index] =
+            0.02f + static_cast<float>(index % 17u) * 0.0003f;
+    }
+    const std::vector<std::uint8_t> gr_residual_before(
+        storage[kGrResidual].payload().begin(),
+        storage[kGrResidual].payload().end());
+    const std::uint16_t gr_weight =
+        strata::kernels::bf16_from_f32(0.0005f);
+    for (const std::size_t index : {kGrDown, kGrInject, kGrUp}) {
+        std::fill(typed<std::uint16_t>(storage[index]).begin(),
+                  typed<std::uint16_t>(storage[index]).end(), gr_weight);
+    }
+    for (std::size_t index = 0u; index < typed<float>(storage[kHistory]).size();
+         ++index) {
+        typed<float>(storage[kHistory])[index] =
+            sample(twin::InputSet::fixture, rng,
+                   static_cast<std::uint32_t>(index + 11u), 0.02f);
+    }
+    for (std::size_t index = 0u; index < typed<float>(storage[kState]).size();
+         ++index) {
+        typed<float>(storage[kState])[index] =
+            sample(twin::InputSet::fixture, rng,
+                   static_cast<std::uint32_t>(index + 29u), 0.01f);
+    }
+    for (std::size_t index = 0u;
+         index < typed<float>(storage[kConvWeights]).size(); ++index) {
+        typed<float>(storage[kConvWeights])[index] =
+            sample(twin::InputSet::fixture, rng,
+                   static_cast<std::uint32_t>(index + 37u), 0.03f);
+    }
+    for (std::size_t index = 0u;
+         index < typed<std::uint16_t>(storage[kAlpha]).size(); ++index) {
+        const int code = static_cast<int>((index * 7u + 3u) % 9u) - 4;
+        typed<std::uint16_t>(storage[kAlpha])[index] =
+            strata::kernels::bf16_from_f32(
+                static_cast<float>(code) * (1.0f / 8192.0f));
+        typed<std::uint16_t>(storage[kBetaWeights])[index] =
+            strata::kernels::bf16_from_f32(
+                static_cast<float>(4 - code) * (1.0f / 8192.0f));
+    }
+    for (std::size_t index = 0u; index < typed<float>(storage[kDtBias]).size();
+         ++index) {
+        typed<float>(storage[kDtBias])[index] =
+            static_cast<float>(static_cast<int>(index % 5u) - 2) * 0.01f;
+        typed<float>(storage[kA])[index] =
+            -0.04f - static_cast<float>(index % 3u) * 0.01f;
+    }
+    for (std::size_t index = 0u; index < typed<float>(storage[kGamma]).size();
+         ++index) {
+        typed<float>(storage[kGamma])[index] =
+            0.75f + static_cast<float>(index % 11u) * (1.0f / 32.0f);
+    }
+    fill_q8_0_weights(typed<block_q8_0>(storage[kQkvWeights]), N_EMBD, 1u);
+    fill_q8_0_weights(typed<block_q8_0>(storage[kGateWeights]), N_EMBD, 4u);
+    fill_q8_0_weights(typed<block_q8_0>(storage[kOutputWeights]), kValueDim, 7u);
+    std::memcpy(storage[kActiveRows].payload().data(), &rows, sizeof(rows));
+
+    const std::array<std::size_t, 15u> output_indices{
+        kGrNormalized, kGrRs, kGrLo, kGrInjectOut, kMixed, kXq, kQkv, kH,
+        kGate, kBeta, kZ, kY, kYq, kBlockOut, kSink};
+    const auto poison_outputs = [&] {
+        for (const std::size_t index : output_indices) {
+            std::fill(storage[index].payload().begin(),
+                      storage[index].payload().end(), poison);
+        }
+    };
+    poison_outputs();
+    for (auto& buffer : storage) buffer.capture_before_dispatch();
+
+    auto params_ring = WindowParamsRing::open(context, error);
+    check(params_ring != nullptr, label + " open parameter ring", error);
+    if (!params_ring) return false;
+    const std::array<std::uint32_t, rows> tokens{1u};
+    const std::array<WindowSamplerSettings, rows> samplers{};
+    const BufferRef params = params_ring->build_slot(
+        0u, position, tokens, samplers, 0u, 0x1234u, 0x5678u, error);
+    check(static_cast<bool>(params), label + " build T=1 parameters", error);
+    if (!params) return false;
+
+    const GRReadBuffers attention{
+        storage[kGrResidual].view(), storage[kGrBlockOut].view(),
+        storage[kGrInjectPrev].view(), storage[kGrNorm].view(),
+        storage[kGrNormalized].view(), storage[kGrRs].view(),
+        storage[kGrDown].view(), storage[kGrInject].view(),
+        storage[kGrLo].view(), storage[kGrInjectOut].view(),
+        storage[kGrUp].view(), storage[kMixed].view()};
+    const WindowGDNBlockBuffers gdn{
+        storage[kMixed].view(), storage[kHistory].view(), storage[kState].view(),
+        MatVecWeightFormat::q8_0, storage[kQkvWeights].view(),
+        storage[kConvWeights].view(), storage[kAlpha].view(),
+        storage[kBetaWeights].view(), storage[kDtBias].view(), storage[kA].view(),
+        MatVecWeightFormat::q8_0, storage[kGateWeights].view(),
+        storage[kGamma].view(), MatVecWeightFormat::q8_0,
+        storage[kOutputWeights].view(), storage[kXq].view(), storage[kQkv].view(),
+        storage[kH].view(), storage[kGate].view(), storage[kBeta].view(),
+        storage[kZ].view(), storage[kY].view(), storage[kYq].view(),
+        storage[kBlockOut].view(), storage[kSink].view(),
+        storage[kActiveRows].view()};
+    const WindowT1AttentionGDNBuffers buffers{params, attention, gdn};
+
+    const auto run_reference = [&] {
+        return run_command(
+            context, label + " component reference",
+            [&](CommandBuffer& command, std::string& command_error) {
+                return encode_gr_read(context, command, rows, false, attention,
+                                      command_error) &&
+                       encode_window_gdn_block(context, command, rows, gdn,
+                                               command_error);
+            },
+            error);
+    };
+    const bool reference_completed = run_reference();
+    check(reference_completed, label + " component reference executes", error);
+    if (!reference_completed) return false;
+    std::array<std::vector<std::uint8_t>, output_indices.size()> expected_outputs;
+    for (std::size_t output = 0u; output < output_indices.size(); ++output) {
+        const auto payload = storage[output_indices[output]].payload();
+        expected_outputs[output].assign(payload.begin(), payload.end());
+    }
+    const auto mixed_payload = storage[kMixed].payload();
+    const bool mixed_is_nonzero = std::any_of(
+        mixed_payload.begin(), mixed_payload.end(),
+        [](std::uint8_t value) { return value != 0u; });
+    check(mixed_is_nonzero, label + " GR read produces a nonzero mixed row");
+
+    const std::vector<std::uint8_t> history_before(
+        storage[kHistory].payload().begin(), storage[kHistory].payload().end());
+    const std::vector<std::uint8_t> state_before(
+        storage[kState].payload().begin(), storage[kState].payload().end());
+
+    poison_outputs();
+    const bool window_completed = run_command(
+        context, label + " Window coordinator",
+        [&](CommandBuffer& command, std::string& command_error) {
+            return encode_window_t1_attention_gdn(
+                context, command, vocabulary_size, buffers, command_error);
+        },
+        error);
+    check(window_completed, label + " Window coordinator executes", error);
+    if (!window_completed) return false;
+
+    bool outputs_match = true;
+    for (std::size_t output = 0u; output < output_indices.size(); ++output) {
+        const auto payload = storage[output_indices[output]].payload();
+        const bool matches = std::equal(
+            expected_outputs[output].begin(), expected_outputs[output].end(),
+            payload.begin(), payload.end());
+        check(matches, label + " ordered Window output " +
+                           std::to_string(output) + " matches component chain");
+        outputs_match &= matches;
+        const std::array<twin::ByteRange, 1u> written{{
+            {0u, payload.size()}}};
+        const auto guard = storage[output_indices[output]].first_unwritten_change(
+            written);
+        check(!guard, label + " output guard " + std::to_string(output),
+              guard ? guard->reason : "");
+        outputs_match &= !guard;
+    }
+    const bool state_unchanged =
+        std::equal(history_before.begin(), history_before.end(),
+                   storage[kHistory].payload().begin(),
+                   storage[kHistory].payload().end()) &&
+        std::equal(state_before.begin(), state_before.end(),
+                   storage[kState].payload().begin(),
+                   storage[kState].payload().end());
+    check(state_unchanged, label + " speculative GDN leaves state and history unchanged");
+    const bool residual_unchanged = std::equal(
+        gr_residual_before.begin(), gr_residual_before.end(),
+        storage[kGrResidual].payload().begin(),
+        storage[kGrResidual].payload().end());
+    check(residual_unchanged, label + " attention read preserves the residual input");
+    if (!outputs_match || !state_unchanged || !mixed_is_nonzero ||
+        !residual_unchanged) {
+        return false;
+    }
+
+    const bool apply_control_completed = run_command(
+        context, label + " apply=true negative control",
+        [&](CommandBuffer& command, std::string& command_error) {
+            return encode_gr_read(context, command, rows, true, attention,
+                                  command_error);
+        },
+        error);
+    check(apply_control_completed,
+          label + " apply=true negative control executes", error);
+    if (!apply_control_completed) return false;
+    const auto true_apply_mixed = storage[kMixed].payload();
+    const bool apply_false_is_observable = !std::equal(
+        expected_outputs[4].begin(), expected_outputs[4].end(),
+        true_apply_mixed.begin(), true_apply_mixed.end());
+    check(apply_false_is_observable,
+          label + " nonzero block output distinguishes apply=false");
+    if (!apply_false_is_observable) return false;
+
+    const auto outputs_are_poisoned = [&] {
+        for (const std::size_t index : output_indices) {
+            if (!std::all_of(storage[index].payload().begin(),
+                             storage[index].payload().end(),
+                             [=](std::uint8_t value) { return value == poison; })) {
+                return false;
+            }
+        }
+        return true;
+    };
+    poison_outputs();
+    auto separate_mixed_storage = twin::GuardedBuffer{};
+    check(separate_mixed_storage.allocate(
+              context, label + " wrong mixed handoff", byte_sizes[kMixed], error),
+          label + " allocate wrong mixed handoff", error);
+    if (!separate_mixed_storage.view()) return false;
+    WindowT1AttentionGDNBuffers wrong_handoff = buffers;
+    wrong_handoff.gdn.mixed = separate_mixed_storage.view();
+    auto wrong_handoff_command = context.make_command_buffer(
+        label + " wrong mixed handoff", error);
+    check(wrong_handoff_command != nullptr,
+          label + " wrong-handoff command buffer", error);
+    if (!wrong_handoff_command) return false;
+    const bool wrong_handoff_rejected = !encode_window_t1_attention_gdn(
+        context, *wrong_handoff_command, vocabulary_size, wrong_handoff, error);
+    const bool wrong_handoff_discarded =
+        wrong_handoff_command->unsafe_native_handle() == nullptr;
+    check(wrong_handoff_rejected && wrong_handoff_discarded &&
+              error.find("must be the GDN mixed input") != std::string::npos &&
+              outputs_are_poisoned(),
+          label + " rejects a split mixed handoff", error);
+
+    const std::array<std::uint32_t, 2u> two_tokens{1u, 2u};
+    const std::array<WindowSamplerSettings, 2u> two_samplers{};
+    const BufferRef two_row_params = params_ring->build_slot(
+        1u, position, two_tokens, two_samplers, 0u, 0x1234u, 0x5678u, error);
+    check(static_cast<bool>(two_row_params), label + " build T=2 rejection params",
+          error);
+    if (!two_row_params) return false;
+    WindowT1AttentionGDNBuffers wrong_rows = buffers;
+    wrong_rows.params = two_row_params;
+    auto wrong_rows_command = context.make_command_buffer(
+        label + " reject T=2", error);
+    check(wrong_rows_command != nullptr, label + " T=2 command buffer", error);
+    if (!wrong_rows_command) return false;
+    const bool wrong_rows_rejected = !encode_window_t1_attention_gdn(
+        context, *wrong_rows_command, vocabulary_size, wrong_rows, error);
+    const bool wrong_rows_discarded =
+        wrong_rows_command->unsafe_native_handle() == nullptr;
+    check(wrong_rows_rejected && wrong_rows_discarded &&
+              error.find("T=1") != std::string::npos && outputs_are_poisoned(),
+          label + " rejects T=2 parameters", error);
+
+    strata::metal::WindowParams valid_params{};
+    std::memcpy(&valid_params, params.contents, sizeof(valid_params));
+    const auto reject_mutated_params = [&](const std::string& case_name,
+                                           const std::string& expected_error,
+                                           auto mutate) {
+        strata::metal::WindowParams malformed = valid_params;
+        mutate(malformed);
+        std::memcpy(params.contents, &malformed, sizeof(malformed));
+        WindowT1AttentionGDNBuffers malformed_buffers = buffers;
+        malformed_buffers.params = params;
+        auto command = context.make_command_buffer(
+            label + " reject " + case_name, error);
+        if (!command) {
+            std::memcpy(params.contents, &valid_params, sizeof(valid_params));
+            check(false, label + " " + case_name + " command buffer", error);
+            return false;
+        }
+        poison_outputs();
+        const bool rejected = !encode_window_t1_attention_gdn(
+            context, *command, vocabulary_size, malformed_buffers, error);
+        const bool discarded = command->unsafe_native_handle() == nullptr;
+        const bool unchanged = outputs_are_poisoned();
+        std::memcpy(params.contents, &valid_params, sizeof(valid_params));
+        const bool correct = rejected && discarded && unchanged &&
+                             error.find(expected_error) != std::string::npos;
+        check(correct, label + " rejects " + case_name, error);
+        return correct;
+    };
+    const bool invalid_nc_rejected = reject_mutated_params(
+        "T=1 with invalid nc", "T=1", [](strata::metal::WindowParams& malformed) {
+            malformed.nc = 2u;
+        });
+    const bool nonzero_keep_rejected = reject_mutated_params(
+        "nonzero n_keep", "n_keep=0", [](strata::metal::WindowParams& malformed) {
+            malformed.n_keep = 1u;
+        });
+    const bool invalid_token_rejected = reject_mutated_params(
+        "out-of-vocabulary token", "outside the text vocabulary",
+        [&](strata::metal::WindowParams& malformed) {
+            malformed.tokens[0] = vocabulary_size;
+        });
+    const bool invalid_step_rejected = reject_mutated_params(
+        "inconsistent StepRow", "StepRow", [](strata::metal::WindowParams& malformed) {
+            ++malformed.step[0].n_kv;
+        });
+
+    WindowT1AttentionGDNBuffers overlapping_stages = buffers;
+    overlapping_stages.gdn.state = attention.residual;
+    auto overlap_command = context.make_command_buffer(
+        label + " reject cross-stage overlap", error);
+    check(overlap_command != nullptr,
+          label + " cross-stage overlap command buffer", error);
+    if (!overlap_command) return false;
+    poison_outputs();
+    const bool overlap_rejected = !encode_window_t1_attention_gdn(
+        context, *overlap_command, vocabulary_size, overlapping_stages, error);
+    const bool overlap_discarded =
+        overlap_command->unsafe_native_handle() == nullptr;
+    const bool overlap_untouched = outputs_are_poisoned();
+    check(overlap_rejected && overlap_discarded && overlap_untouched &&
+              error.find("overlap outside the mixed handoff") !=
+                  std::string::npos,
+          label + " rejects writable cross-stage overlap", error);
+
+    const BufferRef short_active_rows = storage[kActiveRows].view().slice(0u, 3u);
+    WindowT1AttentionGDNBuffers late_failure = buffers;
+    late_failure.gdn.active_rows = short_active_rows;
+    auto late_failure_command = context.make_command_buffer(
+        label + " late GDN validation failure", error);
+    check(late_failure_command != nullptr,
+          label + " late-failure command buffer", error);
+    if (!late_failure_command) return false;
+    poison_outputs();
+    const bool late_failure_rejected = !encode_window_t1_attention_gdn(
+        context, *late_failure_command, vocabulary_size, late_failure, error);
+    const bool late_failure_discarded =
+        late_failure_command->unsafe_native_handle() == nullptr;
+    check(late_failure_rejected && late_failure_discarded &&
+              error.find("undersized") != std::string::npos && outputs_are_poisoned(),
+          label + " late GDN failure discards the earlier GR read", error);
+
+    auto shared_failure_command = context.make_command_buffer(
+        label + " caller-owned late failure", error);
+    check(shared_failure_command != nullptr,
+          label + " caller-owned failure command buffer", error);
+    if (!shared_failure_command) return false;
+    poison_outputs();
+    const bool shared_failure_rejected = !Encoder::encode(
+        context, *shared_failure_command, "Window attention/GDN shared failure",
+        [&](Encoder& encoder, std::string& body_error) {
+            return encode_window_t1_attention_gdn(
+                context, encoder, vocabulary_size, late_failure, body_error);
+        },
+        error);
+    const bool shared_failure_discarded =
+        shared_failure_command->unsafe_native_handle() == nullptr;
+    check(shared_failure_rejected && shared_failure_discarded &&
+              error.find("undersized") != std::string::npos && outputs_are_poisoned(),
+          label + " caller-owned late failure discards the segment", error);
+
+    return wrong_handoff_rejected && wrong_handoff_discarded &&
+           wrong_rows_rejected && wrong_rows_discarded && invalid_nc_rejected &&
+           nonzero_keep_rejected && invalid_token_rejected &&
+           invalid_step_rejected && overlap_rejected && overlap_discarded &&
+           late_failure_rejected && late_failure_discarded &&
+           shared_failure_rejected && shared_failure_discarded;
+}
+
 bool test_window_gdn_block_contract(Context& context) {
     bool passed = true;
     const WindowGDNBlockBuffers empty{};
@@ -2546,6 +3028,7 @@ int main(int argc, char** argv) {
     if (!foreign_context) return 1;
 
     bool passed = test_encoder_validation(*context, *foreign_context);
+    passed &= test_window_t1_attention_gdn(*context);
     passed &= test_window_gdn_block_contract(*context);
     passed &= test_conv_l2_shared_encoder_validation(
         context_options, *foreign_context);
