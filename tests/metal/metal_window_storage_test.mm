@@ -53,6 +53,8 @@ using namespace strata::metal;
 
 namespace {
 
+constexpr std::uint32_t kGgmlTypeQ3K = 11u;
+
 template <typename T>
 concept HasPleLifecycle = requires(T& reader, std::string& error) {
     reader.open(std::string{}, error);
@@ -690,7 +692,7 @@ Fixture write_fullmode_handoff_fixture(const fs::path& directory) {
         {"blk.0.ffn_gate_exps.weight", {2'560u, 640u, kExperts}, 42u, 0u},
         {"blk.0.ffn_up_exps.weight", {2'560u, 640u, kExperts}, 42u, 0u},
         {"blk.0.ffn_down_exps.weight", {640u, 2'560u, kExperts}, 42u, 0u},
-        {"token_embd.weight", {1u, 1u}, 0u, 0u},
+        {"token_embd.weight", {2'560u, 1u}, kGgmlTypeQ3K, 0u},
         {fixture.router_tensor_name, {2'560u, kExperts}, 0u, 0u},
         {"per_layer_token_embd.weight",
          {strata::kernels::PLE_HEAD_DIM, kPleRows}, 20u, 0u},
@@ -704,7 +706,7 @@ Fixture write_fullmode_handoff_fixture(const fs::path& directory) {
             cursor += kExperts * kExpertSlabBytes;
         } else if (tensor.name == "token_embd.weight") {
             fixture.dense_offset = cursor;
-            cursor += sizeof(float);
+            cursor += (2'560u / 256u) * sizeof(block_q3_K);
         } else if (tensor.name == fixture.router_tensor_name) {
             fixture.router_offset = cursor;
             cursor += kRouterSourceBytes;
@@ -746,6 +748,17 @@ Fixture write_fullmode_handoff_fixture(const fs::path& directory) {
                                 static_cast<off_t>(fixture.file_size)) == 0,
                 "size sparse full-mode handoff GGUF fixture");
 
+        std::vector<block_q3_K> embedding_row(2'560u / 256u);
+        for (block_q3_K& block : embedding_row) {
+            std::fill_n(block.hmask, std::size(block.hmask), 0u);
+            std::fill_n(block.qs, std::size(block.qs), 0x55u);
+            std::fill_n(block.scales, std::size(block.scales), 0u);
+            block.d = strata::kernels::f16_from_f32(0.001f);
+        }
+        write_all_at(descriptor, embedding_row.data(),
+                     embedding_row.size() * sizeof(block_q3_K),
+                     fixture.data_start + fixture.dense_offset);
+
         // Equal zero router logits select expert IDs 0..9 in stable tie order.
         // Give those ten expert slabs finite positive Q2_0 values so the test
         // exercises nonzero routed as well as shared FFN output.
@@ -774,7 +787,7 @@ Fixture write_fullmode_handoff_fixture(const fs::path& directory) {
         ple_geometry.head_dim = kSessionHeadWidth;
         ple_geometry.n_embd = kSessionEmbeddingWidth;
         ple_geometry.vocab = kSessionVocabularySize;
-        const std::array<std::uint32_t, 1u> ple_tokens{1u};
+        const std::array<std::uint32_t, 1u> ple_tokens{0u};
         const std::array<std::uint32_t, 2u> ple_history{5u, 0u};
         WindowPleRows ple_rows;
         std::string ple_error;
@@ -2799,7 +2812,7 @@ void run_fullmode_handoff_test(Context& context,
                                const fs::path& parent_directory,
                                bool use_ple_entry = false) {
     constexpr std::uint32_t kExperts = 256u;
-    constexpr std::uint32_t kVocabulary = 248'320u;
+    constexpr std::uint32_t kVocabulary = 1u;
     constexpr std::uint32_t kRows = 1u;
     constexpr std::size_t kGrRows = HC_DIM;
     constexpr std::size_t kGrLowRank = HC_LOW_RANK;
@@ -2821,7 +2834,7 @@ void run_fullmode_handoff_test(Context& context,
     full_geometry.head_dim = 256u;
     full_geometry.n_embd = N_EMBD;
     full_geometry.vocab = kVocabulary;
-    full_geometry.types = {"f32", "iq4_nl", "q2_0"};
+    full_geometry.types = {"f32", "iq4_nl", "q2_0", "q3_k"};
     full_geometry.layers[0].gate_up_type = "q2_0";
     full_geometry.layers[0].down_type = "q2_0";
 
@@ -2844,7 +2857,7 @@ void run_fullmode_handoff_test(Context& context,
     runtime_geometry.n_kv_head = 2u;
     runtime_geometry.head_dim = 256u;
     runtime_geometry.n_embd = N_EMBD;
-    runtime_geometry.vocab = kVocabulary;
+    runtime_geometry.vocab = kSessionVocabularySize;
     auto scratch =
         WindowScratchStorage::open(context, runtime_geometry, 4u, error);
     require(scratch != nullptr,
@@ -2860,7 +2873,7 @@ void run_fullmode_handoff_test(Context& context,
     auto params_ring = WindowParamsRing::open(context, error);
     require(params_ring != nullptr,
             "open full-mode handoff WindowParamsRing: " + error);
-    const std::array<std::uint32_t, kRows> tokens{1u};
+    const std::array<std::uint32_t, kRows> tokens{0u};
     const std::array<WindowSamplerSettings, kRows> samplers{};
     const BufferRef params = params_ring->build_slot(
         0u, 1u, tokens, samplers, 0u, 0x11223344u, 0x55667788u, error);
@@ -3069,8 +3082,6 @@ void run_fullmode_handoff_test(Context& context,
     auto shared_down_sink =
         allocate("full-mode handoff shared down sink", sizeof(float));
 
-    std::fill_n(static_cast<float*>(residual.contents),
-                4u * N_EMBD, 0.02f);
     std::fill_n(static_cast<float*>(attention_norm.contents),
                 attention_norm.length / sizeof(float), 1.0f);
     std::fill_n(static_cast<float*>(ffn_norm.contents),
@@ -3105,6 +3116,33 @@ void run_fullmode_handoff_test(Context& context,
                 shared_gate_input_weights.length / sizeof(std::uint16_t),
                 strata::kernels::bf16_from_f32(0.01f));
     std::memset(pending_output.contents, 0xa5, pending_output.length);
+
+    FullModeTensorView token_embedding_view;
+    require(full_mode->dense_tensor_view("token_embd.weight",
+                                         token_embedding_view, error),
+            "resolve mapped FullMode token embedding: " + error);
+    require(token_embedding_view.ggml_type == kGgmlTypeQ3K &&
+                token_embedding_view.shape ==
+                    std::vector<std::uint64_t>{N_EMBD, kVocabulary},
+            "FullMode token embedding has the expected Q3_K [2560, 1] shape");
+    auto embedding_seed_command = context.make_command_buffer(
+        "Seed FullMode input stem for handoff reference", error);
+    require(embedding_seed_command != nullptr,
+            "create FullMode input-stem reference command: " + error);
+    require(encode_window_embedding(
+        context, *embedding_seed_command, kVocabulary,
+                EmbedRowsFormat::q3_k,
+                {params, token_embedding_view.buffer, pending_output, residual},
+                error),
+            "encode mapped FullMode token embedding and GR broadcast: " +
+                error);
+    require(embedding_seed_command->commit(error),
+            "commit FullMode input-stem reference: " + error);
+    id<MTLCommandBuffer> native_embedding_seed =
+        (__bridge id<MTLCommandBuffer>)embedding_seed_command->unsafe_native_handle();
+    [native_embedding_seed waitUntilCompleted];
+    require(native_embedding_seed.status == MTLCommandBufferStatusCompleted,
+            "FullMode input-stem reference completed");
     const std::vector<std::uint8_t> initial_residual(
         static_cast<const std::uint8_t*>(residual.contents),
         static_cast<const std::uint8_t*>(residual.contents) +
@@ -3295,6 +3333,31 @@ void run_fullmode_handoff_test(Context& context,
             ple_entry, MatVecWeightFormat::q2_0, 1u,
             PLEHistoryUpdate::defer};
     }
+    const WindowT1FullModeStepBuffers full_step_buffers{
+        pending_output, residual, full_buffers, pending_consumer};
+
+    WindowT1FullModeStepBuffers mismatched_branch = full_step_buffers;
+    mismatched_branch.consumer =
+        use_ple_entry
+            ? WindowMoePendingConsumer{attention_entry}
+            : WindowMoePendingConsumer{WindowMoePendingPLEConsumer{}};
+    auto branch_mismatch_command = context.make_command_buffer(
+        "Reject mismatched FullMode consumer branch", error);
+    require(branch_mismatch_command != nullptr,
+            "create mismatched FullMode branch command: " + error);
+    const bool branch_mismatch_encoded = Encoder::encode(
+        context, *branch_mismatch_command, "mismatched FullMode branch",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_t1_full_mode_step(
+                context, *full_mode, encoder, kVocabulary, kExperts,
+                MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
+                use_ple_entry, mismatched_branch, encode_error);
+        },
+        error);
+    require(!branch_mismatch_encoded &&
+                error.find("does not match the selected PLE branch") !=
+                    std::string::npos,
+            "T=1 FullMode step must reject a branch/payload mismatch before dispatch");
 
     WindowMoePendingConsumer mismatched_consumer =
         use_ple_entry
@@ -3319,6 +3382,112 @@ void run_fullmode_handoff_test(Context& context,
                     std::string::npos,
             "Window pending consumer must reject a branch/tag mismatch before dispatch");
 
+    WindowT1FullModeStepBuffers mismatched_streams = full_step_buffers;
+    mismatched_streams.streams = attention_entry_mixed;
+    auto stream_mismatch_command = context.make_command_buffer(
+        "Reject mismatched FullMode input streams", error);
+    require(stream_mismatch_command != nullptr,
+            "create mismatched FullMode input-stream command: " + error);
+    const bool stream_mismatch_encoded = Encoder::encode(
+        context, *stream_mismatch_command, "mismatched FullMode input streams",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_t1_full_mode_step(
+                context, *full_mode, encoder, kVocabulary, kExperts,
+                MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
+                use_ple_entry, mismatched_streams, encode_error);
+        },
+        error);
+    require(!stream_mismatch_encoded &&
+                error.find("must be the layer-0 attention residual view") !=
+                    std::string::npos,
+            "T=1 FullMode step must reject streams that do not feed layer-0 attention");
+
+    WindowT1FullModeStepBuffers later_weight_alias = full_step_buffers;
+    later_weight_alias.embedding = attention_norm;
+    auto later_weight_alias_command = context.make_command_buffer(
+        "Reject embedding overlap with later attention weights", error);
+    require(later_weight_alias_command != nullptr,
+            "create later-weight alias command: " + error);
+    const bool later_weight_alias_encoded = Encoder::encode(
+        context, *later_weight_alias_command, "later attention weight alias",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_t1_full_mode_step(
+                context, *full_mode, encoder, kVocabulary, kExperts,
+                MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
+                use_ple_entry, later_weight_alias, encode_error);
+        },
+        error);
+    require(!later_weight_alias_encoded &&
+                error.find("embedding scratch overlaps") != std::string::npos,
+            "T=1 FullMode step must reject embedding scratch reused by a later attention read");
+
+    WindowT1FullModeStepBuffers partial_pending_alias = full_step_buffers;
+    partial_pending_alias.embedding = pending_output.slice(
+        sizeof(float), pending_output.length - sizeof(float));
+    require(static_cast<bool>(partial_pending_alias.embedding),
+            "create partial view into the pending MoE output");
+    auto partial_pending_alias_command = context.make_command_buffer(
+        "Reject partial embedding overlap with pending output", error);
+    require(partial_pending_alias_command != nullptr,
+            "create partial pending-output alias command: " + error);
+    const bool partial_pending_alias_encoded = Encoder::encode(
+        context, *partial_pending_alias_command,
+        "partial pending-output alias",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_t1_full_mode_step(
+                context, *full_mode, encoder, kVocabulary, kExperts,
+                MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
+                use_ple_entry, partial_pending_alias, encode_error);
+        },
+        error);
+    require(!partial_pending_alias_encoded &&
+                error.find("embedding scratch overlaps") != std::string::npos,
+            "embedding scratch may reuse shared.output only when the views are exactly equal");
+
+    WindowT1FullModeStepBuffers late_failure = full_step_buffers;
+    if (use_ple_entry) {
+        WindowMoePendingPLEConsumer invalid_ple =
+            std::get<WindowMoePendingPLEConsumer>(late_failure.consumer);
+        invalid_ple.buffers.ple.post.residual = attention_entry_mixed;
+        late_failure.consumer = std::move(invalid_ple);
+    } else {
+        WindowMoeAttentionEntryBuffers invalid_attention =
+            std::get<WindowMoeAttentionEntryBuffers>(late_failure.consumer);
+        invalid_attention.attention.residual = attention_entry_mixed;
+        late_failure.consumer = std::move(invalid_attention);
+    }
+    const std::vector<std::uint8_t> residual_before_late_failure(
+        static_cast<const std::uint8_t*>(residual.contents),
+        static_cast<const std::uint8_t*>(residual.contents) + residual.length);
+    const std::vector<std::uint8_t> pending_before_late_failure(
+        static_cast<const std::uint8_t*>(pending_output.contents),
+        static_cast<const std::uint8_t*>(pending_output.contents) +
+            pending_output.length);
+    auto late_failure_command = context.make_command_buffer(
+        "Discard failed FullMode T=1 step", error);
+    require(late_failure_command != nullptr,
+            "create late-failure FullMode step command: " + error);
+    const bool late_failure_encoded = Encoder::encode(
+        context, *late_failure_command, "late-failure FullMode T=1 step",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_t1_full_mode_step(
+                context, *full_mode, encoder, kVocabulary, kExperts,
+                MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
+                use_ple_entry, late_failure, encode_error);
+        },
+        error);
+    require(!late_failure_encoded,
+            "T=1 FullMode step must propagate a late consumer validation error");
+    require(std::equal(
+                residual_before_late_failure.begin(),
+                residual_before_late_failure.end(),
+                static_cast<const std::uint8_t*>(residual.contents)) &&
+                std::equal(
+                    pending_before_late_failure.begin(),
+                    pending_before_late_failure.end(),
+                    static_cast<const std::uint8_t*>(pending_output.contents)),
+            "late consumer failure must discard the input stem and producer segment");
+
     auto row_count_command = context.make_command_buffer(
         "Reject multi-row Window pending consumer", error);
     require(row_count_command != nullptr,
@@ -3341,32 +3510,48 @@ void run_fullmode_handoff_test(Context& context,
             "create same-segment FullMode handoff command: " + error);
     require(session->track_use(*command, error),
             "track GDN state through FullMode handoff: " + error);
+    constexpr std::size_t kActiveEmbeddingBytes =
+        N_EMBD * sizeof(float);
+    constexpr std::size_t kActiveResidualBytes =
+        4u * N_EMBD * sizeof(float);
+    std::vector<std::uint8_t> embedding_sentinel(
+        kActiveEmbeddingBytes, 0x5au);
+    std::memcpy(pending_output.contents, embedding_sentinel.data(),
+                embedding_sentinel.size());
+    require(!std::equal(initial_residual.begin(),
+                        initial_residual.begin() + kActiveEmbeddingBytes,
+                        embedding_sentinel.begin()),
+            "the reference token embedding differs from the integrated embedding sentinel");
+    std::vector<std::uint8_t> residual_sentinel(
+        kActiveResidualBytes, 0x3cu);
+    std::memcpy(residual.contents, residual_sentinel.data(),
+                residual_sentinel.size());
+    require(!std::equal(initial_residual.begin(),
+                        initial_residual.begin() + kActiveResidualBytes,
+                        residual_sentinel.begin()),
+            "the reference input stem differs from the integrated residual sentinel");
     const bool encoded = Encoder::encode(
         context, *command,
         use_ple_entry ? "FullMode producer and pending PLE consumer"
                       : "FullMode producer and pending attention consumer",
         [&](Encoder& encoder, std::string& encode_error) {
-            if (!encode_window_t1_moe_layer0_full_mode(
-                    context, *full_mode, encoder, kVocabulary, kExperts,
-                    MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
-                    full_buffers, encode_error)) {
-                return false;
-            }
-            return encode_window_moe_pending_consumer(
-                context, encoder, kRows, use_ple_entry,
-                pending_consumer, encode_error);
+            return encode_window_t1_full_mode_step(
+                context, *full_mode, encoder, kVocabulary, kExperts,
+                MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
+                use_ple_entry, full_step_buffers, encode_error);
         },
         error);
     require(encoded,
-            "encode FullMode producer followed by the selected PLE consumer in one segment: " +
+            "encode FullMode token embedding, producer and selected consumer in one segment: " +
                 error);
     require(command->commit(error),
-            "commit FullMode producer and pending consumer: " + error);
+            "commit FullMode input stem, producer and pending consumer: " +
+                error);
     id<MTLCommandBuffer> native =
         (__bridge id<MTLCommandBuffer>)command->unsafe_native_handle();
     [native waitUntilCompleted];
     require(native.status == MTLCommandBufferStatusCompleted,
-            "same-segment FullMode producer and pending consumer completed: " +
+            "same-segment FullMode input stem, producer and pending consumer completed: " +
                 (native.error ? std::string(native.error.localizedDescription.UTF8String)
                               : std::string{}));
 

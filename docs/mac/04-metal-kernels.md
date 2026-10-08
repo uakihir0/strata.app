@@ -152,7 +152,7 @@ It does not cover:
 | `common/dot.h` | Integer dot helpers (`dot4_i8`), per-format `load`/`acc` decoders for the mat-vecs (section 5.8) |
 | `common/codebooks.h` | `iq2xxs_grid`, `iq2xs_grid`, `iq2s_grid`, `iq3xxs_grid`, `iq3s_grid`, `iq1s_grid_gpu`, `ksigns_iq2xs`, `kmask_iq2xs`, `kvalues_iq4nl`, copied from ggml-common.h at llama.cpp `3cf03257f` |
 | `common/params.h` | Architecture constants of [03](03-model-reference.md), section 3.1 (`N_EMBD`, `HC`, `N_LAYER`, ...) as `constant constexpr` values; model metadata such as `rope.freq_base` remains runtime data |
-| `safe/embed.metal` | Q3_K, IQ3_S, IQ4_XS and BF16 token gathers, bit-exact image-row copies and GR stream broadcast; the validated embedding encoders and Prefill embedding coordinator support caller-owned Encoder segments with concurrent-mode barriers. The T=1 Window input-stem coordinator composes gather→broadcast; a separate layer-0 coordinator composes attention GR read→GDN→FFN GR read. Full Window decode and Prefill production dispatch remain unimplemented |
+| `safe/embed.metal` | Q3_K, IQ3_S, IQ4_XS and BF16 token gathers, bit-exact image-row copies and GR stream broadcast; the validated embedding encoders and Prefill embedding coordinator support caller-owned Encoder segments with concurrent-mode barriers. The FullMode T=1 step maps native `token_embd.weight` types Q3_K/IQ3_S/IQ4_XS and composes gather→broadcast→layer-0 MoE→one pending consumer; it checks scratch liveness and allows only exact reuse as `shared.output`. Its BF16 gather remains available to standalone callers, but this coordinator does not resolve the optional BF16 embedding artifact. A separate layer-0 coordinator composes attention GR read→GDN→FFN GR read. Full Window decode and Prefill production dispatch remain unimplemented |
 | `safe/prefill_gr.metal` | Prefill-specific GR read normalization with the documented two-stage butterfly, plus a separate BF16X2 low-remainder pipeline; validated standalone and caller-owned Encoder APIs can compose after the Prefill embedding stage, while `Prefill::run` remains unimplemented |
 | `safe/ple.metal` | `strata_ple_gate`, `strata_ple_broadcast`, `strata_ple_conv_residual` and `strata_ple_history` are implemented; validated gate, value-broadcast, conv-residual and history encoders can join a caller-owned `Encoder` segment (the Window path must use its documented serial mode); production PLE dispatch remains unimplemented |
 | `safe/gr.metal` | Weighted RMS norm, fused `strata_gr_norm`, tiled `strata_gr_down`, fused `strata_gr_up`, O-class `strata_gr_cvec`, native `strata_gr_post`, `strata_gr_down_silu` and `strata_gr_pre_gated` are implemented; validated weighted-norm, norm/down/up/cvec/post/down-SiLU/pre-gated encoders exist, and weighted RMS norm, GR norm, GR down, GR up, GR cvec, GR post, GR down-SiLU and GR pre-gated can join a caller-owned `Encoder` segment; the T=1 Window layer-0 coordinator calls attention and FFN GR reads with their distinct `hc_attn_*` and `hc_ffn_*` weights; later Window layers and Prefill production dispatch remain unimplemented |
@@ -2242,7 +2242,14 @@ the sixteen IQ4_NL rows from the synthetic FullMode GGUF's mapped PLE table thro
 do not select a production scheduler branch or establish model-backed decode parity.
 Both tests route through `encode_window_moe_pending_consumer`, which requires the selected
 `ple_enabled` tag to match a variant containing exactly one consumer payload. The mismatch case is
-rejected before dispatch; `Window::run` does not call this selector yet.
+rejected before dispatch. They now call `encode_window_t1_full_mode_step`, which resolves the
+read-only native `token_embd.weight` view from `FullModeStorage`, maps GGML Q3_K, IQ3_S or IQ4_XS
+to its gather format, and orders embedding gather, GR broadcast, the FullMode layer-0 producer,
+and the selected PLE or next-attention consumer in one segment. (The optional BF16 embedding
+artifact is not resolved by this coordinator.) The embedding scratch is dead after broadcast and
+is checked against all later live views. It may be reused as `shared.output` only when the views
+are exactly equal. This synthetic T=1 composition still does not wire `Window::run`, later layers,
+commit, head, sampler, tiered scheduling, or model parity.
 
 ### 5.10 MoE: router, plan, experts, shared expert and combine
 
