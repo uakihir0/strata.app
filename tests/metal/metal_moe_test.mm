@@ -807,22 +807,19 @@ bool test_plan_case(Context& context, std::uint32_t experts,
     usage_buffer.capture_before_dispatch();
     plans_buffer.capture_before_dispatch();
 
-    const twin::MoePlanParams params{
-        rows, experts, tiered ? 1u : 0u, kPlanLayer};
-    twin::Dispatch work;
-    work.grid_mode = twin::GridMode::threadgroups;
-    work.grid = {1u, 1u, 1u};
-    work.threads_per_group = {128u, 1u, 1u};
-    work.buffers = {{0u, ids_buffer.view()},
-                    {1u, resident_buffer.view()},
-                    {2u, usage_buffer.view()},
-                    {3u, plans_buffer.view()}};
-    work.parameters = &params;
-    work.parameter_bytes = sizeof(params);
-    work.parameter_index = 4u;
-    const bool dispatched =
-        twin::dispatch_manifest(context, "strata_moe_plan", work, err);
-    check(dispatched, label + " Metal dispatch", err);
+    const ReadOnlyBufferRef ids_view =
+        context.buffers().read_only(ids_buffer.view());
+    const ReadOnlyBufferRef resident_view =
+        context.buffers().read_only(resident_buffer.view());
+    auto command = context.make_command_buffer(label, err);
+    const bool dispatched = ids_view && resident_view && command &&
+        encode_moe_plan(
+            context, *command, rows, experts, tiered, kPlanLayer,
+            {ids_view, resident_view, usage_buffer.view(),
+             plans_buffer.view()},
+            err) &&
+        command->commit(err) && command->wait_until_completed(err);
+    check(dispatched, label + " validated engine encoder", err);
     if (!dispatched) return false;
 
     const auto* expected_plan_bytes =
@@ -875,6 +872,227 @@ bool test_plan_case(Context& context, std::uint32_t experts,
     check(!plans_buffer.first_unwritten_change(plans_written),
           label + " plan writes stay within the selected layer");
     return !plan_failure && !usage_failure;
+}
+
+bool test_plan_dispatch_validation(Context& context) {
+    constexpr std::uint32_t kLayer = 3u;
+    constexpr std::uint32_t kExperts = 512u;
+    constexpr std::uint32_t kRows = 1u;
+    constexpr std::size_t kIdsBytes = 80u * sizeof(std::int32_t);
+    constexpr std::size_t kTableEntries = (kLayer + 1u) * kExperts;
+    constexpr std::size_t kResidentBytes =
+        kTableEntries * sizeof(std::int32_t);
+    constexpr std::size_t kUsageBytes = kTableEntries * sizeof(float);
+    constexpr std::size_t kPlansBytes =
+        (kLayer + 1u) * sizeof(TieredMoePlan);
+    constexpr std::string_view label = "MoE plan encoder validation";
+
+    std::string err;
+    twin::GuardedBuffer ids;
+    twin::GuardedBuffer resident;
+    twin::GuardedBuffer usage;
+    twin::GuardedBuffer plans;
+    twin::GuardedBuffer alias;
+    check(ids.allocate(context, "MoE plan validation IDs", kIdsBytes + 1u,
+                       err),
+          "MoE plan validation IDs buffer", err);
+    check(resident.allocate(context, "MoE plan validation resident",
+                            kResidentBytes, err),
+          "MoE plan validation resident buffer", err);
+    check(usage.allocate(context, "MoE plan validation usage", kUsageBytes,
+                         err),
+          "MoE plan validation usage buffer", err);
+    check(plans.allocate(context, "MoE plan validation plans", kPlansBytes,
+                         err),
+          "MoE plan validation plans buffer", err);
+    check(alias.allocate(context, "MoE plan validation alias",
+                         std::max(kUsageBytes, kPlansBytes), err),
+          "MoE plan validation alias buffer", err);
+    if (!ids.view() || !resident.view() || !usage.view() || !plans.view() ||
+        !alias.view()) {
+        return false;
+    }
+
+    std::fill(usage.payload().begin(), usage.payload().end(), 0x5au);
+    std::fill(plans.payload().begin(), plans.payload().end(), 0xa5u);
+    std::fill(alias.payload().begin(), alias.payload().end(), 0x3cu);
+    const std::vector<std::uint8_t> usage_before(usage.payload().begin(),
+                                                 usage.payload().end());
+    const std::vector<std::uint8_t> plans_before(plans.payload().begin(),
+                                                 plans.payload().end());
+    const std::vector<std::uint8_t> alias_before(alias.payload().begin(),
+                                                 alias.payload().end());
+    const ReadOnlyBufferRef ids_view = context.buffers().read_only(ids.view());
+    const ReadOnlyBufferRef resident_view =
+        context.buffers().read_only(resident.view());
+    if (!ids_view || !resident_view) {
+        check(false, std::string(label) + " read-only input views", err);
+        return false;
+    }
+    const MoePlanBuffers valid{ids_view, resident_view, usage.view(),
+                               plans.view()};
+
+    const auto reject = [&](const std::string& case_label,
+                            std::uint32_t rows, std::uint32_t experts,
+                            bool tiered, std::uint32_t layer,
+                            MoePlanBuffers buffers,
+                            std::string_view error_fragment) {
+        auto command = context.make_command_buffer(case_label, err);
+        const bool rejected = command && !encode_moe_plan(
+            context, *command, rows, experts, tiered, layer, buffers, err);
+        const bool discarded = command &&
+            command->unsafe_native_handle() == nullptr;
+        const bool error_matches =
+            err.find(error_fragment) != std::string::npos;
+        const bool outputs_unchanged =
+            std::equal(usage_before.begin(), usage_before.end(),
+                       usage.payload().begin(), usage.payload().end()) &&
+            std::equal(plans_before.begin(), plans_before.end(),
+                       plans.payload().begin(), plans.payload().end()) &&
+            std::equal(alias_before.begin(), alias_before.end(),
+                       alias.payload().begin(), alias.payload().end());
+        check(rejected && discarded && error_matches && outputs_unchanged,
+              case_label + " rejects before dispatch and discards", err);
+        return rejected && discarded && error_matches && outputs_unchanged;
+    };
+
+    const bool zero_rows = reject(
+        "reject zero-row MoE plan", 0u, kExperts, true, kLayer, valid,
+        "1..8 rows");
+    const bool too_many_rows = reject(
+        "reject over-capacity MoE plan", 9u, kExperts, true, kLayer, valid,
+        "1..8 rows");
+    const bool invalid_experts = reject(
+        "reject unsupported MoE plan expert count", kRows, 128u, true,
+        kLayer, valid, "256 or 512 experts");
+    const bool invalid_layer = reject(
+        "reject out-of-range MoE plan layer", kRows, kExperts, true,
+        kTieredMaxLayers, valid, "valid layer");
+    const bool short_ids = reject(
+        "reject undersized MoE plan IDs", kRows, kExperts, true, kLayer,
+        {ids_view.slice(0u, kRows * kTopK * sizeof(std::int32_t) -
+                               sizeof(std::int32_t)),
+         resident_view, usage.view(), plans.view()},
+        "IDs");
+    const bool misaligned_ids = reject(
+        "reject misaligned MoE plan IDs", kRows, kExperts, true, kLayer,
+        {context.buffers().read_only(ids.view().slice(
+             1u, kRows * kTopK * sizeof(std::int32_t))),
+         resident_view, usage.view(), plans.view()},
+        "misaligned");
+    const bool short_resident = reject(
+        "reject undersized MoE resident table", kRows, kExperts, true,
+        kLayer,
+        {ids_view, resident_view.slice(0u, sizeof(std::int32_t)),
+         usage.view(), plans.view()},
+        "resident table");
+    const bool short_usage = reject(
+        "reject undersized MoE usage table in full mode", kRows, kExperts,
+        false, kLayer,
+        {ids_view, resident_view, usage.view().slice(0u, sizeof(float)),
+         plans.view()},
+        "usage table");
+    const bool short_plans = reject(
+        "reject undersized MoE plan output", kRows, kExperts, true, kLayer,
+        {ids_view, resident_view, usage.view(),
+         plans.view().slice(0u, sizeof(TieredMoePlan))},
+        "plan output");
+
+    const BufferRef alias_view = alias.view();
+    const ReadOnlyBufferRef alias_read =
+        context.buffers().read_only(alias_view);
+    const bool ids_usage_alias = reject(
+        "reject MoE plan IDs and usage alias", kRows, kExperts, true,
+        kLayer,
+        {context.buffers().read_only(alias_view.slice(0u, kIdsBytes)),
+         resident_view, alias_view, plans.view()},
+        "overlap");
+    const bool resident_plan_alias = reject(
+        "reject MoE plan resident and output alias", kRows, kExperts, true,
+        kLayer,
+        {ids_view, alias_read, usage.view(), alias_view},
+        "overlap");
+    const bool usage_plan_alias = reject(
+        "reject MoE plan usage and output alias", kRows, kExperts, true,
+        kLayer,
+        {ids_view, resident_view, alias_view, alias_view},
+        "overlap");
+    const bool ids_plan_alias = reject(
+        "reject MoE plan IDs and output alias", kRows, kExperts, true,
+        kLayer,
+        {context.buffers().read_only(
+             alias_view.slice(0u, kRows * kTopK * sizeof(std::int32_t))),
+         resident_view, usage.view(), alias_view},
+        "overlap");
+    const bool resident_usage_alias = reject(
+        "reject MoE plan resident and usage alias", kRows, kExperts, true,
+        kLayer,
+        {ids_view, alias_read, alias_view, plans.view()},
+        "overlap");
+
+    auto late_failure_command =
+        context.make_command_buffer("reject caller-owned late MoE plan failure",
+                                    err);
+    const bool late_failure = late_failure_command && !Encoder::encode(
+        context, *late_failure_command, "MoE plan late failure",
+        [&](Encoder& encoder, std::string& body_error) {
+            if (!encode_moe_plan(context, encoder, kRows, kExperts, true,
+                                 kLayer, valid, body_error)) {
+                return false;
+            }
+            return encode_moe_plan(context, encoder, 9u, kExperts, true,
+                                   kLayer, valid, body_error);
+        },
+        err);
+    const bool late_discarded = late_failure_command &&
+        late_failure_command->unsafe_native_handle() == nullptr;
+    const bool after_late_unchanged =
+        std::equal(usage_before.begin(), usage_before.end(),
+                   usage.payload().begin(), usage.payload().end()) &&
+        std::equal(plans_before.begin(), plans_before.end(),
+                   plans.payload().begin(), plans.payload().end());
+    check(late_failure && late_discarded && after_late_unchanged &&
+              err.find("1..8 rows") != std::string::npos,
+          "caller-owned late MoE plan failure rolls back earlier dispatch",
+          err);
+
+    const char* const dispatch_mode = std::getenv("STRATA_METAL_DISPATCH");
+    const bool concurrent_mode = dispatch_mode != nullptr &&
+        std::string_view(dispatch_mode) == "concurrent";
+    bool open_group_rejected = true;
+    if (concurrent_mode) {
+        auto group_command = context.make_command_buffer(
+            "reject MoE plan inside concurrent group", err);
+        const bool encoded = group_command && !Encoder::encode(
+            context, *group_command, "MoE plan open group",
+            [&](Encoder& encoder, std::string& body_error) {
+                return encoder.group_begin(body_error) &&
+                    encode_moe_plan(context, encoder, kRows, kExperts, true,
+                                    kLayer, valid, body_error);
+            },
+            err);
+        const bool discarded = group_command &&
+            group_command->unsafe_native_handle() == nullptr;
+        open_group_rejected = encoded && discarded &&
+            err.find("ordered dispatch boundary") != std::string::npos;
+        check(open_group_rejected,
+              "caller-owned MoE plan rejects concurrent group", err);
+    }
+
+    const bool final_unchanged =
+        std::equal(usage_before.begin(), usage_before.end(),
+                   usage.payload().begin(), usage.payload().end()) &&
+        std::equal(plans_before.begin(), plans_before.end(),
+                   plans.payload().begin(), plans.payload().end()) &&
+        std::equal(alias_before.begin(), alias_before.end(),
+                   alias.payload().begin(), alias.payload().end());
+    check(final_unchanged, std::string(label) + " leaves outputs unchanged");
+    return zero_rows && too_many_rows && invalid_experts && invalid_layer &&
+           short_ids && misaligned_ids && short_resident && short_usage &&
+           short_plans && ids_usage_alias && resident_plan_alias &&
+           usage_plan_alias && ids_plan_alias && resident_usage_alias &&
+           late_failure && late_discarded &&
+           after_late_unchanged && open_group_rejected && final_unchanged;
 }
 
 bool test_plan_inputs(Context& context, twin::InputSet set,
@@ -7503,6 +7721,7 @@ int main(int argc, char** argv) {
     if (!context) return 1;
 
     if (!test_route_dispatch_validation(*context)) ++g_failures;
+    if (!test_plan_dispatch_validation(*context)) ++g_failures;
 
     std::vector<twin::InputSet> sets;
     if (options.input_set_explicit) {
