@@ -2206,6 +2206,11 @@ bool run_window_gdn_block(Context& context, std::uint32_t rows,
             if (!group_command) return false;
             bool saw_open_group = false;
             bool rejected = false;
+            bool commit_rejected = false;
+            const WindowGDNCommitBuffers commit_buffers{
+                history_buffer.view(), qkv_buffer.view(), state_buffer.view(),
+                h_buffer.view(), gate_buffer.view(), beta_buffer.view(),
+                z_buffer.view(), gamma_buffer.view(), y_buffer.view()};
             const bool group_encoded = Encoder::encode(
                 context, *group_command, "Window GDN group boundary",
                 [&](Encoder& encoder, std::string& body_error) {
@@ -2217,23 +2222,189 @@ bool run_window_gdn_block(Context& context, std::uint32_t rows,
                             context, encoder, rows, buffers, block_error) &&
                             block_error.find("ordered concurrent-group boundary") !=
                                 std::string::npos;
+                        std::string commit_error;
+                        commit_rejected = !encode_window_gdn_commit(
+                            context, encoder, rows, commit_buffers, commit_error) &&
+                            commit_error.find("ordered concurrent-group boundary") !=
+                                std::string::npos;
                     }
                     if (!encoder.group_end(body_error)) return false;
-                    if (!saw_open_group || !rejected) {
-                        body_error = "Window GDN did not reject an open concurrent group";
+                    if (!saw_open_group || !rejected || !commit_rejected) {
+                        body_error = "Window GDN coordinator did not reject an open concurrent group";
                         return false;
                     }
                     return true;
                 },
                 error);
-            const bool group_contract = group_encoded && saw_open_group && rejected;
+            const bool group_contract = group_encoded && saw_open_group &&
+                                        rejected && commit_rejected;
             check(group_contract,
-                  label + " rejects dependent dispatch in open concurrent group",
+                  label + " block and commit reject open concurrent group",
                   error);
             if (group_command) group_command->discard();
             passed &= group_contract;
         }
     }
+
+    const std::uint32_t accepted_rows = rows == 1u ? 1u : rows - 1u;
+    const WindowGDNCommitBuffers commit_buffers{
+        history_buffer.view(), qkv_buffer.view(), state_buffer.view(),
+        h_buffer.view(), gate_buffer.view(), beta_buffer.view(),
+        z_buffer.view(), gamma_buffer.view(), y_buffer.view()};
+
+    if (rows == 1u && !shared_encoder) {
+        WindowGDNCommitBuffers aliased = commit_buffers;
+        aliased.state = aliased.history;
+        std::string alias_error;
+        auto alias_command = context.make_command_buffer(
+            "Window GDN commit cross-stage alias", alias_error);
+        check(alias_command != nullptr,
+              label + " commit alias command buffer", alias_error);
+        if (!alias_command) return false;
+        const bool accepted_alias = encode_window_gdn_commit(
+            context, *alias_command, accepted_rows, aliased, alias_error);
+        const bool alias_rejected = !accepted_alias &&
+            alias_command->unsafe_native_handle() == nullptr &&
+            alias_error.find("state buffer overlaps history") !=
+                std::string::npos;
+        check(alias_rejected,
+              label + " commit rejects history/state cross-stage alias",
+              alias_error);
+        passed &= alias_rejected;
+    }
+
+    if (rows == 2u) {
+        WindowGDNCommitBuffers late_failure = commit_buffers;
+        late_failure.gamma = gamma_buffer.view().slice(
+            0u, gamma.size() * sizeof(float) - sizeof(float));
+        const std::vector<std::uint8_t> history_before(
+            history_buffer.payload().begin(), history_buffer.payload().end());
+        const std::vector<std::uint8_t> state_before(
+            state_buffer.payload().begin(), state_buffer.payload().end());
+        auto command = context.make_command_buffer(
+            "Window GDN commit command-buffer late failure", error);
+        check(command != nullptr,
+              label + " commit late-failure command buffer", error);
+        if (!command) return false;
+        const bool accepted_command = encode_window_gdn_commit(
+            context, *command, accepted_rows, late_failure, error);
+        const bool command_discarded = !accepted_command &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find("gamma") != std::string::npos;
+        const bool command_untouched =
+            history_before == std::vector<std::uint8_t>(
+                                  history_buffer.payload().begin(),
+                                  history_buffer.payload().end()) &&
+            state_before == std::vector<std::uint8_t>(
+                                state_buffer.payload().begin(),
+                                state_buffer.payload().end());
+        check(command_discarded && command_untouched,
+              label + " command-buffer commit failure rolls back history and state",
+              error);
+        passed &= command_discarded && command_untouched;
+
+        auto shared_command = context.make_command_buffer(
+            "Window GDN shared commit late failure", error);
+        check(shared_command != nullptr,
+              label + " shared commit late-failure command buffer", error);
+        if (!shared_command) return false;
+        const bool accepted_shared = Encoder::encode(
+            context, *shared_command, "Window GDN shared commit rollback",
+            [&](Encoder& encoder, std::string& body_error) {
+                return encode_window_gdn_commit(
+                    context, encoder, accepted_rows, late_failure, body_error);
+            },
+            error);
+        const bool shared_discarded = !accepted_shared &&
+            shared_command->unsafe_native_handle() == nullptr &&
+            error.find("gamma") != std::string::npos;
+        const bool shared_untouched =
+            history_before == std::vector<std::uint8_t>(
+                                  history_buffer.payload().begin(),
+                                  history_buffer.payload().end()) &&
+            state_before == std::vector<std::uint8_t>(
+                                state_buffer.payload().begin(),
+                                state_buffer.payload().end());
+        check(shared_discarded && shared_untouched,
+              label + " caller-owned commit failure rolls back history and state",
+              error);
+        passed &= shared_discarded && shared_untouched;
+    }
+
+    std::vector<float> expected_history = history;
+    oracle::gdn_conv_commit(
+        expected_history,
+        actual_qkv.first(static_cast<std::size_t>(accepted_rows) * kChannels),
+        accepted_rows);
+    std::vector<float> expected_replayed_state = initial_state;
+    std::vector<twin::tf> unused_commit_output, expected_replayed_state_tf;
+    oracle::gdn_step_norm(
+        expected_replayed_state,
+        actual_h.first(static_cast<std::size_t>(accepted_rows) * kChannels),
+        actual_gate.first(static_cast<std::size_t>(accepted_rows) * kHeads),
+        actual_beta.first(static_cast<std::size_t>(accepted_rows) * kHeads),
+        actual_z.first(static_cast<std::size_t>(accepted_rows) * kValueDim),
+        gamma, accepted_rows, GDNStateMode::commit, unused_commit_output,
+        expected_replayed_state_tf);
+
+    history_buffer.capture_before_dispatch();
+    state_buffer.capture_before_dispatch();
+    qkv_buffer.capture_before_dispatch();
+    h_buffer.capture_before_dispatch();
+    gate_buffer.capture_before_dispatch();
+    beta_buffer.capture_before_dispatch();
+    z_buffer.capture_before_dispatch();
+    gamma_buffer.capture_before_dispatch();
+    y_buffer.capture_before_dispatch();
+    const bool commit_dispatched = run_command(
+        context, label + " commit n_keep=" + std::to_string(accepted_rows),
+        [&](CommandBuffer& command, std::string& commit_error) {
+            if (!shared_encoder) {
+                return encode_window_gdn_commit(
+                    context, command, accepted_rows, commit_buffers,
+                    commit_error);
+            }
+            return Encoder::encode(
+                context, command, "shared Window GDN accepted-prefix commit",
+                [&](Encoder& encoder, std::string& body_error) {
+                    return encode_window_gdn_commit(
+                        context, encoder, accepted_rows, commit_buffers,
+                        body_error);
+                },
+                commit_error);
+        },
+        error);
+    if (!commit_dispatched) return false;
+
+    const bool history_matches = std::memcmp(
+        history_buffer.payload().data(), expected_history.data(),
+        expected_history.size() * sizeof(float)) == 0;
+    check(history_matches,
+          label + " accepted-prefix commit advances convolution history exactly");
+    passed &= history_matches;
+    const bool state_matches = compare_units(
+        typed<const float>(state_buffer).first(kStateElements),
+        expected_replayed_state_tf, 512.0,
+        label + " accepted-prefix commit replays recurrent state", options,
+        accepted_rows);
+    passed &= state_matches;
+    const std::array<twin::ByteRange, 1> history_written{{
+        {0u, expected_history.size() * sizeof(float)}}};
+    const std::array<twin::ByteRange, 1> state_written{{
+        {0u, initial_state.size() * sizeof(float)}}};
+    const bool commit_guards =
+        !history_buffer.first_unwritten_change(history_written) &&
+        !state_buffer.first_unwritten_change(state_written) &&
+        !qkv_buffer.first_unwritten_change({}) &&
+        !h_buffer.first_unwritten_change({}) &&
+        !gate_buffer.first_unwritten_change({}) &&
+        !beta_buffer.first_unwritten_change({}) &&
+        !z_buffer.first_unwritten_change({}) &&
+        !gamma_buffer.first_unwritten_change({}) &&
+        !y_buffer.first_unwritten_change({});
+    check(commit_guards,
+          label + " commit guards and replay inputs remain unchanged");
+    passed &= commit_guards;
     return passed;
 }
 
@@ -2252,6 +2423,35 @@ bool test_window_gdn_block_contract(Context& context) {
             command->unsafe_native_handle() == nullptr &&
             error.find("row count must be in 1..8") != std::string::npos;
         check(rejected, "Window GDN rejects T=" + std::to_string(rows), error);
+        passed &= rejected;
+    }
+    const WindowGDNCommitBuffers empty_commit{};
+    {
+        std::string error;
+        auto command = context.make_command_buffer(
+            "Window GDN empty commit", error);
+        check(command != nullptr, "Window GDN empty-commit command buffer", error);
+        if (!command) return false;
+        const bool accepted = encode_window_gdn_commit(
+            context, *command, 0u, empty_commit, error);
+        const bool no_op = accepted && error.empty();
+        check(no_op, "Window GDN commit accepts n_keep=0 without buffers", error);
+        passed &= no_op;
+        command->discard();
+    }
+    {
+        std::string error;
+        auto command = context.make_command_buffer(
+            "Window GDN oversized commit", error);
+        check(command != nullptr,
+              "Window GDN oversized-commit command buffer", error);
+        if (!command) return false;
+        const bool accepted = encode_window_gdn_commit(
+            context, *command, 9u, empty_commit, error);
+        const bool rejected = !accepted &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find("row count must be in 0..8") != std::string::npos;
+        check(rejected, "Window GDN commit rejects n_keep=9", error);
         passed &= rejected;
     }
     return passed;

@@ -100,7 +100,79 @@ bool q8_1_weight_format(MatVecWeightFormat format) {
     return format != MatVecWeightFormat::bf16;
 }
 
+bool validate_commit_views(Context& context,
+                           const WindowGDNCommitBuffers& buffers,
+                           std::string& error) {
+    const std::array views{
+        NamedView{buffers.history, "history"},
+        NamedView{buffers.qkv, "qkv"},
+        NamedView{buffers.state, "state"},
+        NamedView{buffers.h, "h"},
+        NamedView{buffers.gate, "gate"},
+        NamedView{buffers.beta, "beta"},
+        NamedView{buffers.z, "z"},
+        NamedView{buffers.gamma, "gamma"},
+        NamedView{buffers.output_scratch, "output scratch"},
+    };
+    for (std::size_t i = 0u; i < views.size(); ++i) {
+        if (!views[i].view || !context.buffers().owns(views[i].view)) {
+            error = "Window GDN commit " + std::string(views[i].name) +
+                    " buffer is not owned by this Context";
+            return false;
+        }
+        for (std::size_t j = 0u; j < i; ++j) {
+            if (views_overlap(views[i].view, views[j].view)) {
+                error = "Window GDN commit " +
+                        std::string(views[i].name) + " buffer overlaps " +
+                        std::string(views[j].name);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 }  // namespace
+
+bool encode_window_gdn_commit(Context& context, Encoder& encoder,
+                              std::uint32_t rows,
+                              const WindowGDNCommitBuffers& buffers,
+                              std::string& error) {
+    error.clear();
+    if (rows > 8u) {
+        error = "Window GDN commit row count must be in 0..8";
+        return false;
+    }
+    if (rows == 0u) return true;
+    if (encoder.concurrent_group_open()) {
+        error = "Window GDN commit requires an ordered concurrent-group boundary";
+        return false;
+    }
+    if (!validate_commit_views(context, buffers, error)) return false;
+
+    if (!encode_gdn_conv_commit(context, encoder, rows,
+                                {buffers.history, buffers.qkv}, error)) {
+        return false;
+    }
+    return encode_gdn_step_norm(
+        context, encoder, rows, GDNStateMode::commit,
+        {buffers.state, buffers.h, buffers.gate, buffers.beta, buffers.z,
+         buffers.gamma, buffers.output_scratch},
+        error);
+}
+
+bool encode_window_gdn_commit(Context& context, CommandBuffer& command_buffer,
+                              std::uint32_t rows,
+                              const WindowGDNCommitBuffers& buffers,
+                              std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Window GDN commit",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_gdn_commit(context, encoder, rows, buffers,
+                                            encode_error);
+        },
+        error);
+}
 
 bool encode_window_gdn_block(Context& context, Encoder& encoder,
                              std::uint32_t rows,
