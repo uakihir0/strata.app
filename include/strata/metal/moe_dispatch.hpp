@@ -41,9 +41,11 @@ bool encode_moe_route(Context& context, CommandBuffer& command_buffer,
                       std::string& error);
 
 /// Group top-10 expert IDs in first-appearance order for one Window layer.
-/// IDs must come from the route kernel. The resident and usage tables use
-/// `experts` as their active layer stride; both remain bound in full mode to
-/// match the kernel ABI, though full mode does not read or update them.
+/// `experts` is the active table stride (1..512); every input ID must be in
+/// `[0, experts)`. Production callers pass IDs from the matching 256- or
+/// 512-expert route kernel. The resident and usage tables use `experts` as their active layer stride;
+/// both remain bound in full mode to match the kernel ABI, though full mode
+/// does not read or update them.
 /// The plan view starts at layer zero and contains the selected layer.
 /// Inputs and outputs must remain alive until command completion.
 bool encode_moe_plan(Context& context, Encoder& encoder,

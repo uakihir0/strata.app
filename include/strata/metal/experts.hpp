@@ -66,6 +66,16 @@ public:
                        const TieredMoePlan& plan, ExpertLayerStats& stats,
                        std::string& error);
 
+    /// Wait for a GPU-produced shared plan, resolve its misses, then signal the
+    /// matching layer-ready value on the same monotonic event. A skipped plan
+    /// reads and validates only its four-word header. On failure, the caller
+    /// must release any GPU waits before abandoning the command buffer.
+    bool resolve_layer_after_plan(
+        const std::shared_ptr<ExpertLeaseSet>& lease_set, std::uint32_t layer,
+        Events& events, std::uint64_t plan_ready_value,
+        std::uint64_t layer_ready_value, std::uint64_t timeout_ms,
+        ExpertLayerStats& stats, std::string& error);
+
     /// Prefetch every cold expert of a layer, used by large prefill chunks.
     bool prefetch_layer(std::uint32_t layer, std::string& error);
     /// Prefetch predicted cold ids, used by decode lookahead.

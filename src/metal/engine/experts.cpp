@@ -6,6 +6,7 @@
 #include <atomic>
 #include <charconv>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <cstdlib>
 #include <exception>
@@ -603,6 +604,83 @@ bool ExpertStore::resolve_layer(
     }
     std::atomic_thread_fence(std::memory_order_release);
     stats = resolved;
+    return true;
+}
+
+bool ExpertStore::resolve_layer_after_plan(
+    const std::shared_ptr<ExpertLeaseSet>& lease_set, std::uint32_t layer,
+    Events& events, std::uint64_t plan_ready_value,
+    std::uint64_t layer_ready_value, std::uint64_t timeout_ms,
+    ExpertLayerStats& stats, std::string& error) {
+    error.clear();
+    if (!lease_set) {
+        error = "ERR tiered expert resolution has no prepared command-buffer lease set";
+        return false;
+    }
+    if (!impl_->validate_layer(layer, error)) return false;
+    if (plan_ready_value == 0 ||
+        plan_ready_value == std::numeric_limits<std::uint64_t>::max() ||
+        layer_ready_value != plan_ready_value + 1) {
+        error = "ERR tiered layer handshake requires consecutive positive event values";
+        return false;
+    }
+    if (events.signaled_value() >= layer_ready_value) {
+        error = "ERR tiered layer-ready event value was already signaled";
+        return false;
+    }
+
+    const BufferRef plans = impl_->storage->plan_buffer();
+    if (!plans || plans.contents == nullptr) {
+        error = "ERR tiered shared plan buffer is unavailable";
+        return false;
+    }
+    const std::size_t plan_offset =
+        static_cast<std::size_t>(layer) * sizeof(TieredMoePlan);
+    constexpr std::size_t header_bytes = 4 * sizeof(std::uint32_t);
+    if (plan_offset > plans.length || header_bytes > plans.length - plan_offset) {
+        error = "ERR tiered shared plan header is outside its buffer";
+        return false;
+    }
+    if (!events.wait(plan_ready_value, timeout_ms, error)) return false;
+    std::atomic_thread_fence(std::memory_order_acquire);
+
+    std::array<std::uint32_t, 4> header{};
+    const auto* plan_bytes = static_cast<const std::byte*>(plans.contents) + plan_offset;
+    std::memcpy(header.data(), plan_bytes, header_bytes);
+    const std::uint32_t n_groups = header[0];
+    const std::uint32_t n_entries = header[1];
+    const std::uint32_t n_miss = header[2];
+    const std::uint32_t skip = header[3];
+    const auto invalid_header = [&](const char* reason) {
+        error = "ERR invalid tiered plan header for layer " +
+                std::to_string(layer) + ": " + reason;
+        return false;
+    };
+    if (n_groups == 0 || n_groups > kTieredMoePlanGroups ||
+        n_entries > kTieredMoePlanGroups || n_groups > n_entries ||
+        n_entries == 0 || n_entries % 10 != 0 || skip > 1) {
+        return invalid_header("counts, row width, or skip flag are invalid");
+    }
+
+    ExpertLayerStats resolved;
+    if (skip != 0) {
+        if (n_miss != 0) return invalid_header("skipped plan reports misses");
+        resolved.lookups = n_entries;
+        resolved.hits = n_entries;
+    } else {
+        if (plan_offset > plans.length ||
+            sizeof(TieredMoePlan) > plans.length - plan_offset) {
+            error = "ERR tiered shared plan is outside its buffer";
+            return false;
+        }
+        TieredMoePlan plan{};
+        std::memcpy(&plan, plan_bytes, sizeof(plan));
+        if (!resolve_layer(lease_set, layer, plan, resolved, error)) return false;
+    }
+
+    if (!events.signal_host(layer_ready_value, error)) return false;
+    stats = resolved;
+    error.clear();
     return true;
 }
 

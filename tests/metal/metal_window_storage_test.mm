@@ -4,6 +4,7 @@
 #include "strata/metal/model_storage.hpp"
 #include "strata/metal/kv.hpp"
 #include "strata/metal/experts.hpp"
+#include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/window_ple_stage.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/ngram.hpp"
@@ -16,6 +17,7 @@
 #include <array>
 #include <cerrno>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -59,6 +61,9 @@ static_assert(!std::is_convertible_v<ReadOnlyBufferRef, BufferRef>,
 static_assert(std::is_same_v<decltype(std::declval<const ModelStorage&>().full_mode_storage()),
                              const FullModeStorage*>,
               "ModelStorage must expose only a borrowed const full-mode resolver");
+static_assert(std::is_same_v<decltype(std::declval<ModelStorage&>().tiered_storage()),
+                             TieredStorage*>,
+              "ModelStorage must expose only a borrowed tiered resolver source");
 
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
@@ -86,6 +91,8 @@ public:
         layer_pending_ = false;
         return true;
     }
+
+    void mark_layer_released() noexcept { layer_pending_ = false; }
 
     bool finish_and_drain(std::string& error) {
         bool succeeded = true;
@@ -1052,6 +1059,19 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
                 error.find("layer/expert coordinates") != std::string::npos,
             "ExpertStore must reject equal-product but transposed model dimensions");
 
+    auto* writable_plans = static_cast<TieredMoePlan*>(plan_buffer.contents);
+    BufferRef plan_ids_buffer = context.buffers().allocate(
+        "tiered resolver plan IDs", 10 * sizeof(std::int32_t), error);
+    require(static_cast<bool>(plan_ids_buffer),
+            "allocate IDs for the GPU plan producer: " + error);
+    const ReadOnlyBufferRef plan_ids =
+        context.buffers().read_only(plan_ids_buffer);
+    const ReadOnlyBufferRef plan_resident =
+        context.buffers().read_only(resident_table);
+    const MoePlanBuffers gpu_plan_buffers{
+        plan_ids, plan_resident, usage_table, plan_buffer};
+    require(plan_ids && plan_resident,
+            "create read-only views for the GPU plan producer: " + error);
     TieredMoePlan resolve_plan{};
     resolve_plan.n_groups = 4;
     resolve_plan.n_entries = 10;
@@ -1111,48 +1131,58 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
                     " before reading or publishing slots");
     }
 
-    auto arrival_events = context.make_events("tiered resolver GPU arrival", error);
-    auto release_events = context.make_events("tiered resolver host release", error);
-    auto layer_done_events = context.make_events("tiered resolver layer completion", error);
-    auto completion_gate_events = context.make_events("tiered resolver command completion", error);
-    require(arrival_events != nullptr && release_events != nullptr &&
-                layer_done_events != nullptr && completion_gate_events != nullptr,
-            "create layer-handshake test events: " + error);
-    const std::uint64_t arrival_value = arrival_events->reserve_value();
-    const std::uint64_t release_value = release_events->reserve_value();
-    const std::uint64_t layer_done_value = layer_done_events->reserve_value();
-    const std::uint64_t completion_gate_value = completion_gate_events->reserve_value();
+    auto handshake_events = context.make_events("tiered resolver layer handshake", error);
+    require(handshake_events != nullptr, "create layer-handshake test event: " + error);
+    const std::uint64_t arrival_value = handshake_events->reserve_value();
+    const std::uint64_t release_value = handshake_events->reserve_value();
+    const std::uint64_t layer_done_value = handshake_events->reserve_value();
+    const std::uint64_t completion_gate_value = handshake_events->reserve_value();
+    const std::array<std::int32_t, 10> resolve_ids{
+        7, 7, 7, 7, 3, 3, 2, 8, 8, 8};
+    std::memcpy(plan_ids_buffer.contents, resolve_ids.data(), sizeof(resolve_ids));
     auto resolve_command =
         context.make_command_buffer("tiered expert miss resolution", error);
     require(resolve_command != nullptr,
             "create tiered expert resolver command buffer: " + error);
-    require(arrival_events->encode_signal(*resolve_command, arrival_value, error) &&
-                release_events->encode_wait(*resolve_command, release_value, error) &&
-                layer_done_events->encode_signal(*resolve_command, layer_done_value, error) &&
-                completion_gate_events->encode_wait(*resolve_command,
-                                                   completion_gate_value, error),
+    require(encode_moe_plan(context, *resolve_command, 1, geometry.n_expert,
+                            true, 0, gpu_plan_buffers, error),
+            "encode GPU plan before signaling plan-ready: " + error);
+    require(handshake_events->encode_signal(*resolve_command, arrival_value, error) &&
+                handshake_events->encode_wait(*resolve_command, release_value, error) &&
+                handshake_events->encode_signal(*resolve_command, layer_done_value, error) &&
+                handshake_events->encode_wait(*resolve_command,
+                                              completion_gate_value, error),
             "encode plan-ready and host-release events: " + error);
     auto resolve_leases =
         expert_store->prepare_command_buffer(*resolve_command, error);
     require(resolve_leases != nullptr,
             "register slot release before command-buffer submission: " + error);
+    ExpertLayerStats invalid_event_stats;
+    require(!expert_store->resolve_layer_after_plan(
+                resolve_leases, 0, *handshake_events, arrival_value,
+                layer_done_value, 0, invalid_event_stats, error) &&
+                error.find("consecutive positive event values") != std::string::npos &&
+                handshake_events->signaled_value() == 0,
+            "reject a layer-ready value that could release a later GPU wait");
     id<MTLCommandBuffer> native_resolve =
         (__bridge id<MTLCommandBuffer>)resolve_command->unsafe_native_handle();
     require(resolve_command->commit(error),
             "submit plan-producing command buffer: " + error);
     CommandGatesCleanup gate_cleanup(
-        release_events.get(), release_value, completion_gate_events.get(),
+        handshake_events.get(), release_value, handshake_events.get(),
         completion_gate_value, native_resolve);
-    require(arrival_events->wait(arrival_value, 5000, error),
-            "wait until the simulated GPU plan is ready: " + error);
     ExpertLayerStats first_resolve;
-    require(expert_store->resolve_layer(resolve_leases, 0, resolve_plan,
-                                        first_resolve, error),
-            "resolve a mixed plan after its command buffer is submitted: " + error);
-    require(first_resolve.hits == 5 && first_resolve.lookups == 10 &&
+    require(expert_store->resolve_layer_after_plan(
+                resolve_leases, 0, *handshake_events, arrival_value, release_value,
+                5000, first_resolve, error),
+            "resolve the shared GPU plan and release the waiting layer: " + error);
+    gate_cleanup.mark_layer_released();
+    require(handshake_events->signaled_value() == release_value &&
+                std::memcmp(writable_plans, &resolve_plan, sizeof(resolve_plan)) == 0 &&
+                first_resolve.hits == 5 && first_resolve.lookups == 10 &&
                 first_resolve.ram_blobs + first_resolve.file_blobs == 2 &&
                 first_resolve.file_bytes == first_resolve.file_blobs * blob,
-            "DONE counters must count routed hits and classify each cold expert once");
+            "handshake must publish misses before signaling and count routed hits");
 
     for (const std::uint32_t expert_id : {3u, 8u}) {
         auto lease = storage->slot_pool()->lookup_ready(
@@ -1194,8 +1224,8 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
             "all same-parity slots stay pinned before the layer-complete handshake (lease=" +
                 std::to_string(static_cast<bool>(exhausted_half)) + ", error=" + error + ")");
     require(gate_cleanup.release_layer(error),
-            "release the submitted layer after slot reads: " + error);
-    require(layer_done_events->wait(layer_done_value, 5000, error),
+            "the resolver must already have released the submitted layer: " + error);
+    require(handshake_events->wait(layer_done_value, 5000, error),
             "wait until the simulated GPU layer has consumed its expert addresses: " + error);
     resolve_leases->retire_layer(0);
     auto reused_half = storage->slot_pool()->acquire(
@@ -1211,6 +1241,115 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
             "release the command-completion gate and drain the GPU command: " + error);
     other_layer_pins.clear();
     reused_half.reset();
+
+    const std::array<std::int32_t, 10> skip_ids{
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7};
+    std::memcpy(plan_ids_buffer.contents, skip_ids.data(), sizeof(skip_ids));
+    const std::uint64_t skip_arrival = handshake_events->reserve_value();
+    const std::uint64_t skip_release = handshake_events->reserve_value();
+    const std::uint64_t skip_done = handshake_events->reserve_value();
+    const std::uint64_t skip_completion = handshake_events->reserve_value();
+    auto skip_command = context.make_command_buffer("tiered skipped plan", error);
+    require(skip_command != nullptr, "create skipped-plan command buffer: " + error);
+    require(encode_moe_plan(context, *skip_command, 1, geometry.n_expert,
+                            true, 0, gpu_plan_buffers, error),
+            "encode GPU all-resident plan before skip signal: " + error);
+    require(handshake_events->encode_signal(*skip_command, skip_arrival, error) &&
+                handshake_events->encode_wait(*skip_command, skip_release, error) &&
+                handshake_events->encode_signal(*skip_command, skip_done, error) &&
+                handshake_events->encode_wait(*skip_command, skip_completion, error),
+            "encode skipped-plan handshake events: " + error);
+    auto skip_leases = expert_store->prepare_command_buffer(*skip_command, error);
+    require(skip_leases != nullptr,
+            "prepare skipped-plan completion callback: " + error);
+    id<MTLCommandBuffer> native_skip =
+        (__bridge id<MTLCommandBuffer>)skip_command->unsafe_native_handle();
+    require(skip_command->commit(error), "submit skipped-plan command buffer: " + error);
+    CommandGatesCleanup skip_cleanup(handshake_events.get(), skip_release,
+                                     handshake_events.get(), skip_completion,
+                                     native_skip);
+    require(handshake_events->wait(skip_arrival, 5000, error),
+            "wait for GPU all-resident plan before poisoning ignored arrays: " + error);
+    require(writable_plans[0].n_groups == 1 &&
+                writable_plans[0].n_entries == 10 &&
+                writable_plans[0].n_miss == 0 && writable_plans[0].skip == 1,
+            "GPU plan kernel must publish the valid skip header before its event");
+    writable_plans[0].grp_e[0] = -1;
+    writable_plans[0].grp_res[0] = 7;
+    writable_plans[0].grp_start[0] = -1;
+    writable_plans[0].ent_tok[0] = -1;
+    writable_plans[0].ent_dst[0] = -1;
+    ExpertLayerStats skipped_stats;
+    require(expert_store->resolve_layer_after_plan(
+                skip_leases, 0, *handshake_events, skip_arrival, skip_release,
+                5000, skipped_stats, error),
+            "resolve a skipped plan without inspecting its arrays: " + error);
+    skip_cleanup.mark_layer_released();
+    require(skipped_stats.hits == 10 && skipped_stats.lookups == 10 &&
+                skipped_stats.ram_blobs == 0 && skipped_stats.file_blobs == 0 &&
+                handshake_events->signaled_value() == skip_release,
+            "a skipped plan must report resident hits and signal the host release");
+    require(handshake_events->wait(skip_done, 5000, error),
+            "wait for skipped layer completion: " + error);
+    skip_leases->retire_layer(0);
+    require(skip_cleanup.finish_and_drain(error),
+            "drain skipped-plan command buffer: " + error);
+
+    TieredMoePlan invalid_skipped_plan{};
+    invalid_skipped_plan.n_groups = 0;
+    invalid_skipped_plan.n_entries = 10;
+    invalid_skipped_plan.skip = 1;
+    writable_plans[0] = invalid_skipped_plan;
+    const std::uint64_t invalid_arrival = handshake_events->reserve_value();
+    const std::uint64_t invalid_release = handshake_events->reserve_value();
+    const std::uint64_t invalid_done = handshake_events->reserve_value();
+    const std::uint64_t invalid_completion = handshake_events->reserve_value();
+    auto invalid_handshake_command =
+        context.make_command_buffer("tiered invalid skipped plan", error);
+    require(invalid_handshake_command != nullptr,
+            "create invalid skipped-plan command buffer: " + error);
+    require(handshake_events->encode_signal(
+                *invalid_handshake_command, invalid_arrival, error) &&
+                handshake_events->encode_wait(
+                    *invalid_handshake_command, invalid_release, error) &&
+                handshake_events->encode_signal(
+                    *invalid_handshake_command, invalid_done, error) &&
+                handshake_events->encode_wait(
+                    *invalid_handshake_command, invalid_completion, error),
+            "encode invalid-plan handshake events: " + error);
+    auto invalid_handshake_leases =
+        expert_store->prepare_command_buffer(*invalid_handshake_command, error);
+    require(invalid_handshake_leases != nullptr,
+            "prepare invalid-plan completion callback: " + error);
+    id<MTLCommandBuffer> native_invalid =
+        (__bridge id<MTLCommandBuffer>)invalid_handshake_command->unsafe_native_handle();
+    require(invalid_handshake_command->commit(error),
+            "submit invalid skipped-plan command buffer: " + error);
+    CommandGatesCleanup invalid_cleanup(handshake_events.get(), invalid_release,
+                                       handshake_events.get(), invalid_completion,
+                                       native_invalid);
+    ExpertLayerStats invalid_handshake_stats;
+    require(!expert_store->resolve_layer_after_plan(
+                invalid_handshake_leases, 0, *handshake_events,
+                invalid_arrival, invalid_release, 5000,
+                invalid_handshake_stats, error) &&
+                error.find("counts, row width, or skip flag") != std::string::npos &&
+                handshake_events->signaled_value() == invalid_arrival,
+            "a skipped plan with no groups must fail without signaling layer-ready");
+    invalid_skipped_plan.n_groups = 1;
+    invalid_skipped_plan.n_miss = 1;
+    writable_plans[0] = invalid_skipped_plan;
+    require(!expert_store->resolve_layer_after_plan(
+                invalid_handshake_leases, 0, *handshake_events,
+                invalid_arrival, invalid_release, 5000,
+                invalid_handshake_stats, error) &&
+                error.find("skipped plan reports misses") != std::string::npos &&
+                handshake_events->signaled_value() == invalid_arrival,
+            "a skipped plan reporting misses must fail without signaling layer-ready");
+    require(invalid_cleanup.release_layer(error) &&
+                handshake_events->wait(invalid_done, 5000, error) &&
+                invalid_cleanup.finish_and_drain(error),
+            "caller must release and drain GPU waits after plan-resolution failure: " + error);
 
     require(expert_store->prefetch_layer(0, error),
             "prefetch every cold expert of a layer: " + error);
@@ -1618,6 +1757,8 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
     auto full_storage = ModelStorage::open(context, plain_fixture.path.string(), plain_geometry,
                                            plain_sources, full_plan, error);
     require(full_storage != nullptr, "open and warm full-mode model storage owner: " + error);
+    require(full_storage->tiered_storage() == nullptr,
+            "full-mode ModelStorage must not publish a tiered resolver source");
     require(std::string(full_storage->mode()) == "full" &&
                 full_storage->resident_experts() == plain_geometry.n_expert &&
                 full_storage->window_count() != 0 && full_storage->full_mode_warmed(),
@@ -1953,6 +2094,8 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
             "tiered ModelStorage must not publish a reader for its closed startup mapping");
     require(tiered_storage->full_mode_storage() == nullptr,
             "tiered ModelStorage must not publish full-mode weight views or tables");
+    require(tiered_storage->tiered_storage() != nullptr,
+            "tiered ModelStorage must expose the borrowed ExpertStore construction source");
     const BufferRef tiered_model_usage = tiered_storage->moe_usage_table();
     require(tiered_model_usage && context.buffers().owns(tiered_model_usage) &&
                 tiered_model_usage.length == static_cast<std::size_t>(kTieredMaxLayers) *

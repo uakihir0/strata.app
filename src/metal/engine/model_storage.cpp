@@ -325,6 +325,10 @@ const FullModeStorage* ModelStorage::full_mode_storage() const noexcept {
     return full_.get();
 }
 
+TieredStorage* ModelStorage::tiered_storage() noexcept {
+    return tiered_.get();
+}
+
 strata::kernels::PleTableReader* ModelStorage::ple_reader() noexcept {
     return full_ != nullptr ? full_->ple_reader() : nullptr;
 }

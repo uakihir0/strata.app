@@ -61,6 +61,9 @@ public:
     /// pointer does not outlive this ModelStorage, and its buffer views expose
     /// CPU mappings only through const pointers.
     const FullModeStorage* full_mode_storage() const noexcept;
+    /// Borrow the mutable tiered expert resolver source; null in full mode.
+    /// The pointer does not outlive this ModelStorage.
+    TieredStorage* tiered_storage() noexcept;
     /// Available in full mode; null in tiered mode.
     strata::kernels::PleTableReader* ple_reader() noexcept;
 

@@ -962,9 +962,12 @@ bool test_plan_dispatch_validation(Context& context) {
     const bool too_many_rows = reject(
         "reject over-capacity MoE plan", 9u, kExperts, true, kLayer, valid,
         "1..8 rows");
-    const bool invalid_experts = reject(
-        "reject unsupported MoE plan expert count", kRows, 128u, true,
-        kLayer, valid, "256 or 512 experts");
+    const bool zero_experts = reject(
+        "reject zero-expert MoE plan", kRows, 0u, true,
+        kLayer, valid, "1..512 experts");
+    const bool over_capacity_experts = reject(
+        "reject over-capacity MoE plan expert count", kRows, 513u, true,
+        kLayer, valid, "1..512 experts");
     const bool invalid_layer = reject(
         "reject out-of-range MoE plan layer", kRows, kExperts, true,
         kTieredMaxLayers, valid, "valid layer");
@@ -1087,8 +1090,9 @@ bool test_plan_dispatch_validation(Context& context) {
         std::equal(alias_before.begin(), alias_before.end(),
                    alias.payload().begin(), alias.payload().end());
     check(final_unchanged, std::string(label) + " leaves outputs unchanged");
-    return zero_rows && too_many_rows && invalid_experts && invalid_layer &&
-           short_ids && misaligned_ids && short_resident && short_usage &&
+    return zero_rows && too_many_rows && zero_experts &&
+           over_capacity_experts && invalid_layer && short_ids &&
+           misaligned_ids && short_resident && short_usage &&
            short_plans && ids_usage_alias && resident_plan_alias &&
            usage_plan_alias && ids_plan_alias && resident_usage_alias &&
            late_failure && late_discarded &&

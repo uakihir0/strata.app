@@ -147,10 +147,9 @@ bool validate_plan(Context& context, Encoder& encoder,
         error = "MoE plan requires an ordered dispatch boundary";
         return false;
     }
-    if (rows == 0u || rows > 8u ||
-        (experts != 256u && experts != 512u) ||
-        layer >= kTieredMaxLayers) {
-        error = "MoE plan requires 1..8 rows, 256 or 512 experts, and a valid layer";
+    if (rows == 0u || rows > 8u || experts == 0u ||
+        experts > kTieredMaxExperts || layer >= kTieredMaxLayers) {
+        error = "MoE plan requires 1..8 rows, 1..512 experts, and a valid layer";
         return false;
     }
 
