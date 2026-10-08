@@ -54,6 +54,23 @@ using namespace strata::metal;
 namespace {
 
 constexpr std::uint32_t kGgmlTypeQ3K = 11u;
+constexpr std::uint32_t kGgmlTypeQ8_0 = 8u;
+constexpr std::uint32_t kGgmlTypeBF16 = 30u;
+constexpr std::uint32_t kGgmlTypeQ2_0 = 42u;
+
+MatVecWeightFormat fullmode_ple_key_format(std::uint32_t ggml_type) {
+    switch (ggml_type) {
+        case kGgmlTypeQ2_0:
+            return MatVecWeightFormat::q2_0;
+        case kGgmlTypeQ8_0:
+            return MatVecWeightFormat::q8_0;
+        case kGgmlTypeBF16:
+            return MatVecWeightFormat::bf16;
+        default:
+            throw std::runtime_error(
+                "unsupported synthetic FullMode PLE key type");
+    }
+}
 
 template <typename T>
 concept HasPleLifecycle = requires(T& reader, std::string& error) {
@@ -649,7 +666,9 @@ Fixture write_fixture(const fs::path& directory, bool overlap_ple = false,
     return fixture;
 }
 
-Fixture write_fullmode_handoff_fixture(const fs::path& directory) {
+Fixture write_fullmode_handoff_fixture(
+    const fs::path& directory,
+    std::uint32_t ple_key_type = kGgmlTypeQ2_0) {
     constexpr std::uint64_t kExperts = 256u;
     constexpr std::uint64_t kGateUpElements = 2'560u * 640u;
     constexpr std::uint64_t kDownElements = 640u * 2'560u;
@@ -673,8 +692,10 @@ Fixture write_fullmode_handoff_fixture(const fs::path& directory) {
     };
 
     Fixture fixture;
-    fixture.path = directory / "fullmode-handoff.gguf";
-    fixture.dense_pack_path = directory / "fullmode-handoff-dense.bin";
+    fixture.path = directory /
+        ("fullmode-handoff-" + std::to_string(ple_key_type) + ".gguf");
+    fixture.dense_pack_path = directory /
+        ("fullmode-handoff-" + std::to_string(ple_key_type) + "-dense.bin");
     fixture.expert_count = kExperts;
     fixture.expert_slab_bytes = kExpertSlabBytes;
     fixture.expert_layers = 1u;
@@ -694,8 +715,8 @@ Fixture write_fullmode_handoff_fixture(const fs::path& directory) {
         {"blk.0.ffn_down_exps.weight", {640u, 2'560u, kExperts}, 42u, 0u},
         {"token_embd.weight", {2'560u, 1u}, kGgmlTypeQ3K, 0u},
         {fixture.router_tensor_name, {2'560u, kExperts}, 0u, 0u},
-        {"blk.1.ple_key.weight", {2'560u, 10'240u}, 42u, 0u},
-        {"blk.1.ple_value.weight", {2'560u, 2'560u}, 30u, 0u},
+        {"blk.1.ple_key.weight", {2'560u, 10'240u}, ple_key_type, 0u},
+        {"blk.1.ple_value.weight", {2'560u, 2'560u}, kGgmlTypeBF16, 0u},
         {"blk.1.ple_norm_key.weight", {10'240u}, 0u, 0u},
         {"blk.1.ple_norm_query.weight", {10'240u}, 0u, 0u},
         {"blk.1.ple_norm_conv.weight", {10'240u}, 0u, 0u},
@@ -731,11 +752,15 @@ Fixture write_fullmode_handoff_fixture(const fs::path& directory) {
                 elements *= dimension;
             }
             std::uint64_t tensor_bytes = 0u;
-            if (tensor.type == 42u) {
+            if (tensor.type == kGgmlTypeQ2_0) {
                 require(elements % 64u == 0u,
                         "FullMode PLE Q2_0 fixture block alignment");
                 tensor_bytes = (elements / 64u) * sizeof(block_q2_0);
-            } else if (tensor.type == 30u || tensor.type == 1u) {
+            } else if (tensor.type == kGgmlTypeQ8_0) {
+                require(elements % 32u == 0u,
+                        "FullMode PLE Q8_0 fixture block alignment");
+                tensor_bytes = (elements / 32u) * sizeof(block_q8_0);
+            } else if (tensor.type == kGgmlTypeBF16 || tensor.type == 1u) {
                 tensor_bytes = elements * sizeof(std::uint16_t);
             } else {
                 require(tensor.type == 0u,
@@ -790,18 +815,41 @@ Fixture write_fullmode_handoff_fixture(const fs::path& directory) {
                      embedding_row.size() * sizeof(block_q3_K),
                      fixture.data_start + fixture.dense_offset);
 
-        std::vector<block_q2_0> ple_key_blocks(
-            static_cast<std::size_t>(
-                (2'560u * 10'240u) / 64u));
-        for (block_q2_0& block : ple_key_blocks) {
-            block.d = 0x1000u;
-            std::fill_n(block.qs, std::size(block.qs), 0xaau);
+        constexpr std::uint64_t kPleKeyElements = 2'560u * 10'240u;
+        const std::uint64_t ple_key_offset =
+            fixture.data_start +
+            dense_tensor_offsets.at("blk.1.ple_key.weight");
+        if (ple_key_type == kGgmlTypeQ2_0) {
+            std::vector<block_q2_0> ple_key_blocks(
+                static_cast<std::size_t>(kPleKeyElements / 64u));
+            for (block_q2_0& block : ple_key_blocks) {
+                block.d = 0x1000u;
+                std::fill_n(block.qs, std::size(block.qs), 0xaau);
+            }
+            write_all_at(descriptor, ple_key_blocks.data(),
+                         ple_key_blocks.size() * sizeof(block_q2_0),
+                         ple_key_offset);
+        } else if (ple_key_type == kGgmlTypeQ8_0) {
+            std::vector<block_q8_0> ple_key_blocks(
+                static_cast<std::size_t>(kPleKeyElements / 32u));
+            for (block_q8_0& block : ple_key_blocks) {
+                block.d = 0x1000u;
+                std::fill_n(block.qs, std::size(block.qs), 1);
+            }
+            write_all_at(descriptor, ple_key_blocks.data(),
+                         ple_key_blocks.size() * sizeof(block_q8_0),
+                         ple_key_offset);
+        } else if (ple_key_type == kGgmlTypeBF16) {
+            std::vector<std::uint16_t> ple_key_weights(
+                static_cast<std::size_t>(kPleKeyElements),
+                strata::kernels::bf16_from_f32(0.001f));
+            write_all_at(descriptor, ple_key_weights.data(),
+                         ple_key_weights.size() * sizeof(std::uint16_t),
+                         ple_key_offset);
+        } else {
+            throw std::runtime_error(
+                "unsupported synthetic FullMode PLE key type");
         }
-        write_all_at(
-            descriptor, ple_key_blocks.data(),
-            ple_key_blocks.size() * sizeof(block_q2_0),
-            fixture.data_start + dense_tensor_offsets.at(
-                                      "blk.1.ple_key.weight"));
         std::vector<std::uint16_t> ple_value(
             static_cast<std::size_t>(2'560u) * 2'560u,
             strata::kernels::bf16_from_f32(0.0001f));
@@ -2892,7 +2940,8 @@ BufferRef require_scratch_view(Context& context,
 
 void run_fullmode_handoff_test(Context& context,
                                const fs::path& parent_directory,
-                               bool use_ple_entry = false) {
+                               bool use_ple_entry = false,
+                               std::uint32_t ple_key_type = kGgmlTypeQ2_0) {
     constexpr std::uint32_t kExperts = 256u;
     constexpr std::uint32_t kVocabulary = 1u;
     constexpr std::uint32_t kRows = 1u;
@@ -2906,7 +2955,8 @@ void run_fullmode_handoff_test(Context& context,
     const fs::path directory = parent_directory /
         (use_ple_entry ? "fullmode-ple-handoff" : "fullmode-handoff");
     fs::create_directory(directory);
-    const Fixture fixture = write_fullmode_handoff_fixture(directory);
+    const Fixture fixture =
+        write_fullmode_handoff_fixture(directory, ple_key_type);
     WindowSources sources = inspect_fixture(fixture);
     Geometry full_geometry = owner_test_geometry(fixture, sources);
     full_geometry.family = "qwen4exp";
@@ -2917,7 +2967,7 @@ void run_fullmode_handoff_test(Context& context,
     full_geometry.n_embd = N_EMBD;
     full_geometry.vocab = kVocabulary;
     full_geometry.types = {
-        "bf16", "f16", "f32", "iq4_nl", "q2_0", "q3_k"};
+        "bf16", "f16", "f32", "iq4_nl", "q2_0", "q3_k", "q8_0"};
     full_geometry.layers[0].gate_up_type = "q2_0";
     full_geometry.layers[0].down_type = "q2_0";
 
@@ -3334,7 +3384,9 @@ void run_fullmode_handoff_test(Context& context,
         FullModeTensorView ple_key_weights;
         require(full_mode->dense_tensor_view("blk.1.ple_key.weight",
                                              ple_key_weights, error),
-                "resolve FullMode PLE Q2_0 key tensor: " + error);
+                "resolve FullMode PLE native key tensor: " + error);
+        require(ple_key_weights.ggml_type == ple_key_type,
+                "FullMode PLE key tensor preserves its inspected native type");
         FullModeTensorView ple_value_weights;
         require(full_mode->dense_tensor_view("blk.1.ple_value.weight",
                                              ple_value_weights, error),
@@ -3405,10 +3457,16 @@ void run_fullmode_handoff_test(Context& context,
         step_ple_block.post.conv_gamma = {};
         const WindowMoePLEEntryBuffers step_ple_entry{
             full_buffers.ffn, ffn, step_ple_block};
-        // The FullMode step must resolve every model tensor and replace this
-        // deliberately wrong format from the mapped model metadata.
+        const MatVecWeightFormat resolved_key_format =
+            fullmode_ple_key_format(ple_key_type);
+        const MatVecWeightFormat decoy_key_format =
+            resolved_key_format == MatVecWeightFormat::bf16
+                ? MatVecWeightFormat::q2_0
+                : MatVecWeightFormat::bf16;
+        // The FullMode step must replace this format decoy from the mapped
+        // model metadata for every supported native key type.
         pending_consumer = WindowMoePendingPLEConsumer{
-            step_ple_entry, MatVecWeightFormat::bf16, 1u,
+            step_ple_entry, decoy_key_format, 1u,
             PLEHistoryUpdate::defer};
     }
     const WindowT1FullModeStepBuffers full_step_buffers{
@@ -3743,9 +3801,10 @@ void run_fullmode_handoff_test(Context& context,
                 "track PLE history through the direct reference: " + error);
         require(encode_window_ple_entry(
                     context, *reference_command, kRows,
-                    MatVecWeightFormat::q2_0, 1u,
+                    fullmode_ple_key_format(ple_key_type), 1u,
                     PLEHistoryUpdate::defer, reference_entry, error),
-                "encode direct GR-post plus PLE-entry reference: " + error);
+                "encode direct GR-post plus native-format PLE-entry reference: " +
+                    error);
         require(reference_command->commit(error),
                 "commit direct PLE-entry reference: " + error);
         id<MTLCommandBuffer> native_reference =
@@ -3898,14 +3957,18 @@ int main(int argc, char** argv) {
         const bool model_owner_only = argc == 3 && std::string(argv[2]) == "--model-owner";
         const bool fullmode_handoff_only =
             argc == 3 && std::string(argv[2]) == "--fullmode-handoff";
+        const std::string mode = argc == 3 ? argv[2] : "";
         const bool fullmode_ple_handoff_only =
-            argc == 3 && std::string(argv[2]) == "--fullmode-ple-handoff";
+            mode == "--fullmode-ple-handoff" ||
+            mode == "--fullmode-ple-handoff-q8" ||
+            mode == "--fullmode-ple-handoff-bf16";
         require(argc == 2 || never_wrap_only || tiered_copy_only ||
-                    model_owner_only || fullmode_handoff_only ||
+            model_owner_only || fullmode_handoff_only ||
                     fullmode_ple_handoff_only,
                 "usage: metal_window_storage_test strata.metallib "
                 "[--never-wrap|--tiered-copy|--model-owner|--fullmode-handoff|"
-                "--fullmode-ple-handoff]");
+                "--fullmode-ple-handoff|--fullmode-ple-handoff-q8|"
+                "--fullmode-ple-handoff-bf16]");
         if (argc == 2) test_warmup_wave_barrier();
         char directory_template[] = "/tmp/strata-window-storage.XXXXXX";
         char* directory_name = mkdtemp(directory_template);
@@ -3934,11 +3997,19 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (fullmode_ple_handoff_only) {
-            run_fullmode_handoff_test(*context, directory, true);
+            const std::uint32_t ple_key_type =
+                mode == "--fullmode-ple-handoff-q8"
+                    ? kGgmlTypeQ8_0
+                    : mode == "--fullmode-ple-handoff-bf16"
+                          ? kGgmlTypeBF16
+                          : kGgmlTypeQ2_0;
+            run_fullmode_handoff_test(*context, directory, true,
+                                      ple_key_type);
             context.reset();
             std::error_code ignored;
             fs::remove_all(directory, ignored);
-            std::cout << "metal_fullmode_ple_handoff_test: OK\n";
+            std::cout << "metal_fullmode_ple_handoff_test (GGML type "
+                      << ple_key_type << "): OK\n";
             return 0;
         }
         if (model_owner_only) {
