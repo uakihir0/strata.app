@@ -666,14 +666,16 @@ If the query fails, the read still proceeds and the blob is conservatively count
    exclusion, and every converted exclusion must match exactly one validated `dense.bin` row and one arena binding.
    Unlisted pack bytes are never read. Windows split at `maxBufferLength` may overlap by up to 16 KiB at the split;
    the union counts those bytes once. The tiered loader validates the complete source inventory before allocating
-   and uses anonymous no-copy arenas; `metal_tiered_copy_test` checks the resulting Metal allocation set contains no
-   GGUF-backed buffer.
+   and uses anonymous no-copy arenas; `metal_tiered_copy_test` checks that the CPU-visible address ranges of all six
+   tiered buffers do not overlap the live GGUF mapping.
 
 Violating rule 1 or 2 would, on the first command buffer, page the whole file into memory and push the machine into
 heavy memory pressure. `metal_never_wrap_test` checks the full-mode loader's PLE and union rules on a live synthetic
-mmap. `metal_tiered_copy_test` checks the backing region names of all six tiered buffers against the known GGUF
-mapping and verifies that the bulk descriptor copies only inspected tensor ranges. The miss descriptor is opened
-separately with read-ahead disabled; U6 implements its runtime reads.
+mmap. `metal_tiered_copy_test` confirms `proc_regionfilename` identifies the source GGUF mapping, compares each
+Metal buffer's address range against that mapping, and verifies that the bulk descriptor copies only inspected
+tensor ranges. The test does not use `proc_regionfilename` on Metal buffer contents: a no-copy Metal buffer can report
+an unrelated file as its region name. The miss descriptor is opened separately with read-ahead disabled; U6
+implements its runtime reads.
 
 ---
 
@@ -871,7 +873,7 @@ python tools/hit_curve.py TRACE ... [--profile data/expert-profile.bin] [--n-exp
 | `metal_window_test` | Window planning (section 4.2): 16 KiB rounding, merge rule, splits at expert-slab boundaries when `maxBufferLength` is forced small (test hook), and preservation of the merged-range union across an oversized unread gap. On the header fixtures of [03](03-model-reference.md) work item R1: one window for Q2_0 shard 1, none for the PLE shard, two for Swift shard 1 with no PLE tensor mapping (page-alignment padding may cover up to one page at an adjacent tensor boundary), and `wrapped_unread` of 252,149,760 B plus padding for Swift. |
 | `metal_window_storage_test` | Sections 4.1 and 4.3: a nine-expert synthetic GGUF spanning multiple VM pages is mmaped, wrapped in page-rounded no-copy MTLBuffer, and mapped to the exact expert address table; checks the full-mode shared-mapping IQ4 PLE reader through `ModelStorage`, tiered-mode reader absence, exact converted-router arena bytes, immutable inspection-time row mapping, 16 KiB padding, malformed/overlapping ranges, layer bounds, rollback and warm-up, plus the shared maximum-capacity address/resident buffers and mmap lifetime. `metal_window_test` checks profile order across wave boundaries, multiple converted-router row bindings, pack-range overlap and `maxBufferLength`, and compact row indexing with a two-layer, 256-expert Coder layout. |
 | `metal_never_wrap_test` | Section 6: the live full-mode loader requires the shard inventory and `wrapped_unread` total to match the memory plan, accounts for every GGUF tensor exactly once as included or intentionally excluded, excludes the PLE tensor from sources, slices and addresses, resolves the converted F32 router only to its BF16 arena binding, and allows at most one 16 KiB page of overlap at the PLE boundary. |
-| `metal_tiered_copy_test` | On a small synthetic GGUF: the dense and resident arenas hold exact source bytes (byte compare), including converted `dense.bin` router rows; the tiered opener configures both descriptors and address/resident/plan tables match the layout; region-name queries prove no tiered buffer is backed by the GGUF and fail closed if a reported path cannot be compared; same-size source replacements, malformed dense-pack ranges/sizes and pending-generation markers fail before allocation. `metal_weight_store_test` checks rejection of held source-file/source-set/pack locks and pending generations, and that returned leases keep blocking writers through storage opening. |
+| `metal_tiered_copy_test` | On a small synthetic GGUF: the dense and resident arenas hold exact source bytes (byte compare), including converted `dense.bin` router rows; the tiered opener configures both descriptors and address/resident/plan tables match the layout; the test confirms the source GGUF mapping path and checks that no tiered buffer address range overlaps it. It rejects same-size source replacements, malformed dense-pack ranges/sizes and pending-generation markers before allocation. `metal_weight_store_test` checks rejection of held source-file/source-set/pack locks and pending generations, and that returned leases keep blocking writers through storage opening. |
 | `metal_slot_pool_test` | Ping-pong halves, Loading-to-Ready publication, duplicate-load refusal, abandoned-load retry, LRU tags, and no slot reuse until the layer-complete event; the command-buffer callback releases remaining leases, and the test gates the GPU with an arrival/release event pair. |
 | `metal_full_vs_tiered` (gate C4) | The same prompts, greedy and seeded, give byte-identical tokens and DONE counts (except the tier counters) in full mode and in tiered mode with `--gpu-budget-mib` forcing 50% and 90% residency ([09-testing-and-validation.md](09-testing-and-validation.md)) |
 | `metal_memory_pressure_smoke` | The M-4 procedure; records its numbers. Runs weekly, and on demand ([09-testing-and-validation.md](09-testing-and-validation.md), section 5.5). |

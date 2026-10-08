@@ -688,14 +688,23 @@ bool region_path_is_not_gguf(const fs::path& region_path, const fs::path& gguf_p
     return true;
 }
 
-void require_not_backed_by_gguf(BufferRef buffer, const fs::path& gguf_path,
+void require_not_overlapping_gguf_mapping(BufferRef buffer, const strata::GgufFile& gguf,
                                 const std::string& label) {
     require(buffer && buffer.contents != nullptr, label + " must expose its allocation");
-    const fs::path backing_path = mapped_file_path(buffer.contents);
-    if (backing_path.empty()) return;
-    std::string error;
-    require(region_path_is_not_gguf(backing_path, gguf_path, error),
-            label + " " + error);
+    const std::uintptr_t buffer_start =
+        reinterpret_cast<std::uintptr_t>(buffer.contents);
+    const std::uintptr_t source_start =
+        reinterpret_cast<std::uintptr_t>(gguf.mapping_data());
+    const std::uintptr_t address_limit = std::numeric_limits<std::uintptr_t>::max();
+    require(buffer.length <= address_limit - buffer_start &&
+                gguf.file_size() <= address_limit - source_start,
+            label + " or GGUF mapping range overflows the process address space");
+    const std::uintptr_t buffer_end =
+        buffer_start + static_cast<std::uintptr_t>(buffer.length);
+    const std::uintptr_t source_end =
+        source_start + static_cast<std::uintptr_t>(gguf.file_size());
+    require(buffer_end <= source_start || source_end <= buffer_start,
+            label + " overlaps the GGUF mapping address range");
 }
 
 void run_tiered_copy_test(Context& context, const Fixture& fixture,
@@ -924,7 +933,7 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
         }
         return *found;
     };
-    const TieredTensorBinding& dense_binding = tensor_binding("token_embd.weight");
+    const TieredTensorBinding dense_binding = tensor_binding("token_embd.weight");
     require(dense_binding.arena_offset + dense_binding.byte_count <= dense_arena.length &&
                 std::memcmp(static_cast<const std::uint8_t*>(dense_arena.contents) +
                                 dense_binding.arena_offset,
@@ -1219,12 +1228,12 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     [native_cache waitUntilCompleted];
     require(context.buffers().allocation_count() == 6,
             "tiered mode must allocate its three arenas and three tables, without GGUF windows");
-    require_not_backed_by_gguf(dense_arena, fixture.path, "tiered dense arena");
-    require_not_backed_by_gguf(resident_arena, fixture.path, "tiered resident arena");
-    require_not_backed_by_gguf(slot_arena, fixture.path, "tiered slot arena");
-    require_not_backed_by_gguf(address_table, fixture.path, "tiered address table");
-    require_not_backed_by_gguf(resident_table, fixture.path, "tiered resident table");
-    require_not_backed_by_gguf(plan_buffer, fixture.path, "tiered plan table");
+    require_not_overlapping_gguf_mapping(dense_arena, source_file, "tiered dense arena");
+    require_not_overlapping_gguf_mapping(resident_arena, source_file, "tiered resident arena");
+    require_not_overlapping_gguf_mapping(slot_arena, source_file, "tiered slot arena");
+    require_not_overlapping_gguf_mapping(address_table, source_file, "tiered address table");
+    require_not_overlapping_gguf_mapping(resident_table, source_file, "tiered resident table");
+    require_not_overlapping_gguf_mapping(plan_buffer, source_file, "tiered plan table");
 
     storage.reset();
     require(can_take_exclusive_lock(source_set_lock) &&
