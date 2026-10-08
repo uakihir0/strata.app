@@ -55,6 +55,10 @@ public:
     const KvStore* kv_store() const noexcept;
     const MtpRuntimeStorage* mtp_runtime() const noexcept;
     const WindowScratchStorage* window_scratch() const noexcept;
+    /// Borrow the full-mode tensor/table resolver; null in tiered mode. The
+    /// pointer does not outlive this ModelStorage, and its buffer views expose
+    /// CPU mappings only through const pointers.
+    const FullModeStorage* full_mode_storage() const noexcept;
     /// Available in full mode; null in tiered mode.
     strata::kernels::PleTableReader* ple_reader() noexcept;
 

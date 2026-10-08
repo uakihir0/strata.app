@@ -163,6 +163,10 @@ BufferRef Buffers::allocate(const std::string& label, std::size_t bytes, std::st
     return {handle, buffer.contents, buffer.gpuAddress, bytes, 0, validity};
 }
 
+bool Buffers::owns(ReadOnlyBufferRef buffer) const {
+    return buffer && owns(buffer.buffer_);
+}
+
 bool Buffers::owns(BufferRef buffer) const {
     if (!impl_ || !buffer || buffer.validity_ == nullptr) return false;
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex);

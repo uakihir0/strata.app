@@ -191,6 +191,38 @@ private:
     friend class Buffers;
 };
 
+/// A borrowed Context-owned buffer view for reading model weights. Unlike
+/// BufferRef, its CPU mapping is exposed only as const data. Copies retain the
+/// same generation-checked validity token but do not own the MTLBuffer.
+class ReadOnlyBufferRef {
+public:
+    ReadOnlyBufferRef() = default;
+
+    explicit operator bool() const noexcept { return static_cast<bool>(buffer_); }
+    const void* contents() const noexcept {
+        return buffer_ ? static_cast<const void*>(buffer_.contents) : nullptr;
+    }
+    std::uint64_t gpu_address() const noexcept {
+        return buffer_ ? buffer_.gpu_address : 0;
+    }
+    std::size_t length() const noexcept { return buffer_ ? buffer_.length : 0; }
+    std::size_t offset() const noexcept { return buffer_ ? buffer_.offset : 0; }
+
+    /// Return a bounded read-only subview, or an empty view on failure.
+    ReadOnlyBufferRef slice(std::size_t relative_offset,
+                            std::size_t view_length) const noexcept {
+        return *this ? ReadOnlyBufferRef(buffer_.slice(relative_offset, view_length))
+                     : ReadOnlyBufferRef{};
+    }
+
+private:
+    explicit ReadOnlyBufferRef(BufferRef buffer) : buffer_(std::move(buffer)) {}
+    BufferRef buffer_;
+
+    friend class Buffers;
+    friend class FullModeStorage;
+};
+
 /// Owns a Metal command buffer until this C++ handle is destroyed. Use enqueue()
 /// and commit() to control submission. Destroying a NotEnqueued handle discards
 /// it; Metal cannot cancel an Enqueued handle, so destruction commits it.
@@ -347,6 +379,8 @@ public:
     std::uint64_t allocated_size() const;
     /// True when this generation-checked view references an MTLBuffer retained by this pool.
     bool owns(BufferRef buffer) const;
+    /// Read-only view equivalent; validates its private underlying generation token.
+    bool owns(ReadOnlyBufferRef buffer) const;
     /// Monotonic identity for a live owned buffer handle; zero when it is not owned.
     std::uint64_t allocation_identity(BufferRef buffer) const;
     /// Also verifies that the handle still refers to the same allocation generation.

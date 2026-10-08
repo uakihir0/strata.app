@@ -51,6 +51,14 @@ using PublicLeaseSlot =
     std::remove_cvref_t<decltype(WindowSourceFileLock{}.lock_lease())>;
 static_assert(!std::is_convertible_v<std::shared_ptr<void>, PublicLeaseSlot>,
               "storage callers must not be able to forge a descriptor-owning lease");
+static_assert(std::is_same_v<decltype(std::declval<const ReadOnlyBufferRef&>().contents()),
+                             const void*>,
+              "full-mode model views must expose only const CPU mappings");
+static_assert(!std::is_convertible_v<ReadOnlyBufferRef, BufferRef>,
+              "read-only model views must not convert to mutable buffer references");
+static_assert(std::is_same_v<decltype(std::declval<const ModelStorage&>().full_mode_storage()),
+                             const FullModeStorage*>,
+              "ModelStorage must expose only a borrowed const full-mode resolver");
 
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
@@ -1611,6 +1619,19 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
                 full_ple->mode() == strata::kernels::PleIo::Mmap &&
                 full_ple->rows() == 728,
             "full-mode ModelStorage must publish its mapped PLE reader");
+    const FullModeStorage* full_mode = full_storage->full_mode_storage();
+    FullModeTensorView owner_token_view;
+    require(full_mode != nullptr &&
+                full_mode->dense_tensor_view("token_embd.weight",
+                                             owner_token_view, error) &&
+                owner_token_view.buffer &&
+                context.buffers().owns(owner_token_view.buffer) &&
+                full_mode->expert_address_table() &&
+                full_mode->resident_table() &&
+                context.buffers().owns(full_mode->expert_address_table()) &&
+                context.buffers().owns(full_mode->resident_table()),
+            "full-mode ModelStorage must expose borrowed dense weights and expert tables: " +
+                error);
     const KvStore* full_kv = full_storage->kv_store();
     const BufferRef full_rope = full_kv != nullptr ? full_kv->rope() : BufferRef{};
     require(full_kv != nullptr &&
@@ -1628,6 +1649,7 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
     std::unique_ptr<ModelStorage> provisional_storage;
     BufferRef provisional_kv_allocation;
     BufferRef provisional_rope;
+    ReadOnlyBufferRef provisional_weight;
     const std::size_t allocations_before_owner_rollback =
         context.buffers().allocation_count();
     const std::uint64_t bytes_before_owner_rollback =
@@ -1643,7 +1665,13 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
         provisional_kv_allocation =
             provisional_storage->kv_store()->allocation();
         provisional_rope = provisional_storage->kv_store()->rope();
-        require(provisional_kv_allocation && provisional_rope &&
+        FullModeTensorView provisional_token_view;
+        require(provisional_storage->full_mode_storage() != nullptr &&
+                    provisional_storage->full_mode_storage()->dense_tensor_view(
+                        "token_embd.weight", provisional_token_view, error),
+                "resolve a provisional read-only full-mode weight view: " + error);
+        provisional_weight = provisional_token_view.buffer;
+        require(provisional_kv_allocation && provisional_rope && provisional_weight &&
                     context.buffers().allocation_count() >
                         allocations_before_owner_rollback,
                 "provisional main KV and RoPE views must be live before rollback");
@@ -1655,8 +1683,9 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
                 provisional_storage->kv_store() != nullptr &&
                 !provisional_storage->kv_store()->allocation() &&
                 !provisional_storage->kv_store()->rope() &&
-                !provisional_kv_allocation && !provisional_rope,
-            "outer rollback must release main KV and invalidate its shared RoPE views");
+                !provisional_kv_allocation && !provisional_rope &&
+                !provisional_weight && !context.buffers().owns(provisional_weight),
+            "outer rollback must release provisional buffers and invalidate read-only weight views");
     provisional_storage.reset();
 
     const std::size_t allocations_after_full = context.buffers().allocation_count();
@@ -1744,10 +1773,10 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
                                             packed_geometry, packed_sources,
                                             packed_window_plan, error);
         require(opened != nullptr, "open packed full-mode storage for rollback: " + error);
-        const BufferRef arena = opened->dense_pack_arena();
-        require(arena && arena.length == 3 * kWindowPageBytes &&
+        const ReadOnlyBufferRef arena = opened->dense_pack_arena();
+        require(arena && arena.length() == 3 * kWindowPageBytes &&
                     opened->layout().dense_pack_bytes == packed_fixture.dense_pack_bytes &&
-                    opened->layout().dense_pack_arena_bytes == arena.length,
+                    opened->layout().dense_pack_arena_bytes == arena.length(),
                 "full-mode router arena must be padded to its 16 KiB allocation boundary");
         const auto row = std::find_if(
             opened->layout().tensors.begin(), opened->layout().tensors.end(),
@@ -1755,8 +1784,8 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
                 return binding.tensor_name == "blk.0.ffn_gate_inp.weight";
             });
         require(row != opened->layout().tensors.end() &&
-                    row->gpu_address >= arena.gpu_address &&
-                    row->gpu_address + row->byte_count <= arena.gpu_address + arena.length,
+                    row->gpu_address >= arena.gpu_address() &&
+                    row->gpu_address + row->byte_count <= arena.gpu_address() + arena.length(),
                 "converted router binding must point inside the dense-pack arena");
         FullModeTensorView router_view;
         require(opened->dense_tensor_view("blk.0.ffn_gate_inp.weight",
@@ -1764,8 +1793,8 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
                 "resolve converted router as a full-mode tensor view: " + error);
         require(router_view.ggml_type == 30 &&
                     router_view.shape == std::vector<std::uint64_t>{2'560, 9} &&
-                    router_view.buffer.length == packed_fixture.dense_pack_bytes &&
-                    router_view.buffer.gpu_address == row->gpu_address,
+                    router_view.buffer.length() == packed_fixture.dense_pack_bytes &&
+                    router_view.buffer.gpu_address() == row->gpu_address,
                 "converted router view must expose its runtime BF16 type, GGUF shape and arena slice");
         std::vector<std::uint8_t> expected(
             static_cast<std::size_t>(packed_fixture.dense_pack_bytes));
@@ -1773,14 +1802,14 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
         input.read(reinterpret_cast<char*>(expected.data()),
                    static_cast<std::streamsize>(expected.size()));
         require(input.gcount() == static_cast<std::streamsize>(expected.size()) &&
-                    std::memcmp(arena.contents, expected.data(), expected.size()) == 0,
+                    std::memcmp(arena.contents(), expected.data(), expected.size()) == 0,
                 "full-mode dense-pack arena must contain the exact converted router row");
-        require(std::memcmp(router_view.buffer.contents, expected.data(),
+        require(std::memcmp(router_view.buffer.contents(), expected.data(),
                             expected.size()) == 0,
                 "converted router view must expose the exact dense-pack bytes");
-        const auto* arena_bytes = static_cast<const std::uint8_t*>(arena.contents);
+        const auto* arena_bytes = static_cast<const std::uint8_t*>(arena.contents());
         require(std::all_of(arena_bytes + expected.size(),
-                            arena_bytes + arena.length,
+                            arena_bytes + arena.length(),
                             [](std::uint8_t value) { return value == 0; }),
                 "full-mode dense-pack arena padding must be initialized");
         require(context.buffers().allocation_count() > allocations_after_full,
@@ -1797,7 +1826,7 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
             padded_plan, error);
         require(padded_storage != nullptr,
                 "open a dense pack with unlisted prefix and tail bytes: " + error);
-        const BufferRef padded_arena = padded_storage->dense_pack_arena();
+        const ReadOnlyBufferRef padded_arena = padded_storage->dense_pack_arena();
         const auto padded_row = std::find_if(
             padded_storage->layout().tensors.begin(),
             padded_storage->layout().tensors.end(),
@@ -1805,13 +1834,13 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
                 return binding.tensor_name == "blk.0.ffn_gate_inp.weight";
             });
         require(padded_arena && padded_row != padded_storage->layout().tensors.end() &&
-                    padded_row->gpu_address == padded_arena.gpu_address &&
-                    std::memcmp(padded_arena.contents, expected.data(), expected.size()) == 0 &&
+                    padded_row->gpu_address == padded_arena.gpu_address() &&
+                    std::memcmp(padded_arena.contents(), expected.data(), expected.size()) == 0 &&
                     std::all_of(
-                        static_cast<const std::uint8_t*>(padded_arena.contents) +
+                        static_cast<const std::uint8_t*>(padded_arena.contents()) +
                             expected.size(),
-                        static_cast<const std::uint8_t*>(padded_arena.contents) +
-                            padded_arena.length,
+                        static_cast<const std::uint8_t*>(padded_arena.contents()) +
+                            padded_arena.length(),
                         [](std::uint8_t value) { return value == 0; }),
                 "only the indexed dense-pack row may be copied into the GPU arena");
     }
@@ -1902,6 +1931,8 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
             "tiered owner must report copied resident storage without full-mode warm-up");
     require(tiered_storage->ple_reader() == nullptr,
             "tiered ModelStorage must not publish a reader for its closed startup mapping");
+    require(tiered_storage->full_mode_storage() == nullptr,
+            "tiered ModelStorage must not publish full-mode weight views or tables");
     require(tiered_storage->kv_store() != nullptr &&
                 tiered_storage->kv_store()->allocation().length ==
                     tiered_plan.kv_bytes &&
@@ -1936,17 +1967,17 @@ void run_multi_converted_view_offset_test(Context& context,
     require(first.ggml_type == 30 && second.ggml_type == 30 &&
                 first.shape == std::vector<std::uint64_t>{2'560, 9} &&
                 second.shape == std::vector<std::uint64_t>{2'560} &&
-                first.buffer.length == fixture.router_row_bytes &&
-                second.buffer.length == fixture.second_router_row_bytes &&
-                second.buffer.gpu_address - first.buffer.gpu_address ==
+                first.buffer.length() == fixture.router_row_bytes &&
+                second.buffer.length() == fixture.second_router_row_bytes &&
+                second.buffer.gpu_address() - first.buffer.gpu_address() ==
                     fixture.router_row_bytes &&
-                static_cast<const std::uint8_t*>(second.buffer.contents) ==
-                    static_cast<const std::uint8_t*>(first.buffer.contents) +
+                static_cast<const std::uint8_t*>(second.buffer.contents()) ==
+                    static_cast<const std::uint8_t*>(first.buffer.contents()) +
                         fixture.router_row_bytes,
             "second converted router view must preserve its nonzero arena offset and metadata");
 
     const auto* bytes =
-        static_cast<const std::uint8_t*>(second.buffer.contents);
+        static_cast<const std::uint8_t*>(second.buffer.contents());
     for (std::size_t i = 0; i < fixture.second_router_row_bytes; ++i) {
         const auto expected = static_cast<std::uint8_t>(0x20 + (i % 0x50));
         require(bytes[i] == expected,
@@ -2106,8 +2137,8 @@ int main(int argc, char** argv) {
             *context, fixture.path.string(), geometry, sources, plan, error);
         require(storage != nullptr, "map full-mode GGUF windows: " + error);
         require(storage->windows().size() == 1 && storage->windows()[0].size() == 1 &&
-                    storage->windows()[0][0].length > 8 * kWindowPageBytes &&
-                    storage->windows()[0][0].length % kWindowPageBytes == 0,
+                    storage->windows()[0][0].length() > 8 * kWindowPageBytes &&
+                    storage->windows()[0][0].length() % kWindowPageBytes == 0,
                 "one multi-page, page-rounded GGUF window should be wrapped");
 
         const FullModeLayout& layout = storage->layout();
@@ -2117,8 +2148,8 @@ int main(int argc, char** argv) {
         require(token_view.ggml_type == 0 &&
                     token_view.shape == std::vector<std::uint64_t>{64, 64} &&
                     token_view.buffer &&
-                    token_view.buffer.length == 64 * 64 * sizeof(float) &&
-                    *static_cast<const std::uint8_t*>(token_view.buffer.contents) == 0x4d,
+                    token_view.buffer.length() == 64 * 64 * sizeof(float) &&
+                    *static_cast<const std::uint8_t*>(token_view.buffer.contents()) == 0x4d,
                 "dense tensor view must retain GGML type, shape, exact extent and mapped bytes");
         FullModeTensorView rejected_view = token_view;
         require(!storage->dense_tensor_view("blk.0.ffn_gate_exps.weight",
@@ -2160,10 +2191,10 @@ int main(int argc, char** argv) {
             [](const TensorGpuBinding& binding) {
                 return binding.tensor_name == "blk.0.ffn_gate_inp.weight";
             });
-        const BufferRef dense_pack_arena = storage->dense_pack_arena();
+        const ReadOnlyBufferRef dense_pack_arena = storage->dense_pack_arena();
         require(router_binding != layout.tensors.end() && dense_pack_arena &&
-                    dense_pack_arena.length == 3 * kWindowPageBytes &&
-                    router_binding->gpu_address == dense_pack_arena.gpu_address &&
+                    dense_pack_arena.length() == 3 * kWindowPageBytes &&
+                    router_binding->gpu_address == dense_pack_arena.gpu_address() &&
                     router_binding->byte_count == fixture.dense_pack_bytes,
                 "converted router address binding must point to the aligned BF16 arena");
         std::vector<std::uint8_t> packed_router(
@@ -2173,7 +2204,7 @@ int main(int argc, char** argv) {
             input.read(reinterpret_cast<char*>(packed_router.data()),
                        static_cast<std::streamsize>(packed_router.size()));
             require(input.gcount() == static_cast<std::streamsize>(packed_router.size()) &&
-                        std::memcmp(dense_pack_arena.contents, packed_router.data(),
+                        std::memcmp(dense_pack_arena.contents(), packed_router.data(),
                                     packed_router.size()) == 0,
                     "full-mode dense-pack arena must contain the converted BF16 router bytes");
         }
@@ -2187,9 +2218,9 @@ int main(int argc, char** argv) {
             require(overlap <= kWindowPageBytes,
                     "a full-mode no-copy window may overlap only PLE boundary padding");
             saw_ple_padding = true;
-            const BufferRef& window = storage->windows()[0][index];
+            const ReadOnlyBufferRef& window = storage->windows()[0][index];
             const std::uint64_t mapped_ple_start =
-                window.gpu_address + (overlap_start - file_window.start);
+                window.gpu_address() + (overlap_start - file_window.start);
             const std::uint64_t mapped_ple_end = mapped_ple_start + overlap;
             for (std::uint64_t address : layout.expert_addresses) {
                 require(address == 0 || address < mapped_ple_start || address >= mapped_ple_end,
@@ -2223,11 +2254,11 @@ int main(int argc, char** argv) {
         require(std::equal(expected.begin(), expected.end(), layout.expert_addresses.begin()),
                 "expert GPU addresses must follow layer, expert, gate/up/down order");
 
-        const BufferRef address_table = storage->expert_address_table();
-        const BufferRef resident_table = storage->resident_table();
+        const ReadOnlyBufferRef address_table = storage->expert_address_table();
+        const ReadOnlyBufferRef resident_table = storage->resident_table();
         require(address_table && resident_table, "full-mode tables must be shared Metal buffers");
-        const auto* mapped_addresses = static_cast<const std::uint64_t*>(address_table.contents);
-        const auto* mapped_resident = static_cast<const std::int32_t*>(resident_table.contents);
+        const auto* mapped_addresses = static_cast<const std::uint64_t*>(address_table.contents());
+        const auto* mapped_resident = static_cast<const std::int32_t*>(resident_table.contents());
         require(std::equal(expected.begin(), expected.end(), mapped_addresses),
                 "shared expert address table must match its checked host layout");
         require(std::all_of(mapped_resident, mapped_resident + 9,
@@ -2241,10 +2272,10 @@ int main(int argc, char** argv) {
         require(storage->warm_up(expert_order, error),
                 "CPU and GPU page warm-up: " + error);
 
-        const BufferRef live_window = storage->windows()[0][0];
+        const ReadOnlyBufferRef live_window = storage->windows()[0][0];
         const std::uint64_t live_window_start = plan.files[0].windows[0].start;
         storage.reset();
-        const auto* payload = static_cast<const std::uint8_t*>(live_window.contents);
+        const auto* payload = static_cast<const std::uint8_t*>(live_window.contents());
         require(payload[fixture.data_start + fixture.offsets[0] - live_window_start] == 0x30 &&
                     payload[fixture.data_start + fixture.offsets[2] - live_window_start] == 0x42 &&
                     payload[fixture.data_start + fixture.offsets[2] +

@@ -803,6 +803,7 @@ struct FullModeStorage::Impl {
     WindowSources sources;
     WindowPlan plan;
     std::vector<std::vector<BufferRef>> windows;
+    std::vector<std::vector<ReadOnlyBufferRef>> read_only_windows;
     BufferRef dense_pack_arena;
     FullModeLayout layout;
     BufferRef expert_addresses;
@@ -887,6 +888,7 @@ std::unique_ptr<FullModeStorage> FullModeStorage::open(Context& context,
 
     auto buffer_transaction = context.buffers().transaction();
     candidate->windows.resize(sources.files.size());
+    candidate->read_only_windows.resize(sources.files.size());
     for (std::size_t shard = 0; shard < sources.files.size(); ++shard) {
         const WindowFileSource& source = sources.files[shard];
         const FileWindowPlan& file_plan = plan.files[shard];
@@ -896,6 +898,7 @@ std::unique_ptr<FullModeStorage> FullModeStorage::open(Context& context,
         }
         const strata::GgufFile& file = candidate->model->shard(shard);
         candidate->windows[shard].reserve(file_plan.windows.size());
+        candidate->read_only_windows[shard].reserve(file_plan.windows.size());
         gpu_bases[shard].clear();
         gpu_bases[shard].reserve(file_plan.windows.size());
         for (std::size_t index = 0; index < file_plan.windows.size(); ++index) {
@@ -911,6 +914,7 @@ std::unique_ptr<FullModeStorage> FullModeStorage::open(Context& context,
                 std::static_pointer_cast<void>(candidate->model), error);
             if (!buffer) return nullptr;
             candidate->windows[shard].push_back(buffer);
+            candidate->read_only_windows[shard].push_back(ReadOnlyBufferRef(buffer));
             gpu_bases[shard].push_back(buffer.gpu_address);
         }
     }
@@ -999,16 +1003,21 @@ std::unique_ptr<FullModeStorage> FullModeStorage::open(Context& context,
 
 const FullModeLayout& FullModeStorage::layout() const noexcept { return impl_->layout; }
 
-const std::vector<std::vector<BufferRef>>& FullModeStorage::windows() const noexcept {
-    return impl_->windows;
+const std::vector<std::vector<ReadOnlyBufferRef>>& FullModeStorage::windows() const noexcept {
+    return impl_->read_only_windows;
 }
 
-BufferRef FullModeStorage::dense_pack_arena() const noexcept {
-    return impl_->dense_pack_arena;
+ReadOnlyBufferRef FullModeStorage::dense_pack_arena() const noexcept {
+    return ReadOnlyBufferRef(impl_->dense_pack_arena);
 }
 
-BufferRef FullModeStorage::expert_address_table() const noexcept { return impl_->expert_addresses; }
-BufferRef FullModeStorage::resident_table() const noexcept { return impl_->resident; }
+ReadOnlyBufferRef FullModeStorage::expert_address_table() const noexcept {
+    return ReadOnlyBufferRef(impl_->expert_addresses);
+}
+
+ReadOnlyBufferRef FullModeStorage::resident_table() const noexcept {
+    return ReadOnlyBufferRef(impl_->resident);
+}
 
 strata::kernels::PleTableReader* FullModeStorage::ple_reader() noexcept {
     return impl_ != nullptr && impl_->ple_table != nullptr
@@ -1150,7 +1159,7 @@ bool FullModeStorage::dense_tensor_view(const std::string& tensor_name,
 
     view.ggml_type = runtime_type;
     view.shape = tensor->shape;
-    view.buffer = candidate_view;
+    view.buffer = ReadOnlyBufferRef(candidate_view);
     return true;
 }
 

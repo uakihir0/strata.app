@@ -49,7 +49,7 @@ struct FullModeTensorView {
     // are BF16 even when their source GGUF tensor has another type.
     std::uint32_t ggml_type = 0;
     std::vector<std::uint64_t> shape;
-    BufferRef buffer;
+    ReadOnlyBufferRef buffer;
 };
 
 /// Preserve profile order, then append all unranked experts in layer/expert order.
@@ -90,10 +90,10 @@ public:
     FullModeStorage& operator=(const FullModeStorage&) = delete;
 
     const FullModeLayout& layout() const noexcept;
-    const std::vector<std::vector<BufferRef>>& windows() const noexcept;
-    BufferRef dense_pack_arena() const noexcept;
-    BufferRef expert_address_table() const noexcept;
-    BufferRef resident_table() const noexcept;
+    const std::vector<std::vector<ReadOnlyBufferRef>>& windows() const noexcept;
+    ReadOnlyBufferRef dense_pack_arena() const noexcept;
+    ReadOnlyBufferRef expert_address_table() const noexcept;
+    ReadOnlyBufferRef resident_table() const noexcept;
     /// Row access to the storage-owned PLE reader; lifecycle and I/O mode stay
     /// controlled by this owner.
     strata::kernels::PleTableReader* ple_reader() noexcept;
