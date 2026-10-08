@@ -4,6 +4,8 @@
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/tiered.hpp"
 
+#include "../kernels/common/types.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +18,23 @@ namespace {
 constexpr std::uint32_t kMoeTopK = 10u;
 constexpr std::uint32_t kMoeRouteThreads = 32u;
 constexpr std::uint32_t kMoePlanThreads = 128u;
+constexpr std::uint32_t kMoeInputBlocksPerRow = 80u;
+constexpr std::uint32_t kMoeExpertOutputWidth = 640u;
+constexpr std::uint32_t kMoeExpertOutputRowGroups =
+    2u * kMoeExpertOutputWidth / 8u;
+
+struct MoeExpertAddress {
+    std::uint64_t role[3]{};
+};
+static_assert(sizeof(MoeExpertAddress) == 24u);
+
+struct MoeGroupedGateUpParams {
+    std::uint32_t n_expert;
+    std::uint32_t layer;
+    std::uint32_t n_rows;
+};
+static_assert(sizeof(MoeGroupedGateUpParams) == 12u);
+static_assert(sizeof(Q81) == 36u);
 
 struct MoePlanParams {
     std::uint32_t rows;
@@ -75,6 +94,37 @@ bool views_overlap(ReadOnlyBufferRef left, BufferRef right) {
            ranges_overlap(static_cast<std::uintptr_t>(left_gpu), left.length(),
                           static_cast<std::uintptr_t>(right.gpu_address),
                           right.length);
+}
+
+bool views_overlap(ReadOnlyBufferRef left, ReadOnlyBufferRef right) {
+    const void* left_contents = left.contents();
+    const void* right_contents = right.contents();
+    if (left_contents != nullptr && right_contents != nullptr &&
+        ranges_overlap(reinterpret_cast<std::uintptr_t>(left_contents),
+                       left.length(),
+                       reinterpret_cast<std::uintptr_t>(right_contents),
+                       right.length())) {
+        return true;
+    }
+    const std::uint64_t left_gpu = left.gpu_address();
+    const std::uint64_t right_gpu = right.gpu_address();
+    return left_gpu != 0u && right_gpu != 0u &&
+           ranges_overlap(static_cast<std::uintptr_t>(left_gpu), left.length(),
+                          static_cast<std::uintptr_t>(right_gpu), right.length());
+}
+
+const char* moe_expert_kernel(MoeExpertFormat format) {
+    switch (format) {
+        case MoeExpertFormat::q2_0: return "strata_moe_gu_q2_0";
+        case MoeExpertFormat::iq1_m: return "strata_moe_gu_iq1_m";
+        case MoeExpertFormat::iq2_xxs: return "strata_moe_gu_iq2_xxs";
+        case MoeExpertFormat::iq2_xs: return "strata_moe_gu_iq2_xs";
+        case MoeExpertFormat::iq2_s: return "strata_moe_gu_iq2_s";
+        case MoeExpertFormat::iq3_xxs: return "strata_moe_gu_iq3_xxs";
+        case MoeExpertFormat::iq3_s: return "strata_moe_gu_iq3_s";
+        case MoeExpertFormat::iq4_xs: return "strata_moe_gu_iq4_xs";
+    }
+    return nullptr;
 }
 
 bool validate_route(Context& context, Encoder& encoder, std::uint32_t rows,
@@ -277,6 +327,123 @@ bool encode_moe_route_impl(Context& context, Encoder& encoder,
                             read_only, bytes, {}, error);
 }
 
+bool encode_moe_experts_impl(Context& context, Encoder& encoder,
+                             std::uint32_t rows, std::uint32_t experts,
+                             std::uint32_t layer, MoeExpertFormat format,
+                             const MoeGroupedExpertBuffers& buffers,
+                             std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "grouped MoE experts require an ordered dispatch boundary";
+        return false;
+    }
+    if (rows == 0u || rows > 8u || experts == 0u ||
+        experts > kTieredMaxExperts || layer >= kTieredMaxLayers) {
+        error = "grouped MoE experts require 1..8 rows, 1..512 experts, and a valid layer";
+        return false;
+    }
+    const char* kernel = moe_expert_kernel(format);
+    if (kernel == nullptr) {
+        error = "grouped MoE expert format is unsupported";
+        return false;
+    }
+
+    const std::uint64_t entry_count =
+        static_cast<std::uint64_t>(rows) * kMoeTopK;
+    const std::uint64_t address_count =
+        (static_cast<std::uint64_t>(layer) + 1u) * experts;
+    const std::uint64_t plan_count =
+        static_cast<std::uint64_t>(layer) + 1u;
+    std::size_t addresses_bytes = 0u;
+    std::size_t activations_bytes = 0u;
+    std::size_t plans_bytes = 0u;
+    std::size_t output_bytes = 0u;
+    if (entry_count > std::numeric_limits<std::uint32_t>::max() ||
+        !checked_bytes(address_count, sizeof(MoeExpertAddress),
+                       addresses_bytes) ||
+        !checked_bytes(static_cast<std::uint64_t>(rows) *
+                           kMoeInputBlocksPerRow,
+                       sizeof(Q81), activations_bytes) ||
+        !checked_bytes(plan_count, sizeof(TieredMoePlan), plans_bytes) ||
+        !checked_bytes(entry_count * kMoeExpertOutputWidth, sizeof(float),
+                       output_bytes)) {
+        error = "grouped MoE expert shape exceeds the host byte range";
+        return false;
+    }
+
+    if (!buffers.addresses || !context.buffers().owns(buffers.addresses) ||
+        buffers.addresses.length() < addresses_bytes ||
+        buffers.addresses.offset() % alignof(MoeExpertAddress) != 0u) {
+        error = "grouped MoE expert address table is stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (!buffers.activations ||
+        !context.buffers().owns(buffers.activations) ||
+        buffers.activations.length() < activations_bytes ||
+        buffers.activations.offset() % alignof(Q81) != 0u) {
+        error = "grouped MoE Q8_1 activations are stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (!buffers.plans || !context.buffers().owns(buffers.plans) ||
+        buffers.plans.length() < plans_bytes ||
+        buffers.plans.offset() % alignof(TieredMoePlan) != 0u) {
+        error = "grouped MoE plan table is stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (!buffers.gate || !context.buffers().owns(buffers.gate) ||
+        buffers.gate.length < output_bytes ||
+        buffers.gate.offset % alignof(float) != 0u) {
+        error = "grouped MoE gate output is stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (!buffers.up || !context.buffers().owns(buffers.up) ||
+        buffers.up.length < output_bytes ||
+        buffers.up.offset % alignof(float) != 0u) {
+        error = "grouped MoE up output is stale, foreign, undersized or misaligned";
+        return false;
+    }
+
+    if (views_overlap(buffers.addresses, buffers.activations) ||
+        views_overlap(buffers.addresses, buffers.plans) ||
+        views_overlap(buffers.activations, buffers.plans) ||
+        views_overlap(buffers.addresses, buffers.gate) ||
+        views_overlap(buffers.addresses, buffers.up) ||
+        views_overlap(buffers.activations, buffers.gate) ||
+        views_overlap(buffers.activations, buffers.up) ||
+        views_overlap(buffers.plans, buffers.gate) ||
+        views_overlap(buffers.plans, buffers.up) ||
+        views_overlap(buffers.gate, buffers.up)) {
+        error = "grouped MoE expert outputs must not overlap their inputs or each other";
+        return false;
+    }
+
+    const MoeGroupedGateUpParams params{experts, layer, rows};
+    const std::array writable{
+        EncoderBufferBinding{buffers.gate, 3u, output_bytes,
+                             alignof(float)},
+        EncoderBufferBinding{buffers.up, 4u, output_bytes,
+                             alignof(float)},
+    };
+    const std::array read_only{
+        EncoderReadOnlyBufferBinding{buffers.addresses, 0u,
+                                     addresses_bytes,
+                                     alignof(MoeExpertAddress)},
+        EncoderReadOnlyBufferBinding{buffers.activations, 1u,
+                                     activations_bytes, alignof(Q81)},
+        EncoderReadOnlyBufferBinding{buffers.plans, 2u, plans_bytes,
+                                     alignof(TieredMoePlan)},
+    };
+    const std::array bytes{
+        EncoderBytesBinding{&params, sizeof(params), 5u},
+    };
+    error.clear();
+    return encoder.dispatch(kernel, {kMoeExpertOutputRowGroups,
+                                     static_cast<std::uint32_t>(entry_count),
+                                     1u},
+                            {256u, 1u, 1u}, writable, read_only, bytes, {},
+                            error);
+}
+
 }  // namespace
 
 bool encode_moe_route(Context& context, Encoder& encoder,
@@ -318,6 +485,30 @@ bool encode_moe_plan(Context& context, CommandBuffer& command_buffer,
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_moe_plan_impl(context, encoder, rows, experts,
                                         tiered, layer, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_moe_experts(Context& context, Encoder& encoder,
+                        std::uint32_t rows, std::uint32_t experts,
+                        std::uint32_t layer, MoeExpertFormat format,
+                        const MoeGroupedExpertBuffers& buffers,
+                        std::string& error) {
+    return encode_moe_experts_impl(context, encoder, rows, experts, layer,
+                                   format, buffers, error);
+}
+
+bool encode_moe_experts(Context& context, CommandBuffer& command_buffer,
+                        std::uint32_t rows, std::uint32_t experts,
+                        std::uint32_t layer, MoeExpertFormat format,
+                        const MoeGroupedExpertBuffers& buffers,
+                        std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "grouped MoE experts",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_moe_experts_impl(context, encoder, rows, experts,
+                                           layer, format, buffers,
+                                           encode_error);
         },
         error);
 }

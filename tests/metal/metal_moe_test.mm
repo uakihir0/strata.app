@@ -157,6 +157,46 @@ void check(bool condition, const std::string& label,
     if (!condition) ++g_failures;
 }
 
+bool dispatch_grouped_experts(
+    Context& context, MoeExpertFormat format, std::uint32_t rows,
+    std::uint32_t experts, std::uint32_t layer,
+    const twin::GuardedBuffer& address_buffer,
+    const twin::GuardedBuffer& input_buffer,
+    const twin::GuardedBuffer& plan_buffer,
+    const twin::GuardedBuffer& gate_buffer,
+    const twin::GuardedBuffer& up_buffer, std::string& error,
+    bool caller_owned = false) {
+    const MoeGroupedExpertBuffers buffers{
+        context.buffers().read_only(address_buffer.view()),
+        context.buffers().read_only(input_buffer.view()),
+        context.buffers().read_only(plan_buffer.view()),
+        gate_buffer.view(),
+        up_buffer.view(),
+    };
+    auto command_buffer =
+        context.make_command_buffer("grouped MoE expert twin", error);
+    if (!command_buffer) {
+        return false;
+    }
+    const bool encoded = caller_owned
+        ? Encoder::encode(
+              context, *command_buffer, "grouped MoE expert twin",
+              [&](Encoder& encoder, std::string& encode_error) {
+                  return encode_moe_experts(context, encoder, rows, experts,
+                                            layer, format, buffers,
+                                            encode_error);
+              },
+              error)
+        : encode_moe_experts(context, *command_buffer, rows, experts, layer,
+                             format, buffers, error);
+    if (!encoded || !command_buffer->commit(error) ||
+        !command_buffer->wait_until_completed(error)) {
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
 std::vector<float> make_logits(std::uint32_t experts, twin::InputSet set,
                                std::uint64_t seed) {
     std::vector<float> logits(static_cast<std::size_t>(kRows) * experts);
@@ -1097,6 +1137,286 @@ bool test_plan_dispatch_validation(Context& context) {
            usage_plan_alias && ids_plan_alias && resident_usage_alias &&
            late_failure && late_discarded &&
            after_late_unchanged && open_group_rejected && final_unchanged;
+}
+
+bool test_grouped_expert_dispatch_validation(Context& context) {
+    constexpr std::uint32_t kRows = 1u;
+    constexpr std::uint32_t kExperts = 1u;
+    constexpr std::uint32_t kLayer = 0u;
+    constexpr std::size_t kAddressBytes = sizeof(MoeExpertAddress);
+    constexpr std::size_t kActivationBytes = 80u * sizeof(Q81);
+    constexpr std::size_t kPlanBytes = sizeof(TieredMoePlan);
+    constexpr std::size_t kOutputBytes =
+        kTopK * kMoeExpertWidth * sizeof(float);
+    constexpr std::size_t kSafeWeightBytes =
+        kMoeExpertWidth * kMoeQ2BlocksPerRow * sizeof(block_q2_0);
+    constexpr std::string_view label = "grouped MoE expert encoder validation";
+
+    std::string err;
+    twin::GuardedBuffer addresses;
+    twin::GuardedBuffer activations;
+    twin::GuardedBuffer plans;
+    twin::GuardedBuffer gate;
+    twin::GuardedBuffer up;
+    twin::GuardedBuffer alias;
+    twin::GuardedBuffer safe_weights;
+    check(addresses.allocate(context, "grouped expert validation addresses",
+                             2u * kAddressBytes + 1u, err),
+          "grouped expert address table buffer", err);
+    check(activations.allocate(
+              context, "grouped expert validation Q8_1 activations",
+              2u * kActivationBytes, err),
+          "grouped expert Q8_1 activation buffer", err);
+    check(plans.allocate(context, "grouped expert validation plans",
+                         kPlanBytes, err),
+          "grouped expert plan table buffer", err);
+    check(gate.allocate(context, "grouped expert validation gate",
+                        2u * kOutputBytes, err),
+          "grouped expert gate output buffer", err);
+    check(up.allocate(context, "grouped expert validation up",
+                      2u * kOutputBytes, err),
+          "grouped expert up output buffer", err);
+    check(alias.allocate(context, "grouped expert validation alias",
+                         kOutputBytes + kAddressBytes, err),
+          "grouped expert alias buffer", err);
+    check(safe_weights.allocate(context, "grouped expert validation weights",
+                                kSafeWeightBytes, err),
+          "grouped expert safe weight buffer", err);
+    if (!addresses.view() || !activations.view() || !plans.view() ||
+        !gate.view() || !up.view() || !alias.view() ||
+        !safe_weights.view()) {
+        return false;
+    }
+
+    std::fill(safe_weights.payload().begin(), safe_weights.payload().end(), 0u);
+    MoeExpertAddress safe_address{};
+    safe_address.role[0] = safe_weights.view().gpu_address;
+    safe_address.role[1] = safe_weights.view().gpu_address;
+    const std::array safe_address_table{safe_address, safe_address};
+    std::memcpy(addresses.payload().data(), safe_address_table.data(),
+                sizeof(safe_address_table));
+    if (!context.buffers().commit_residency(err)) {
+        check(false, "grouped expert validation weight residency", err);
+        return false;
+    }
+
+    std::fill(gate.payload().begin(), gate.payload().end(), 0x5au);
+    std::fill(up.payload().begin(), up.payload().end(), 0xa5u);
+    std::fill(alias.payload().begin(), alias.payload().end(), 0x3cu);
+    std::fill(activations.payload().begin(), activations.payload().end(), 0u);
+    const std::vector<std::uint8_t> gate_before(gate.payload().begin(),
+                                                gate.payload().end());
+    const std::vector<std::uint8_t> up_before(up.payload().begin(),
+                                              up.payload().end());
+    const std::vector<std::uint8_t> alias_before(alias.payload().begin(),
+                                                 alias.payload().end());
+    const ReadOnlyBufferRef addresses_view =
+        context.buffers().read_only(addresses.view());
+    const ReadOnlyBufferRef activations_view =
+        context.buffers().read_only(activations.view());
+    const ReadOnlyBufferRef plans_view =
+        context.buffers().read_only(plans.view());
+    if (!addresses_view || !activations_view || !plans_view) {
+        check(false, std::string(label) + " read-only input views", err);
+        return false;
+    }
+    const MoeGroupedExpertBuffers valid{
+        addresses_view, activations_view, plans_view, gate.view(), up.view()};
+
+    const auto outputs_unchanged = [&] {
+        return std::equal(gate_before.begin(), gate_before.end(),
+                          gate.payload().begin(), gate.payload().end()) &&
+               std::equal(up_before.begin(), up_before.end(),
+                          up.payload().begin(), up.payload().end()) &&
+               std::equal(alias_before.begin(), alias_before.end(),
+                          alias.payload().begin(), alias.payload().end());
+    };
+    const auto reject = [&](const std::string& case_label,
+                            std::uint32_t rows, std::uint32_t experts,
+                            std::uint32_t layer, MoeExpertFormat format,
+                            MoeGroupedExpertBuffers buffers,
+                            std::string_view error_fragment) {
+        auto command = context.make_command_buffer(case_label, err);
+        const bool rejected = command && !encode_moe_experts(
+            context, *command, rows, experts, layer, format, buffers, err);
+        const bool discarded =
+            command && command->unsafe_native_handle() == nullptr;
+        const bool error_matches =
+            err.find(error_fragment) != std::string::npos;
+        const bool unchanged = outputs_unchanged();
+        check(rejected && discarded && error_matches && unchanged,
+              case_label + " rejects before dispatch and discards", err);
+        return rejected && discarded && error_matches && unchanged;
+    };
+
+    const bool zero_rows = reject(
+        "reject zero-row grouped experts", 0u, kExperts, kLayer,
+        MoeExpertFormat::q2_0, valid, "1..8 rows");
+    const bool too_many_rows = reject(
+        "reject over-capacity grouped experts", 9u, kExperts, kLayer,
+        MoeExpertFormat::q2_0, valid, "1..8 rows");
+    const bool zero_experts = reject(
+        "reject zero-expert grouped experts", kRows, 0u, kLayer,
+        MoeExpertFormat::q2_0, valid, "1..512 experts");
+    const bool invalid_layer = reject(
+        "reject out-of-range grouped expert layer", kRows, kExperts,
+        kTieredMaxLayers, MoeExpertFormat::q2_0, valid, "valid layer");
+    const bool invalid_format = reject(
+        "reject unsupported grouped expert format", kRows, kExperts,
+        kLayer, static_cast<MoeExpertFormat>(0xffu), valid, "unsupported");
+    const bool short_addresses = reject(
+        "reject undersized grouped expert address table", kRows, kExperts,
+        kLayer, MoeExpertFormat::q2_0,
+        {addresses_view.slice(0u, kAddressBytes - 1u), activations_view,
+         plans_view, gate.view(), up.view()},
+        "address table");
+    const bool misaligned_addresses = reject(
+        "reject misaligned grouped expert address table", kRows, kExperts,
+        kLayer, MoeExpertFormat::q2_0,
+        {addresses_view.slice(1u, kAddressBytes), activations_view,
+         plans_view, gate.view(), up.view()},
+        "misaligned");
+    const bool short_activations = reject(
+        "reject undersized grouped expert activations", kRows, kExperts,
+        kLayer, MoeExpertFormat::q2_0,
+        {addresses_view, activations_view.slice(0u, sizeof(Q81)),
+         plans_view, gate.view(), up.view()},
+        "activations");
+    const bool short_plans = reject(
+        "reject undersized grouped expert plans", kRows, kExperts, kLayer,
+        MoeExpertFormat::q2_0,
+        {addresses_view, activations_view,
+         plans_view.slice(0u, kPlanBytes - 1u), gate.view(), up.view()},
+        "plan table");
+    const BufferRef alias_view = alias.view();
+    const ReadOnlyBufferRef alias_read =
+        context.buffers().read_only(alias_view);
+    const bool aliased_outputs = reject(
+        "reject overlapping grouped expert outputs", kRows, kExperts,
+        kLayer, MoeExpertFormat::q2_0,
+        {addresses_view, activations_view, plans_view, alias_view,
+         alias_view},
+        "overlap");
+    const bool aliased_input_output = reject(
+        "reject grouped expert input and output alias", kRows, kExperts,
+        kLayer, MoeExpertFormat::q2_0,
+        {alias_read, activations_view, plans_view, alias_view, up.view()},
+        "overlap");
+    const bool partial_input_output_alias = reject(
+        "reject partial grouped expert input and output alias", kRows,
+        kExperts, kLayer, MoeExpertFormat::q2_0,
+        {context.buffers().read_only(
+             alias_view.slice(0u, kAddressBytes)),
+         activations_view, plans_view,
+         alias_view.slice(kAddressBytes / 2u, kOutputBytes), up.view()},
+        "overlap");
+
+    auto late_failure_command =
+        context.make_command_buffer("reject caller-owned late grouped expert failure",
+                                    err);
+    const bool late_failure = late_failure_command && !Encoder::encode(
+        context, *late_failure_command, "grouped expert late failure",
+        [&](Encoder& encoder, std::string& body_error) {
+            if (!encode_moe_experts(context, encoder, kRows, kExperts, kLayer,
+                                    MoeExpertFormat::q2_0, valid,
+                                    body_error)) {
+                return false;
+            }
+            return encode_moe_experts(context, encoder, 9u, kExperts, kLayer,
+                                      MoeExpertFormat::q2_0, valid,
+                                      body_error);
+        },
+        err);
+    const bool late_discarded = late_failure_command &&
+        late_failure_command->unsafe_native_handle() == nullptr;
+    const bool after_late_unchanged = outputs_unchanged();
+    check(late_failure && late_discarded && after_late_unchanged &&
+              err.find("1..8 rows") != std::string::npos,
+          "caller-owned late grouped expert failure rolls back earlier work",
+          err);
+
+    const char* const dispatch_mode = std::getenv("STRATA_METAL_DISPATCH");
+    const bool concurrent_mode = dispatch_mode != nullptr &&
+        std::string_view(dispatch_mode) == "concurrent";
+    bool open_group_rejected = true;
+    if (concurrent_mode) {
+        auto group_command = context.make_command_buffer(
+            "reject grouped experts inside concurrent group", err);
+        const bool encoded = group_command && !Encoder::encode(
+            context, *group_command, "grouped expert open group",
+            [&](Encoder& encoder, std::string& body_error) {
+                return encoder.group_begin(body_error) &&
+                    encode_moe_experts(context, encoder, kRows, kExperts,
+                                       kLayer, MoeExpertFormat::q2_0, valid,
+                                       body_error);
+            },
+            err);
+        const bool discarded =
+            group_command && group_command->unsafe_native_handle() == nullptr;
+        open_group_rejected = encoded && discarded &&
+            err.find("ordered dispatch boundary") != std::string::npos;
+        check(open_group_rejected,
+              "caller-owned grouped experts rejects concurrent group", err);
+    }
+
+    const auto make_test_plan = [](std::uint32_t rows,
+                                   std::int32_t expert) {
+        TieredMoePlan plan{};
+        plan.n_groups = 1u;
+        plan.n_entries = rows * kTopK;
+        plan.skip = 1u;
+        plan.grp_e[0] = expert;
+        plan.grp_start[1] = static_cast<std::int32_t>(plan.n_entries);
+        for (std::uint32_t entry = 0; entry < plan.n_entries; ++entry) {
+            plan.ent_tok[entry] = static_cast<std::int32_t>(entry / kTopK);
+            plan.ent_dst[entry] = static_cast<std::int32_t>(entry);
+        }
+        return plan;
+    };
+    const auto dispatch_mismatched_plan = [&](
+        const std::string& case_label, std::uint32_t rows,
+        std::uint32_t experts, const TieredMoePlan& plan) {
+        std::memcpy(plans.payload().data(), &plan, sizeof(plan));
+        auto command = context.make_command_buffer(case_label, err);
+        const bool completed = command && encode_moe_experts(
+            context, *command, rows, experts, kLayer,
+            MoeExpertFormat::q2_0, valid, err) &&
+            command->commit(err) && command->wait_until_completed(err);
+        const bool unchanged = outputs_unchanged();
+        check(completed && unchanged,
+              case_label + " is bounded by the GPU plan", err);
+        return completed && unchanged;
+    };
+    const TieredMoePlan two_row_plan = make_test_plan(2u, 0);
+    const TieredMoePlan wrong_expert_plan = make_test_plan(1u, 1);
+    TieredMoePlan wrong_token_plan = make_test_plan(1u, 0);
+    wrong_token_plan.ent_tok[0] = 1;
+    TieredMoePlan wrong_group_range_plan = make_test_plan(1u, 0);
+    wrong_group_range_plan.grp_start[1] =
+        static_cast<std::int32_t>(wrong_group_range_plan.n_entries + 1u);
+    const bool mismatched_rows = dispatch_mismatched_plan(
+        "reject grouped expert plan row-count mismatch", 1u, kExperts,
+        two_row_plan);
+    const bool mismatched_experts = dispatch_mismatched_plan(
+        "reject grouped expert plan expert-count mismatch", kRows,
+        kExperts, wrong_expert_plan);
+    const bool invalid_token = dispatch_mismatched_plan(
+        "reject grouped expert plan token index", kRows, kExperts,
+        wrong_token_plan);
+    const bool invalid_group_range = dispatch_mismatched_plan(
+        "reject grouped expert plan group range", kRows, kExperts,
+        wrong_group_range_plan);
+
+    const bool final_unchanged = outputs_unchanged();
+    check(final_unchanged,
+          std::string(label) + " leaves rejected outputs unchanged");
+    return zero_rows && too_many_rows && zero_experts && invalid_layer &&
+           invalid_format && short_addresses && misaligned_addresses &&
+           short_activations && short_plans && aliased_outputs &&
+           aliased_input_output && partial_input_output_alias &&
+           late_failure && late_discarded && after_late_unchanged &&
+           open_group_rejected && mismatched_rows && mismatched_experts &&
+           invalid_token && invalid_group_range && final_unchanged;
 }
 
 bool test_plan_inputs(Context& context, twin::InputSet set,
@@ -3263,21 +3583,9 @@ bool test_moe_gu_q2_0_case(
     up_buffer.capture_before_dispatch();
     address_buffer.capture_before_dispatch();
 
-    const MoeGroupedParams params{experts, kMoeGroupedLayer};
-    twin::Dispatch work;
-    work.grid_mode = twin::GridMode::threadgroups;
-    work.grid = {160u, static_cast<std::uint32_t>(entry_count), 1u};
-    work.threads_per_group = {256u, 1u, 1u};
-    work.buffers = {{0u, address_buffer.view()},
-                    {1u, input_buffer.view()},
-                    {2u, plan_buffer.view()},
-                    {3u, gate_buffer.view()},
-                    {4u, up_buffer.view()}};
-    work.parameters = &params;
-    work.parameter_bytes = sizeof(params);
-    work.parameter_index = 5u;
-    const bool dispatched = twin::dispatch_manifest(
-        context, "strata_moe_gu_q2_0", work, err);
+    const bool dispatched = dispatch_grouped_experts(
+        context, MoeExpertFormat::q2_0, rows, experts, kMoeGroupedLayer, address_buffer, input_buffer,
+        plan_buffer, gate_buffer, up_buffer, err);
     check(dispatched, label + " Metal dispatch", err);
     if (!dispatched) return false;
 
@@ -3508,21 +3816,9 @@ bool test_moe_gu_iq1_m_case(
     up_weight_buffer.capture_before_dispatch();
     address_buffer.capture_before_dispatch();
 
-    const MoeGroupedParams params{experts, kMoeGroupedLayer};
-    twin::Dispatch work;
-    work.grid_mode = twin::GridMode::threadgroups;
-    work.grid = {160u, static_cast<std::uint32_t>(entry_count), 1u};
-    work.threads_per_group = {256u, 1u, 1u};
-    work.buffers = {{0u, address_buffer.view()},
-                    {1u, input_buffer.view()},
-                    {2u, plan_buffer.view()},
-                    {3u, gate_buffer.view()},
-                    {4u, up_buffer.view()}};
-    work.parameters = &params;
-    work.parameter_bytes = sizeof(params);
-    work.parameter_index = 5u;
-    const bool dispatched = twin::dispatch_manifest(
-        context, "strata_moe_gu_iq1_m", work, err);
+    const bool dispatched = dispatch_grouped_experts(
+        context, MoeExpertFormat::iq1_m, rows, experts, kMoeGroupedLayer, address_buffer, input_buffer,
+        plan_buffer, gate_buffer, up_buffer, err);
     check(dispatched, label + " Metal dispatch", err);
     if (!dispatched) return false;
 
@@ -3916,21 +4212,9 @@ bool test_moe_gu_iq2_xxs_case(
     up_weight_buffer.capture_before_dispatch();
     address_buffer.capture_before_dispatch();
 
-    const MoeGroupedParams params{experts, kMoeGroupedLayer};
-    twin::Dispatch work;
-    work.grid_mode = twin::GridMode::threadgroups;
-    work.grid = {160u, static_cast<std::uint32_t>(entry_count), 1u};
-    work.threads_per_group = {256u, 1u, 1u};
-    work.buffers = {{0u, address_buffer.view()},
-                    {1u, input_buffer.view()},
-                    {2u, plan_buffer.view()},
-                    {3u, gate_buffer.view()},
-                    {4u, up_buffer.view()}};
-    work.parameters = &params;
-    work.parameter_bytes = sizeof(params);
-    work.parameter_index = 5u;
-    const bool dispatched = twin::dispatch_manifest(
-        context, "strata_moe_gu_iq2_xxs", work, err);
+    const bool dispatched = dispatch_grouped_experts(
+        context, MoeExpertFormat::iq2_xxs, rows, experts, kMoeGroupedLayer,
+        address_buffer, input_buffer, plan_buffer, gate_buffer, up_buffer, err);
     check(dispatched, label + " Metal dispatch", err);
     if (!dispatched) return false;
 
@@ -4320,21 +4604,10 @@ bool test_moe_gu_iq2_xxs_onehot_fixture(
     gate_buffer.capture_before_dispatch();
     up_buffer.capture_before_dispatch();
 
-    const MoeGroupedParams params{experts, kMoeGroupedLayer};
-    twin::Dispatch work;
-    work.grid_mode = twin::GridMode::threadgroups;
-    work.grid = {160u, rows * kTopK, 1u};
-    work.threads_per_group = {256u, 1u, 1u};
-    work.buffers = {{0u, address_buffer.view()},
-                    {1u, input_buffer.view()},
-                    {2u, plan_buffer.view()},
-                    {3u, gate_buffer.view()},
-                    {4u, up_buffer.view()}};
-    work.parameters = &params;
-    work.parameter_bytes = sizeof(params);
-    work.parameter_index = 5u;
-    const bool dispatched = twin::dispatch_manifest(
-        context, "strata_moe_gu_iq2_xxs", work, err);
+    const bool dispatched = dispatch_grouped_experts(
+        context, MoeExpertFormat::iq2_xxs, rows, experts, kMoeGroupedLayer,
+        address_buffer, input_buffer, plan_buffer, gate_buffer, up_buffer, err,
+        true);
     check(dispatched, label + " Metal dispatch", err);
     if (!dispatched) return false;
 
@@ -4614,21 +4887,9 @@ bool test_moe_gu_iq2_xs_case(
     up_weight_buffer.capture_before_dispatch();
     address_buffer.capture_before_dispatch();
 
-    const MoeGroupedParams params{experts, kMoeGroupedLayer};
-    twin::Dispatch work;
-    work.grid_mode = twin::GridMode::threadgroups;
-    work.grid = {160u, static_cast<std::uint32_t>(entry_count), 1u};
-    work.threads_per_group = {256u, 1u, 1u};
-    work.buffers = {{0u, address_buffer.view()},
-                    {1u, input_buffer.view()},
-                    {2u, plan_buffer.view()},
-                    {3u, gate_buffer.view()},
-                    {4u, up_buffer.view()}};
-    work.parameters = &params;
-    work.parameter_bytes = sizeof(params);
-    work.parameter_index = 5u;
-    const bool dispatched = twin::dispatch_manifest(
-        context, "strata_moe_gu_iq2_xs", work, err);
+    const bool dispatched = dispatch_grouped_experts(
+        context, MoeExpertFormat::iq2_xs, rows, experts, kMoeGroupedLayer, address_buffer, input_buffer,
+        plan_buffer, gate_buffer, up_buffer, err);
     check(dispatched, label + " Metal dispatch", err);
     if (!dispatched) return false;
 
@@ -5051,21 +5312,9 @@ bool test_moe_gu_iq2_s_case(
     up_weight_buffer.capture_before_dispatch();
     address_buffer.capture_before_dispatch();
 
-    const MoeGroupedParams params{experts, kMoeGroupedLayer};
-    twin::Dispatch work;
-    work.grid_mode = twin::GridMode::threadgroups;
-    work.grid = {160u, static_cast<std::uint32_t>(entry_count), 1u};
-    work.threads_per_group = {256u, 1u, 1u};
-    work.buffers = {{0u, address_buffer.view()},
-                    {1u, input_buffer.view()},
-                    {2u, plan_buffer.view()},
-                    {3u, gate_buffer.view()},
-                    {4u, up_buffer.view()}};
-    work.parameters = &params;
-    work.parameter_bytes = sizeof(params);
-    work.parameter_index = 5u;
-    const bool dispatched = twin::dispatch_manifest(
-        context, "strata_moe_gu_iq2_s", work, err);
+    const bool dispatched = dispatch_grouped_experts(
+        context, MoeExpertFormat::iq2_s, rows, experts, kMoeGroupedLayer, address_buffer, input_buffer,
+        plan_buffer, gate_buffer, up_buffer, err);
     check(dispatched, label + " Metal dispatch", err);
     if (!dispatched) return false;
 
@@ -5485,21 +5734,9 @@ bool test_moe_gu_iq3_xxs_case(
     up_weight_buffer.capture_before_dispatch();
     address_buffer.capture_before_dispatch();
 
-    const MoeGroupedParams params{experts, kMoeGroupedLayer};
-    twin::Dispatch work;
-    work.grid_mode = twin::GridMode::threadgroups;
-    work.grid = {160u, static_cast<std::uint32_t>(entry_count), 1u};
-    work.threads_per_group = {256u, 1u, 1u};
-    work.buffers = {{0u, address_buffer.view()},
-                    {1u, input_buffer.view()},
-                    {2u, plan_buffer.view()},
-                    {3u, gate_buffer.view()},
-                    {4u, up_buffer.view()}};
-    work.parameters = &params;
-    work.parameter_bytes = sizeof(params);
-    work.parameter_index = 5u;
-    const bool dispatched = twin::dispatch_manifest(
-        context, "strata_moe_gu_iq3_xxs", work, err);
+    const bool dispatched = dispatch_grouped_experts(
+        context, MoeExpertFormat::iq3_xxs, rows, experts, kMoeGroupedLayer, address_buffer, input_buffer,
+        plan_buffer, gate_buffer, up_buffer, err);
     check(dispatched, label + " Metal dispatch", err);
     if (!dispatched) return false;
 
@@ -5919,21 +6156,9 @@ bool test_moe_gu_iq3_s_case(
     up_weight_buffer.capture_before_dispatch();
     address_buffer.capture_before_dispatch();
 
-    const MoeGroupedParams params{experts, kMoeGroupedLayer};
-    twin::Dispatch work;
-    work.grid_mode = twin::GridMode::threadgroups;
-    work.grid = {160u, static_cast<std::uint32_t>(entry_count), 1u};
-    work.threads_per_group = {256u, 1u, 1u};
-    work.buffers = {{0u, address_buffer.view()},
-                    {1u, input_buffer.view()},
-                    {2u, plan_buffer.view()},
-                    {3u, gate_buffer.view()},
-                    {4u, up_buffer.view()}};
-    work.parameters = &params;
-    work.parameter_bytes = sizeof(params);
-    work.parameter_index = 5u;
-    const bool dispatched = twin::dispatch_manifest(
-        context, "strata_moe_gu_iq3_s", work, err);
+    const bool dispatched = dispatch_grouped_experts(
+        context, MoeExpertFormat::iq3_s, rows, experts, kMoeGroupedLayer, address_buffer, input_buffer,
+        plan_buffer, gate_buffer, up_buffer, err);
     check(dispatched, label + " Metal dispatch", err);
     if (!dispatched) return false;
 
@@ -6354,21 +6579,9 @@ bool test_moe_gu_iq4_xs_case(
     up_weight_buffer.capture_before_dispatch();
     address_buffer.capture_before_dispatch();
 
-    const MoeGroupedParams params{experts, kMoeGroupedLayer};
-    twin::Dispatch work;
-    work.grid_mode = twin::GridMode::threadgroups;
-    work.grid = {160u, static_cast<std::uint32_t>(entry_count), 1u};
-    work.threads_per_group = {256u, 1u, 1u};
-    work.buffers = {{0u, address_buffer.view()},
-                    {1u, input_buffer.view()},
-                    {2u, plan_buffer.view()},
-                    {3u, gate_buffer.view()},
-                    {4u, up_buffer.view()}};
-    work.parameters = &params;
-    work.parameter_bytes = sizeof(params);
-    work.parameter_index = 5u;
-    const bool dispatched = twin::dispatch_manifest(
-        context, "strata_moe_gu_iq4_xs", work, err);
+    const bool dispatched = dispatch_grouped_experts(
+        context, MoeExpertFormat::iq4_xs, rows, experts, kMoeGroupedLayer, address_buffer, input_buffer,
+        plan_buffer, gate_buffer, up_buffer, err);
     check(dispatched, label + " Metal dispatch", err);
     if (!dispatched) return false;
 
@@ -7726,6 +7939,7 @@ int main(int argc, char** argv) {
 
     if (!test_route_dispatch_validation(*context)) ++g_failures;
     if (!test_plan_dispatch_validation(*context)) ++g_failures;
+    if (!test_grouped_expert_dispatch_validation(*context)) ++g_failures;
 
     std::vector<twin::InputSet> sets;
     if (options.input_set_explicit) {

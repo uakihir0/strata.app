@@ -23,6 +23,29 @@ struct MoePlanBuffers {
     BufferRef plans;
 };
 
+enum class MoeExpertFormat {
+    q2_0,
+    iq1_m,
+    iq2_xxs,
+    iq2_xs,
+    iq2_s,
+    iq3_xxs,
+    iq3_s,
+    iq4_xs,
+};
+
+struct MoeGroupedExpertBuffers {
+    /// Row-major `[layer, expert, gate/up/down]` GPU-address table.
+    ReadOnlyBufferRef addresses;
+    /// Q8_1 activations, with 80 blocks for each input row.
+    ReadOnlyBufferRef activations;
+    /// `TieredMoePlan` table containing the selected layer's validated plan.
+    ReadOnlyBufferRef plans;
+    /// Each output reserves `[rows * 10, 640]` floats.
+    BufferRef gate;
+    BufferRef up;
+};
+
 /// Encode the stable top-10 route selection for 256 or 512 experts.
 /// `divide_weights` selects the prompt-path division mode; Window decode must
 /// pass false to match the model's multiply-by-reciprocal path. The views must
@@ -57,5 +80,26 @@ bool encode_moe_plan(Context& context, CommandBuffer& command_buffer,
                      std::uint32_t rows, std::uint32_t experts,
                      bool tiered, std::uint32_t layer,
                      const MoePlanBuffers& buffers, std::string& error);
+
+/// Encode the grouped gate/up projection for a plan produced for the same
+/// rows, experts and layer by the ordered MoE plan encoder. In tiered mode,
+/// queue this consumer only after ExpertStore successfully resolves the plan.
+/// Dispatches all 640 rows of each projection. The GPU checks plan row/group
+/// bounds, selected expert IDs and token indices before reading or writing.
+/// The plan partition and selected expert addresses must still come from
+/// trusted engine outputs and remain valid until command completion; this
+/// method does not read back or fully validate GPU-produced plan arrays.
+/// The inputs and output buffers must remain alive until command completion.
+bool encode_moe_experts(Context& context, Encoder& encoder,
+                        std::uint32_t rows, std::uint32_t experts,
+                        std::uint32_t layer, MoeExpertFormat format,
+                        const MoeGroupedExpertBuffers& buffers,
+                        std::string& error);
+/// Standalone transactional form. A validation failure discards the segment.
+bool encode_moe_experts(Context& context, CommandBuffer& command_buffer,
+                        std::uint32_t rows, std::uint32_t experts,
+                        std::uint32_t layer, MoeExpertFormat format,
+                        const MoeGroupedExpertBuffers& buffers,
+                        std::string& error);
 
 }  // namespace strata::metal

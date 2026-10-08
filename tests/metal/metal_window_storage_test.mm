@@ -96,8 +96,9 @@ static_assert(sizeof(TestMoeExpertAddress) == 24);
 struct TestMoeGroupedParams {
     std::uint32_t n_expert = 0;
     std::uint32_t layer = 0;
+    std::uint32_t n_rows = 0;
 };
-static_assert(sizeof(TestMoeGroupedParams) == 8);
+static_assert(sizeof(TestMoeGroupedParams) == 12);
 
 class CommandGatesCleanup {
 public:
@@ -1375,7 +1376,7 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
         {gate_output, 3, kOutputBytes, alignof(float)},
         {up_output, 4, kOutputBytes, alignof(float)},
     }};
-    const TestMoeGroupedParams consumer_params{geometry.n_expert, 0};
+    const TestMoeGroupedParams consumer_params{geometry.n_expert, 0, 1};
     const EncoderBytesBinding params_binding{
         &consumer_params, sizeof(consumer_params), 5};
     // One x group reads gate rows 0..7 only; the up projection starts at x=80.

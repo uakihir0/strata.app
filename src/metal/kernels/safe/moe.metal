@@ -283,8 +283,44 @@ struct MoeGroupedParams {
     uint layer;
 };
 
+struct MoeGroupedGateUpParams {
+    uint n_expert;
+    uint layer;
+    uint n_rows;
+};
+
 static_assert(sizeof(MoeExpertAddr) == 24, "MoeExpertAddr host ABI");
 static_assert(sizeof(MoeGroupedParams) == 8, "MoeGroupedParams host ABI");
+static_assert(sizeof(MoeGroupedGateUpParams) == 12,
+              "MoeGroupedGateUpParams host ABI");
+
+static inline bool moe_group_header_valid(
+    device const MoePlan* plan, uint n_rows, uint n_expert,
+    uint group_index) {
+    if (n_rows == 0u || n_rows > 8u ||
+        plan->n_groups == 0u || plan->n_groups > 80u ||
+        plan->n_entries != n_rows * 10u ||
+        plan->n_entries > 80u || group_index >= plan->n_groups) {
+        return false;
+    }
+    const int entry_begin = plan->grp_start[group_index];
+    const int entry_end = plan->grp_start[group_index + 1u];
+    const int expert = plan->grp_e[group_index];
+    return entry_begin >= 0 && entry_end > entry_begin &&
+           uint(entry_end) <= plan->n_entries && expert >= 0 &&
+           uint(expert) < n_expert;
+}
+
+static inline uint moe_group_entry_tokens_valid(
+    device const MoePlan* plan, uint entry_begin, uint entry_end,
+    uint n_rows, uint lane) {
+    if (lane != 0u) return 1u;
+    for (uint entry = entry_begin; entry < entry_end; ++entry) {
+        const int token = plan->ent_tok[entry];
+        if (token < 0 || uint(token) >= n_rows) return 0u;
+    }
+    return 1u;
+}
 
 struct MoeQ2Part {
     int qx[4];
@@ -346,28 +382,39 @@ kernel void strata_moe_gu_q2_0(
     device const MoePlan* plans [[buffer(2)]],
     device float* gate [[buffer(3)]],
     device float* up [[buffer(4)]],
-    constant MoeGroupedParams& params [[buffer(5)]],
+    constant MoeGroupedGateUpParams& params [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]]) {
     device const MoePlan* plan = plans + params.layer;
     const uint group_index = group.y;
-    if (group_index >= plan->n_groups) return;
+    if (!moe_group_header_valid(plan, params.n_rows, params.n_expert,
+                               group_index)) {
+        return;
+    }
+    const int group_entry_begin = plan->grp_start[group_index];
+    const int group_entry_end = plan->grp_start[group_index + 1u];
+    const int group_expert = plan->grp_e[group_index];
 
     const uint warp = tid / 32u;
     const uint lane = tid % 32u;
+    if (simd_broadcast_first(moe_group_entry_tokens_valid(
+            plan, uint(group_entry_begin), uint(group_entry_end),
+            params.n_rows, lane)) == 0u) {
+        return;
+    }
     const uint row = group.x * 8u + warp;
     const bool is_up = row >= 640u;
     const uint expert_row = is_up ? row - 640u : row;
     const uint role = is_up ? 1u : 0u;
     const MoeExpertAddr address =
-        addresses[params.layer * params.n_expert +
-                  uint(plan->grp_e[group_index])];
+        addresses[params.layer * params.n_expert + uint(group_expert)];
+    if (address.role[role] == nullptr) return;
     const device block_q2_0* row_weights =
         reinterpret_cast<device const block_q2_0*>(address.role[role]) +
         expert_row * 40u;
 
-    const uint entry_begin = uint(plan->grp_start[group_index]);
-    const uint entry_end = uint(plan->grp_start[group_index + 1u]);
+    const uint entry_begin = uint(group_entry_begin);
+    const uint entry_end = uint(group_entry_end);
     device float* destination = is_up ? up : gate;
     for (uint first = entry_begin; first < entry_end; first += 4u) {
         const uint count = min(4u, entry_end - first);
@@ -601,28 +648,39 @@ kernel void strata_moe_gu_iq1_m(
     device const MoePlan* plans [[buffer(2)]],
     device float* gate [[buffer(3)]],
     device float* up [[buffer(4)]],
-    constant MoeGroupedParams& params [[buffer(5)]],
+    constant MoeGroupedGateUpParams& params [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]]) {
     device const MoePlan* plan = plans + params.layer;
     const uint group_index = group.y;
-    if (group_index >= plan->n_groups) return;
+    if (!moe_group_header_valid(plan, params.n_rows, params.n_expert,
+                               group_index)) {
+        return;
+    }
+    const int group_entry_begin = plan->grp_start[group_index];
+    const int group_entry_end = plan->grp_start[group_index + 1u];
+    const int group_expert = plan->grp_e[group_index];
 
     const uint warp = tid / 32u;
     const uint lane = tid % 32u;
+    if (simd_broadcast_first(moe_group_entry_tokens_valid(
+            plan, uint(group_entry_begin), uint(group_entry_end),
+            params.n_rows, lane)) == 0u) {
+        return;
+    }
     const uint row = group.x * 8u + warp;
     const bool is_up = row >= 640u;
     const uint expert_row = is_up ? row - 640u : row;
     const uint role = is_up ? 1u : 0u;
     const MoeExpertAddr address =
-        addresses[params.layer * params.n_expert +
-                  uint(plan->grp_e[group_index])];
+        addresses[params.layer * params.n_expert + uint(group_expert)];
+    if (address.role[role] == nullptr) return;
     const device block_iq1_m* row_weights =
         reinterpret_cast<device const block_iq1_m*>(address.role[role]) +
         expert_row * 10u;
 
-    const uint entry_begin = uint(plan->grp_start[group_index]);
-    const uint entry_end = uint(plan->grp_start[group_index + 1u]);
+    const uint entry_begin = uint(group_entry_begin);
+    const uint entry_end = uint(group_entry_end);
     device float* destination = is_up ? up : gate;
     for (uint first = entry_begin; first < entry_end; first += 4u) {
         const uint count = min(4u, entry_end - first);
@@ -711,28 +769,39 @@ kernel void strata_moe_gu_iq2_xxs(
     device const MoePlan* plans [[buffer(2)]],
     device float* gate [[buffer(3)]],
     device float* up [[buffer(4)]],
-    constant MoeGroupedParams& params [[buffer(5)]],
+    constant MoeGroupedGateUpParams& params [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]]) {
     device const MoePlan* plan = plans + params.layer;
     const uint group_index = group.y;
-    if (group_index >= plan->n_groups) return;
+    if (!moe_group_header_valid(plan, params.n_rows, params.n_expert,
+                               group_index)) {
+        return;
+    }
+    const int group_entry_begin = plan->grp_start[group_index];
+    const int group_entry_end = plan->grp_start[group_index + 1u];
+    const int group_expert = plan->grp_e[group_index];
 
     const uint warp = tid / 32u;
     const uint lane = tid % 32u;
+    if (simd_broadcast_first(moe_group_entry_tokens_valid(
+            plan, uint(group_entry_begin), uint(group_entry_end),
+            params.n_rows, lane)) == 0u) {
+        return;
+    }
     const uint row = group.x * 8u + warp;
     const bool is_up = row >= 640u;
     const uint expert_row = is_up ? row - 640u : row;
     const uint role = is_up ? 1u : 0u;
     const MoeExpertAddr address =
-        addresses[params.layer * params.n_expert +
-                  uint(plan->grp_e[group_index])];
+        addresses[params.layer * params.n_expert + uint(group_expert)];
+    if (address.role[role] == nullptr) return;
     const device block_iq2_xxs* row_weights =
         reinterpret_cast<device const block_iq2_xxs*>(address.role[role]) +
         expert_row * 10u;
 
-    const uint entry_begin = uint(plan->grp_start[group_index]);
-    const uint entry_end = uint(plan->grp_start[group_index + 1u]);
+    const uint entry_begin = uint(group_entry_begin);
+    const uint entry_end = uint(group_entry_end);
     device float* destination = is_up ? up : gate;
     for (uint first = entry_begin; first < entry_end; first += 4u) {
         const uint count = min(4u, entry_end - first);
@@ -826,28 +895,39 @@ kernel void strata_moe_gu_iq2_xs(
     device const MoePlan* plans [[buffer(2)]],
     device float* gate [[buffer(3)]],
     device float* up [[buffer(4)]],
-    constant MoeGroupedParams& params [[buffer(5)]],
+    constant MoeGroupedGateUpParams& params [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]]) {
     device const MoePlan* plan = plans + params.layer;
     const uint group_index = group.y;
-    if (group_index >= plan->n_groups) return;
+    if (!moe_group_header_valid(plan, params.n_rows, params.n_expert,
+                               group_index)) {
+        return;
+    }
+    const int group_entry_begin = plan->grp_start[group_index];
+    const int group_entry_end = plan->grp_start[group_index + 1u];
+    const int group_expert = plan->grp_e[group_index];
 
     const uint warp = tid / 32u;
     const uint lane = tid % 32u;
+    if (simd_broadcast_first(moe_group_entry_tokens_valid(
+            plan, uint(group_entry_begin), uint(group_entry_end),
+            params.n_rows, lane)) == 0u) {
+        return;
+    }
     const uint row = group.x * 8u + warp;
     const bool is_up = row >= 640u;
     const uint expert_row = is_up ? row - 640u : row;
     const uint role = is_up ? 1u : 0u;
     const MoeExpertAddr address =
-        addresses[params.layer * params.n_expert +
-                  uint(plan->grp_e[group_index])];
+        addresses[params.layer * params.n_expert + uint(group_expert)];
+    if (address.role[role] == nullptr) return;
     const device block_iq2_xs* row_weights =
         reinterpret_cast<device const block_iq2_xs*>(address.role[role]) +
         expert_row * 10u;
 
-    const uint entry_begin = uint(plan->grp_start[group_index]);
-    const uint entry_end = uint(plan->grp_start[group_index + 1u]);
+    const uint entry_begin = uint(group_entry_begin);
+    const uint entry_end = uint(group_entry_end);
     device float* destination = is_up ? up : gate;
     for (uint first = entry_begin; first < entry_end; first += 4u) {
         const uint count = min(4u, entry_end - first);
@@ -943,28 +1023,39 @@ kernel void strata_moe_gu_iq2_s(
     device const MoePlan* plans [[buffer(2)]],
     device float* gate [[buffer(3)]],
     device float* up [[buffer(4)]],
-    constant MoeGroupedParams& params [[buffer(5)]],
+    constant MoeGroupedGateUpParams& params [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]]) {
     device const MoePlan* plan = plans + params.layer;
     const uint group_index = group.y;
-    if (group_index >= plan->n_groups) return;
+    if (!moe_group_header_valid(plan, params.n_rows, params.n_expert,
+                               group_index)) {
+        return;
+    }
+    const int group_entry_begin = plan->grp_start[group_index];
+    const int group_entry_end = plan->grp_start[group_index + 1u];
+    const int group_expert = plan->grp_e[group_index];
 
     const uint warp = tid / 32u;
     const uint lane = tid % 32u;
+    if (simd_broadcast_first(moe_group_entry_tokens_valid(
+            plan, uint(group_entry_begin), uint(group_entry_end),
+            params.n_rows, lane)) == 0u) {
+        return;
+    }
     const uint row = group.x * 8u + warp;
     const bool is_up = row >= 640u;
     const uint expert_row = is_up ? row - 640u : row;
     const uint role = is_up ? 1u : 0u;
     const MoeExpertAddr address =
-        addresses[params.layer * params.n_expert +
-                  uint(plan->grp_e[group_index])];
+        addresses[params.layer * params.n_expert + uint(group_expert)];
+    if (address.role[role] == nullptr) return;
     const device block_iq2_s* row_weights =
         reinterpret_cast<device const block_iq2_s*>(address.role[role]) +
         expert_row * 10u;
 
-    const uint entry_begin = uint(plan->grp_start[group_index]);
-    const uint entry_end = uint(plan->grp_start[group_index + 1u]);
+    const uint entry_begin = uint(group_entry_begin);
+    const uint entry_end = uint(group_entry_end);
     device float* destination = is_up ? up : gate;
     for (uint first = entry_begin; first < entry_end; first += 4u) {
         const uint count = min(4u, entry_end - first);
@@ -1054,28 +1145,39 @@ kernel void strata_moe_gu_iq3_xxs(
     device const MoePlan* plans [[buffer(2)]],
     device float* gate [[buffer(3)]],
     device float* up [[buffer(4)]],
-    constant MoeGroupedParams& params [[buffer(5)]],
+    constant MoeGroupedGateUpParams& params [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]]) {
     device const MoePlan* plan = plans + params.layer;
     const uint group_index = group.y;
-    if (group_index >= plan->n_groups) return;
+    if (!moe_group_header_valid(plan, params.n_rows, params.n_expert,
+                               group_index)) {
+        return;
+    }
+    const int group_entry_begin = plan->grp_start[group_index];
+    const int group_entry_end = plan->grp_start[group_index + 1u];
+    const int group_expert = plan->grp_e[group_index];
 
     const uint warp = tid / 32u;
     const uint lane = tid % 32u;
+    if (simd_broadcast_first(moe_group_entry_tokens_valid(
+            plan, uint(group_entry_begin), uint(group_entry_end),
+            params.n_rows, lane)) == 0u) {
+        return;
+    }
     const uint row = group.x * 8u + warp;
     const bool is_up = row >= 640u;
     const uint expert_row = is_up ? row - 640u : row;
     const uint role = is_up ? 1u : 0u;
     const MoeExpertAddr address =
-        addresses[params.layer * params.n_expert +
-                  uint(plan->grp_e[group_index])];
+        addresses[params.layer * params.n_expert + uint(group_expert)];
+    if (address.role[role] == nullptr) return;
     const device block_iq3_xxs* row_weights =
         reinterpret_cast<device const block_iq3_xxs*>(address.role[role]) +
         expert_row * 10u;
 
-    const uint entry_begin = uint(plan->grp_start[group_index]);
-    const uint entry_end = uint(plan->grp_start[group_index + 1u]);
+    const uint entry_begin = uint(group_entry_begin);
+    const uint entry_end = uint(group_entry_end);
     device float* destination = is_up ? up : gate;
     for (uint first = entry_begin; first < entry_end; first += 4u) {
         const uint count = min(4u, entry_end - first);
@@ -1156,28 +1258,39 @@ kernel void strata_moe_gu_iq3_s(
     device const MoePlan* plans [[buffer(2)]],
     device float* gate [[buffer(3)]],
     device float* up [[buffer(4)]],
-    constant MoeGroupedParams& params [[buffer(5)]],
+    constant MoeGroupedGateUpParams& params [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]]) {
     device const MoePlan* plan = plans + params.layer;
     const uint group_index = group.y;
-    if (group_index >= plan->n_groups) return;
+    if (!moe_group_header_valid(plan, params.n_rows, params.n_expert,
+                               group_index)) {
+        return;
+    }
+    const int group_entry_begin = plan->grp_start[group_index];
+    const int group_entry_end = plan->grp_start[group_index + 1u];
+    const int group_expert = plan->grp_e[group_index];
 
     const uint warp = tid / 32u;
     const uint lane = tid % 32u;
+    if (simd_broadcast_first(moe_group_entry_tokens_valid(
+            plan, uint(group_entry_begin), uint(group_entry_end),
+            params.n_rows, lane)) == 0u) {
+        return;
+    }
     const uint row = group.x * 8u + warp;
     const bool is_up = row >= 640u;
     const uint expert_row = is_up ? row - 640u : row;
     const uint role = is_up ? 1u : 0u;
     const MoeExpertAddr address =
-        addresses[params.layer * params.n_expert +
-                  uint(plan->grp_e[group_index])];
+        addresses[params.layer * params.n_expert + uint(group_expert)];
+    if (address.role[role] == nullptr) return;
     const device block_iq3_s* row_weights =
         reinterpret_cast<device const block_iq3_s*>(address.role[role]) +
         expert_row * 10u;
 
-    const uint entry_begin = uint(plan->grp_start[group_index]);
-    const uint entry_end = uint(plan->grp_start[group_index + 1u]);
+    const uint entry_begin = uint(group_entry_begin);
+    const uint entry_end = uint(group_entry_end);
     device float* destination = is_up ? up : gate;
     for (uint first = entry_begin; first < entry_end; first += 4u) {
         const uint count = min(4u, entry_end - first);
@@ -1247,28 +1360,39 @@ kernel void strata_moe_gu_iq4_xs(
     device const MoePlan* plans [[buffer(2)]],
     device float* gate [[buffer(3)]],
     device float* up [[buffer(4)]],
-    constant MoeGroupedParams& params [[buffer(5)]],
+    constant MoeGroupedGateUpParams& params [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]]) {
     device const MoePlan* plan = plans + params.layer;
     const uint group_index = group.y;
-    if (group_index >= plan->n_groups) return;
+    if (!moe_group_header_valid(plan, params.n_rows, params.n_expert,
+                               group_index)) {
+        return;
+    }
+    const int group_entry_begin = plan->grp_start[group_index];
+    const int group_entry_end = plan->grp_start[group_index + 1u];
+    const int group_expert = plan->grp_e[group_index];
 
     const uint warp = tid / 32u;
     const uint lane = tid % 32u;
+    if (simd_broadcast_first(moe_group_entry_tokens_valid(
+            plan, uint(group_entry_begin), uint(group_entry_end),
+            params.n_rows, lane)) == 0u) {
+        return;
+    }
     const uint row = group.x * 8u + warp;
     const bool is_up = row >= 640u;
     const uint expert_row = is_up ? row - 640u : row;
     const uint role = is_up ? 1u : 0u;
     const MoeExpertAddr address =
-        addresses[params.layer * params.n_expert +
-                  uint(plan->grp_e[group_index])];
+        addresses[params.layer * params.n_expert + uint(group_expert)];
+    if (address.role[role] == nullptr) return;
     const device block_iq4_xs* row_weights =
         reinterpret_cast<device const block_iq4_xs*>(address.role[role]) +
         expert_row * 10u;
 
-    const uint entry_begin = uint(plan->grp_start[group_index]);
-    const uint entry_end = uint(plan->grp_start[group_index + 1u]);
+    const uint entry_begin = uint(group_entry_begin);
+    const uint entry_end = uint(group_entry_end);
     device float* destination = is_up ? up : gate;
     for (uint first = entry_begin; first < entry_end; first += 4u) {
         const uint count = min(4u, entry_end - first);
