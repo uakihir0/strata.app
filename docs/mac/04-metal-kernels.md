@@ -822,11 +822,12 @@ buffers ([06](06-engine-host-port.md), section 7.4). The window's command buffer
   - `pending(0) = 0`;
   - `pending(1) = !ple_on`;
   - `pending(l) = !covers(l − 1)` for l ≥ 2.
-- When the full-mode layer-0 MoE coordinator leaves its result pending, the caller binds the PLE
-  entry's `previous_block_out` to `ffn.shared.output`, `previous_inject` to the layer-0 FFN read's
-  `inject_out`, and `ple.post.residual` to that read's `residual`. The no-PLE layer-1 attention read
-  uses those same output and injection views as `block_out` and `inject_prev` with `apply = true`.
-  The Window scheduler must encode exactly the selected consumer for the window.
+- When the full-mode layer-0 MoE coordinator leaves its result pending,
+  `encode_window_moe_ple_entry` binds the PLE entry's `previous_block_out` to
+  `ffn.shared.output`, `previous_inject` to the layer-0 FFN read's `inject_out`, and requires
+  `ple.post.residual` to be the same view as that read's `residual`. The no-PLE layer-1 attention
+  read uses those same output and injection views as `block_out` and `inject_prev` with
+  `apply = true`. The Window scheduler must encode exactly the selected consumer for the window.
 - The FFN write of layer l (step 11):
   - l = 47: `strata_gr_post`, then `strata_gr_cvec` with `write = 0` if `covers(47)`;
   - l < 47 and `covers(l)`: `strata_gr_cvec` with `write = 1`, which performs the write and then steers;
@@ -2209,11 +2210,16 @@ that segment with the layer-0 GPU plan kernel, using the produced route IDs and 
 usage and plan views. `encode_window_t1_moe_layer0_full_mode` takes the `FullModeStorage` owner,
 uses its expert address/resident/usage tables, and composes the actual router/route/plan prefix
 with routed expert FFN, shared expert and combine in one ordered transaction. It leaves the
-combined output pending in `ffn.shared.output`; it does not write the GR residual. When scheduling
-the PLE entry, the caller supplies that output as `previous_block_out`, pairs it with the layer-0
-FFN read's `inject_out`, and targets the same GR residual before the PLE block. Otherwise layer 1's
-attention GR read consumes those output and injection views as `block_out` and `inject_prev`
-according to `pending(1)`. The Window scheduler must select exactly one consumer. The coordinator validates the consumer's table identity,
+combined output pending in `ffn.shared.output`; it does not write the GR residual.
+`encode_window_moe_ple_entry` takes the routed/shared result and layer-0 FFN GR-read structures,
+binds that output as `previous_block_out` and the GR read's `inject_out` as `previous_inject`, and
+requires the PLE residual to reuse the GR read's residual view. Its caller-owned Encoder form runs
+after the producer in the same ordered segment; the standalone form requires the producer command
+buffer dependency to be registered with `consumer.depends_on(producer, error)`, and the producer
+to complete successfully before the consumer command buffer is submitted.
+Otherwise layer 1's attention GR
+read consumes those output and injection views as `block_out` and `inject_prev` according to
+`pending(1)`. The Window scheduler must select exactly one consumer. The coordinator validates the consumer's table identity,
 Q8_1 activations, plan, route weights and mixed input, plus the same `WindowParams.nc`. Consumer
 reads may overlap producer storage only in the specific input roles declared for each handoff.
 Router weights and the resident table are checked as producer inputs, and consumer outputs and

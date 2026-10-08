@@ -2117,11 +2117,13 @@ bool run_ple_block_projection_case(Context& context,
         guarded[active_rows_buffer].view(),
         post,
     };
-    const WindowPLEEntryBuffers window_entry{
-        guarded[previous_block_buffer].view(),
-        guarded[previous_inject_buffer].view(),
-        block,
-    };
+    MoeRoutedSharedFFNBuffers previous_ffn{};
+    previous_ffn.shared.output = guarded[previous_block_buffer].view();
+    GRReadBuffers previous_gr_read{};
+    previous_gr_read.residual = guarded[residual_buffer].view();
+    previous_gr_read.inject_out = guarded[previous_inject_buffer].view();
+    const WindowMoePLEEntryBuffers window_entry{
+        previous_ffn, previous_gr_read, block};
 
     if (check_late_failure) {
         std::array<std::vector<std::uint8_t>, buffer_count> before;
@@ -2176,6 +2178,38 @@ bool run_ple_block_projection_case(Context& context,
         check(alias_unchanged,
               label + " alias rejection preserves all buffers");
 
+        if (prepend_gr_post) {
+            WindowMoePLEEntryBuffers wrong_residual_entry = window_entry;
+            wrong_residual_entry.previous_gr_read.residual =
+                guarded[norm_buffer].view();
+            auto wrong_residual_command = context.make_command_buffer(
+                label + " mismatched pending-MoE residual", error);
+            if (!wrong_residual_command) {
+                check(false, label + " mismatched-residual command buffer",
+                      error);
+                return false;
+            }
+            const bool wrong_residual_rejected =
+                !encode_window_moe_ple_entry(
+                    context, *wrong_residual_command, rows, key_format,
+                    compiled_columns, PLEHistoryUpdate::defer,
+                    wrong_residual_entry, error);
+            const bool wrong_residual_discarded =
+                wrong_residual_rejected &&
+                wrong_residual_command->unsafe_native_handle() == nullptr &&
+                error.find("previous GR residual") != std::string::npos;
+            check(wrong_residual_discarded,
+                  label + " rejects a PLE residual outside the pending GR handoff",
+                  error);
+            const bool wrong_residual_unchanged =
+                unchanged_after_rejection();
+            check(wrong_residual_unchanged,
+                  label + " mismatched residual rejection preserves all buffers");
+            if (!wrong_residual_discarded || !wrong_residual_unchanged) {
+                return false;
+            }
+        }
+
         PLEBlockBuffers invalid_block = block;
         invalid_block.post.history = guarded[history_buffer].view().slice(
             0u, history_count * sizeof(float) - sizeof(float));
@@ -2185,10 +2219,10 @@ bool run_ple_block_projection_case(Context& context,
             check(false, label + " late-failure command buffer", error);
             return false;
         }
-        WindowPLEEntryBuffers invalid_entry = window_entry;
+        WindowMoePLEEntryBuffers invalid_entry = window_entry;
         invalid_entry.ple = invalid_block;
         const bool accepted = prepend_gr_post
-                                  ? encode_window_ple_entry(
+                                  ? encode_window_moe_ple_entry(
                                         context, *rejected, rows, key_format,
                                         compiled_columns,
                                         PLEHistoryUpdate::defer, invalid_entry,
@@ -2225,7 +2259,7 @@ bool run_ple_block_projection_case(Context& context,
                 context, *caller_owned_rejection,
                 "Window PLE caller-owned late failure",
                 [&](Encoder& encoder, std::string& encode_error) {
-                    return encode_window_ple_entry(
+                    return encode_window_moe_ple_entry(
                         context, encoder, rows, key_format, compiled_columns,
                         PLEHistoryUpdate::defer, invalid_entry, encode_error);
                 },
@@ -2259,7 +2293,7 @@ bool run_ple_block_projection_case(Context& context,
                 context, *grouped, "Window PLE open-group rejection",
                 [&](Encoder& encoder, std::string& encode_error) {
                     if (!encoder.group_begin(encode_error)) return false;
-                    const bool stage_accepted = encode_window_ple_entry(
+                    const bool stage_accepted = encode_window_moe_ple_entry(
                         context, encoder, rows, key_format, compiled_columns,
                         PLEHistoryUpdate::defer, window_entry, stage_error);
                     if (!encoder.group_end(encode_error)) return false;
@@ -2287,7 +2321,7 @@ bool run_ple_block_projection_case(Context& context,
         return false;
     }
     const bool encoded = prepend_gr_post && rows == 1u
-                             ? encode_window_ple_entry(
+                             ? encode_window_moe_ple_entry(
                                    context, *command, rows, key_format,
                                    compiled_columns,
                                    PLEHistoryUpdate::defer, window_entry, error)
@@ -2299,7 +2333,7 @@ bool run_ple_block_projection_case(Context& context,
                                [&](Encoder& encoder,
                                    std::string& encode_error) {
                                    return prepend_gr_post
-                                              ? encode_window_ple_entry(
+                                              ? encode_window_moe_ple_entry(
                                                     context, encoder, rows,
                                                     key_format,
                                                     compiled_columns,

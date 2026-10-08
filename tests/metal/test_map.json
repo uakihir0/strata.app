@@ -303,11 +303,11 @@
     },
     "metal_ple_test": {
       "label": "metal",
-      "origin": "09 9.1"
+      "origin": "04 §5.1/§5.3, 09 9.1, D-IMPL-292, REV-088"
     },
     "metal_ple_test_concurrent": {
       "label": "metal",
-      "origin": "09 9.1"
+      "origin": "04 §5.1/§5.3, 09 9.1, D-IMPL-292, REV-088"
     },
     "metal_prefill_test": {
       "label": "metal",
