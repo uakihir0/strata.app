@@ -138,6 +138,10 @@
       "label": "metal",
       "origin": "06 L9; D-IMPL-294; REV-091"
     },
+    "metal_fullmode_ple_handoff_test": {
+      "label": "metal",
+      "origin": "06 L9; D-IMPL-295; REV-092"
+    },
     "metal_model_storage_owner_test": {
       "label": "metal",
       "origin": "05 U3"

@@ -65,6 +65,7 @@
       "ctest:metal_window_storage_test",
       "ctest:metal_model_storage_owner_test",
       "ctest:metal_fullmode_handoff_test",
+      "ctest:metal_fullmode_ple_handoff_test",
       "ctest:metal_mtp_storage_test"
     ],
     "REQ-MEM-09": [

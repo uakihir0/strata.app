@@ -2234,8 +2234,12 @@ draft-head API, and Prefill dispatch remain pending.
 `metal_fullmode_handoff_test` exercises the full-mode producer and the no-PLE attention consumer
 in one ordered segment using a sparse 256-expert GGUF fixture. It checks the produced route,
 nonzero routed/shared output, consumer outputs against a direct GR-read reference, and exactly-once
-residual application. This fixture does not integrate the PLE branch, select a scheduler branch,
-or establish model-backed decode parity.
+residual application. `metal_fullmode_ple_handoff_test` exercises that producer with the typed PLE
+entry in one ordered segment, then compares its PLE outputs and residual against a direct GR-post
+plus PLE-entry reference. It gathers its PLE input from sparse rows in the synthetic FullMode
+GGUF through the host staging path; its PLE projection weights remain synthetic. These
+branch-specific tests do not select a production scheduler branch or establish model-backed decode
+parity.
 
 ### 5.10 MoE: router, plan, experts, shared expert and combine
 

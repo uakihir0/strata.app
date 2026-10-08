@@ -581,6 +581,8 @@ strata_metal_test(metal_tiered_copy_test metal metal_window_storage_test ${STRAT
 strata_metal_test(metal_model_storage_owner_test metal metal_window_storage_test ${STRATA_METALLIB} --model-owner)
 strata_metal_test(metal_fullmode_handoff_test metal metal_window_storage_test ${STRATA_METALLIB} --fullmode-handoff)
 set_tests_properties(metal_fullmode_handoff_test PROPERTIES TIMEOUT 180)
+strata_metal_test(metal_fullmode_ple_handoff_test metal metal_window_storage_test ${STRATA_METALLIB} --fullmode-ple-handoff)
+set_tests_properties(metal_fullmode_ple_handoff_test PROPERTIES TIMEOUT 180)
 add_executable(metal_slot_pool_test tests/metal/metal_slot_pool_test.mm)
 target_link_libraries(metal_slot_pool_test PRIVATE strata_metal_engine strata_metal_options)
 strata_metal_test(metal_slot_pool_test metal metal_slot_pool_test)

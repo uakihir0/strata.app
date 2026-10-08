@@ -7,11 +7,14 @@
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/window_dispatch.hpp"
+#include "strata/metal/window_ple_dispatch.hpp"
+#include "strata/metal/ple_dispatch.hpp"
 #include "strata/metal/window_ple_stage.hpp"
 #include "strata/metal/window_scratch.hpp"
 #include "strata/metal/session_state.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "window_source_lock_test_access.hpp"
 #include "../../src/metal/kernels/common/params.h"
@@ -653,7 +656,7 @@ Fixture write_fullmode_handoff_fixture(const fs::path& directory) {
         2'560u * kExperts * sizeof(float);
     constexpr std::uint64_t kRouterPackedBytes =
         2'560u * kExperts * sizeof(std::uint16_t);
-    constexpr std::uint64_t kPleRows = 728u;
+    constexpr std::uint64_t kPleRows = strata::kernels::PLE_TABLE_ROWS;
     constexpr std::uint64_t kPleBytes =
         kPleRows * strata::kernels::PLE_ROW_BYTES;
     static_assert(kGateUpElements == kDownElements);
@@ -759,6 +762,38 @@ Fixture write_fullmode_handoff_fixture(const fs::path& directory) {
                     fixture.data_start + fixture.offsets[role] +
                         expert * kExpertSlabBytes);
             }
+        }
+        Geometry ple_geometry;
+        ple_geometry.family = "qwen4exp";
+        ple_geometry.model = "synthetic-fullmode-handoff";
+        ple_geometry.n_layers = kSessionModelLayers;
+        ple_geometry.n_expert = kExperts;
+        ple_geometry.n_qsa_layers = kSessionQsaLayers;
+        ple_geometry.n_kv_head = kSessionKvHeads;
+        ple_geometry.head_dim = kSessionHeadWidth;
+        ple_geometry.n_embd = kSessionEmbeddingWidth;
+        ple_geometry.vocab = kSessionVocabularySize;
+        const std::array<std::uint32_t, 1u> ple_tokens{1u};
+        const std::array<std::uint32_t, 2u> ple_history{5u, 0u};
+        WindowPleRows ple_rows;
+        std::string ple_error;
+        require(build_window_ple_rows(ple_tokens, ple_history, ple_geometry,
+                                      ple_rows, ple_error),
+                "build synthetic FullMode PLE table rows: " + ple_error);
+        std::array<block_iq4_nl,
+                   strata::kernels::PLE_HEAD_DIM / 32u> ple_row{};
+        for (block_iq4_nl& block : ple_row) {
+            block.d = 0x3c00u;
+            std::fill_n(block.qs, 16u, 0x88u);
+        }
+        for (const std::uint32_t row : ple_rows.all_rows()) {
+            require(row < kPleRows,
+                    "synthetic FullMode PLE row is inside the sparse table");
+            write_all_at(
+                descriptor, ple_row.data(), sizeof(ple_row),
+                fixture.data_start + fixture.ple_offset +
+                    static_cast<std::uint64_t>(row) *
+                        strata::kernels::PLE_ROW_BYTES);
         }
     } catch (...) {
         (void)::close(descriptor);
@@ -2760,7 +2795,8 @@ BufferRef require_scratch_view(Context& context,
 }
 
 void run_fullmode_handoff_test(Context& context,
-                               const fs::path& parent_directory) {
+                               const fs::path& parent_directory,
+                               bool use_ple_entry = false) {
     constexpr std::uint32_t kExperts = 256u;
     constexpr std::uint32_t kVocabulary = 248'320u;
     constexpr std::uint32_t kRows = 1u;
@@ -2771,7 +2807,8 @@ void run_fullmode_handoff_test(Context& context,
     constexpr std::size_t kMoeQ8Blocks = 640u / 32u;
     static_assert(sizeof(block_q8_0) == 34u);
 
-    const fs::path directory = parent_directory / "fullmode-handoff";
+    const fs::path directory = parent_directory /
+        (use_ple_entry ? "fullmode-ple-handoff" : "fullmode-handoff");
     fs::create_directory(directory);
     const Fixture fixture = write_fullmode_handoff_fixture(directory);
     WindowSources sources = inspect_fixture(fixture);
@@ -2909,9 +2946,11 @@ void run_fullmode_handoff_test(Context& context,
     const BufferRef shared_gate_logit =
         require_scratch_view(context, *scratch, layout.shared_gate_logit,
                               "shared gate logit");
-    const BufferRef pending_output =
-        require_scratch_view(context, *scratch, layout.ple_input,
-                              "pending MoE output");
+    const BufferRef pending_output = use_ple_entry
+        ? require_scratch_view(context, *scratch, layout.embedding,
+                               "pending PLE-branch MoE output")
+        : require_scratch_view(context, *scratch, layout.ple_input,
+                               "pending MoE output");
     const BufferRef attention_entry_mixed =
         require_scratch_view(context, *scratch, layout.ple_value,
                               "next attention mixed");
@@ -3125,6 +3164,123 @@ void run_fullmode_handoff_test(Context& context,
          moe_plans},
         {routed, shared}};
 
+    PLEBlockBuffers ple_block{};
+    WindowMoePLEEntryBuffers ple_entry{};
+    std::vector<std::uint8_t> ple_history_initial;
+    if (use_ple_entry) {
+        const std::array<std::uint32_t, 2u> committed_tokens{5u, 0u};
+        WindowPleRows ple_rows;
+        require(build_window_ple_rows(tokens, committed_tokens,
+                                      runtime_geometry, ple_rows, error),
+                "build layer-1 PLE row IDs: " + error);
+        strata::kernels::PleTableReader* ple_reader =
+            full_mode->ple_reader();
+        require(ple_reader != nullptr && ple_reader->is_open(),
+                "resolve FullMode's mapped PLE reader");
+        BufferRef ple_input;
+        require(stage_window_ple_input(*ple_reader, ple_rows, *scratch,
+                                       ple_input, error),
+                "stage mapped FullMode PLE rows into Window scratch: " + error);
+        require(ple_input.length ==
+                    static_cast<std::size_t>(kRows) * N_EMBD * sizeof(float),
+                "staged PLE input exposes exactly the active T=1 rows");
+        const BufferRef ple_key =
+            require_scratch_view(context, *scratch, layout.ple_key,
+                                 "PLE key");
+        const BufferRef ple_value =
+            require_scratch_view(context, *scratch, layout.ple_value,
+                                 "PLE value");
+        const BufferRef ple_query =
+            require_scratch_view(context, *scratch, layout.ple_query,
+                                 "PLE query");
+        const BufferRef ple_gate =
+            require_scratch_view(context, *scratch, layout.ple_gate,
+                                 "PLE gate");
+        const BufferRef ple_gated =
+            require_scratch_view(context, *scratch, layout.ple_gated,
+                                 "PLE gated");
+        const BufferRef ple_norm =
+            require_scratch_view(context, *scratch, layout.ple_norm,
+                                 "PLE convolution norm");
+        const BufferRef ple_history = session->ple_history();
+        require(ple_history && context.buffers().owns(ple_history),
+                "resolve Context-owned PLE history for the Window entry");
+        ple_history_initial.assign(
+            static_cast<const std::uint8_t*>(ple_history.contents),
+            static_cast<const std::uint8_t*>(ple_history.contents) +
+                ple_history.length);
+        const BufferRef ple_key_weights = allocate(
+            "FullMode handoff PLE Q2_0 key weights",
+            static_cast<std::size_t>(HC_DIM) * (N_EMBD / 64u) *
+                sizeof(block_q2_0));
+        const BufferRef ple_value_weights = allocate(
+            "FullMode handoff PLE BF16 value weights",
+            static_cast<std::size_t>(N_EMBD) * N_EMBD *
+                sizeof(std::uint16_t));
+        const BufferRef ple_key_q8_1 = allocate(
+            "FullMode handoff PLE Q8_1 key activations",
+            static_cast<std::size_t>(N_EMBD / 32u) * sizeof(Q81));
+        const BufferRef ple_sink =
+            require_scratch_view(context, *scratch, layout.matvec_sink,
+                                 "PLE mat-vec sink");
+        const BufferRef ple_key_gamma =
+            allocate("FullMode handoff PLE key gamma",
+                     static_cast<std::size_t>(HC_DIM) * sizeof(float));
+        const BufferRef ple_query_gamma =
+            allocate("FullMode handoff PLE query gamma",
+                     static_cast<std::size_t>(HC_DIM) * sizeof(float));
+        const BufferRef ple_conv_gamma =
+            allocate("FullMode handoff PLE convolution gamma",
+                     static_cast<std::size_t>(HC_DIM) * sizeof(float));
+        const BufferRef ple_conv1d = allocate(
+            "FullMode handoff PLE convolution weights",
+            static_cast<std::size_t>(HC_DIM) * 4u * sizeof(std::uint16_t));
+        auto* q2_blocks =
+            static_cast<block_q2_0*>(ple_key_weights.contents);
+        const std::size_t q2_block_count =
+            ple_key_weights.length / sizeof(block_q2_0);
+        for (std::size_t block = 0; block < q2_block_count; ++block) {
+            q2_blocks[block].d = 0x1000u;
+            std::fill_n(q2_blocks[block].qs, 16u, 0xaau);
+        }
+        std::fill_n(
+            static_cast<std::uint16_t*>(ple_value_weights.contents),
+            ple_value_weights.length / sizeof(std::uint16_t),
+            strata::kernels::bf16_from_f32(0.0001f));
+        std::fill_n(static_cast<float*>(ple_key_gamma.contents),
+                    HC_DIM, 1.0f);
+        std::fill_n(static_cast<float*>(ple_query_gamma.contents),
+                    HC_DIM, 1.0f);
+        std::fill_n(static_cast<float*>(ple_conv_gamma.contents),
+                    HC_DIM, 1.0f);
+        std::fill_n(static_cast<std::uint16_t*>(ple_conv1d.contents),
+                    ple_conv1d.length / sizeof(std::uint16_t),
+                    strata::kernels::f16_from_f32(0.125f));
+        require(std::all_of(static_cast<const float*>(ple_input.contents),
+                            static_cast<const float*>(ple_input.contents) +
+                                N_EMBD,
+                            [](float value) { return std::isfinite(value); }) &&
+                    std::any_of(static_cast<const float*>(ple_input.contents),
+                                static_cast<const float*>(ple_input.contents) +
+                                    N_EMBD,
+                                [](float value) {
+                                    return std::abs(value) > 1.0e-7f;
+                                }),
+                "mapped PLE rows stage finite nonzero table values");
+        ple_block = {
+            ple_input,
+            ple_key_q8_1,
+            ple_key_weights,
+            ple_value_weights,
+            ple_sink,
+            gdn_active_rows,
+            {ple_key, residual, ple_query, ple_norm, ple_value, ple_gate,
+             ple_gated, ple_history, ple_conv1d, ple_key_gamma,
+             ple_query_gamma, ple_conv_gamma},
+        };
+        ple_entry = {full_buffers.ffn, ffn, ple_block};
+    }
+
     const GRReadBuffers next_attention{
         residual, next_attention_block_decoy, next_attention_inject_decoy,
         next_attention_norm, gr_xn, gr_rs, next_attention_down,
@@ -3139,7 +3295,9 @@ void run_fullmode_handoff_test(Context& context,
     require(session->track_use(*command, error),
             "track GDN state through FullMode handoff: " + error);
     const bool encoded = Encoder::encode(
-        context, *command, "FullMode producer and pending attention consumer",
+        context, *command,
+        use_ple_entry ? "FullMode producer and pending PLE consumer"
+                      : "FullMode producer and pending attention consumer",
         [&](Encoder& encoder, std::string& encode_error) {
             if (!encode_window_t1_moe_layer0_full_mode(
                     context, *full_mode, encoder, kVocabulary, kExperts,
@@ -3147,20 +3305,25 @@ void run_fullmode_handoff_test(Context& context,
                     full_buffers, encode_error)) {
                 return false;
             }
+            if (use_ple_entry) {
+                return encode_window_moe_ple_entry(
+                    context, encoder, kRows, MatVecWeightFormat::q2_0, 1u,
+                    PLEHistoryUpdate::defer, ple_entry, encode_error);
+            }
             return encode_window_moe_attention_entry(
                 context, encoder, kRows, attention_entry, encode_error);
         },
         error);
     require(encoded,
-            "encode FullMode producer followed by no-PLE consumer in one segment: " +
+            "encode FullMode producer followed by the selected PLE consumer in one segment: " +
                 error);
     require(command->commit(error),
-            "commit FullMode producer and attention consumer: " + error);
+            "commit FullMode producer and pending consumer: " + error);
     id<MTLCommandBuffer> native =
         (__bridge id<MTLCommandBuffer>)command->unsafe_native_handle();
     [native waitUntilCompleted];
     require(native.status == MTLCommandBufferStatusCompleted,
-            "same-segment FullMode producer and attention consumer completed: " +
+            "same-segment FullMode producer and pending consumer completed: " +
                 (native.error ? std::string(native.error.localizedDescription.UTF8String)
                               : std::string{}));
 
@@ -3218,12 +3381,107 @@ void run_fullmode_handoff_test(Context& context,
                                 return std::abs(value) > 1.0e-7f;
                             }),
             "FullMode producer's FFN read emits a finite nonzero injection");
-    require(!std::equal(
-                reinterpret_cast<const std::uint8_t*>(producer_injection),
-                reinterpret_cast<const std::uint8_t*>(producer_injection) +
-                    4u * sizeof(float),
-                reinterpret_cast<const std::uint8_t*>(injection_decoy)),
-            "next attention injection decoy differs from the producer injection");
+    if (!use_ple_entry) {
+        require(!std::equal(
+                    reinterpret_cast<const std::uint8_t*>(producer_injection),
+                    reinterpret_cast<const std::uint8_t*>(producer_injection) +
+                        4u * sizeof(float),
+                    reinterpret_cast<const std::uint8_t*>(injection_decoy)),
+                "next attention injection decoy differs from the producer injection");
+    }
+
+    if (use_ple_entry) {
+        const std::array<BufferRef, 6u> outputs{
+            ple_block.post.key, ple_block.post.value, ple_block.post.query,
+            ple_block.post.gate, ple_block.post.gated,
+            ple_block.post.ple_norm};
+        const std::array<std::size_t, 6u> extents{
+            kRows * HC_DIM * sizeof(float),
+            kRows * N_EMBD * sizeof(float),
+            kRows * HC_DIM * sizeof(float), kRows * HC * sizeof(float),
+            kRows * HC_DIM * sizeof(float), kRows * HC_DIM * sizeof(float)};
+        std::array<std::vector<std::uint8_t>, 6u> actual_ple_outputs;
+        for (std::size_t index = 0; index < outputs.size(); ++index) {
+            require(outputs[index].length >= extents[index],
+                    "PLE handoff output view covers its active T=1 extent");
+            const auto* begin =
+                static_cast<const std::uint8_t*>(outputs[index].contents);
+            actual_ple_outputs[index].assign(begin, begin + extents[index]);
+        }
+        const std::vector<std::uint8_t> actual_residual(
+            static_cast<const std::uint8_t*>(residual.contents),
+            static_cast<const std::uint8_t*>(residual.contents) +
+                residual.length);
+        const std::vector<std::uint8_t> pending_snapshot(
+            static_cast<const std::uint8_t*>(pending_output.contents),
+            static_cast<const std::uint8_t*>(pending_output.contents) +
+                pending_output.length);
+        const auto finite_nonzero = [](BufferRef view, std::size_t count) {
+            const auto* values = static_cast<const float*>(view.contents);
+            return std::all_of(values, values + count,
+                               [](float value) {
+                                   return std::isfinite(value);
+                               }) &&
+                   std::any_of(values, values + count, [](float value) {
+                       return std::abs(value) > 1.0e-7f;
+                   });
+        };
+        require(finite_nonzero(ple_block.post.value, N_EMBD) &&
+                    finite_nonzero(ple_block.post.gated, HC_DIM),
+                "same-segment FullMode-to-PLE consumer produces finite nonzero value and gated rows");
+
+        BufferRef reference_residual = allocate_zeroed_buffer(
+            context, "full-mode PLE handoff reference residual",
+            residual.length);
+        std::memcpy(reference_residual.contents, initial_residual.data(),
+                    initial_residual.size());
+        PLEBlockBuffers reference_ple = ple_block;
+        reference_ple.post.residual = reference_residual;
+        const WindowPLEEntryBuffers reference_entry{
+            pending_output, inject2, reference_ple};
+        auto reference_command = context.make_command_buffer(
+            "Reference FullMode-to-PLE entry", error);
+        require(reference_command != nullptr,
+                "create direct PLE-entry reference command: " + error);
+        require(session->track_use(*reference_command, error),
+                "track PLE history through the direct reference: " + error);
+        require(encode_window_ple_entry(
+                    context, *reference_command, kRows,
+                    MatVecWeightFormat::q2_0, 1u,
+                    PLEHistoryUpdate::defer, reference_entry, error),
+                "encode direct GR-post plus PLE-entry reference: " + error);
+        require(reference_command->commit(error),
+                "commit direct PLE-entry reference: " + error);
+        id<MTLCommandBuffer> native_reference =
+            (__bridge id<MTLCommandBuffer>)reference_command->unsafe_native_handle();
+        [native_reference waitUntilCompleted];
+        require(native_reference.status == MTLCommandBufferStatusCompleted,
+                "direct PLE-entry reference completed");
+
+        for (std::size_t index = 0; index < outputs.size(); ++index) {
+            const auto* expected =
+                static_cast<const std::uint8_t*>(outputs[index].contents);
+            require(std::equal(actual_ple_outputs[index].begin(),
+                               actual_ple_outputs[index].end(), expected),
+                    "typed FullMode PLE handoff matches the direct PLE entry for output " +
+                        std::to_string(index));
+        }
+        require(actual_residual.size() == reference_residual.length &&
+                    std::equal(actual_residual.begin(), actual_residual.end(),
+                               static_cast<const std::uint8_t*>(
+                                   reference_residual.contents)),
+                "typed PLE handoff matches direct GR-post plus PLE residual and applies the pending write once");
+        require(std::equal(
+                    pending_snapshot.begin(), pending_snapshot.end(),
+                    static_cast<const std::uint8_t*>(pending_output.contents)),
+                "PLE consumer preserves the FullMode pending output");
+        require(std::equal(
+                    ple_history_initial.begin(), ple_history_initial.end(),
+                    static_cast<const std::uint8_t*>(
+                        ple_block.post.history.contents)),
+                "deferred Window PLE entry preserves committed history");
+        return;
+    }
 
     const auto output_snapshots = [&] {
         const std::array<BufferRef, 5u> outputs{
@@ -3344,10 +3602,14 @@ int main(int argc, char** argv) {
         const bool model_owner_only = argc == 3 && std::string(argv[2]) == "--model-owner";
         const bool fullmode_handoff_only =
             argc == 3 && std::string(argv[2]) == "--fullmode-handoff";
+        const bool fullmode_ple_handoff_only =
+            argc == 3 && std::string(argv[2]) == "--fullmode-ple-handoff";
         require(argc == 2 || never_wrap_only || tiered_copy_only ||
-                    model_owner_only || fullmode_handoff_only,
+                    model_owner_only || fullmode_handoff_only ||
+                    fullmode_ple_handoff_only,
                 "usage: metal_window_storage_test strata.metallib "
-                "[--never-wrap|--tiered-copy|--model-owner|--fullmode-handoff]");
+                "[--never-wrap|--tiered-copy|--model-owner|--fullmode-handoff|"
+                "--fullmode-ple-handoff]");
         if (argc == 2) test_warmup_wave_barrier();
         char directory_template[] = "/tmp/strata-window-storage.XXXXXX";
         char* directory_name = mkdtemp(directory_template);
@@ -3373,6 +3635,14 @@ int main(int argc, char** argv) {
             std::error_code ignored;
             fs::remove_all(directory, ignored);
             std::cout << "metal_fullmode_handoff_test: OK\n";
+            return 0;
+        }
+        if (fullmode_ple_handoff_only) {
+            run_fullmode_handoff_test(*context, directory, true);
+            context.reset();
+            std::error_code ignored;
+            fs::remove_all(directory, ignored);
+            std::cout << "metal_fullmode_ple_handoff_test: OK\n";
             return 0;
         }
         if (model_owner_only) {
