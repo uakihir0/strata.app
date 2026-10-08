@@ -278,11 +278,11 @@
     },
     "metal_gr_test": {
       "label": "metal",
-      "origin": "09 9.1, D-IMPL-293, REV-090, D-IMPL-299, REV-096"
+      "origin": "04 §5.1/§5.4, 09 9.1, D-IMPL-293, REV-090, D-IMPL-299, REV-096, D-IMPL-304, REV-101"
     },
     "metal_gr_test_concurrent": {
       "label": "metal",
-      "origin": "09 9.1, D-IMPL-293, REV-090, D-IMPL-299, REV-096"
+      "origin": "04 §5.1/§5.4, 09 9.1, D-IMPL-293, REV-090, D-IMPL-299, REV-096, D-IMPL-304, REV-101"
     },
     "metal_math_test": {
       "label": "metal",

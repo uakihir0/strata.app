@@ -4,6 +4,7 @@
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/gr_dispatch.hpp"
 #include "strata/metal/window_dispatch.hpp"
+#include "strata/metal/window_head_mixer.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "twin.hpp"
 
@@ -4554,6 +4555,262 @@ bool test_gr_pre_gated_shared_encoder_validation(
     return passed;
 }
 
+bool test_window_head_mixer(Context& context,
+                            const twin::Options& options) {
+    constexpr std::uint32_t max_rows = 8u;
+    constexpr std::size_t hc_dim = HC_DIM;
+    constexpr std::size_t low_rank = HC_LOW_RANK;
+    constexpr std::size_t down_weight_count = low_rank * hc_dim;
+    constexpr std::size_t up_weight_count = hc_dim * low_rank;
+    constexpr std::size_t max_input_count = max_rows * hc_dim;
+    constexpr std::size_t max_low_rank_count = max_rows * low_rank;
+    constexpr std::size_t max_output_count = max_rows * N_EMBD;
+    constexpr std::size_t max_sink_count = max_rows * hc_dim;
+    const std::size_t weight_bytes =
+        down_weight_count * sizeof(std::uint16_t);
+
+    std::string error;
+    BufferRef residual = context.buffers().allocate(
+        "Window head mixer test residual",
+        max_input_count * sizeof(float), error);
+    BufferRef gamma = context.buffers().allocate(
+        "Window head mixer test norm gamma",
+        hc_dim * sizeof(float), error);
+    BufferRef down_weights = context.buffers().allocate(
+        "Window head mixer test down weights", weight_bytes, error);
+    BufferRef up_weights = context.buffers().allocate(
+        "Window head mixer test up weights", weight_bytes, error);
+    BufferRef active_rows = context.buffers().allocate(
+        "Window head mixer test active rows", sizeof(std::uint32_t), error);
+    BufferRef normalized = context.buffers().allocate(
+        "Window head mixer test normalized",
+        max_input_count * sizeof(float), error);
+    BufferRef low_rank_output = context.buffers().allocate(
+        "Window head mixer test low rank",
+        max_low_rank_count * sizeof(float), error);
+    BufferRef gate = context.buffers().allocate(
+        "Window head mixer test gate",
+        max_input_count * sizeof(float), error);
+    BufferRef mixed = context.buffers().allocate(
+        "Window head mixer test mixed",
+        max_output_count * sizeof(float), error);
+    BufferRef sink = context.buffers().allocate(
+        "Window head mixer test matvec sink",
+        max_sink_count * sizeof(float), error);
+    if (!residual || !gamma || !down_weights || !up_weights ||
+        !active_rows || !normalized || !low_rank_output || !gate ||
+        !mixed || !sink) {
+        check(false, "Window head mixer test allocations", error);
+        return false;
+    }
+
+    std::vector<std::uint16_t> down_matrix(down_weight_count, 0u);
+    std::vector<std::uint16_t> up_matrix(up_weight_count, 0u);
+    for (std::size_t row = 0u; row < low_rank; ++row) {
+        down_matrix[row * hc_dim + row] =
+            strata::kernels::bf16_from_f32(1.0f);
+    }
+    for (std::size_t row = 0u; row < hc_dim; ++row) {
+        up_matrix[row * low_rank + row % low_rank] =
+            strata::kernels::bf16_from_f32(1.0f);
+    }
+    std::memcpy(down_weights.contents, down_matrix.data(), weight_bytes);
+    std::memcpy(up_weights.contents, up_matrix.data(), weight_bytes);
+
+    std::vector<float> gamma_values(hc_dim);
+    std::mt19937_64 rng(options.seed ^ 0x484541444d495845ull);
+    for (std::uint32_t stream = 0u; stream < HC; ++stream) {
+        for (std::uint32_t col = 0u; col < N_EMBD; ++col) {
+            gamma_values[static_cast<std::size_t>(stream) * N_EMBD + col] =
+                gamma_value(twin::InputSet::fixture, stream, col, rng);
+        }
+    }
+    std::memcpy(gamma.contents, gamma_values.data(),
+                gamma_values.size() * sizeof(float));
+
+    const WindowHeadMixerBuffers buffers{
+        residual,
+        context.buffers().read_only(gamma),
+        context.buffers().read_only(down_weights),
+        context.buffers().read_only(up_weights),
+        context.buffers().read_only(active_rows),
+        normalized,
+        low_rank_output,
+        gate,
+        mixed,
+        sink,
+    };
+
+    bool passed = true;
+    for (std::uint32_t rows = 1u; rows <= max_rows; ++rows) {
+        const std::size_t input_count =
+            static_cast<std::size_t>(rows) * hc_dim;
+        const std::size_t output_count =
+            static_cast<std::size_t>(rows) * N_EMBD;
+        std::vector<float> input(input_count);
+        for (std::uint32_t row = 0u; row < rows; ++row) {
+            for (std::uint32_t col = 0u; col < hc_dim; ++col) {
+                input[static_cast<std::size_t>(row) * hc_dim + col] =
+                    input_value(twin::InputSet::fixture, row, col, rng);
+            }
+        }
+        std::memcpy(residual.contents, input.data(),
+                    input.size() * sizeof(float));
+        std::memcpy(active_rows.contents, &rows, sizeof(rows));
+
+        std::vector<twin::tf> normalized_reference;
+        rms_norm_reference(input, gamma_values, rows * HC, N_EMBD, HC,
+                           kEpsilon, normalized_reference);
+        std::vector<float> normalized_values(input_count);
+        for (std::size_t index = 0u; index < input_count; ++index) {
+            normalized_values[index] = normalized_reference[index].value;
+        }
+
+        std::vector<twin::tf> low_rank_reference(
+            static_cast<std::size_t>(rows) * low_rank);
+        std::vector<float> gate_reference(input_count);
+        for (std::uint32_t row = 0u; row < rows; ++row) {
+            for (std::uint32_t col = 0u; col < low_rank; ++col) {
+                const twin::tf down{
+                    normalized_values[static_cast<std::size_t>(row) *
+                                         hc_dim +
+                                     col]};
+                const twin::tf scaled =
+                    twin::fma(twin::tf{0.25f}, down, twin::tf{});
+                low_rank_reference[static_cast<std::size_t>(row) *
+                                       low_rank +
+                                   col] =
+                    scaled /
+                    (twin::tf{1.0f} + twin::accurate_exp(-scaled));
+            }
+            for (std::uint32_t col = 0u; col < hc_dim; ++col) {
+                gate_reference[static_cast<std::size_t>(row) * hc_dim + col] =
+                    low_rank_reference[static_cast<std::size_t>(row) *
+                                           low_rank +
+                                       col % low_rank]
+                        .value;
+            }
+        }
+        std::vector<twin::tf> expected;
+        gr_pre_gated_reference(normalized_values, gate_reference, rows,
+                               expected);
+
+        const std::uint32_t poison = 0x7fc00000u;
+        std::memcpy(normalized.contents, &poison, sizeof(poison));
+        std::memcpy(low_rank_output.contents, &poison, sizeof(poison));
+        std::memcpy(gate.contents, &poison, sizeof(poison));
+        std::memcpy(mixed.contents, &poison, sizeof(poison));
+        std::memcpy(sink.contents, &poison, sizeof(poison));
+
+        const std::string label =
+            "Window head mixer T=" + std::to_string(rows);
+        auto command = context.make_command_buffer(label, error);
+        if (!command) {
+            check(false, label + " command buffer", error);
+            return false;
+        }
+        const bool encoded =
+            rows == max_rows
+                ? Encoder::encode(
+                      context, *command, "Window head mixer shared Encoder",
+                      [&](Encoder& encoder, std::string& encode_error) {
+                          return encode_window_head_mixer(
+                              context, encoder, rows, buffers, encode_error);
+                      },
+                      error)
+                : encode_window_head_mixer(
+                      context, *command, rows, buffers, error);
+        check(encoded, label + " ordered production encode", error);
+        if (!encoded) {
+            command->discard();
+            return false;
+        }
+        const bool dispatched = submit_and_wait(command, label, error);
+        check(dispatched, label + " Metal dispatch", error);
+        if (!dispatched) return false;
+
+        const auto actual = std::span<const float>(
+            static_cast<const float*>(mixed.contents), output_count);
+        const auto mismatch = twin::compare_floats(
+            actual, expected,
+            {twin::Comparison::units, 256.0, 0.0, 0u});
+        if (mismatch) twin::report_failure(label.c_str(), options, rows,
+                                          *mismatch);
+        check(!mismatch, label + " scalar head-mixer oracle U(256)");
+        passed &= !mismatch;
+        check(std::memcmp(residual.contents, input.data(),
+                          input.size() * sizeof(float)) == 0,
+              label + " keeps residual input unchanged");
+        check(std::memcmp(gamma.contents, gamma_values.data(),
+                          gamma_values.size() * sizeof(float)) == 0 &&
+                  std::memcmp(down_weights.contents, down_matrix.data(),
+                              weight_bytes) == 0 &&
+                  std::memcmp(up_weights.contents, up_matrix.data(),
+                              weight_bytes) == 0,
+              label + " keeps model inputs unchanged");
+    }
+
+    std::uint32_t invalid_active_rows = 7u;
+    std::memcpy(active_rows.contents, &invalid_active_rows,
+                sizeof(invalid_active_rows));
+    auto invalid_command = context.make_command_buffer(
+        "Window head mixer rejects mismatched active rows", error);
+    if (!invalid_command) {
+        check(false, "Window head mixer invalid-input command buffer", error);
+        return false;
+    }
+    const bool rejects_mismatched_rows =
+        !encode_window_head_mixer(context, *invalid_command, 8u, buffers,
+                                  error) &&
+        error.find("does not match") != std::string::npos;
+    check(rejects_mismatched_rows,
+          "Window head mixer rejects active-row count mismatch", error);
+    invalid_command->discard();
+    passed &= rejects_mismatched_rows;
+
+    WindowHeadMixerBuffers overlapping = buffers;
+    overlapping.gate = overlapping.normalized;
+    auto overlap_command = context.make_command_buffer(
+        "Window head mixer rejects scratch overlap", error);
+    if (!overlap_command) {
+        check(false, "Window head mixer overlap command buffer", error);
+        return false;
+    }
+    const bool rejects_overlapping_scratch =
+        !encode_window_head_mixer(context, *overlap_command, 8u, overlapping,
+                                  error) &&
+        error.find("writable scratch views must be disjoint") !=
+            std::string::npos;
+    check(rejects_overlapping_scratch,
+          "Window head mixer rejects writable scratch alias", error);
+    overlap_command->discard();
+    passed &= rejects_overlapping_scratch;
+
+    std::memcpy(active_rows.contents, &max_rows, sizeof(max_rows));
+    WindowHeadMixerBuffers late_failure = buffers;
+    late_failure.up_weights = context.buffers().read_only(
+        up_weights.slice(0u, weight_bytes - sizeof(std::uint16_t)));
+    auto late_failure_command = context.make_command_buffer(
+        "Window head mixer discards earlier stages on late failure", error);
+    if (!late_failure_command) {
+        check(false, "Window head mixer late-failure command buffer", error);
+        return false;
+    }
+    const bool rejects_late_failure =
+        !encode_window_head_mixer(context, *late_failure_command, max_rows,
+                                  late_failure, error) &&
+        error.find("undersized") != std::string::npos;
+    check(rejects_late_failure,
+          "Window head mixer rejects a short up-projection after prior stages",
+          error);
+    const bool discarded_late_failure =
+        late_failure_command->unsafe_native_handle() == nullptr;
+    check(discarded_late_failure,
+          "Window head mixer late failure discards the whole command buffer");
+    passed &= rejects_late_failure && discarded_late_failure;
+    return passed;
+}
+
 bool test_gr_cvec_encoder_validation(Context& context) {
     std::string error;
     const auto reject = [&](const std::string& label, std::uint32_t rows,
@@ -5007,6 +5264,7 @@ int main(int argc, char** argv) {
     passed &= test_gr_pre_gated_encoder_validation(*context, *foreign_context);
     passed &= test_weighted_rms_norm_encoder_validation(
         *context, *foreign_context);
+    passed &= test_window_head_mixer(*context, options);
     if (options.input_set_explicit) {
         passed &= run_set(*context, options.input_set, options);
     } else {

@@ -1,6 +1,6 @@
 # 04. Metal kernels
 
-Status: implementation-ready specification, 2026-10-03.
+Status: implementation-ready specification, updated 2026-10-09.
 Upstream baseline: [Niko1221/Strata](https://github.com/Niko1221/Strata) v0.1.34, commit `1678de33`.
 Sources:
 - [audit/A-model-and-kernels.md](audit/A-model-and-kernels.md), sections C-F: the kernel inventory, the decode and
@@ -1294,8 +1294,8 @@ passed as a `setBytes` constant:
 `encode_gr_down_silu` validates T=1..8, derives `n_values = T * HC_LOW_RANK`, checks the 256-thread manifest
 geometry and the full in-place float view range, alignment and Context ownership, then binds `n_values` at buffer 1
 and dispatches ⌈n_values/256⌉ groups. Its caller-owned `Encoder` overload applies the same validation and
-manifest-checked bindings. In either form, the caller's command buffer must belong to the same Context and remain
-unsubmitted. The down projection and head mixer do not call this encoder yet.
+manifest-checked bindings. The Window head-mixer composition below calls this stage after its down projection. In
+either form, the caller's command buffer must belong to the same Context and remain unsubmitted.
 
 **`strata_gr_pre_gated`**, grid (10, T) × 256. This is the unfused form (upstream `pre_gated<false>`), the only one
 the Mac needs: the head has no inject. `xn` is the output of `strata_rms_norm_w` and `gate` is the up mat-vec's
@@ -1320,8 +1320,8 @@ scaled with the documented fused operation.
 `encode_gr_pre_gated` validates T, the fixed `(10, T) × 256` dispatch, all three buffer ranges, float alignment and
 Context ownership. The read-only `xn` and `gate` views may overlap; the writable `mixed` view must be disjoint from
 both. Its caller-owned `Encoder` overload uses the same checks and manifest-validated dispatch. The command buffer
-must belong to the same Context and remain unsubmitted. Window and head-mixer production dispatch do not call this
-encoder yet.
+must belong to the same Context and remain unsubmitted. The Window head-mixer composition below calls this stage;
+production `Window::run` remains unimplemented.
 
 **`strata_gr_cvec`** (O-class), grid (4, T) × 256, threadgroup (c, t). Upstream: `cvec.cu`
 ([K1 section 7](audit/K1-gr-router-shared-rope-cvec.md)).
@@ -1366,6 +1366,15 @@ have folded, so "loaded, off" ≡ stock bitwise. The test `cvec_off_eq_stock` ch
 3. `strata_gr_down_silu`;
 4. `strata_mv_bf16_b160_n<NC>` (`output_hc_up`, 320 → 10240) → `gate`;
 5. `strata_gr_pre_gated` → `mixed[T][2560]`.
+
+`encode_window_head_mixer` composes these stages in this order for T=1..8. It derives the smallest supported `NC`
+from T, requires the active-row word to match T, and rejects overlapping scratch outputs or scratch that aliases
+model inputs; exact in-place aliasing of residual and normalized output is allowed. The `Encoder&` form must be
+called outside an open concurrent group so dependent dispatches receive barriers; the `CommandBuffer&` form
+discards the whole segment on failure. Callers provide the validated model-weight and scratch views and keep
+read-only inputs unchanged until completion. This composition is covered by a synthetic scalar-oracle test in
+serial and concurrent dispatch modes. It does not resolve FullMode tensors, bind the final vocabulary head, or
+wire the sequence into `Window::run`.
 
 The MTP drafter uses `strata_gr_norm`, `strata_gr_down` and `strata_gr_up` for its two reads, and the head mixer
 kernels for its final mixer (section 5.11).
