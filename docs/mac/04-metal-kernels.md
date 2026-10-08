@@ -2236,10 +2236,13 @@ in one ordered segment using a sparse 256-expert GGUF fixture. It checks the pro
 nonzero routed/shared output, consumer outputs against a direct GR-read reference, and exactly-once
 residual application. `metal_fullmode_ple_handoff_test` exercises that producer with the typed PLE
 entry in one ordered segment, then compares its PLE outputs and residual against a direct GR-post
-plus PLE-entry reference. It gathers its PLE input from sparse rows in the synthetic FullMode
-GGUF through the host staging path; its PLE projection weights remain synthetic. These
-branch-specific tests do not select a production scheduler branch or establish model-backed decode
-parity.
+plus PLE-entry reference. It builds row IDs from the test token and committed history, then stages
+the sixteen IQ4_NL rows from the synthetic FullMode GGUF's mapped PLE table through
+`stage_window_ple_input`; its PLE projection weights remain synthetic. These branch-specific tests
+do not select a production scheduler branch or establish model-backed decode parity.
+Both tests route through `encode_window_moe_pending_consumer`, which requires the selected
+`ple_enabled` tag to match a variant containing exactly one consumer payload. The mismatch case is
+rejected before dispatch; `Window::run` does not call this selector yet.
 
 ### 5.10 MoE: router, plan, experts, shared expert and combine
 

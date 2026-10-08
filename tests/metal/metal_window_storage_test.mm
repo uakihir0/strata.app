@@ -8,6 +8,7 @@
 #include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/window_dispatch.hpp"
 #include "strata/metal/window_ple_dispatch.hpp"
+#include "strata/metal/window_pending_dispatch.hpp"
 #include "strata/metal/ple_dispatch.hpp"
 #include "strata/metal/window_ple_stage.hpp"
 #include "strata/metal/window_scratch.hpp"
@@ -3288,6 +3289,52 @@ void run_fullmode_handoff_test(Context& context,
         attention_entry_mixed};
     const WindowMoeAttentionEntryBuffers attention_entry{
         full_buffers.ffn, ffn, next_attention};
+    WindowMoePendingConsumer pending_consumer = attention_entry;
+    if (use_ple_entry) {
+        pending_consumer = WindowMoePendingPLEConsumer{
+            ple_entry, MatVecWeightFormat::q2_0, 1u,
+            PLEHistoryUpdate::defer};
+    }
+
+    WindowMoePendingConsumer mismatched_consumer =
+        use_ple_entry
+            ? WindowMoePendingConsumer{attention_entry}
+            : WindowMoePendingConsumer{WindowMoePendingPLEConsumer{
+                  ple_entry, MatVecWeightFormat::q2_0, 1u,
+                  PLEHistoryUpdate::defer}};
+    auto mismatch_command = context.make_command_buffer(
+        "Reject mismatched Window pending consumer", error);
+    require(mismatch_command != nullptr,
+            "create mismatched Window branch command: " + error);
+    const bool mismatch_encoded = Encoder::encode(
+        context, *mismatch_command, "mismatched Window pending consumer",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_moe_pending_consumer(
+                context, encoder, kRows, use_ple_entry,
+                mismatched_consumer, encode_error);
+        },
+        error);
+    require(!mismatch_encoded &&
+                error.find("does not match the selected PLE branch") !=
+                    std::string::npos,
+            "Window pending consumer must reject a branch/tag mismatch before dispatch");
+
+    auto row_count_command = context.make_command_buffer(
+        "Reject multi-row Window pending consumer", error);
+    require(row_count_command != nullptr,
+            "create multi-row Window consumer command: " + error);
+    const bool row_count_encoded = Encoder::encode(
+        context, *row_count_command, "multi-row Window pending consumer",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_moe_pending_consumer(
+                context, encoder, 2u, use_ple_entry, pending_consumer,
+                encode_error);
+        },
+        error);
+    require(!row_count_encoded &&
+                error.find("requires exactly one row") != std::string::npos,
+            "T=1 pending consumer must reject rows that its FullMode producer did not write");
+
     auto command = context.make_command_buffer(
         "FullMode layer-0 MoE to no-PLE attention handoff", error);
     require(command != nullptr,
@@ -3305,13 +3352,9 @@ void run_fullmode_handoff_test(Context& context,
                     full_buffers, encode_error)) {
                 return false;
             }
-            if (use_ple_entry) {
-                return encode_window_moe_ple_entry(
-                    context, encoder, kRows, MatVecWeightFormat::q2_0, 1u,
-                    PLEHistoryUpdate::defer, ple_entry, encode_error);
-            }
-            return encode_window_moe_attention_entry(
-                context, encoder, kRows, attention_entry, encode_error);
+            return encode_window_moe_pending_consumer(
+                context, encoder, kRows, use_ple_entry,
+                pending_consumer, encode_error);
         },
         error);
     require(encoded,
