@@ -32,6 +32,7 @@
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/metal/context.hpp"
 #include "strata/metal/encoder.hpp"
+#include "strata/metal/gr_dispatch.hpp"
 #include "strata/metal/moe_dispatch.hpp"
 
 #include <algorithm>
@@ -3529,6 +3530,42 @@ bool test_moe_routed_shared_ffn_write(
     outputs_match &= residual_pending && injection_pending &&
                      pending_residual_guard && pending_injection_guard &&
                      pending_output_guard;
+
+    storage[residual].capture_before_dispatch();
+    storage[injection].capture_before_dispatch();
+    storage[combined_output].capture_before_dispatch();
+    const GRPostBuffers pending_write_buffers{
+        storage[residual].view(), storage[combined_output].view(),
+        storage[injection].view(), storage[residual].view()};
+    auto pending_write_command =
+        context.make_command_buffer(label + " consume pending GR write", error);
+    const bool pending_write_encoded =
+        pending_write_command &&
+        encode_gr_post(context, *pending_write_command, rows,
+                       pending_write_buffers, error);
+    const bool pending_write_dispatched =
+        pending_write_encoded && pending_write_command->commit(error) &&
+        pending_write_command->wait_until_completed(error);
+    check(pending_write_dispatched,
+          label + " consume pending combined output through GR post", error);
+    if (!pending_write_dispatched) return false;
+    const auto* pending_residual =
+        reinterpret_cast<const float*>(
+            storage[residual].payload().data());
+    const auto pending_write_failure = twin::compare_floats(
+        std::span<const float>(pending_residual,
+                               expected_post.size()),
+        expected_post, tolerance);
+    check(!pending_write_failure,
+          label + " pending combined output is applied once at GR post U(16)");
+    outputs_match &= !pending_write_failure;
+    const bool pending_write_guards =
+        !storage[residual].first_unwritten_change(residual_written) &&
+        !storage[injection].first_unwritten_change({}) &&
+        !storage[combined_output].first_unwritten_change({});
+    check(pending_write_guards,
+          label + " GR post writes only the residual and preserves pending inputs");
+    outputs_match &= pending_write_guards;
 
     std::vector<std::vector<std::uint8_t>> route_before;
     route_before.reserve(routed_storage.size());
