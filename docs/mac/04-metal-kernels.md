@@ -2192,8 +2192,9 @@ outputs must be disjoint from every input and one another. This supports the con
 weight view without changing the existing mutable mat-vec API. `encode_q8_0_matvec` provides the
 same read-only binding contract for Q8_1 activations, Q8_0 weights and live-row metadata, with
 F32 output and padded-column sink views. It supports the shared-expert projections without
-converting full-mode model views back to mutable `BufferRef`; the shared-expert chain and combine
-are still not composed into the production Window path. The T=1 Window router prefix orders
+converting full-mode model views back to mutable `BufferRef`. The validated
+`encode_moe_shared_ffn` coordinator now composes the shared-expert chain and
+combine, but production Window dispatch still does not call it. The T=1 Window router prefix orders
 the layer-0 attention/GDN/FFN read, 256/512-expert BF16 router, multiply-by-reciprocal top-10 route
 and Q8_1 quantization of `mixed` in one segment. It slices the live-row count from `WindowParams.nc`
 and reuses GDN's `xq` only after the GDN reads finish. `encode_window_t1_moe_plan_prefix` extends
@@ -2460,6 +2461,22 @@ Context ownership, extents, alignment and output/input overlap, and requires an
 ordered dispatch boundary. The typed encoder and scalar oracle cover the
 standalone combine and the composed shared-expert chain; production Window
 scheduling remains unfinished.
+
+`encode_moe_shared_ffn` composes the shared path in one ordered Encoder segment:
+read-only Q8_0 gate/up projections, shared SwiGLU, Q8_1 quantization, the
+read-only Q8_0 down projection, the read-only BF16 gate projection, then routed
+and shared combine. It accepts the Q8_1 mixed activation and F32 `mixed`
+views, the shared weight views, and already available routed parts and weights.
+It derives the smallest supported compiled column width for T=1..8. Before
+encoding, it validates Context ownership, extents, alignment, the live-row
+metadata, and pairwise separation of every writable scratch, output and
+padded-column sink from all inputs and each other. Read-only inputs may alias.
+The standalone form discards the whole unsubmitted command buffer on failure;
+the caller-owned form must propagate false from its enclosing encode body.
+Tiered callers must wait for successful plan resolution and routed expert
+production before combining. This coordinator does not build the route or
+expert plan, resolve misses, write the FFN residual, or wire the production
+Window scheduler, so it does not establish end-to-end inference.
 
 `encode_moe_routed_ffn` composes the routed path for T=1..8 in this order:
 grouped gate/up, routed SwiGLU, Q8_1 quantization of the 640-wide hidden rows,

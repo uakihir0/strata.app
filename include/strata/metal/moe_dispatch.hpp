@@ -98,6 +98,41 @@ struct MoeCombineBuffers {
     BufferRef output;
 };
 
+struct MoeSharedFFNBuffers {
+    /// Q8_1 rows of the mixed FFN input, `[rows, 80]`.
+    ReadOnlyBufferRef input_activations;
+    /// F32 mixed FFN input for the BF16 shared gate, `[rows, 2560]`.
+    ReadOnlyBufferRef mixed;
+    /// Shared gate/up Q8_0 weights, each `[640, 80]` blocks.
+    ReadOnlyBufferRef gate_weights;
+    ReadOnlyBufferRef up_weights;
+    /// Shared down Q8_0 weights, `[2560, 20]` blocks.
+    ReadOnlyBufferRef down_weights;
+    /// Shared gate-input BF16 weights, `[1, 2560]`.
+    ReadOnlyBufferRef shared_gate_weights;
+    /// Host-visible uint32 row count equal to `rows`.
+    ReadOnlyBufferRef active_rows;
+    /// Routed down results `[rows, 10, 2560]` and weights `[rows, 10]`.
+    ReadOnlyBufferRef routed_parts;
+    ReadOnlyBufferRef route_weights;
+
+    /// F32 gate, up, hidden and shared down outputs; gate logits are F32.
+    BufferRef gate;
+    BufferRef up;
+    BufferRef hidden;
+    BufferRef down_activations;
+    BufferRef shared_output;
+    BufferRef shared_gate_logits;
+    BufferRef output;
+
+    /// Mat-vec padded-column outputs. Each requires at least one float when
+    /// `rows` equals the compiled column width.
+    BufferRef gate_sink;
+    BufferRef up_sink;
+    BufferRef down_sink;
+    BufferRef shared_gate_sink;
+};
+
 /// Encode the stable top-10 route selection for 256 or 512 experts.
 /// `divide_weights` selects the prompt-path division mode; Window decode must
 /// pass false to match the model's multiply-by-reciprocal path. The views must
@@ -225,5 +260,28 @@ bool encode_moe_combine(Context& context, CommandBuffer& command_buffer,
                         std::uint32_t rows,
                         const MoeCombineBuffers& buffers,
                         std::string& error);
+
+/// Encode the shared-expert gate/up, SwiGLU, Q8_1, down projection and BF16
+/// gate, then combine that output with already available routed parts and
+/// route weights. The Q8_1 input must contain `rows` rows; the F32 `mixed`
+/// view is consumed by the shared gate projection. Rows must be in 1..8 and
+/// the compiled mat-vec width is the smallest supported width covering rows.
+///
+/// Read-only inputs may overlap. Every scratch/output/sink view must be
+/// disjoint from every input and every other writable view. All views must
+/// remain alive until command completion, and read-only inputs (including
+/// `active_rows`) must remain unchanged. Call this only after routed inputs
+/// are ready; in tiered mode, wait for successful expert resolution first.
+/// The caller-owned form must propagate false from its Encoder body so earlier
+/// dispatches in the segment are discarded.
+bool encode_moe_shared_ffn(Context& context, Encoder& encoder,
+                           std::uint32_t rows,
+                           const MoeSharedFFNBuffers& buffers,
+                           std::string& error);
+/// Standalone transactional form. A failure discards every stage.
+bool encode_moe_shared_ffn(Context& context, CommandBuffer& command_buffer,
+                           std::uint32_t rows,
+                           const MoeSharedFFNBuffers& buffers,
+                           std::string& error);
 
 }  // namespace strata::metal

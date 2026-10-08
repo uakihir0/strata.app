@@ -2928,6 +2928,530 @@ bool dispatch_shared_combine(
     return !failure;
 }
 
+bool test_composed_shared_ffn(
+    Context& context, std::uint32_t rows, std::uint32_t nc,
+    twin::InputSet set, const twin::Options& options,
+    std::span<const float> mixed,
+    std::span<const Q81> mixed_q8_1,
+    std::span<const block_q8_0> gate_weights,
+    std::span<const block_q8_0> up_weights,
+    std::span<const block_q8_0> down_weights,
+    std::span<const std::uint16_t> gate_input_weights,
+    std::span<const float> routed_parts,
+    std::span<const float> route_weights,
+    const twin::MoeSharedExpertOutput& expected_shared) {
+    enum BufferIndex : std::size_t {
+        input_q8_1,
+        mixed_f32,
+        gate_weight_data,
+        up_weight_data,
+        down_weight_data,
+        shared_gate_weight_data,
+        active_row_data,
+        routed_part_data,
+        route_weight_data,
+        gate_output,
+        up_output,
+        hidden_output,
+        down_q8_1_output,
+        shared_output,
+        shared_gate_logits,
+        combined_output,
+        gate_sink,
+        up_sink,
+        down_sink,
+        shared_gate_sink,
+        buffer_count,
+    };
+    const std::string label =
+        "Composed shared MoE FFN rows=" + std::to_string(rows) +
+        " nc=" + std::to_string(nc) +
+        " set=" + twin::input_set_name(set);
+    const std::size_t active_input_q8_bytes =
+        static_cast<std::size_t>(rows) *
+        kMoeInputWidth / 32u * sizeof(Q81);
+    const std::size_t mixed_bytes =
+        static_cast<std::size_t>(rows) * kMoeInputWidth * sizeof(float);
+    const std::size_t gate_weights_bytes = gate_weights.size_bytes();
+    const std::size_t up_weights_bytes = up_weights.size_bytes();
+    const std::size_t down_weights_bytes = down_weights.size_bytes();
+    const std::size_t shared_gate_weights_bytes =
+        gate_input_weights.size_bytes();
+    const std::size_t routed_parts_bytes = routed_parts.size_bytes();
+    const std::size_t route_weights_bytes = route_weights.size_bytes();
+    const std::size_t gate_bytes =
+        static_cast<std::size_t>(rows) * kMoeExpertWidth * sizeof(float);
+    const std::size_t up_bytes = gate_bytes;
+    const std::size_t hidden_bytes = gate_bytes;
+    const std::size_t down_q8_1_bytes =
+        static_cast<std::size_t>(rows) * 20u * sizeof(Q81);
+    const std::size_t shared_bytes =
+        static_cast<std::size_t>(rows) * kMoeDownWidth * sizeof(float);
+    const std::size_t gate_logits_bytes =
+        static_cast<std::size_t>(rows) * sizeof(float);
+    const std::size_t combined_bytes = shared_bytes;
+    const std::size_t gate_sink_write_bytes =
+        static_cast<std::size_t>(nc - rows) * kMoeExpertWidth *
+        sizeof(float);
+    const std::size_t down_sink_write_bytes =
+        static_cast<std::size_t>(nc - rows) * kMoeDownWidth *
+        sizeof(float);
+    const std::size_t shared_gate_sink_write_bytes =
+        static_cast<std::size_t>(nc - rows) * sizeof(float);
+    constexpr std::size_t kSinkExtraBytes = 64u;
+    const std::array<std::size_t, buffer_count> sizes{
+        active_input_q8_bytes,
+        mixed_bytes,
+        gate_weights_bytes,
+        up_weights_bytes,
+        down_weights_bytes,
+        shared_gate_weights_bytes,
+        sizeof(rows),
+        routed_parts_bytes,
+        route_weights_bytes,
+        gate_bytes,
+        up_bytes,
+        hidden_bytes,
+        down_q8_1_bytes,
+        shared_bytes,
+        gate_logits_bytes,
+        combined_bytes,
+        std::max(sizeof(float), gate_sink_write_bytes) + kSinkExtraBytes,
+        std::max(sizeof(float), gate_sink_write_bytes) + kSinkExtraBytes,
+        std::max(sizeof(float), down_sink_write_bytes) + kSinkExtraBytes,
+        std::max(sizeof(float), shared_gate_sink_write_bytes) +
+            kSinkExtraBytes,
+    };
+    const std::array<const char*, buffer_count> names{
+        "Q8_1 input", "mixed input", "gate weights", "up weights",
+        "down weights", "shared gate weights", "active rows",
+        "routed parts", "route weights", "gate output", "up output",
+        "hidden output", "down Q8_1 output", "shared output",
+        "shared gate logits", "combined output", "gate sink", "up sink",
+        "down sink", "shared gate sink",
+    };
+    std::array<twin::GuardedBuffer, buffer_count> storage;
+    std::string error;
+    for (std::size_t i = 0u; i < storage.size(); ++i) {
+        if (!storage[i].allocate(context, label + " " + names[i], sizes[i],
+                                 error)) {
+            check(false, label + " buffer allocation", error);
+            return false;
+        }
+    }
+    const auto copy_bytes = [&](BufferIndex index, const void* source,
+                                std::size_t bytes) {
+        if (source == nullptr || bytes > storage[index].payload().size()) {
+            return false;
+        }
+        std::memcpy(storage[index].payload().data(), source, bytes);
+        return true;
+    };
+    const std::uint32_t live_rows = rows;
+    const bool inputs_copied =
+        copy_bytes(input_q8_1, mixed_q8_1.data(), active_input_q8_bytes) &&
+        copy_bytes(mixed_f32, mixed.data(), mixed_bytes) &&
+        copy_bytes(gate_weight_data, gate_weights.data(), gate_weights_bytes) &&
+        copy_bytes(up_weight_data, up_weights.data(), up_weights_bytes) &&
+        copy_bytes(down_weight_data, down_weights.data(), down_weights_bytes) &&
+        copy_bytes(shared_gate_weight_data, gate_input_weights.data(),
+                   shared_gate_weights_bytes) &&
+        copy_bytes(active_row_data, &live_rows, sizeof(live_rows)) &&
+        copy_bytes(routed_part_data, routed_parts.data(), routed_parts_bytes) &&
+        copy_bytes(route_weight_data, route_weights.data(),
+                   route_weights_bytes);
+    check(inputs_copied, label + " input initialization");
+    if (!inputs_copied) return false;
+
+    const auto to_tf = [](std::span<const float> values) {
+        std::vector<twin::tf> result(values.size());
+        std::transform(values.begin(), values.end(), result.begin(),
+                       [](float value) { return twin::tf{value}; });
+        return result;
+    };
+    std::vector<twin::tf> expected_combined;
+    const bool combine_oracle_ready = twin::moe_combine_reference(
+        routed_parts, route_weights, expected_shared.shared,
+        expected_shared.gate_logits, rows, expected_combined, error);
+    check(combine_oracle_ready, label + " scalar combine oracle", error);
+    if (!combine_oracle_ready) return false;
+    const auto expected_gate = to_tf(expected_shared.gate);
+    const auto expected_up = to_tf(expected_shared.up);
+    const auto expected_hidden = to_tf(expected_shared.hidden);
+    const auto expected_shared_output = to_tf(expected_shared.shared);
+    const auto expected_gate_logits = to_tf(expected_shared.gate_logits);
+    check(storage[gate_output].poison_floats_against(
+              expected_gate, twin::Comparison::units, error),
+          label + " gate poison", error);
+    check(storage[up_output].poison_floats_against(
+              expected_up, twin::Comparison::units, error),
+          label + " up poison", error);
+    check(storage[hidden_output].poison_floats_against(
+              expected_hidden, twin::Comparison::units, error),
+          label + " hidden poison", error);
+    const auto expected_hidden_q8 =
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(
+                expected_shared.hidden_q8_1.data()),
+            down_q8_1_bytes);
+    check(storage[down_q8_1_output].poison_bytes_against(
+              expected_hidden_q8, error),
+          label + " down Q8_1 poison", error);
+    check(storage[shared_output].poison_floats_against(
+              expected_shared_output, twin::Comparison::units, error),
+          label + " shared output poison", error);
+    check(storage[shared_gate_logits].poison_floats_against(
+              expected_gate_logits, twin::Comparison::units, error),
+          label + " gate-logit poison", error);
+    check(storage[combined_output].poison_floats_against(
+              expected_combined, twin::Comparison::units, error),
+          label + " combined-output poison", error);
+    for (const BufferIndex sink :
+         {gate_sink, up_sink, down_sink, shared_gate_sink}) {
+        std::fill(storage[sink].payload().begin(),
+                  storage[sink].payload().end(), 0xa5u);
+    }
+    for (auto& buffer : storage) buffer.capture_before_dispatch();
+
+    const MoeSharedFFNBuffers buffers{
+        context.buffers().read_only(storage[input_q8_1].view()),
+        context.buffers().read_only(storage[mixed_f32].view()),
+        context.buffers().read_only(storage[gate_weight_data].view()),
+        context.buffers().read_only(storage[up_weight_data].view()),
+        context.buffers().read_only(storage[down_weight_data].view()),
+        context.buffers().read_only(storage[shared_gate_weight_data].view()),
+        context.buffers().read_only(storage[active_row_data].view()),
+        context.buffers().read_only(storage[routed_part_data].view()),
+        context.buffers().read_only(storage[route_weight_data].view()),
+        storage[gate_output].view(),
+        storage[up_output].view(),
+        storage[hidden_output].view(),
+        storage[down_q8_1_output].view(),
+        storage[shared_output].view(),
+        storage[shared_gate_logits].view(),
+        storage[combined_output].view(),
+        storage[gate_sink].view(),
+        storage[up_sink].view(),
+        storage[down_sink].view(),
+        storage[shared_gate_sink].view(),
+    };
+
+    bool validation_ok = true;
+    if (rows == 1u && set == twin::InputSet::fixture) {
+        std::array<std::vector<std::uint8_t>, buffer_count> before{};
+        for (std::size_t i = 0u; i < storage.size(); ++i) {
+            before[i].assign(storage[i].payload().begin(),
+                             storage[i].payload().end());
+        }
+        const auto reject = [&](const std::string& case_label,
+                                std::uint32_t case_rows,
+                                const MoeSharedFFNBuffers& case_buffers,
+                                std::string_view expected_error) {
+            auto command = context.make_command_buffer(case_label, error);
+            const bool rejected = command && !encode_moe_shared_ffn(
+                context, *command, case_rows, case_buffers, error);
+            const bool discarded =
+                command && command->unsafe_native_handle() == nullptr;
+            bool unchanged = true;
+            for (std::size_t i = 0u; i < storage.size(); ++i) {
+                unchanged &=
+                    std::equal(before[i].begin(), before[i].end(),
+                               storage[i].payload().begin(),
+                               storage[i].payload().end());
+            }
+            const bool error_matches =
+                error.find(expected_error) != std::string::npos;
+            check(rejected && discarded && unchanged && error_matches,
+                  case_label + " rejects before dispatch", error);
+            validation_ok &= rejected && discarded && unchanged &&
+                             error_matches;
+        };
+        reject(label + " zero rows", 0u, buffers, "1..8 rows");
+        MoeSharedFFNBuffers aliased = buffers;
+        aliased.gate = storage[routed_part_data].view();
+        reject(label + " cross-stage input alias", rows, aliased,
+               "overlap inputs");
+        const std::uint32_t invalid_live_rows = rows + 1u;
+        std::memcpy(storage[active_row_data].payload().data(),
+                    &invalid_live_rows, sizeof(invalid_live_rows));
+        before[active_row_data].assign(
+            storage[active_row_data].payload().begin(),
+            storage[active_row_data].payload().end());
+        reject(label + " active-row mismatch", rows, buffers,
+               "active-row count");
+        std::memcpy(storage[active_row_data].payload().data(), &live_rows,
+                    sizeof(live_rows));
+
+        std::array<std::vector<std::uint8_t>, buffer_count> rollback_before{};
+        for (std::size_t i = 0u; i < storage.size(); ++i) {
+            rollback_before[i].assign(storage[i].payload().begin(),
+                                      storage[i].payload().end());
+        }
+        auto rollback_command =
+            context.make_command_buffer(label + " caller-owned rollback",
+                                        error);
+        const bool rollback_command_ready = rollback_command != nullptr;
+        check(rollback_command_ready,
+              label + " caller-owned rollback command buffer", error);
+        if (rollback_command_ready) {
+            const bool rejected = !Encoder::encode(
+                context, *rollback_command, label + " caller-owned rollback",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    if (!encode_moe_shared_ffn(context, encoder, rows, buffers,
+                                               encode_error)) {
+                        return false;
+                    }
+                    return encode_moe_shared_ffn(context, encoder, 0u, buffers,
+                                                 encode_error);
+                },
+                error);
+            const bool discarded =
+                rollback_command->unsafe_native_handle() == nullptr;
+            bool unchanged = true;
+            for (std::size_t i = 0u; i < storage.size(); ++i) {
+                unchanged &=
+                    std::equal(rollback_before[i].begin(),
+                               rollback_before[i].end(),
+                               storage[i].payload().begin(),
+                               storage[i].payload().end());
+            }
+            check(rejected && discarded && unchanged &&
+                      error.find("1..8 rows") != std::string::npos,
+                  label + " caller-owned late failure rolls back all stages",
+                  error);
+            validation_ok &= rejected && discarded && unchanged &&
+                             error.find("1..8 rows") != std::string::npos;
+        } else {
+            validation_ok = false;
+        }
+
+        const char* const dispatch_mode =
+            std::getenv("STRATA_METAL_DISPATCH");
+        if (dispatch_mode != nullptr &&
+            std::string_view(dispatch_mode) == "concurrent") {
+            auto group_command = context.make_command_buffer(
+                label + " open concurrent group", error);
+            check(group_command != nullptr,
+                  label + " open-group command buffer", error);
+            if (group_command) {
+                std::string boundary_error;
+                const bool rejected = !Encoder::encode(
+                    context, *group_command,
+                    label + " open concurrent group",
+                    [&](Encoder& encoder, std::string& encode_error) {
+                        if (!encoder.group_begin(encode_error)) return false;
+                        const bool compose_rejected =
+                            !encode_moe_shared_ffn(
+                                context, encoder, rows, buffers,
+                                boundary_error) &&
+                            boundary_error.find(
+                                "ordered dispatch boundaries") !=
+                                std::string::npos;
+                        if (!encoder.group_end(encode_error)) return false;
+                        if (!compose_rejected) {
+                            encode_error =
+                                "shared MoE FFN accepted an open group";
+                            return false;
+                        }
+                        encode_error = boundary_error;
+                        return false;
+                    },
+                    error);
+                const bool discarded =
+                    group_command->unsafe_native_handle() == nullptr;
+                check(rejected && discarded &&
+                          error.find("ordered dispatch boundaries") !=
+                              std::string::npos,
+                      label + " rejects an open concurrent group", error);
+                validation_ok &= rejected && discarded &&
+                                 error.find("ordered dispatch boundaries") !=
+                                     std::string::npos;
+            } else {
+                validation_ok = false;
+            }
+        }
+    }
+
+    auto command = context.make_command_buffer(label, error);
+    const bool caller_owned =
+        rows == 1u && set == twin::InputSet::fixture;
+    const bool encoded = command && (caller_owned
+        ? Encoder::encode(
+              context, *command, label,
+              [&](Encoder& encoder, std::string& encode_error) {
+                  return encode_moe_shared_ffn(
+                      context, encoder, rows, buffers, encode_error);
+              },
+              error)
+        : encode_moe_shared_ffn(context, *command, rows, buffers, error));
+    const bool dispatched =
+        encoded && command->commit(error) &&
+        command->wait_until_completed(error);
+    check(dispatched,
+          label + (caller_owned ? " caller-owned encoder"
+                                : " standalone transactional encoder"),
+          error);
+    if (!dispatched) return false;
+
+    std::vector<float> oracle_gate_full;
+    std::vector<float> oracle_up_full;
+    std::vector<float> oracle_down_full;
+    std::vector<float> oracle_gate_logits_full;
+    bool oracle_ready = twin::q8_0_matvec_reference(
+        gate_weights, expected_shared.mixed_q8_1, kMoeInputWidth,
+        kMoeExpertWidth, nc, rows, oracle_gate_full, error);
+    oracle_ready &= twin::q8_0_matvec_reference(
+        up_weights, expected_shared.mixed_q8_1, kMoeInputWidth,
+        kMoeExpertWidth, nc, rows, oracle_up_full, error);
+    oracle_ready &= twin::q8_0_matvec_reference(
+        down_weights, expected_shared.hidden_q8_1, kMoeDownInputWidth,
+        kMoeDownWidth, nc, rows, oracle_down_full, error);
+    oracle_ready &= twin::bf16_matvec_reference(
+        gate_input_weights, mixed, kMoeInputWidth, 1u, nc, rows, 256u,
+        oracle_gate_logits_full, error);
+    check(oracle_ready, label + " padded sink oracles", error);
+    if (!oracle_ready) return false;
+
+    const auto compare_output = [&](BufferIndex index,
+                                    std::span<const twin::tf> expected,
+                                    std::string_view output_label) {
+        const auto* actual_data = reinterpret_cast<const float*>(
+            storage[index].payload().data());
+        const auto failure = twin::compare_floats(
+            std::span<const float>(actual_data, expected.size()), expected,
+            {twin::Comparison::units, 16.0, 0.0, 0u});
+        if (failure) {
+            twin::report_failure(label.c_str(), options, rows, *failure);
+        }
+        check(!failure, label + " " + std::string(output_label) + " U(16)");
+        return !failure;
+    };
+    bool outputs_match = true;
+    outputs_match &= compare_output(gate_output, expected_gate, "gate");
+    outputs_match &= compare_output(up_output, expected_up, "up");
+    outputs_match &=
+        compare_output(hidden_output, expected_hidden, "hidden");
+    const auto down_q8_failure = twin::compare_bytes(
+        std::span<const std::uint8_t>(
+            storage[down_q8_1_output].payload().data(),
+            down_q8_1_bytes),
+        expected_hidden_q8);
+    check(!down_q8_failure, label + " down Q8_1 bytes match exactly");
+    outputs_match &= !down_q8_failure;
+    outputs_match &= compare_output(shared_output, expected_shared_output,
+                                    "shared output");
+    outputs_match &= compare_output(shared_gate_logits,
+                                    expected_gate_logits, "gate logits");
+
+    const auto compare_sink = [&](BufferIndex index,
+                                  std::size_t expected_write_bytes,
+                                  std::size_t active_count,
+                                  std::span<const float> full_expected,
+                                  std::string_view sink_label) {
+        if (expected_write_bytes == 0u) return true;
+        const std::size_t padded_count =
+            expected_write_bytes / sizeof(float);
+        std::vector<twin::tf> expected(
+            full_expected.size() - active_count);
+        std::transform(full_expected.begin() + active_count,
+                       full_expected.end(), expected.begin(),
+                       [](float value) { return twin::tf{value}; });
+        const auto* actual_data = reinterpret_cast<const float*>(
+            storage[index].payload().data());
+        const auto failure = twin::compare_floats(
+            std::span<const float>(actual_data, padded_count), expected,
+            {twin::Comparison::units, 16.0, 0.0, 0u});
+        check(!failure, label + " " + std::string(sink_label) +
+                           " padded values U(16)");
+        return !failure;
+    };
+    outputs_match &= compare_sink(
+        gate_sink, gate_sink_write_bytes,
+        static_cast<std::size_t>(rows) * kMoeExpertWidth,
+        oracle_gate_full, "gate sink");
+    outputs_match &= compare_sink(
+        up_sink, gate_sink_write_bytes,
+        static_cast<std::size_t>(rows) * kMoeExpertWidth,
+        oracle_up_full, "up sink");
+    outputs_match &= compare_sink(
+        down_sink, down_sink_write_bytes,
+        static_cast<std::size_t>(rows) * kMoeDownWidth,
+        oracle_down_full, "down sink");
+    outputs_match &= compare_sink(
+        shared_gate_sink, shared_gate_sink_write_bytes, rows,
+        oracle_gate_logits_full, "shared-gate sink");
+
+    const std::size_t output_float_count = shared_bytes / sizeof(float);
+    const auto* actual_shared_data =
+        reinterpret_cast<const float*>(
+            storage[shared_output].payload().data());
+    const auto* actual_gate_data =
+        reinterpret_cast<const float*>(
+            storage[shared_gate_logits].payload().data());
+    std::vector<twin::tf> recombined_expected;
+    const bool recombine_ready = twin::moe_combine_reference(
+        routed_parts, route_weights,
+        std::span<const float>(actual_shared_data, output_float_count),
+        std::span<const float>(actual_gate_data, rows), rows,
+        recombined_expected, error);
+    check(recombine_ready, label + " combine oracle from GPU shared values",
+          error);
+    if (!recombine_ready) return false;
+    outputs_match &= compare_output(combined_output, recombined_expected,
+                                    "combined output");
+
+    const std::array<twin::ByteRange, 1> gate_written{{{0u, gate_bytes}}};
+    const std::array<twin::ByteRange, 1> up_written{{{0u, up_bytes}}};
+    const std::array<twin::ByteRange, 1> hidden_written{{{0u, hidden_bytes}}};
+    const std::array<twin::ByteRange, 1> down_q8_written{
+        {{0u, down_q8_1_bytes}}};
+    const std::array<twin::ByteRange, 1> shared_written{
+        {{0u, shared_bytes}}};
+    const std::array<twin::ByteRange, 1> gate_logits_written{
+        {{0u, gate_logits_bytes}}};
+    const std::array<twin::ByteRange, 1> combined_written{
+        {{0u, combined_bytes}}};
+    const auto sink_unchanged = [&](BufferIndex index,
+                                    std::size_t written_bytes,
+                                    std::string_view sink_label) {
+        const std::array<twin::ByteRange, 1> written{{{0u, written_bytes}}};
+        check(!storage[index].first_unwritten_change(written),
+              label + " " + std::string(sink_label) +
+                  " exact write range and guards");
+        return !storage[index].first_unwritten_change(written);
+    };
+    bool guards_ok = true;
+    for (const BufferIndex input :
+         {input_q8_1, mixed_f32, gate_weight_data, up_weight_data,
+          down_weight_data, shared_gate_weight_data, active_row_data,
+          routed_part_data, route_weight_data}) {
+        check(!storage[input].first_unwritten_change({}),
+              label + " " + names[input] + " read-only bytes and guards");
+        guards_ok &= !storage[input].first_unwritten_change({});
+    }
+    guards_ok &= !storage[gate_output].first_unwritten_change(gate_written);
+    guards_ok &= !storage[up_output].first_unwritten_change(up_written);
+    guards_ok &=
+        !storage[hidden_output].first_unwritten_change(hidden_written);
+    guards_ok &=
+        !storage[down_q8_1_output].first_unwritten_change(down_q8_written);
+    guards_ok &=
+        !storage[shared_output].first_unwritten_change(shared_written);
+    guards_ok &=
+        !storage[shared_gate_logits].first_unwritten_change(gate_logits_written);
+    guards_ok &=
+        !storage[combined_output].first_unwritten_change(combined_written);
+    guards_ok &= sink_unchanged(gate_sink, gate_sink_write_bytes, "gate sink");
+    guards_ok &= sink_unchanged(up_sink, gate_sink_write_bytes, "up sink");
+    guards_ok &= sink_unchanged(down_sink, down_sink_write_bytes, "down sink");
+    guards_ok &= sink_unchanged(shared_gate_sink,
+                                shared_gate_sink_write_bytes,
+                                "shared-gate sink");
+    check(guards_ok, label + " inputs, output ranges and guards");
+    if (!validation_ok) return false;
+    return outputs_match && guards_ok;
+}
+
 bool test_shared_expert_chain_case(
     Context& context, std::uint32_t rows, twin::InputSet set,
     const twin::Options& options, std::span<const block_q8_0> gate_weights,
@@ -3082,6 +3606,10 @@ bool test_shared_expert_chain_case(
     completed &= dispatch_shared_combine(
         context, rows, set, options, routed_parts, route_weights, shared,
         gate_logits, combined);
+    completed &= test_composed_shared_ffn(
+        context, rows, nc, set, options, mixed, mixed_q8_1, gate_weights,
+        up_weights, down_weights, gate_input_weights, routed_parts,
+        route_weights, composite);
     return completed;
 }
 
