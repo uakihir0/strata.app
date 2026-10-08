@@ -14,6 +14,7 @@
 #include "strata/metal/tiered.hpp"
 #include "strata/metal/window_dispatch.hpp"
 #include "strata/metal/window_gdn_dispatch.hpp"
+#include "../../src/metal/engine/window_dispatch_internal.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "twin.hpp"
@@ -3520,6 +3521,127 @@ bool test_window_t1_attention_gdn(Context& context) {
         exercise_plan_prefix(512u, true, true);
     const bool coder_full_plan =
         exercise_plan_prefix(256u, false, false);
+
+    twin::GuardedBuffer consumer_address_storage;
+    const bool consumer_address_allocated = consumer_address_storage.allocate(
+        context, label + " full-mode consumer addresses",
+        kRouterExperts * 3u * sizeof(std::uint64_t), error);
+    check(consumer_address_allocated,
+          label + " full-mode consumer address allocation", error);
+    if (!consumer_address_allocated) return false;
+    WindowT1MoeLayer0FullBuffers consumer_handoff_buffers{};
+    consumer_handoff_buffers.producer = plan_prefix_buffers;
+    const ReadOnlyBufferRef producer_q8_1 =
+        context.buffers().read_only(layer0_buffers.gdn.xq);
+    const ReadOnlyBufferRef producer_plan =
+        context.buffers().read_only(moe_plan_storage.view());
+    const ReadOnlyBufferRef producer_route_weights =
+        context.buffers().read_only(route_weights_storage.view());
+    const ReadOnlyBufferRef producer_params =
+        context.buffers().read_only(layer0_buffers.params);
+    consumer_handoff_buffers.ffn_write.routed.addresses =
+        context.buffers().read_only(consumer_address_storage.view());
+    consumer_handoff_buffers.ffn_write.routed.input_activations =
+        producer_q8_1;
+    consumer_handoff_buffers.ffn_write.routed.plans = producer_plan;
+    consumer_handoff_buffers.ffn_write.shared.ffn.input_activations =
+        producer_q8_1;
+    consumer_handoff_buffers.ffn_write.shared.ffn.mixed =
+        context.buffers().read_only(layer0_buffers.ffn.mixed);
+    consumer_handoff_buffers.ffn_write.shared.ffn.active_rows =
+        producer_params.slice(offsetof(strata::metal::WindowParams, nc),
+                              sizeof(std::uint32_t));
+    consumer_handoff_buffers.ffn_write.shared.ffn.route_weights =
+        producer_route_weights;
+    consumer_handoff_buffers.ffn_write.shared.residual =
+        layer0_buffers.ffn.residual;
+    consumer_handoff_buffers.ffn_write.shared.inject =
+        layer0_buffers.ffn.inject_out;
+    const bool consumer_handoffs_valid =
+        detail::validate_window_t1_moe_consumer_handoffs(
+            context, vocabulary_size, kRouterExperts,
+            consumer_handoff_buffers, error);
+    check(consumer_handoffs_valid,
+          label + " full-mode MoE consumer uses exact producer handoffs",
+          error);
+
+    WindowT1MoeLayer0FullBuffers aliased_consumer_buffers =
+        consumer_handoff_buffers;
+    aliased_consumer_buffers.ffn_write.routed.addresses =
+        context.buffers().read_only(layer0_buffers.ffn.normalized);
+    const bool producer_write_alias_rejected =
+        !detail::validate_window_t1_moe_consumer_handoffs(
+            context, vocabulary_size, kRouterExperts,
+            aliased_consumer_buffers, error) &&
+        error.find("overlap producer storage") != std::string::npos;
+    check(producer_write_alias_rejected,
+          label + " consumer address table cannot alias producer normalized output",
+          error);
+
+    WindowT1MoeLayer0FullBuffers wrong_role_handoff_buffers =
+        consumer_handoff_buffers;
+    wrong_role_handoff_buffers.ffn_write.shared.ffn.shared_gate_weights =
+        context.buffers().read_only(layer0_buffers.ffn.mixed);
+    const bool wrong_role_handoff_rejected =
+        !detail::validate_window_t1_moe_consumer_handoffs(
+            context, vocabulary_size, kRouterExperts,
+            wrong_role_handoff_buffers, error) &&
+        error.find("overlap producer storage") != std::string::npos;
+    check(wrong_role_handoff_rejected,
+          label + " mixed handoff cannot be reused as shared-gate weights",
+          error);
+
+    WindowT1MoeLayer0FullBuffers router_tensor_alias_buffers =
+        consumer_handoff_buffers;
+    router_tensor_alias_buffers.ffn_write.shared.ffn.shared_gate_weights =
+        plan_prefix_buffers.router.router_tensor;
+    const bool router_tensor_alias_rejected =
+        !detail::validate_window_t1_moe_consumer_handoffs(
+            context, vocabulary_size, kRouterExperts,
+            router_tensor_alias_buffers, error) &&
+        error.find("overlap producer storage") != std::string::npos;
+    check(router_tensor_alias_rejected,
+          label + " router tensor cannot be reused as shared-gate weights",
+          error);
+
+    WindowT1MoeLayer0FullBuffers resident_alias_buffers =
+        consumer_handoff_buffers;
+    resident_alias_buffers.ffn_write.shared.ffn.shared_gate_weights =
+        plan_prefix_buffers.resident;
+    const bool resident_alias_rejected =
+        !detail::validate_window_t1_moe_consumer_handoffs(
+            context, vocabulary_size, kRouterExperts, resident_alias_buffers,
+            error) &&
+        error.find("overlap producer storage") != std::string::npos;
+    check(resident_alias_rejected,
+          label + " resident table cannot be reused as shared-gate weights",
+          error);
+
+    WindowT1MoeLayer0FullBuffers router_write_alias_buffers =
+        consumer_handoff_buffers;
+    router_write_alias_buffers.ffn_write.shared.ffn.shared_output =
+        router_tensor_storage.view();
+    const bool router_write_alias_rejected =
+        !detail::validate_window_t1_moe_consumer_handoffs(
+            context, vocabulary_size, kRouterExperts,
+            router_write_alias_buffers, error) &&
+        error.find("overlap producer storage") != std::string::npos;
+    check(router_write_alias_rejected,
+          label + " shared output cannot overwrite producer router tensor",
+          error);
+
+    WindowT1MoeLayer0FullBuffers router_sink_alias_buffers =
+        consumer_handoff_buffers;
+    router_sink_alias_buffers.ffn_write.shared.ffn.shared_gate_sink =
+        router_tensor_storage.view();
+    const bool router_sink_alias_rejected =
+        !detail::validate_window_t1_moe_consumer_handoffs(
+            context, vocabulary_size, kRouterExperts,
+            router_sink_alias_buffers, error) &&
+        error.find("overlap producer storage") != std::string::npos;
+    check(router_sink_alias_rejected,
+          label + " shared gate sink cannot overwrite producer router tensor",
+          error);
 
     WindowT1MoePlanPrefixBuffers short_moe_plan = plan_prefix_buffers;
     short_moe_plan.plans =

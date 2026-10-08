@@ -2199,11 +2199,18 @@ the layer-0 attention/GDN/FFN read, 256/512-expert BF16 router, multiply-by-reci
 and Q8_1 quantization of `mixed` in one segment. It slices the live-row count from `WindowParams.nc`
 and reuses GDN's `xq` only after the GDN reads finish. `encode_window_t1_moe_plan_prefix` extends
 that segment with the layer-0 GPU plan kernel, using the produced route IDs and disjoint resident,
-usage and plan views. In tiered mode it ends at plan production: the caller must establish plan
-completion/readiness, resolve misses through `ExpertStore`, and submit expert consumers only after
-successful resolution. The coordinator does not signal plan-ready events, resolve tiered misses, or
-execute experts. The indexed draft-head API remains standalone, and production Window/Prefill
-dispatch remains pending.
+usage and plan views. `encode_window_t1_moe_layer0_full_mode` takes the `FullModeStorage` owner,
+uses its expert address/resident/usage tables, and composes the actual router/route/plan prefix
+with routed expert FFN, shared expert, combine and GR residual write in one ordered transaction.
+It validates the consumer's table identity, Q8_1 activations, plan, route weights and mixed input,
+and the same `WindowParams.nc`, residual and injection. Consumer reads may overlap producer storage
+only in the specific input roles declared for each handoff. Router weights and the resident table
+are checked as producer inputs, and consumer outputs and sinks cannot overlap them. In tiered mode
+the plan prefix ends at plan production; a caller must establish plan readiness, resolve misses
+through `ExpertStore`, retain expert leases through GPU completion, and then call the lower-level
+routed/shared consumer.
+There is no production scheduler that performs this sequence. Later Window layers, the indexed
+draft-head API, and Prefill dispatch remain pending.
 
 ### 5.10 MoE: router, plan, experts, shared expert and combine
 

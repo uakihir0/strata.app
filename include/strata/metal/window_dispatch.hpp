@@ -3,12 +3,14 @@
 
 #include "strata/metal/embed_dispatch.hpp"
 #include "strata/metal/gr_dispatch.hpp"
+#include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/window_gdn_dispatch.hpp"
 #include "strata/metal/window_params.hpp"
 
 namespace strata::metal {
 
 class Encoder;
+class FullModeStorage;
 
 struct WindowEmbeddingBuffers {
     /// The complete ABI-compatible block built by WindowParamsRing.
@@ -72,6 +74,14 @@ struct WindowT1MoePlanPrefixBuffers {
     ReadOnlyBufferRef resident;
     BufferRef usage;
     BufferRef plans;
+};
+
+/// Full-mode layer-0 T=1 Window buffers. The exact producer structure is
+/// passed with its consumer so the coordinator can bind the route, plan,
+/// activation and GR writeback handoffs before dispatch.
+struct WindowT1MoeLayer0FullBuffers {
+    WindowT1MoePlanPrefixBuffers producer;
+    MoeRoutedSharedFFNWriteBuffers ffn_write;
 };
 
 /// Encode the T=1 input stem: gather the token from WindowParams, then
@@ -155,5 +165,28 @@ bool encode_window_t1_moe_plan_prefix(
     Context& context, CommandBuffer& command_buffer,
     std::uint32_t vocabulary_size, std::uint32_t experts, bool tiered,
     const WindowT1MoePlanPrefixBuffers& buffers, std::string& error);
+
+/// Encode the full-mode T=1 layer-0 Window router/route/plan prefix followed
+/// by routed expert FFN, shared expert/combine and GR residual write in one
+/// ordered transaction. The `FullModeStorage` owner supplies the expert
+/// address, resident and usage tables; caller-provided consumer views must
+/// match those exact tables. Producer and consumer views are checked against
+/// the same `producer` structure before dispatch. Tiered callers must resolve
+/// plans and retain leases through their command buffer before using the
+/// lower-level MoE consumer. Keep the FullModeStorage alive through GPU
+/// completion. Propagate false from a caller-owned Encoder body.
+bool encode_window_t1_moe_layer0_full_mode(
+    Context& context, const FullModeStorage& full_mode, Encoder& encoder,
+    std::uint32_t vocabulary_size,
+    std::uint32_t experts,
+    MoeExpertFormat gate_up_format, MoeDownFormat down_format,
+    const WindowT1MoeLayer0FullBuffers& buffers, std::string& error);
+/// Standalone transactional form; a validation failure discards the segment.
+bool encode_window_t1_moe_layer0_full_mode(
+    Context& context, const FullModeStorage& full_mode,
+    CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size, std::uint32_t experts,
+    MoeExpertFormat gate_up_format, MoeDownFormat down_format,
+    const WindowT1MoeLayer0FullBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal

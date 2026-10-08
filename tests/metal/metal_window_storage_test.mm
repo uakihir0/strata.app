@@ -6,6 +6,7 @@
 #include "strata/metal/experts.hpp"
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/moe_dispatch.hpp"
+#include "strata/metal/window_dispatch.hpp"
 #include "strata/metal/window_ple_stage.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/ngram.hpp"
@@ -2516,6 +2517,22 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
             "tiered ModelStorage must not publish full-mode weight views or tables");
     require(tiered_storage->tiered_storage() != nullptr,
             "tiered ModelStorage must expose the borrowed ExpertStore construction source");
+    WindowT1MoeLayer0FullBuffers wrong_mode_moe_buffers{};
+    wrong_mode_moe_buffers.ffn_write.routed.addresses =
+        context.buffers().read_only(
+            tiered_storage->tiered_storage()->expert_address_table());
+    auto wrong_mode_moe_command = context.make_command_buffer(
+        "reject tiered table in full-mode Window MoE", error);
+    require(wrong_mode_moe_command != nullptr,
+            "create full-mode MoE table-source regression command: " + error);
+    require(!encode_window_t1_moe_layer0_full_mode(
+                context, *full_mode, *wrong_mode_moe_command,
+                packed_geometry.vocab, packed_geometry.n_expert,
+                MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
+                wrong_mode_moe_buffers, error) &&
+                wrong_mode_moe_command->unsafe_native_handle() == nullptr &&
+                error.find("FullModeStorage") != std::string::npos,
+            "full-mode Window MoE must reject the TieredStorage address table before dispatch");
     const BufferRef tiered_model_usage = tiered_storage->moe_usage_table();
     require(tiered_model_usage && context.buffers().owns(tiered_model_usage) &&
                 tiered_model_usage.length == static_cast<std::size_t>(kTieredMaxLayers) *

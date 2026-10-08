@@ -7,6 +7,8 @@
 #include "strata/metal/mv_dispatch.hpp"
 #include "strata/metal/tiered.hpp"
 #include "strata/metal/window_dispatch.hpp"
+#include "strata/metal/window.hpp"
+#include "window_dispatch_internal.hpp"
 
 #include <algorithm>
 #include <array>
@@ -18,6 +20,7 @@
 #include <string_view>
 
 #include "../kernels/common/params.h"
+#include "../kernels/common/types.h"
 
 namespace strata::metal {
 namespace {
@@ -79,6 +82,41 @@ bool buffer_views_overlap(ReadOnlyBufferRef left, ReadOnlyBufferRef right) {
         ranges_overlap(left_gpu_address, left.length(), right_gpu_address,
                        right.length());
     return cpu_backing_overlap || gpu_backing_overlap;
+}
+
+bool same_buffer_start(const void* left_contents, std::uint64_t left_gpu,
+                       const void* right_contents,
+                       std::uint64_t right_gpu) {
+    bool comparable = false;
+    if (left_contents != nullptr && right_contents != nullptr) {
+        if (left_contents != right_contents) return false;
+        comparable = true;
+    }
+    if (left_gpu != 0u && right_gpu != 0u) {
+        if (left_gpu != right_gpu) return false;
+        comparable = true;
+    }
+    return comparable;
+}
+
+bool same_buffer_start(ReadOnlyBufferRef left, ReadOnlyBufferRef right) {
+    return same_buffer_start(left.contents(), left.gpu_address(),
+                             right.contents(), right.gpu_address());
+}
+
+bool same_buffer_start(BufferRef left, ReadOnlyBufferRef right) {
+    return same_buffer_start(left.contents, left.gpu_address,
+                             right.contents(), right.gpu_address());
+}
+
+bool same_buffer_start(ReadOnlyBufferRef left, BufferRef right) {
+    return same_buffer_start(left.contents(), left.gpu_address(),
+                             right.contents, right.gpu_address);
+}
+
+bool same_buffer_start(BufferRef left, BufferRef right) {
+    return same_buffer_start(left.contents, left.gpu_address,
+                             right.contents, right.gpu_address);
 }
 
 bool validate_prefix_buffer(Context& context, BufferRef buffer,
@@ -584,7 +622,238 @@ bool validate_window_t1_moe_plan_prefix(
     return true;
 }
 
+bool validate_window_t1_moe_layer0_consumer_handoffs(
+    Context& context, std::uint32_t vocabulary_size, std::uint32_t experts,
+    const WindowT1MoeLayer0FullBuffers& buffers, std::string& error) {
+    if (!validate_window_t1_moe_plan_prefix(
+            context, vocabulary_size, experts, buffers.producer, error)) {
+        return false;
+    }
+    if (experts != 256u && experts != 512u) {
+        error = "Window T=1 MoE FFN requires 256 or 512 experts";
+        return false;
+    }
+
+    const WindowT1MoeRouterPrefixBuffers& producer =
+        buffers.producer.router;
+    const WindowT1AttentionGDNFFNBuffers& layer0 = producer.layer0;
+    WindowParams params{};
+    if (!validate_window_params(context, layer0.params, vocabulary_size,
+                                params, error)) {
+        return false;
+    }
+    if (params.n_keep != 0u) {
+        error = "Window T=1 MoE FFN requires an ordinary decode step";
+        return false;
+    }
+
+    const ReadOnlyBufferRef producer_input =
+        context.buffers().read_only(layer0.gdn.xq);
+    const ReadOnlyBufferRef producer_plan =
+        context.buffers().read_only(buffers.producer.plans);
+    const ReadOnlyBufferRef producer_route_weights =
+        context.buffers().read_only(producer.route_weights);
+    const ReadOnlyBufferRef params_read_only =
+        context.buffers().read_only(layer0.params);
+    const ReadOnlyBufferRef active_rows = params_read_only.slice(
+        offsetof(WindowParams, nc), sizeof(std::uint32_t));
+    const MoeRoutedFFNBuffers& routed = buffers.ffn_write.routed;
+    const MoeSharedFFNWriteBuffers& shared = buffers.ffn_write.shared;
+    if (!producer_input || !producer_plan || !producer_route_weights ||
+        !active_rows) {
+        error = "Window T=1 MoE FFN could not form producer views";
+        return false;
+    }
+    if (!same_buffer_start(producer_input, routed.input_activations) ||
+        !same_buffer_start(producer_input,
+                           shared.ffn.input_activations)) {
+        error = "Window T=1 MoE FFN activations must use the producer Q8_1 input";
+        return false;
+    }
+    if (!same_buffer_start(producer_plan, routed.plans)) {
+        error = "Window T=1 MoE FFN plan must use the producer plan output";
+        return false;
+    }
+    if (!same_buffer_start(producer_route_weights,
+                           shared.ffn.route_weights)) {
+        error = "Window T=1 MoE FFN route weights must use the producer output";
+        return false;
+    }
+    if (!same_buffer_start(layer0.ffn.mixed, shared.ffn.mixed)) {
+        error = "Window T=1 MoE FFN mixed input must use the producer output";
+        return false;
+    }
+    if (!same_buffer_start(layer0.ffn.residual, shared.residual) ||
+        !same_buffer_start(layer0.ffn.inject_out, shared.inject)) {
+        error = "Window T=1 MoE FFN writeback must use the producer GR views";
+        return false;
+    }
+    if (!same_buffer_start(active_rows, shared.ffn.active_rows)) {
+        error = "Window T=1 MoE FFN live rows must use WindowParams.nc";
+        return false;
+    }
+
+    struct ConsumerInputView {
+        ReadOnlyBufferRef view;
+        BufferRef allowed_handoff;
+    };
+    const std::array<ConsumerInputView, 12u> consumer_inputs{{
+        {routed.addresses, {}},
+        {routed.input_activations, layer0.gdn.xq},
+        {routed.plans, buffers.producer.plans},
+        {shared.ffn.input_activations, layer0.gdn.xq},
+        {shared.ffn.mixed, layer0.ffn.mixed},
+        {shared.ffn.gate_weights, {}},
+        {shared.ffn.up_weights, {}},
+        {shared.ffn.down_weights, {}},
+        {shared.ffn.shared_gate_weights, {}},
+        {shared.ffn.routed_parts, {}},
+        {shared.ffn.route_weights, producer.route_weights},
+        {context.buffers().read_only(shared.inject),
+         layer0.ffn.inject_out},
+    }};
+    const std::array<BufferRef, 13u> consumer_outputs{
+        routed.gate,
+        routed.up,
+        routed.hidden,
+        routed.down_activations,
+        routed.parts,
+        shared.ffn.gate,
+        shared.ffn.up,
+        shared.ffn.hidden,
+        shared.ffn.down_activations,
+        shared.ffn.shared_output,
+        shared.ffn.shared_gate_logits,
+        shared.ffn.output,
+        shared.residual,
+    };
+    const std::array<BufferRef, 4u> consumer_sinks{
+        shared.ffn.gate_sink,
+        shared.ffn.up_sink,
+        shared.ffn.down_sink,
+        shared.ffn.shared_gate_sink,
+    };
+    const bool consumer_inputs_disjoint_from_params =
+        std::all_of(consumer_inputs.begin(), consumer_inputs.end(),
+                    [&](const ConsumerInputView& input) {
+                        return !buffer_views_overlap(input.view,
+                                                     layer0.params);
+                    });
+    if (!consumer_inputs_disjoint_from_params ||
+        !std::all_of(consumer_outputs.begin(), consumer_outputs.end(),
+                     [&](BufferRef view) {
+                         return !buffer_views_overlap(layer0.params, view);
+                     }) ||
+        !std::all_of(consumer_sinks.begin(), consumer_sinks.end(),
+                     [&](BufferRef view) {
+                         return !buffer_views_overlap(layer0.params, view);
+                     })) {
+        error = "Window T=1 MoE FFN consumer overlaps its parameters";
+        return false;
+    }
+
+    const auto producer_attention =
+        gr_read_views(layer0.attention);
+    const auto producer_gdn = gdn_block_views(layer0.gdn);
+    const auto producer_ffn = gr_read_views(layer0.ffn);
+    const std::array<BufferRef, 6u> route_plan_outputs{
+        producer.router_logits,
+        producer.route_ids,
+        producer.route_weights,
+        producer.router_matvec_sink,
+        buffers.producer.usage,
+        buffers.producer.plans,
+    };
+    const std::array<ReadOnlyBufferRef, 2u> producer_read_only_tables{
+        producer.router_tensor, buffers.producer.resident};
+    const auto consumer_disjoint_from = [&](const auto& producer_views) {
+        for (const ConsumerInputView& input : consumer_inputs) {
+            for (const BufferRef& producer_view : producer_views) {
+                const bool allowed_handoff =
+                    input.allowed_handoff &&
+                    same_buffer_start(input.view, input.allowed_handoff) &&
+                    same_buffer_start(producer_view,
+                                      input.allowed_handoff);
+                if (buffer_views_overlap(input.view, producer_view) &&
+                    !allowed_handoff) {
+                    return false;
+                }
+            }
+            for (const ReadOnlyBufferRef& producer_view :
+                 producer_read_only_tables) {
+                if (buffer_views_overlap(input.view, producer_view)) {
+                    return false;
+                }
+            }
+        }
+        for (const BufferRef& output : consumer_outputs) {
+            for (const BufferRef& input : producer_views) {
+                const bool residual_handoff =
+                    same_buffer_start(output, layer0.ffn.residual) &&
+                    same_buffer_start(input, layer0.ffn.residual);
+                if (!residual_handoff &&
+                    buffer_views_overlap(output, input)) {
+                    return false;
+                }
+            }
+            for (const ReadOnlyBufferRef& input :
+                 producer_read_only_tables) {
+                if (buffer_views_overlap(input, output)) return false;
+            }
+        }
+        for (const BufferRef& sink : consumer_sinks) {
+            for (const BufferRef& input : producer_views) {
+                if (buffer_views_overlap(sink, input)) return false;
+            }
+            for (const ReadOnlyBufferRef& input :
+                 producer_read_only_tables) {
+                if (buffer_views_overlap(input, sink)) return false;
+            }
+        }
+        return true;
+    };
+    if (!consumer_disjoint_from(producer_attention) ||
+        !consumer_disjoint_from(producer_gdn) ||
+        !consumer_disjoint_from(producer_ffn) ||
+        !consumer_disjoint_from(route_plan_outputs)) {
+        error = "Window T=1 MoE consumer views overlap producer storage outside a declared handoff";
+        return false;
+    }
+
+    error.clear();
+    return true;
+}
+
+bool validate_window_t1_moe_layer0_full_mode(
+    Context& context, const FullModeStorage& full_mode,
+    std::uint32_t vocabulary_size, std::uint32_t experts,
+    const WindowT1MoeLayer0FullBuffers& buffers, std::string& error) {
+    const ReadOnlyBufferRef full_addresses =
+        full_mode.expert_address_table();
+    const ReadOnlyBufferRef full_resident = full_mode.resident_table();
+    const BufferRef full_usage = full_mode.usage_table();
+    if (!full_addresses || !context.buffers().owns(full_addresses) ||
+        !full_resident || !context.buffers().owns(full_resident) ||
+        !full_usage || !context.buffers().owns(full_usage) ||
+        !same_buffer_start(full_addresses,
+                           buffers.ffn_write.routed.addresses) ||
+        !same_buffer_start(full_resident, buffers.producer.resident) ||
+        !same_buffer_start(full_usage, buffers.producer.usage)) {
+        error = "Window T=1 full-mode MoE must use its FullModeStorage address, resident and usage tables";
+        return false;
+    }
+    return validate_window_t1_moe_layer0_consumer_handoffs(
+        context, vocabulary_size, experts, buffers, error);
+}
+
 }  // namespace
+
+bool detail::validate_window_t1_moe_consumer_handoffs(
+    Context& context, std::uint32_t vocabulary_size, std::uint32_t experts,
+    const WindowT1MoeLayer0FullBuffers& buffers, std::string& error) {
+    return validate_window_t1_moe_layer0_consumer_handoffs(
+        context, vocabulary_size, experts, buffers, error);
+}
 
 bool encode_window_t1_attention_gdn(
     Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
@@ -757,6 +1026,48 @@ bool encode_window_t1_moe_plan_prefix(
             return encode_window_t1_moe_plan_prefix(
                 context, encoder, vocabulary_size, experts, tiered, buffers,
                 encode_error);
+        },
+        error);
+}
+
+bool encode_window_t1_moe_layer0_full_mode(
+    Context& context, const FullModeStorage& full_mode, Encoder& encoder,
+    std::uint32_t vocabulary_size,
+    std::uint32_t experts, MoeExpertFormat gate_up_format,
+    MoeDownFormat down_format,
+    const WindowT1MoeLayer0FullBuffers& buffers, std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "Window T=1 MoE layer requires ordered dispatch boundaries";
+        return false;
+    }
+    if (!validate_window_t1_moe_layer0_full_mode(
+            context, full_mode, vocabulary_size, experts, buffers, error)) {
+        return false;
+    }
+
+    if (!encode_window_t1_moe_plan_prefix(
+            context, encoder, vocabulary_size, experts, false,
+            buffers.producer, error)) {
+        return false;
+    }
+    return encode_moe_routed_shared_ffn_write(
+        context, encoder, 1u, experts, 0u, gate_up_format, down_format,
+        buffers.ffn_write, error);
+}
+
+bool encode_window_t1_moe_layer0_full_mode(
+    Context& context, const FullModeStorage& full_mode,
+    CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size, std::uint32_t experts,
+    MoeExpertFormat gate_up_format, MoeDownFormat down_format,
+    const WindowT1MoeLayer0FullBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Window T=1 layer-0 full-mode MoE",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_t1_moe_layer0_full_mode(
+                context, full_mode, encoder, vocabulary_size, experts,
+                gate_up_format, down_format, buffers, encode_error);
         },
         error);
 }
