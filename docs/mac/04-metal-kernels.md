@@ -668,7 +668,9 @@ struct WindowParams {
   host lays it out once at startup for T = 8; a window of T rows uses the first T rows of each region. Each region
   starts on a 256-B boundary.
 - The arena holds, per window: the residual streams `R[T][4][2560]`, the two inject buffers, the GR intermediates
-  (`xn`, `lo`, `gate`), the Q8_1 activations, the dedicated head Q8_1 rows
+  (`xn`, `lo`, `gate`), the output-head mixer regions `head_normalized[T][4][2560]`,
+  `head_low_rank[T][4][320]`, and `head_gate[T][4][2560]` (680 KiB total at T=8),
+  the mixed rows `head_mixed[T][2560]`, the Q8_1 activations, the dedicated head Q8_1 rows
   `head_q8_1[8][80]` of 36-byte blocks, and the per-layer GDN inputs that commit replays (`qkv`, `h`, `gate`,
   `beta` for each of the 36 GDN layers), the QSA intermediates, the router plan, the expert intermediates, the
   logits `[T][248,320]`, the PLE normalised rows `ple_norm[8][10240]` (section 4.8), the indexer tail and block
@@ -1388,6 +1390,18 @@ transaction. The standalone form discards the command buffer on failure.
 Keep the FullMode owner and every scratch view alive through completion. This
 completes the low-level vocabulary projection composition; `Window::run`,
 sampling, state commit and model-backed decode remain unimplemented.
+
+`encode_window_output_head` resolves the live mixer tensors with exact shapes
+and types: F32 `[10240]` for `output_hc_norm.weight`, BF16 `[10240, 320]` for
+`output_hc_down.weight`, and BF16 `[320, 10240]` for `output_hc_up.weight`.
+It composes the weighted RMS/down/SiLU/up/pre-gated mixer with the vocabulary
+projection in the same ordered encoder. Named T=8 scratch keeps normalized,
+low-rank and gate values in separate regions; the composite rejects residual
+overlap with later Q8_1/logits writes. Its standalone form discards the whole
+transaction on failure; callers using the Encoder form must propagate failure.
+The sparse FullMode test validates the mixer output and logits against scalar
+oracles and checks rollback when `output.weight` is missing. Production
+`Window::run`, sampling, state commit and shipped-model parity remain open.
 
 The MTP drafter uses `strata_gr_norm`, `strata_gr_down` and `strata_gr_up` for its two reads, and the head mixer
 kernels for its final mixer (section 5.11).
@@ -2250,8 +2264,11 @@ view can reach the same backing bytes. Its standalone wrapper is transactional;
 the caller-owned form must propagate failure out of its enclosing Encoder body.
 The Window output-projection coordinator resolves the actual `output.weight`
 view and composes Q8_1 activation quantization with this read-only mat-vec for
-the fixed `[2560, 248320]` head. This composition does not include the sampler
-or `Window::run`.
+the fixed `[2560, 248320]` head. `encode_window_output_head` now resolves the
+FullMode `output_hc_norm`, `output_hc_down` and `output_hc_up` tensors and
+composes the final mixer through logits in one transaction, using dedicated
+named intermediate scratch. Neither composition includes the sampler or a
+production `Window::run` call site.
 The PLE post-projection path accepts read-only gamma and F16 convolution weights; its
 convolution-residual dispatch binds normalized rows,
 history, convolution weights and gated activations as read-only inputs and

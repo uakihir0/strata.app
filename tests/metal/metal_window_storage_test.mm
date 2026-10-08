@@ -14,6 +14,7 @@
 #include "strata/metal/window_t1_input.hpp"
 #include "strata/metal/window_scratch.hpp"
 #include "strata/metal/window_output_projection.hpp"
+#include "strata/metal/window_output_head.hpp"
 #include "strata/metal/session_state.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -710,7 +711,8 @@ Fixture write_fixture(const fs::path& directory, bool overlap_ple = false,
 Fixture write_fullmode_handoff_fixture(
     const fs::path& directory,
     std::uint32_t ple_key_type = kGgmlTypeQ2_0,
-    bool include_output_weight = false) {
+    bool include_output_weight = false,
+    bool include_output_head = false) {
     constexpr std::uint64_t kExperts = 256u;
     constexpr std::uint64_t kGateUpElements = 2'560u * 640u;
     constexpr std::uint64_t kDownElements = 640u * 2'560u;
@@ -736,7 +738,8 @@ Fixture write_fullmode_handoff_fixture(
     Fixture fixture;
     const std::string fixture_suffix =
         std::string("fullmode-handoff-") + std::to_string(ple_key_type) +
-        (include_output_weight ? "-output" : "");
+        (include_output_head ? "-head" :
+         include_output_weight ? "-output" : "");
     fixture.path = directory / (fixture_suffix + ".gguf");
     fixture.dense_pack_path = directory /
         (fixture_suffix + "-dense.bin");
@@ -768,6 +771,14 @@ Fixture write_fullmode_handoff_fixture(
         {"per_layer_token_embd.weight",
          {strata::kernels::PLE_HEAD_DIM, kPleRows}, 20u, 0u},
     };
+    if (include_output_head) {
+        tensors.push_back(
+            {"output_hc_norm.weight", {10'240u}, 0u, 0u});
+        tensors.push_back(
+            {"output_hc_down.weight", {10'240u, 320u}, kGgmlTypeBF16, 0u});
+        tensors.push_back(
+            {"output_hc_up.weight", {320u, 10'240u}, kGgmlTypeBF16, 0u});
+    }
     if (include_output_weight) {
         tensors.push_back(
             {"output.weight", {2'560u, 248'320u}, kGgmlTypeIQ4XS, 0u});
@@ -881,6 +892,37 @@ Fixture write_fullmode_handoff_fixture(
                 descriptor, fixture.output_weight_first_row.data(),
                 sizeof(fixture.output_weight_first_row),
                 fixture.data_start + fixture.output_weight_offset);
+        }
+
+        if (include_output_head) {
+            const std::vector<float> norm_gamma(10'240u, 1.0f);
+            write_all_at(
+                descriptor, norm_gamma.data(),
+                norm_gamma.size() * sizeof(float),
+                fixture.data_start +
+                    dense_tensor_offsets.at("output_hc_norm.weight"));
+
+            std::vector<std::uint16_t> down_weights(
+                10'240u * 320u, strata::kernels::bf16_from_f32(0.0f));
+            down_weights[0] = strata::kernels::bf16_from_f32(1.0f);
+            write_all_at(
+                descriptor, down_weights.data(),
+                down_weights.size() * sizeof(std::uint16_t),
+                fixture.data_start +
+                    dense_tensor_offsets.at("output_hc_down.weight"));
+
+            std::vector<std::uint16_t> up_weights(
+                320u * 10'240u, strata::kernels::bf16_from_f32(0.0f));
+            for (std::size_t output_row = 0u; output_row < 10'240u;
+                 ++output_row) {
+                up_weights[output_row * 320u] =
+                    strata::kernels::bf16_from_f32(0.5f);
+            }
+            write_all_at(
+                descriptor, up_weights.data(),
+                up_weights.size() * sizeof(std::uint16_t),
+                fixture.data_start +
+                    dense_tensor_offsets.at("output_hc_up.weight"));
         }
 
         constexpr std::uint64_t kPleKeyElements = 2'560u * 10'240u;
@@ -1125,6 +1167,16 @@ WindowSources inspect_fixture(const Fixture& fixture) {
         shard.tensors.push_back(
             {tensor->name, file.data_start() + tensor->offset,
              strata::tensor_payload_bytes(*tensor), 0});
+    }
+    for (const std::string& name : {
+             std::string("output_hc_norm.weight"),
+             std::string("output_hc_down.weight"),
+             std::string("output_hc_up.weight")}) {
+        if (const strata::TensorInfo* tensor = file.find(name)) {
+            shard.tensors.push_back(
+                {tensor->name, file.data_start() + tensor->offset,
+                 strata::tensor_payload_bytes(*tensor), 0});
+        }
     }
     const strata::TensorInfo* ple = file.find("per_layer_token_embd.weight");
     if (ple == nullptr) throw std::runtime_error("synthetic GGUF PLE tensor is missing");
@@ -4408,6 +4460,332 @@ void run_fullmode_output_projection_test(Context& context,
             "rejected read-only input alias leaves shared backing unchanged");
 }
 
+void run_fullmode_output_head_test(Context& context,
+                                   const fs::path& parent_directory) {
+    constexpr std::uint32_t kRows = 1u;
+    constexpr std::size_t kActiveLogitsBytes =
+        static_cast<std::size_t>(kWindowOutputVocabularySize) * sizeof(float);
+
+    const fs::path directory = parent_directory / "fullmode-output-head";
+    const fs::path valid_directory = directory / "valid";
+    const fs::path missing_output_directory = directory / "missing-output";
+    fs::create_directories(valid_directory);
+    fs::create_directories(missing_output_directory);
+    const Fixture fixture = write_fullmode_handoff_fixture(
+        valid_directory, kGgmlTypeQ2_0, true, true);
+    WindowSources sources = inspect_fixture(fixture);
+    Geometry full_geometry = owner_test_geometry(fixture, sources);
+    full_geometry.family = "qwen4exp";
+    full_geometry.model = "synthetic-fullmode-output-head";
+    full_geometry.n_expert = 256u;
+    full_geometry.n_qsa_layers = 1u;
+    full_geometry.n_kv_head = 2u;
+    full_geometry.head_dim = 256u;
+    full_geometry.n_embd = kWindowOutputInputWidth;
+    full_geometry.vocab = kWindowOutputVocabularySize;
+    full_geometry.types = {"q2_0", "bf16", "f32", "iq4_xs"};
+    full_geometry.layers[0].gate_up_type = "q2_0";
+    full_geometry.layers[0].down_type = "q2_0";
+
+    std::string error;
+    WindowPlan plan;
+    require(plan_windows(sources, context.device_facts().max_buffer_length,
+                         plan, error),
+            "plan FullMode output-head fixture: " + error);
+    auto full_mode = FullModeStorage::open(
+        context, fixture.path.string(), full_geometry, sources, plan, error);
+    require(full_mode != nullptr,
+            "open FullMode output-head fixture: " + error);
+
+    Geometry runtime_geometry;
+    runtime_geometry.family = "qwen4exp";
+    runtime_geometry.model = "synthetic-window-runtime";
+    runtime_geometry.n_layers = kSessionModelLayers;
+    runtime_geometry.n_expert = 256u;
+    runtime_geometry.n_qsa_layers = kSessionQsaLayers;
+    runtime_geometry.n_kv_head = kSessionKvHeads;
+    runtime_geometry.head_dim = kSessionHeadWidth;
+    runtime_geometry.n_embd = kWindowOutputInputWidth;
+    runtime_geometry.vocab = kWindowOutputVocabularySize;
+    auto scratch =
+        WindowScratchStorage::open(context, runtime_geometry, 4u, error);
+    require(scratch != nullptr,
+            "allocate FullMode output-head scratch: " + error);
+
+    const WindowScratchLayout& layout = scratch->layout();
+    BufferRef residual = require_scratch_view(
+        context, *scratch, layout.residual, "output-head residual");
+    BufferRef normalized = require_scratch_view(
+        context, *scratch, layout.head_normalized, "head normalized");
+    BufferRef low_rank = require_scratch_view(
+        context, *scratch, layout.head_low_rank, "head low rank");
+    BufferRef gate = require_scratch_view(
+        context, *scratch, layout.head_gate, "head gate");
+    BufferRef mixed = require_scratch_view(
+        context, *scratch, layout.head_mixed, "head mixed");
+    BufferRef q8_1 = require_scratch_view(
+        context, *scratch, layout.head_q8_1, "head Q8_1");
+    BufferRef logits = require_scratch_view(
+        context, *scratch, layout.head_logits, "head logits");
+    BufferRef matvec_sink = require_scratch_view(
+        context, *scratch, layout.matvec_sink, "head mat-vec sink");
+    std::fill_n(static_cast<float*>(residual.contents),
+                residual.length / sizeof(float), 1.0f);
+    std::memset(normalized.contents, 0xa5, normalized.length);
+    std::memset(low_rank.contents, 0xa5, low_rank.length);
+    std::memset(gate.contents, 0xa5, gate.length);
+    std::memset(mixed.contents, 0xa5, mixed.length);
+    std::memset(q8_1.contents, 0xa5, q8_1.length);
+    std::memset(logits.contents, 0xa5, logits.length);
+    std::memset(matvec_sink.contents, 0xa5, matvec_sink.length);
+    BufferRef active_rows = allocate_zeroed_buffer(
+        context, "FullMode output-head active rows", sizeof(kRows));
+    std::memcpy(active_rows.contents, &kRows, sizeof(kRows));
+    const WindowOutputHeadBuffers head_buffers{
+        residual, context.buffers().read_only(active_rows)};
+
+    const WindowOutputHeadBuffers aliased_residual_buffers{
+        logits.slice(0u, residual.length), context.buffers().read_only(active_rows)};
+    require(static_cast<bool>(aliased_residual_buffers.residual),
+            "create an output-logits alias for output-head residual");
+    auto alias_rejected = context.make_command_buffer(
+        "FullMode output-head cross-stage alias rejection", error);
+    require(alias_rejected != nullptr,
+            "create FullMode output-head alias command: " + error);
+    WindowOutputHeadResult alias_result;
+    require(!encode_window_output_head(
+                context, *alias_rejected, *full_mode, *scratch, kRows,
+                aliased_residual_buffers, alias_result, error) &&
+                error.find("overlaps later projection output scratch") !=
+                    std::string::npos &&
+                alias_rejected->unsafe_native_handle() == nullptr &&
+                !alias_result.logits,
+            "residual/logits cross-stage alias must be rejected transactionally");
+    const auto filled_with = [](BufferRef view, std::uint8_t value) {
+        const auto* const bytes =
+            static_cast<const std::uint8_t*>(view.contents);
+        return std::all_of(bytes, bytes + view.length,
+                           [value](std::uint8_t byte) {
+                               return byte == value;
+                           });
+    };
+    require(filled_with(normalized, 0xa5u) &&
+                filled_with(low_rank, 0xa5u) &&
+                filled_with(gate, 0xa5u) &&
+                filled_with(mixed, 0xa5u) &&
+                filled_with(q8_1, 0xa5u) &&
+                filled_with(logits, 0xa5u) &&
+                filled_with(matvec_sink, 0xa5u),
+            "cross-stage alias rejection preserves all head scratch bytes");
+
+    WindowOutputHeadResult head_result;
+
+    auto success = context.make_command_buffer(
+        "FullMode output-head composition", error);
+    require(success != nullptr,
+            "create FullMode output-head command: " + error);
+    require(Encoder::encode(
+                context, *success, "FullMode output-head composition",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encode_window_output_head(
+                        context, encoder, *full_mode, *scratch, kRows,
+                        head_buffers, head_result, encode_error);
+                },
+                error),
+            "encode FullMode mixer and vocabulary projection: " + error);
+    require(success->commit(error),
+            "commit FullMode output-head composition: " + error);
+    id<MTLCommandBuffer> native_success =
+        (__bridge id<MTLCommandBuffer>)success->unsafe_native_handle();
+    [native_success waitUntilCompleted];
+    require(native_success.status == MTLCommandBufferStatusCompleted,
+            "FullMode output-head command completes");
+    require(head_result.logits &&
+                head_result.logits.length == kActiveLogitsBytes,
+            "output-head result publishes only active logits rows");
+
+    FullModeTensorView output_weight;
+    require(full_mode->dense_tensor_view("output.weight", output_weight,
+                                         error),
+            "resolve output-head oracle weight: " + error);
+    const auto* const mapped_weights =
+        static_cast<const block_iq4_xs*>(output_weight.buffer.contents());
+    require(std::memcmp(mapped_weights, fixture.output_weight_first_row.data(),
+                        sizeof(fixture.output_weight_first_row)) == 0,
+            "composed output head resolves the retained synthetic output row");
+    std::string oracle_error;
+    std::vector<Q81> oracle_activations;
+    require(twin::quantize_q8_1_reference(
+                std::span<const float>(
+                    static_cast<const float*>(mixed.contents),
+                    kWindowOutputInputWidth),
+                kWindowOutputInputWidth, 1u, oracle_activations,
+                oracle_error),
+            "quantize composed head oracle activation: " + oracle_error);
+    std::vector<float> expected_first_logit;
+    require(twin::iq4_xs_matvec_reference(
+                std::span<const block_iq4_xs>(
+                    fixture.output_weight_first_row),
+                oracle_activations, kWindowOutputInputWidth, 1u, 1u, 1u,
+                expected_first_logit, oracle_error),
+            "compute composed output-head scalar oracle: " + oracle_error);
+    const auto* const actual_logits =
+        static_cast<const float*>(head_result.logits.contents);
+    require(expected_first_logit.size() == 1u &&
+                std::isfinite(actual_logits[0]) &&
+                actual_logits[0] > 0.0f &&
+                actual_logits[0] == expected_first_logit[0],
+            "FullMode output-head logit matches the independent scalar oracle");
+    const float expected_norm =
+        1.0f / std::sqrt(1.0f + 1.0e-6f);
+    const float expected_down_scaled = 0.25f * expected_norm;
+    const float expected_down_silu =
+        expected_down_scaled /
+        (1.0f + std::exp(-expected_down_scaled));
+    const float expected_up = 0.5f * expected_down_silu;
+    const float expected_mixed =
+        expected_norm / (1.0f + std::exp(-expected_up));
+    require(std::all_of(
+                static_cast<const float*>(mixed.contents),
+                static_cast<const float*>(mixed.contents) +
+                    kWindowOutputInputWidth,
+                [expected_mixed](float value) {
+                    return std::isfinite(value) &&
+                           std::abs(value - expected_mixed) < 2.0e-5f;
+                }),
+            "head mixer output matches the sparse FullMode scalar oracle");
+    require(std::all_of(
+                static_cast<const float*>(residual.contents),
+                static_cast<const float*>(residual.contents) +
+                    residual.length / sizeof(float),
+                [](float value) { return value == 1.0f; }),
+            "composed output head preserves the final GR residual");
+    require(std::all_of(
+                static_cast<const std::uint8_t*>(logits.contents) +
+                    kActiveLogitsBytes,
+                static_cast<const std::uint8_t*>(logits.contents) +
+                    logits.length,
+                [](std::uint8_t byte) { return byte == 0xa5u; }),
+            "composed output head writes only the active logits row");
+
+    const Fixture missing_output_fixture =
+        write_fullmode_handoff_fixture(missing_output_directory,
+                                       kGgmlTypeQ2_0, false, true);
+    WindowSources missing_sources = inspect_fixture(missing_output_fixture);
+    Geometry missing_geometry = owner_test_geometry(
+        missing_output_fixture, missing_sources);
+    missing_geometry.family = "qwen4exp";
+    missing_geometry.model = "synthetic-fullmode-output-head-missing-weight";
+    missing_geometry.n_expert = 256u;
+    missing_geometry.n_qsa_layers = 1u;
+    missing_geometry.n_kv_head = 2u;
+    missing_geometry.head_dim = 256u;
+    missing_geometry.n_embd = kWindowOutputInputWidth;
+    missing_geometry.vocab = kWindowOutputVocabularySize;
+    missing_geometry.types = {"q2_0", "bf16", "f32"};
+    missing_geometry.layers[0].gate_up_type = "q2_0";
+    missing_geometry.layers[0].down_type = "q2_0";
+    WindowPlan missing_plan;
+    require(plan_windows(missing_sources,
+                         context.device_facts().max_buffer_length,
+                         missing_plan, error),
+            "plan FullMode output-head missing-weight fixture: " + error);
+    auto missing_weight = FullModeStorage::open(
+        context, missing_output_fixture.path.string(), missing_geometry,
+        missing_sources, missing_plan, error);
+    require(missing_weight != nullptr,
+            "open FullMode output-head missing-weight fixture: " + error);
+
+    const auto snapshot_bytes = [](BufferRef view) {
+        std::vector<std::uint8_t> bytes(view.length);
+        std::memcpy(bytes.data(), view.contents, view.length);
+        return bytes;
+    };
+    std::memset(normalized.contents, 0x5au, normalized.length);
+    std::memset(low_rank.contents, 0x5au, low_rank.length);
+    std::memset(gate.contents, 0x5au, gate.length);
+    std::memset(mixed.contents, 0x5au, mixed.length);
+    std::memset(q8_1.contents, 0x5au, q8_1.length);
+    std::memset(logits.contents, 0x5au, logits.length);
+    std::memset(matvec_sink.contents, 0x5au, matvec_sink.length);
+    const auto normalized_before = snapshot_bytes(normalized);
+    const auto low_rank_before = snapshot_bytes(low_rank);
+    const auto gate_before = snapshot_bytes(gate);
+    const auto mixed_before = snapshot_bytes(mixed);
+    const auto q8_1_before = snapshot_bytes(q8_1);
+    const auto logits_before = snapshot_bytes(logits);
+    const auto sink_before = snapshot_bytes(matvec_sink);
+    WindowOutputHeadResult failed_result;
+    auto rollback = context.make_command_buffer(
+        "FullMode output-head missing-weight rollback", error);
+    require(rollback != nullptr,
+            "create FullMode output-head rollback command: " + error);
+    const bool rejected_late =
+        !encode_window_output_head(
+            context, *rollback, *missing_weight, *scratch, kRows,
+            head_buffers, failed_result, error) &&
+        error.find("cannot resolve output.weight") != std::string::npos &&
+        rollback->unsafe_native_handle() == nullptr && !failed_result.logits;
+    require(rejected_late,
+            "missing output.weight must discard the previously encoded head mixer: " +
+                error);
+    require(std::equal(normalized_before.begin(), normalized_before.end(),
+                       static_cast<const std::uint8_t*>(normalized.contents)) &&
+                std::equal(low_rank_before.begin(), low_rank_before.end(),
+                           static_cast<const std::uint8_t*>(low_rank.contents)) &&
+                std::equal(gate_before.begin(), gate_before.end(),
+                           static_cast<const std::uint8_t*>(gate.contents)) &&
+                std::equal(mixed_before.begin(), mixed_before.end(),
+                           static_cast<const std::uint8_t*>(mixed.contents)) &&
+                std::equal(q8_1_before.begin(), q8_1_before.end(),
+                           static_cast<const std::uint8_t*>(q8_1.contents)) &&
+                std::equal(logits_before.begin(), logits_before.end(),
+                           static_cast<const std::uint8_t*>(logits.contents)) &&
+                std::equal(sink_before.begin(), sink_before.end(),
+                           static_cast<const std::uint8_t*>(
+                               matvec_sink.contents)),
+            "late FullMode output-head failure preserves all scratch bytes");
+
+    auto caller_owned_rollback = context.make_command_buffer(
+        "FullMode output-head caller-owned rollback", error);
+    require(caller_owned_rollback != nullptr,
+            "create caller-owned FullMode output-head rollback command: " +
+                error);
+    WindowOutputHeadResult caller_owned_result;
+    const bool caller_owned_rejected =
+        !Encoder::encode(
+            context, *caller_owned_rollback,
+            "FullMode output-head caller-owned rollback",
+            [&](Encoder& encoder, std::string& encode_error) {
+                return encode_window_output_head(
+                    context, encoder, *missing_weight, *scratch, kRows,
+                    head_buffers, caller_owned_result, encode_error);
+            },
+            error) &&
+        error.find("cannot resolve output.weight") != std::string::npos &&
+        caller_owned_rollback->unsafe_native_handle() == nullptr &&
+        !caller_owned_result.logits;
+    require(caller_owned_rejected,
+            "caller-owned late output-weight failure must discard the whole segment: " +
+                error);
+    require(std::equal(normalized_before.begin(), normalized_before.end(),
+                       static_cast<const std::uint8_t*>(normalized.contents)) &&
+                std::equal(low_rank_before.begin(), low_rank_before.end(),
+                           static_cast<const std::uint8_t*>(low_rank.contents)) &&
+                std::equal(gate_before.begin(), gate_before.end(),
+                           static_cast<const std::uint8_t*>(gate.contents)) &&
+                std::equal(mixed_before.begin(), mixed_before.end(),
+                           static_cast<const std::uint8_t*>(mixed.contents)) &&
+                std::equal(q8_1_before.begin(), q8_1_before.end(),
+                           static_cast<const std::uint8_t*>(q8_1.contents)) &&
+                std::equal(logits_before.begin(), logits_before.end(),
+                           static_cast<const std::uint8_t*>(logits.contents)) &&
+                std::equal(sink_before.begin(), sink_before.end(),
+                           static_cast<const std::uint8_t*>(
+                               matvec_sink.contents)),
+            "caller-owned rollback preserves all head scratch bytes");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -4420,6 +4798,8 @@ int main(int argc, char** argv) {
         const std::string mode = argc == 3 ? argv[2] : "";
         const bool fullmode_output_projection_only =
             mode == "--fullmode-output-projection";
+        const bool fullmode_output_head_only =
+            mode == "--fullmode-output-head";
         const bool fullmode_ple_handoff_only =
             mode == "--fullmode-ple-handoff" ||
             mode == "--fullmode-ple-handoff-q8" ||
@@ -4427,10 +4807,11 @@ int main(int argc, char** argv) {
         require(argc == 2 || never_wrap_only || tiered_copy_only ||
             model_owner_only || fullmode_handoff_only ||
                     fullmode_output_projection_only ||
+                    fullmode_output_head_only ||
                     fullmode_ple_handoff_only,
                 "usage: metal_window_storage_test strata.metallib "
                 "[--never-wrap|--tiered-copy|--model-owner|--fullmode-handoff|"
-                "--fullmode-output-projection|"
+                "--fullmode-output-projection|--fullmode-output-head|"
                 "--fullmode-ple-handoff|--fullmode-ple-handoff-q8|"
                 "--fullmode-ple-handoff-bf16]");
         if (argc == 2) test_warmup_wave_barrier();
@@ -4454,6 +4835,14 @@ int main(int argc, char** argv) {
             std::error_code ignored;
             fs::remove_all(directory, ignored);
             std::cout << "metal_fullmode_output_projection_test: OK\n";
+            return 0;
+        }
+        if (fullmode_output_head_only) {
+            run_fullmode_output_head_test(*context, directory);
+            context.reset();
+            std::error_code ignored;
+            fs::remove_all(directory, ignored);
+            std::cout << "metal_fullmode_output_head_test: OK\n";
             return 0;
         }
         WindowPlan plan;

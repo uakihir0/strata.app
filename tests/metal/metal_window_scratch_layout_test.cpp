@@ -86,6 +86,9 @@ std::vector<WindowScratchRegion> regions_of(const WindowScratchLayout& layout) {
         layout.shared_hidden_q,
         layout.shared_output,
         layout.shared_gate_logit,
+        layout.head_normalized,
+        layout.head_low_rank,
+        layout.head_gate,
         layout.head_mixed,
         layout.head_q8_1,
         layout.head_logits,
@@ -170,6 +173,11 @@ void check_for_capacity(std::uint32_t capacity, std::size_t expected_bytes,
                 layout.moe_hidden_q.bytes == 8u * 10u * 20u * 36u,
             "MoE routing, plans and expert intermediates must match the shader ABI");
     require(layout.ple_norm.bytes == 8u * 10'240u * sizeof(float) &&
+                layout.head_normalized.bytes ==
+                    8u * 4u * 2'560u * sizeof(float) &&
+                layout.head_low_rank.bytes == 8u * 4u * 320u * sizeof(float) &&
+                layout.head_gate.bytes ==
+                    8u * 4u * 2'560u * sizeof(float) &&
                 layout.head_q8_1.bytes == 8u * 80u * 36u &&
                 layout.head_logits.bytes ==
                     8u * 248'320u * sizeof(float) &&
@@ -191,12 +199,12 @@ void check_for_capacity(std::uint32_t capacity, std::size_t expected_bytes,
 
 int main() {
     try {
-        check_for_capacity(32'768u, 47'664'384u, 256u);
-        check_for_capacity(65'536u, 47'926'528u, 256u);
-        check_for_capacity(kWindowScratchMaxCellCapacity, 49'499'392u, 256u);
-        check_for_capacity(32'768u, 47'672'576u);
-        check_for_capacity(65'536u, 47'934'720u);
-        check_for_capacity(kWindowScratchMaxCellCapacity, 49'507'584u);
+        check_for_capacity(32'768u, 48'360'704u, 256u);
+        check_for_capacity(65'536u, 48'622'848u, 256u);
+        check_for_capacity(kWindowScratchMaxCellCapacity, 50'195'712u, 256u);
+        check_for_capacity(32'768u, 48'368'896u);
+        check_for_capacity(65'536u, 48'631'040u);
+        check_for_capacity(kWindowScratchMaxCellCapacity, 50'203'904u);
 
         WindowScratchLayout compact;
         WindowScratchLayout full;

@@ -281,6 +281,14 @@ bool make_window_scratch_layout(const Geometry& geometry,
         append_elements(token_rows, kFloatBytes, cursor,
                         candidate.shared_gate_logit) &&
 
+        append_product({token_rows, kSessionHyperconnections,
+                        kSessionEmbeddingWidth},
+                       kFloatBytes, cursor, candidate.head_normalized) &&
+        append_product({token_rows, kSessionHyperconnections, 320u},
+                       kFloatBytes, cursor, candidate.head_low_rank) &&
+        append_product({token_rows, kSessionHyperconnections,
+                        kSessionEmbeddingWidth},
+                       kFloatBytes, cursor, candidate.head_gate) &&
         append_product({token_rows, kPleInputWidth}, kFloatBytes, cursor,
                        candidate.head_mixed) &&
         append_q81(token_rows, kPleInputWidth, cursor, candidate.head_q8_1) &&

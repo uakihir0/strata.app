@@ -87,6 +87,9 @@ struct WindowScratchLayout {
     WindowScratchRegion shared_output;
     WindowScratchRegion shared_gate_logit;
 
+    WindowScratchRegion head_normalized;
+    WindowScratchRegion head_low_rank;
+    WindowScratchRegion head_gate;
     WindowScratchRegion head_mixed;
     WindowScratchRegion head_q8_1;
     WindowScratchRegion head_logits;

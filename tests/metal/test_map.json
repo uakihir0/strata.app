@@ -142,6 +142,10 @@
       "label": "metal",
       "origin": "04 5.1, 5.8; 06 L9; D-IMPL-306; REV-103"
     },
+    "metal_fullmode_output_head_test": {
+      "label": "metal",
+      "origin": "04 4.4, 5.1, 5.8; 06 L9; D-IMPL-307; REV-104"
+    },
     "metal_fullmode_ple_handoff_test": {
       "label": "metal",
       "origin": "06 L9; D-IMPL-295; D-IMPL-296; REV-092; REV-093; D-IMPL-297; REV-094; D-IMPL-298; REV-095; D-IMPL-299; REV-096; D-IMPL-303; REV-100"
