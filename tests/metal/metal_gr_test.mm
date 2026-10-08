@@ -1847,6 +1847,446 @@ bool run_gr_up_case(Context& context, std::uint32_t rows, bool apply,
     return !residual_mismatch && !mixed_mismatch;
 }
 
+bool run_gr_read_pipeline_case(Context& context, std::uint32_t rows,
+                               bool apply, const twin::Options& options) {
+    const std::string label = "gr_read_pipeline T=" + std::to_string(rows) +
+        (apply ? " apply" : " no-apply");
+    constexpr std::size_t kResidual = 0u;
+    constexpr std::size_t kBlockOut = 1u;
+    constexpr std::size_t kInjectPrev = 2u;
+    constexpr std::size_t kNorm = 3u;
+    constexpr std::size_t kNormalized = 4u;
+    constexpr std::size_t kRs = 5u;
+    constexpr std::size_t kHcDown = 6u;
+    constexpr std::size_t kHcInject = 7u;
+    constexpr std::size_t kLo = 8u;
+    constexpr std::size_t kInjectOut = 9u;
+    constexpr std::size_t kHcUp = 10u;
+    constexpr std::size_t kMixed = 11u;
+
+    const std::size_t residual_count =
+        static_cast<std::size_t>(rows) * HC_DIM;
+    const std::size_t block_count =
+        static_cast<std::size_t>(rows) * N_EMBD;
+    const std::size_t inject_count =
+        static_cast<std::size_t>(rows) * HC;
+    const std::size_t low_rank_count =
+        static_cast<std::size_t>(rows) * HC_LOW_RANK;
+    const std::size_t down_weight_count =
+        static_cast<std::size_t>(HC_LOW_RANK) * HC_DIM;
+    const std::size_t inject_weight_count =
+        static_cast<std::size_t>(HC) * HC_DIM;
+    const std::size_t up_weight_count =
+        static_cast<std::size_t>(HC_DIM) * HC_LOW_RANK;
+    const std::array<std::size_t, 12u> byte_sizes{
+        residual_count * sizeof(float),
+        block_count * sizeof(float),
+        inject_count * sizeof(float),
+        static_cast<std::size_t>(HC_DIM) * sizeof(float),
+        residual_count * sizeof(float),
+        inject_count * sizeof(float),
+        down_weight_count * sizeof(std::uint16_t),
+        inject_weight_count * sizeof(std::uint16_t),
+        low_rank_count * sizeof(float),
+        inject_count * sizeof(float),
+        up_weight_count * sizeof(std::uint16_t),
+        block_count * sizeof(float),
+    };
+
+    std::vector<float> residual(residual_count);
+    std::vector<float> block_out(block_count);
+    std::vector<float> inject_prev(inject_count);
+    std::vector<float> norm(HC_DIM);
+    std::vector<std::uint16_t> hc_down(down_weight_count);
+    std::vector<std::uint16_t> hc_inject(inject_weight_count);
+    std::vector<std::uint16_t> hc_up(up_weight_count);
+    std::mt19937_64 rng(options.seed ^ 0x475252454144ull ^
+                        (static_cast<std::uint64_t>(rows) << 32u) ^
+                        (apply ? 0x4150504c59ull : 0x4e4f415050ull));
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        for (std::uint32_t index = 0u; index < HC_DIM; ++index) {
+            residual[static_cast<std::size_t>(row) * HC_DIM + index] =
+                input_value(twin::InputSet::fixture, row, index, rng);
+        }
+        for (std::uint32_t index = 0u; index < N_EMBD; ++index) {
+            block_out[static_cast<std::size_t>(row) * N_EMBD + index] =
+                gamma_value(twin::InputSet::fixture, row, index, rng);
+        }
+        for (std::uint32_t stream = 0u; stream < HC; ++stream) {
+            inject_prev[static_cast<std::size_t>(row) * HC + stream] =
+                input_value(twin::InputSet::fixture, row, stream, rng);
+        }
+    }
+    for (std::uint32_t index = 0u; index < HC_DIM; ++index) {
+        norm[index] = gamma_value(twin::InputSet::fixture,
+                                  index / N_EMBD, index % N_EMBD, rng);
+    }
+    for (std::uint32_t row = 0u; row < HC_LOW_RANK; ++row) {
+        for (std::uint32_t column = 0u; column < HC_DIM; ++column) {
+            hc_down[static_cast<std::size_t>(row) * HC_DIM + column] =
+                strata::kernels::bf16_from_f32(gamma_value(
+                    twin::InputSet::fixture, row, column, rng));
+        }
+    }
+    for (std::uint32_t row = 0u; row < HC; ++row) {
+        for (std::uint32_t column = 0u; column < HC_DIM; ++column) {
+            hc_inject[static_cast<std::size_t>(row) * HC_DIM + column] =
+                strata::kernels::bf16_from_f32(gamma_value(
+                    twin::InputSet::fixture, HC_LOW_RANK + row, column, rng));
+        }
+    }
+    for (std::uint32_t row = 0u; row < HC_DIM; ++row) {
+        for (std::uint32_t rank = 0u; rank < HC_LOW_RANK; ++rank) {
+            hc_up[static_cast<std::size_t>(row) * HC_LOW_RANK + rank] =
+                strata::kernels::bf16_from_f32(gamma_value(
+                    twin::InputSet::fixture, row, rank, rng));
+        }
+    }
+
+    std::array<twin::GuardedBuffer, 12u> storage;
+    std::array<BufferRef, 12u> views{};
+    const std::array<const char*, 12u> names{
+        "residual", "block_out", "inject_prev", "norm", "normalized",
+        "rs", "hc_down", "hc_inject", "lo", "inject_out", "hc_up",
+        "mixed",
+    };
+    std::string error;
+    for (std::size_t index = 0u; index < storage.size(); ++index) {
+        check(storage[index].allocate(context,
+                                      label + " " + names[index],
+                                      byte_sizes[index], error),
+              label + " " + names[index] + " buffer", error);
+        views[index] = storage[index].view();
+        if (!views[index]) return false;
+    }
+    const auto copy_input = [&](std::size_t index, const void* source) {
+        std::memcpy(storage[index].payload().data(), source, byte_sizes[index]);
+    };
+    copy_input(kResidual, residual.data());
+    copy_input(kBlockOut, block_out.data());
+    copy_input(kInjectPrev, inject_prev.data());
+    copy_input(kNorm, norm.data());
+    copy_input(kHcDown, hc_down.data());
+    copy_input(kHcInject, hc_inject.data());
+    copy_input(kHcUp, hc_up.data());
+    for (const std::size_t index :
+         {kNormalized, kRs, kLo, kInjectOut, kMixed}) {
+        std::memset(storage[index].payload().data(), 0xa5, byte_sizes[index]);
+    }
+    for (auto& buffer : storage) buffer.capture_before_dispatch();
+
+    const GRReadBuffers buffers{
+        views[kResidual], views[kBlockOut], views[kInjectPrev], views[kNorm],
+        views[kNormalized], views[kRs], views[kHcDown], views[kHcInject],
+        views[kLo], views[kInjectOut], views[kHcUp], views[kMixed],
+    };
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = encode_gr_read(context, *command, rows, apply,
+                                        buffers, error);
+    check(encoded, label + " ordered GR read encoding", error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    const bool completed = submit_and_wait(command, label, error);
+    check(completed, label + " ordered GR read execution", error);
+    if (!completed) return false;
+
+    const auto floats = [&](std::size_t index, std::size_t count) {
+        return std::span<const float>(
+            reinterpret_cast<const float*>(storage[index].payload().data()),
+            count);
+    };
+    std::vector<twin::tf> expected_xn;
+    std::vector<twin::tf> expected_rs;
+    gr_norm_reference(residual, block_out, norm, inject_prev, rows, apply,
+                      expected_xn, expected_rs);
+    const auto actual_xn = floats(kNormalized, residual_count);
+    const auto actual_rs = floats(kRs, inject_count);
+    const twin::Comparison norm_comparison = apply
+        ? twin::Comparison::units : twin::Comparison::bits;
+    const auto xn_mismatch = twin::compare_floats(
+        actual_xn, expected_xn,
+        {norm_comparison, apply ? 64.0 : 0.0, 0.0, 0u});
+    const auto rs_mismatch = twin::compare_floats(
+        actual_rs, expected_rs,
+        {norm_comparison, apply ? 64.0 : 0.0, 0.0, 0u});
+    check(!xn_mismatch, label + " normalized rows match the GR norm oracle");
+    check(!rs_mismatch, label + " reciprocal scales match the GR norm oracle");
+
+    std::vector<twin::tf> expected_lo;
+    std::vector<twin::tf> expected_inject_out;
+    gr_down_reference(actual_xn, hc_down, hc_inject, rows,
+                      expected_lo, expected_inject_out);
+    const auto actual_lo = floats(kLo, low_rank_count);
+    const auto actual_inject_out = floats(kInjectOut, inject_count);
+    const auto lo_mismatch = twin::compare_floats(
+        actual_lo, expected_lo,
+        {twin::Comparison::units, 16.0, 0.0, 0u});
+    const auto inject_mismatch = twin::compare_floats(
+        actual_inject_out, expected_inject_out,
+        {twin::Comparison::bits, 0.0, 0.0, 0u});
+    check(!lo_mismatch, label + " low-rank rows match the chained GR oracle");
+    check(!inject_mismatch,
+          label + " injection output matches the chained GR oracle");
+
+    std::vector<twin::tf> expected_residual;
+    std::vector<twin::tf> expected_mixed;
+    gr_up_reference(residual, block_out, inject_prev, norm, actual_rs,
+                    actual_lo, hc_up, rows, apply, expected_residual,
+                    expected_mixed);
+    const auto actual_residual = floats(kResidual, residual_count);
+    const auto actual_mixed = floats(kMixed, block_count);
+    const auto residual_mismatch = twin::compare_floats(
+        actual_residual, expected_residual,
+        {apply ? twin::Comparison::units : twin::Comparison::bits,
+         apply ? 16.0 : 0.0, 0.0, 0u});
+    const auto mixed_mismatch = twin::compare_floats(
+        actual_mixed, expected_mixed,
+        {twin::Comparison::units, 64.0, 0.0, N_EMBD});
+    check(!residual_mismatch,
+          label + (apply ? " residual write matches the GR oracle"
+                         : " residual remains bit-exact"));
+    check(!mixed_mismatch, label + " mixed rows match the GR oracle");
+
+    const std::array<std::size_t, 6u> writable_views{
+        kResidual, kNormalized, kRs, kLo, kInjectOut, kMixed};
+    bool shared_encoder_matches = true;
+    if (rows == 1u) {
+        std::array<std::vector<unsigned char>, writable_views.size()>
+            command_buffer_outputs;
+        for (std::size_t index = 0u; index < writable_views.size(); ++index) {
+            const auto payload = storage[writable_views[index]].payload();
+            command_buffer_outputs[index].assign(payload.begin(), payload.end());
+        }
+        auto shared_command = context.make_command_buffer(
+            label + " caller-owned Encoder", error);
+        if (!shared_command) {
+            check(false, label + " caller-owned Encoder command buffer", error);
+            shared_encoder_matches = false;
+        } else {
+            const bool shared_encoded = Encoder::encode(
+                context, *shared_command, "GR read caller-owned segment",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encode_gr_read(context, encoder, rows, apply,
+                                          buffers, encode_error);
+                }, error);
+            check(shared_encoded,
+                  label + " caller-owned Encoder GR read encoding", error);
+            bool shared_completed = false;
+            if (shared_encoded) {
+                shared_completed = submit_and_wait(
+                    shared_command, label + " caller-owned Encoder", error);
+                check(shared_completed,
+                      label + " caller-owned Encoder GR read execution", error);
+            }
+            bool outputs_match = shared_completed;
+            if (shared_completed) {
+                for (std::size_t index = 0u;
+                     index < writable_views.size(); ++index) {
+                    const auto payload = storage[writable_views[index]].payload();
+                    outputs_match &= std::equal(
+                        command_buffer_outputs[index].begin(),
+                        command_buffer_outputs[index].end(),
+                        payload.begin(), payload.end());
+                }
+            } else {
+                shared_command->discard();
+            }
+            check(outputs_match,
+                  label + " caller-owned Encoder matches standalone outputs");
+            shared_encoder_matches = shared_encoded && shared_completed &&
+                                     outputs_match;
+        }
+    }
+
+    bool inputs_unchanged = true;
+    for (const std::size_t index :
+         {kBlockOut, kInjectPrev, kNorm, kHcDown, kHcInject, kHcUp}) {
+        const bool unchanged = !storage[index].first_unwritten_change({});
+        check(unchanged, label + " " + names[index] + " remains read-only");
+        inputs_unchanged &= unchanged;
+    }
+    const std::array<twin::ByteRange, 1u> residual_written{{
+        {0u, apply ? byte_sizes[kResidual] : 0u}}};
+    const std::array<twin::ByteRange, 1u> normalized_written{{
+        {0u, byte_sizes[kNormalized]}}};
+    const std::array<twin::ByteRange, 1u> rs_written{{
+        {0u, byte_sizes[kRs]}}};
+    const std::array<twin::ByteRange, 1u> lo_written{{
+        {0u, byte_sizes[kLo]}}};
+    const std::array<twin::ByteRange, 1u> inject_written{{
+        {0u, byte_sizes[kInjectOut]}}};
+    const std::array<twin::ByteRange, 1u> mixed_written{{
+        {0u, byte_sizes[kMixed]}}};
+    const bool output_guards =
+        !storage[kResidual].first_unwritten_change(apply
+            ? std::span<const twin::ByteRange>(residual_written)
+            : std::span<const twin::ByteRange>{}) &&
+        !storage[kNormalized].first_unwritten_change(normalized_written) &&
+        !storage[kRs].first_unwritten_change(rs_written) &&
+        !storage[kLo].first_unwritten_change(lo_written) &&
+        !storage[kInjectOut].first_unwritten_change(inject_written) &&
+        !storage[kMixed].first_unwritten_change(mixed_written);
+    check(output_guards, label + " outputs stay inside their declared views");
+
+    bool late_failure_discards = true;
+    std::array<std::vector<unsigned char>, writable_views.size()> before_failure;
+    for (std::size_t index = 0u; index < writable_views.size(); ++index) {
+        const std::size_t view_index = writable_views[index];
+        auto payload = storage[view_index].payload();
+        std::fill(payload.begin(), payload.end(), static_cast<unsigned char>(0x6d));
+        before_failure[index].assign(payload.begin(), payload.end());
+    }
+    GRReadBuffers malformed = buffers;
+    malformed.hc_up = views[kHcUp].slice(0u, sizeof(std::uint16_t));
+    auto rejected_command = context.make_command_buffer(
+        label + " late-stage rejection", error);
+    if (!rejected_command) {
+        check(false, label + " late-stage rejection command buffer", error);
+        late_failure_discards = false;
+    } else {
+        const bool rejected = !encode_gr_read(
+            context, *rejected_command, rows, apply, malformed, error) &&
+            error.find("undersized") != std::string::npos;
+        const bool discarded =
+            rejected_command->unsafe_native_handle() == nullptr;
+        bool outputs_unchanged = true;
+        for (std::size_t index = 0u; index < writable_views.size(); ++index) {
+            const auto payload = storage[writable_views[index]].payload();
+            outputs_unchanged &= std::equal(
+                before_failure[index].begin(), before_failure[index].end(),
+                payload.begin(), payload.end());
+        }
+        check(rejected, label + " late GR up validation rejects short weights",
+              error);
+        check(discarded,
+              label + " late GR up validation discards earlier dispatches");
+        check(outputs_unchanged,
+              label + " failed pipeline leaves every output untouched");
+        late_failure_discards = rejected && discarded && outputs_unchanged;
+    }
+
+    bool caller_owned_late_failure_discards = true;
+    auto rejected_shared_command = context.make_command_buffer(
+        label + " caller-owned late-stage rejection", error);
+    if (!rejected_shared_command) {
+        check(false, label + " caller-owned late-rejection command buffer",
+              error);
+        caller_owned_late_failure_discards = false;
+    } else {
+        const bool rejected = !Encoder::encode(
+            context, *rejected_shared_command,
+            "GR read caller-owned late-stage rejection",
+            [&](Encoder& encoder, std::string& encode_error) {
+                return encode_gr_read(context, encoder, rows, apply,
+                                      malformed, encode_error);
+            }, error) && error.find("undersized") != std::string::npos;
+        const bool discarded =
+            rejected_shared_command->unsafe_native_handle() == nullptr;
+        bool outputs_unchanged = true;
+        for (std::size_t index = 0u; index < writable_views.size(); ++index) {
+            const auto payload = storage[writable_views[index]].payload();
+            outputs_unchanged &= std::equal(
+                before_failure[index].begin(), before_failure[index].end(),
+                payload.begin(), payload.end());
+        }
+        check(rejected,
+              label + " caller-owned GR up validation rejects short weights",
+              error);
+        check(discarded,
+              label + " caller-owned failure discards earlier dispatches");
+        check(outputs_unchanged,
+              label + " caller-owned failure leaves outputs untouched");
+        caller_owned_late_failure_discards = rejected && discarded &&
+                                             outputs_unchanged;
+        if (!discarded) rejected_shared_command->discard();
+    }
+
+    bool alias_rejected = true;
+    GRReadBuffers aliased = buffers;
+    aliased.lo = aliased.normalized;
+    auto alias_command = context.make_command_buffer(
+        label + " cross-stage alias rejection", error);
+    if (!alias_command) {
+        check(false, label + " cross-stage alias command buffer", error);
+        alias_rejected = false;
+    } else {
+        alias_rejected = !encode_gr_read(context, *alias_command, rows, apply,
+                                         aliased, error) &&
+            error.find("overlap across dispatches") != std::string::npos &&
+            alias_command->unsafe_native_handle() == nullptr;
+        check(alias_rejected,
+              label + " cross-stage writable alias is rejected", error);
+    }
+
+    bool concurrent_group_rejected = true;
+    const char* dispatch_mode = std::getenv("STRATA_METAL_DISPATCH");
+    if (dispatch_mode != nullptr &&
+        std::string_view(dispatch_mode) == "concurrent") {
+        auto group_command = context.make_command_buffer(
+            label + " concurrent-group boundary", error);
+        if (!group_command) {
+            check(false, label + " concurrent-group command buffer", error);
+            concurrent_group_rejected = false;
+        } else {
+            concurrent_group_rejected = Encoder::encode(
+                context, *group_command, "GR read group-boundary validation",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    if (!encoder.group_begin(encode_error)) return false;
+                    std::string stage_error;
+                    const bool rejected = !encode_gr_read(
+                        context, encoder, rows, apply, buffers, stage_error) &&
+                        stage_error.find("ordered concurrent-group boundary") !=
+                            std::string::npos;
+                    if (!encoder.group_end(encode_error)) return false;
+                    if (!rejected) {
+                        encode_error = "GR read pipeline accepted an open concurrent group";
+                    }
+                    return rejected;
+                }, error);
+            check(concurrent_group_rejected,
+                  label + " pipeline refuses an open concurrent group", error);
+            group_command->discard();
+        }
+    }
+
+    return !xn_mismatch && !rs_mismatch && !lo_mismatch &&
+           !inject_mismatch && !residual_mismatch && !mixed_mismatch &&
+           inputs_unchanged && output_guards && shared_encoder_matches &&
+           late_failure_discards && caller_owned_late_failure_discards &&
+           alias_rejected && concurrent_group_rejected;
+}
+
+bool test_gr_read_encoder_validation(Context& context) {
+    std::string error;
+    const GRReadBuffers empty{};
+    bool passed = true;
+    for (const std::uint32_t rows : {0u, 9u}) {
+        const std::string label = "GR read encoder rejects T=" +
+                                  std::to_string(rows);
+        auto command = context.make_command_buffer(label, error);
+        if (!command) {
+            check(false, label + " command buffer", error);
+            passed = false;
+            continue;
+        }
+        const bool rejected = !encode_gr_read(
+            context, *command, rows, false, empty, error) &&
+            error.find("1..8") != std::string::npos;
+        const bool discarded = command->unsafe_native_handle() == nullptr;
+        check(rejected, label, error);
+        check(discarded, label + " discards its empty encoder segment");
+        if (!discarded) command->discard();
+        passed &= rejected && discarded;
+    }
+    return passed;
+}
+
 bool test_gr_up_encoder_validation(Context& context) {
     std::string error;
     const auto reject = [&](const std::string& label, std::uint32_t rows,
@@ -4248,6 +4688,8 @@ bool run_set(Context& context, twin::InputSet set, const twin::Options& options)
         passed &= run_gr_up_case(context, 8u, true, set, options, true);
         passed &= run_gr_down_case(context, 1u, set, options, true);
         passed &= run_gr_down_case(context, 8u, set, options, true);
+        passed &= run_gr_read_pipeline_case(context, 1u, false, options);
+        passed &= run_gr_read_pipeline_case(context, 8u, true, options);
     }
     if (set == twin::InputSet::fixture) {
         float sigmoid = 0.0f;
@@ -4331,6 +4773,7 @@ int main(int argc, char** argv) {
     passed &= test_gr_norm_encoder_validation(*context);
     passed &= test_gr_down_encoder_validation(*context, *foreign_context);
     passed &= test_gr_up_encoder_validation(*context);
+    passed &= test_gr_read_encoder_validation(*context);
     passed &= test_gr_post_encoder_validation(*context, *foreign_context);
     passed &= test_gr_down_silu_encoder_validation(*context, *foreign_context);
     passed &= test_gr_pre_gated_encoder_validation(*context, *foreign_context);

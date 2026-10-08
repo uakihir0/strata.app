@@ -1617,4 +1617,64 @@ bool encode_weighted_rms_norm(
         error);
 }
 
+bool encode_gr_read(Context& context, Encoder& encoder, std::uint32_t rows,
+                    bool apply, const GRReadBuffers& buffers,
+                    std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "GR read pipeline requires an ordered concurrent-group boundary";
+        return false;
+    }
+    if (rows == 0u || rows > VERIFY_MAX_T) {
+        error = "GR read row count must be in 1..8";
+        return false;
+    }
+
+    const std::array views{
+        buffers.residual, buffers.block_out, buffers.inject_prev, buffers.norm,
+        buffers.normalized, buffers.rs, buffers.hc_down, buffers.hc_inject,
+        buffers.lo, buffers.inject_out, buffers.hc_up, buffers.mixed,
+    };
+    for (std::size_t index = 0u; index < views.size(); ++index) {
+        for (std::size_t earlier = 0u; earlier < index; ++earlier) {
+            if (buffer_views_overlap(views[index], views[earlier])) {
+                error = "GR read pipeline buffer views overlap across dispatches";
+                return false;
+            }
+        }
+    }
+
+    const GRNormBuffers norm_buffers{
+        buffers.residual, buffers.block_out, buffers.norm,
+        buffers.inject_prev, buffers.normalized, buffers.rs};
+    if (!encode_gr_norm(context, encoder, rows, apply, norm_buffers, error)) {
+        return false;
+    }
+
+    const GRDownBuffers down_buffers{
+        buffers.normalized, buffers.hc_down, buffers.hc_inject,
+        buffers.lo, buffers.inject_out};
+    if (!encode_gr_down(context, encoder, rows, down_buffers, error)) {
+        return false;
+    }
+
+    const GRUpBuffers up_buffers{
+        buffers.residual, buffers.block_out, buffers.inject_prev,
+        buffers.norm, buffers.rs, buffers.lo, buffers.hc_up,
+        buffers.mixed};
+    return encode_gr_up(context, encoder, rows, apply, up_buffers, error);
+}
+
+bool encode_gr_read(Context& context, CommandBuffer& command_buffer,
+                    std::uint32_t rows, bool apply,
+                    const GRReadBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "GR read pipeline",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_gr_read(context, encoder, rows, apply, buffers,
+                                  encode_error);
+        },
+        error);
+}
+
 }  // namespace strata::metal

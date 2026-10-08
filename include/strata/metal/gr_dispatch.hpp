@@ -52,6 +52,25 @@ struct GRUpBuffers {
     BufferRef mixed;
 };
 
+/// Buffers for the ordered GR read pipeline: normalize, project down and
+/// inject, then project up and mix. All twelve views must be pairwise
+/// disjoint, including read-only roles; stage inputs and outputs are wired
+/// from these shared fields.
+struct GRReadBuffers {
+    BufferRef residual;
+    BufferRef block_out;
+    BufferRef inject_prev;
+    BufferRef norm;
+    BufferRef normalized;
+    BufferRef rs;
+    BufferRef hc_down;
+    BufferRef hc_inject;
+    BufferRef lo;
+    BufferRef inject_out;
+    BufferRef hc_up;
+    BufferRef mixed;
+};
+
 struct GRPostBuffers {
     BufferRef residual;
     BufferRef block_out;
@@ -177,6 +196,17 @@ bool encode_gr_norm(Context& context, CommandBuffer& command_buffer,
 bool encode_gr_norm(Context& context, Encoder& encoder,
                     std::uint32_t rows, bool apply,
                     const GRNormBuffers& buffers, std::string& error);
+
+/// Compose normalization, down/injection projection, and up/mix for one GR
+/// read in order. In concurrent dispatch mode call outside an open group so
+/// the Encoder inserts barriers between dependent dispatches. The standalone
+/// wrapper discards the full segment if any stage fails.
+bool encode_gr_read(Context& context, Encoder& encoder, std::uint32_t rows,
+                    bool apply, const GRReadBuffers& buffers,
+                    std::string& error);
+bool encode_gr_read(Context& context, CommandBuffer& command_buffer,
+                    std::uint32_t rows, bool apply,
+                    const GRReadBuffers& buffers, std::string& error);
 
 /// Encode one fused write/project-or-add pass into a caller-owned command
 /// buffer. Buffers and the command buffer must belong to `context`, be

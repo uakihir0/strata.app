@@ -1197,7 +1197,19 @@ the two-word T/apply ABI, the eight buffer ranges and pairwise disjointness, 16-
 threadgroup-memory limits and Context ownership before dispatch. Standalone command-buffer and caller-owned
 `Encoder` forms share these checks; the latter binds the parameter block at slot 8 through the manifest-validated
 dispatch facade. A caller must propagate a `false` result from its enclosing `Encoder::encode` body so earlier
-dispatches in the same segment are discarded. Window and Prefill do not call it yet.
+dispatches in the same segment are discarded.
+
+`encode_gr_read` composes `strata_gr_norm`, `strata_gr_down`, and `strata_gr_up` in that order for T=1..8. It wires
+`normalized` and `rs` from norm to the later stages, `lo` from down to up, and returns the computed `inject_out` to
+the caller for the next read. All twelve supplied buffer views must be pairwise disjoint, including read-only roles;
+this keeps the in-place residual fold and the old/new injection values separate across dispatches. The coordinator
+rejects an open concurrent dispatch group because automatic buffer barriers are suppressed inside one. Its
+caller-owned `Encoder` form inserts the dependencies between dispatches when called outside a group. The
+`CommandBuffer` form wraps the whole chain in one `Encoder::encode` segment, so a late stage validation failure
+discards earlier dispatches. In a larger caller-owned segment, the caller must propagate `false` from the enclosing
+body to get the same rollback. `metal_gr_test` exercises T=1 without a pending write and T=8 with a write, checks
+all stage outputs against their scalar references, rejects cross-stage aliases and an open concurrent group, and
+verifies late-failure discard. This reusable composition is not yet wired into Window or Prefill.
 
 **`strata_gr_post`**, grid (40, T) × 256. This is the native `post`.
 
