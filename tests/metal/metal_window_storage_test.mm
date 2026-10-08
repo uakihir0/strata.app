@@ -69,6 +69,11 @@ void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+bool event_has_value(const Events& events, std::uint64_t expected) {
+    const auto value = events.signaled_value();
+    return value && *value == expected;
+}
+
 class CommandGatesCleanup {
 public:
     CommandGatesCleanup(Events* layer_gate, std::uint64_t layer_value,
@@ -1162,7 +1167,7 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
                 resolve_leases, 0, *handshake_events, arrival_value,
                 layer_done_value, 0, invalid_event_stats, error) &&
                 error.find("consecutive positive event values") != std::string::npos &&
-                handshake_events->signaled_value() == 0,
+                event_has_value(*handshake_events, 0),
             "reject a layer-ready value that could release a later GPU wait");
     id<MTLCommandBuffer> native_resolve =
         (__bridge id<MTLCommandBuffer>)resolve_command->unsafe_native_handle();
@@ -1177,7 +1182,7 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
                 5000, first_resolve, error),
             "resolve the shared GPU plan and release the waiting layer: " + error);
     gate_cleanup.mark_layer_released();
-    require(handshake_events->signaled_value() == release_value &&
+    require(event_has_value(*handshake_events, release_value) &&
                 std::memcmp(writable_plans, &resolve_plan, sizeof(resolve_plan)) == 0 &&
                 first_resolve.hits == 5 && first_resolve.lookups == 10 &&
                 first_resolve.ram_blobs + first_resolve.file_blobs == 2 &&
@@ -1287,7 +1292,7 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     skip_cleanup.mark_layer_released();
     require(skipped_stats.hits == 10 && skipped_stats.lookups == 10 &&
                 skipped_stats.ram_blobs == 0 && skipped_stats.file_blobs == 0 &&
-                handshake_events->signaled_value() == skip_release,
+                event_has_value(*handshake_events, skip_release),
             "a skipped plan must report resident hits and signal the host release");
     require(handshake_events->wait(skip_done, 5000, error),
             "wait for skipped layer completion: " + error);
@@ -1334,7 +1339,7 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
                 invalid_arrival, invalid_release, 5000,
                 invalid_handshake_stats, error) &&
                 error.find("counts, row width, or skip flag") != std::string::npos &&
-                handshake_events->signaled_value() == invalid_arrival,
+                event_has_value(*handshake_events, invalid_arrival),
             "a skipped plan with no groups must fail without signaling layer-ready");
     invalid_skipped_plan.n_groups = 1;
     invalid_skipped_plan.n_miss = 1;
@@ -1344,7 +1349,7 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
                 invalid_arrival, invalid_release, 5000,
                 invalid_handshake_stats, error) &&
                 error.find("skipped plan reports misses") != std::string::npos &&
-                handshake_events->signaled_value() == invalid_arrival,
+                event_has_value(*handshake_events, invalid_arrival),
             "a skipped plan reporting misses must fail without signaling layer-ready");
     require(invalid_cleanup.release_layer(error) &&
                 handshake_events->wait(invalid_done, 5000, error) &&
@@ -1389,6 +1394,19 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     require_not_overlapping_gguf_mapping(resident_table, source_file, "tiered resident table");
     require_not_overlapping_gguf_mapping(plan_buffer, source_file, "tiered plan table");
     require_not_overlapping_gguf_mapping(usage_table, source_file, "tiered usage table");
+
+    const std::uint64_t abandoned_plan_ready = handshake_events->reserve_value();
+    const std::uint64_t abandoned_layer_ready = handshake_events->reserve_value();
+    require(abandoned_plan_ready != 0 &&
+                abandoned_layer_ready == abandoned_plan_ready + 1 &&
+                handshake_events->release_gpu_waits(5000, error),
+            "retire the synthetic handshake event after its final GPU use: " + error);
+    ExpertLayerStats released_event_stats;
+    require(!expert_store->resolve_layer_after_plan(
+                cache_leases, 0, *handshake_events, abandoned_plan_ready,
+                abandoned_layer_ready, 0, released_event_stats, error) &&
+                error.find("event is unavailable or was released") != std::string::npos,
+            "ExpertStore must reject a released handshake event instead of reading its sentinel");
 
     storage.reset();
     require(can_take_exclusive_lock(source_set_lock) &&

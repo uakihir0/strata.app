@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -425,8 +426,13 @@ public:
     Events& operator=(const Events&) = delete;
 
     std::uint64_t reserve_value();
-    std::uint64_t signaled_value() const;
+    /// No value after `release_gpu_waits`; the terminal sentinel is not completion evidence.
+    std::optional<std::uint64_t> signaled_value() const;
     bool signal_host(std::uint64_t value, std::string& err);
+    /// Permanently release encoded GPU event waits, then drain committed or enqueued
+    /// command buffers that used them within `timeout_ms`. UINT64_MAX is reserved for
+    /// this terminal state, and the event cannot be reused afterward.
+    bool release_gpu_waits(std::uint64_t timeout_ms, std::string& err);
     bool wait(std::uint64_t value, std::uint64_t timeout_ms, std::string& err) const;
     bool encode_wait(CommandBuffer& command_buffer, std::uint64_t value, std::string& err) const;
     bool encode_signal(CommandBuffer& command_buffer, std::uint64_t value, std::string& err) const;

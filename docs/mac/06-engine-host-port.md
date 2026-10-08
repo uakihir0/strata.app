@@ -127,7 +127,7 @@ The names below are used throughout the documentation set. The namespace is `str
 | `Buffers` | `src/metal/host/buffers.mm` | Shared buffers; no-copy windows over mapped files (16 KiB-aligned, each ≤ `maxBufferLength`); a bump arena with fixed addresses | `pinned.cu`, every `cudaHostAlloc` / `cudaMalloc` site |
 | Generic Encoder | `include/strata/metal/encoder.hpp`, `src/metal/host/encoder.mm` | Creates one labeled compute encoder per segment under the Context fence; validates manifest geometry, pipeline limits, Context-owned buffer views, and exact resource slots from pipeline binding reflection; clears stale slots and caps inline bytes at 4 KiB per segment. `EncoderReadOnlyBufferBinding` carries `ReadOnlyBufferRef` to MSL `const` inputs and rejects overlap with writable views through handle, CPU-backing, or GPU-address ranges. `STRATA_METAL_DISPATCH` selects serial or concurrent encoding; concurrent dispatches get a buffer barrier after each singleton or declared independent group. A failed body or validation discards the unsubmitted command buffer. Typed coordinators encode the T=1 Window input stem, layer-0 attention/GDN/FFN read and router→route→Q8_1 prefix; MoE plan has a validated standalone encoder, while experts, later Window layers, MTP and Prefill production paths remain pending. | CUDA launch sites and stream capture |
 | MoE route and plan encoders | `include/strata/metal/moe_dispatch.hpp`, `src/metal/engine/moe_dispatch.cpp` | Validates top-10 routing for 256/512 experts and plan grouping for T=1..8 with active expert strides from 1 to 512, each with standalone transactional or caller-owned Encoder forms. Router logits and plan IDs/residency bind read-only; the plan validates layer-strided table extents and rejects every writable overlap. Window selects multiply-by-reciprocal route weights and Prefill selects division. `encode_window_t1_moe_router_prefix` orders the read-only BF16 router, Window route and Q8_1 input row after layer 0. Plan dispatch has its own oracle tests and an event-gated GPU-plan-to-resolver fixture; expert execution and the production `MissResolver` scheduler remain separate | `native_router.cu`, `native_moe.cu` |
-| `Events` | `src/metal/host/events.mm` | `MTLSharedEvent` values for the tiered-mode layer handshake; completion waits | `doorbell_*`, `wait_flag_ge`, `cudaEvent*` |
+| `Events` | `src/metal/host/events.mm` | Monotonic `MTLSharedEvent` values for the tiered layer handshake; `release_gpu_waits(timeout_ms)` releases blocked command buffers and permanently retires a failed event | `doorbell_*`, `wait_flag_ge`, `cudaEvent*` |
 | `PipelineCache` | `src/metal/host/pipeline_cache.mm` | The `MTLBinaryArchive` of compiled pipelines in `~/Library/Caches/strata/`: its name, load, update and pruning ([08](08-build-and-distribution.md), section 10.1) | `CUDA_MODULE_LOADING=EAGER` and the driver's JIT cache |
 | `Capture` | `src/metal/host/capture.mm` | `--metal-capture`: a GPU trace of the first decode window ([08](08-build-and-distribution.md), section 10.2) | none (Nsight is external) |
 | `WeightStore` | `src/metal/engine/weights.cpp` | Opens GGUF shards and the native pack (`index.txt` v3, `native_experts.txt` v3 or v4, `conversions.json`); maps tensors to (buffer, offset) | `weights.cpp`, `native_dense.cpp`, `native_head.cpp` |
@@ -1027,9 +1027,9 @@ leases to that set before signaling the layer-ready event. This keeps slot
 addresses pinned even though plan resolution happens after command-buffer
 submission.
 
-`ExpertStore::resolve_layer_after_plan` implements the host bridge for a tiered decode plan. It waits for the plan-ready value, acquires the shared plan buffer, resolves cold experts through the existing slot cache and fetch workers, and signals the immediately following layer-ready value on that same `Events` object only after address publication succeeds. It reads only the four-word header when `skip` is set, and rejects a skipped plan that reports misses. On failure it leaves the layer-ready value unsignaled; the caller must release the blocked GPU waits and fail the request. `ModelStorage::tiered_storage()` supplies the borrowed tiered storage needed to create `ExpertStore` and remains valid only for the owner's lifetime.
+`ExpertStore::resolve_layer_after_plan` implements the host bridge for a tiered decode plan. It waits for the plan-ready value, acquires the shared plan buffer, resolves cold experts through the existing slot cache and fetch workers, and signals the immediately following layer-ready value on that same `Events` object only after address publication succeeds. It reads only the four-word header when `skip` is set, and rejects a skipped plan that reports misses. On failure it leaves the layer-ready value unsignaled; the caller must call `Events::release_gpu_waits(timeout_ms, error)` and fail the request. That method validates its drain timeout before changing the event, advances it to `UINT64_MAX`, drains committed or enqueued command buffers that contain its waits, and permanently disables event operations. After release, `signaled_value()` returns no value and `wait()` refuses to treat the sentinel as completion. `ModelStorage::tiered_storage()` supplies the borrowed tiered storage needed to create `ExpertStore` and remains valid only for the owner's lifetime.
 
-This helper is not yet a production Window scheduler. Command-buffer layer encoding, timeout recovery through `release_gpu_waits`, lookahead scheduling and automatic retirement at later layer events remain open. The current fixture encodes the GPU plan kernel into a synthetic command buffer before its ready signal, then resolves that shared-buffer result.
+This helper is not yet a production Window scheduler. Command-buffer layer encoding, lookahead scheduling and automatic retirement at later layer events remain open. The current fixture encodes the GPU plan kernel into a synthetic command buffer before its ready signal, then resolves that shared-buffer result.
 
 When a later layer-ready event proves that an earlier layer's expert kernels
 have finished reading, the host retires that layer's leases before reusing its
@@ -1128,7 +1128,7 @@ These keep the upstream names and semantics from `verify.hpp`:
 | `set_commit_async(bool)` | 126 | Kept |
 | `wait_commit()` | 129 | Waits for the commit command buffer, through its completion or an event value |
 | `diag()` | 62 | Last window: T, pos0, the layer the `MissResolver` reached, event values |
-| `release_gpu_waits(timeout_ms)` | 68 | Sets the window event to `UINT64_MAX` (section 14) |
+| `release_gpu_waits(timeout_ms)` | 68 | Sets the event to `UINT64_MAX`, waits up to the timeout for committed or enqueued command buffers containing its waits to complete, and retires the event permanently (section 14) |
 
 Dropped: `set_stage`, `set_next`, `handoff_floats` (layer split); `set_split` (`--spec-split`); `set_pcie_mode`.
 
@@ -1435,8 +1435,10 @@ If the engine is `busy` and `beats` has not changed for the limit, the watchdog 
    - the memory line `memory: R MiB resident, S MiB in swap, A MiB RAM available; F major page faults so far`, filled
      from `process_memory()` and `available_memory()`. Upstream prints zeros here on macOS.
    - Mac addition: `gpu: last command buffer "<label>" status <status>, W MiB budget, A MiB allocated`.
-3. It calls `release_gpu_waits`: set every window event's `signaledValue` to `UINT64_MAX`, which releases any encoded
-   `encodeWaitForEvent`. In full mode nothing is waiting on the host. Then it calls `std::abort()`.
+3. It calls `release_gpu_waits` for each window event. Each event advances to `UINT64_MAX`, which releases its encoded
+   `encodeWaitForEvent` operations, then waits up to the supplied timeout for committed command buffers containing those
+   waits to complete. Released events are permanently unusable, and `wait()` does not provide completion evidence. In full mode nothing
+   is waiting on the host. Then the watchdog calls `std::abort()`.
 
 ### 14.3 Crash report instead of a minidump
 

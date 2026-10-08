@@ -31,9 +31,23 @@ int main() {
     check(context != nullptr, "open device context", err);
     if (!context) return 1;
 
+    auto invalid_timeout_event = context->make_events("strata invalid release timeout test", err);
+    check(invalid_timeout_event != nullptr, "create event for release-timeout validation", err);
+    if (invalid_timeout_event) {
+        const bool invalid_timeout_rejected = !invalid_timeout_event->release_gpu_waits(
+            std::numeric_limits<std::uint64_t>::max(), err);
+        const auto still_live_value = invalid_timeout_event->signaled_value();
+        check(invalid_timeout_rejected && still_live_value && *still_live_value == 0 &&
+                  invalid_timeout_event->reserve_value() == 1,
+              "reject an overflowing release timeout before changing event state", err);
+    }
+
     auto event = context->make_events("strata test event", err);
     check(event != nullptr, "create shared event", err);
     if (!event) return 1;
+    check(!event->signal_host(std::numeric_limits<std::uint64_t>::max(), err) &&
+              err.find("release sentinel") != std::string::npos,
+          "reserve the terminal event value for wait release", err);
     const auto first = event->reserve_value();
     const auto second = event->reserve_value();
     check(first == 1 && second == 2, "reserve monotonically increasing values");
@@ -52,6 +66,9 @@ int main() {
     if (!signal) return 1;
     id<MTLCommandBuffer> native_signal =
         (__bridge id<MTLCommandBuffer>)signal->unsafe_native_handle();
+    check(!event->encode_signal(*signal, std::numeric_limits<std::uint64_t>::max(), err) &&
+              err.find("release sentinel") != std::string::npos,
+          "reject the terminal value as an ordinary GPU signal", err);
     const auto gpu_signal = second + 3;   // Deliberately signal a value that was never reserved.
     check(event->encode_signal(*signal, gpu_signal, err), "encode GPU signal", err);
     check(signal->enqueue(err), "enqueue command buffer after encoding", err);
@@ -210,6 +227,9 @@ int main() {
     if (!wait) return 1;
     id<MTLCommandBuffer> native_wait =
         (__bridge id<MTLCommandBuffer>)wait->unsafe_native_handle();
+    check(!event->encode_wait(*wait, std::numeric_limits<std::uint64_t>::max(), err) &&
+              err.find("release sentinel") != std::string::npos,
+          "reject the terminal value as an ordinary GPU wait", err);
     check(event->encode_signal(*wait, arrived, err),
           "encode GPU arrival before the wait", err);
     check(event->encode_wait(*wait, wait_for, err), "encode GPU wait", err);
@@ -220,7 +240,8 @@ int main() {
     check(event->wait(arrived, 5000, err), "GPU reached the event wait", err);
     check(!event->wait(release_signal, 100, err) && err.find("timed out") != std::string::npos,
           "GPU wait blocks its following signal while the event is unsignaled", err);
-    check(event->signaled_value() < release_signal,
+    const auto before_release_value = event->signaled_value();
+    check(before_release_value && *before_release_value < release_signal,
           "following GPU signal remains pending before host release");
     check(!event->signal_host(overtaking_signal, err) && err.find("monotonically") != std::string::npos,
           "host cannot overtake a pending GPU signal", err);
@@ -228,7 +249,9 @@ int main() {
     check(event->wait(release_signal, 5000, err), "GPU wait releases its following signal", err);
     [native_wait waitUntilCompleted];
     check(native_wait.status == MTLCommandBufferStatusCompleted, "GPU wait command completed");
-    check(event->signaled_value() >= wait_for, "event value remains monotonic");
+    const auto completed_wait_value = event->signaled_value();
+    check(completed_wait_value && *completed_wait_value >= wait_for,
+          "event value remains monotonic");
     check(!event->signal_host(first, err) && err.find("monotonically") != std::string::npos,
           "reject a backwards host signal", err);
 
@@ -298,6 +321,165 @@ int main() {
             }
         } else {
             drain_context.reset();
+        }
+    }
+
+    auto release_event = context->make_events("strata released wait test", err);
+    check(release_event != nullptr, "create one-shot released event", err);
+    if (release_event) {
+        const std::uint64_t arrived_value = release_event->reserve_value();
+        const std::uint64_t blocked_value = release_event->reserve_value();
+        const std::uint64_t trailing_signal = release_event->reserve_value();
+        auto blocked = context->make_command_buffer("strata release blocked wait", err);
+        check(blocked != nullptr, "create command buffer blocked on release event", err);
+        if (blocked) {
+            id<MTLCommandBuffer> native_blocked =
+                (__bridge id<MTLCommandBuffer>)blocked->unsafe_native_handle();
+            check(release_event->encode_signal(*blocked, arrived_value, err),
+                  "encode arrival before the blocked event wait", err);
+            check(release_event->encode_wait(*blocked, blocked_value, err),
+                  "encode a GPU wait for the release test", err);
+            check(release_event->encode_signal(*blocked, trailing_signal, err),
+                  "encode a signal after the blocked event wait", err);
+
+            const std::uint64_t staged_wait_value = release_event->reserve_value();
+            auto staged = context->make_command_buffer("strata staged released wait", err);
+            check(staged != nullptr, "create an unsubmitted wait before release", err);
+            if (staged) {
+                check(release_event->encode_wait(*staged, staged_wait_value, err),
+                      "encode an unsubmitted event wait", err);
+            }
+
+            check(blocked->commit(err), "submit command buffer with a blocked event wait", err);
+            check(release_event->wait(arrived_value, 5000, err),
+                  "GPU reaches the blocked event wait", err);
+            check(!release_event->wait(trailing_signal, 50, err) &&
+                      err.find("timed out") != std::string::npos,
+                  "trailing GPU signal stays blocked before release", err);
+            check(release_event->release_gpu_waits(5000, err),
+                  "release event waits and drain committed command buffers", err);
+            [native_blocked waitUntilCompleted];
+            check(native_blocked.status == MTLCommandBufferStatusCompleted,
+                  "released GPU wait allows the submitted command buffer to complete");
+            check(!release_event->signaled_value(),
+                  "released event stops exposing a completion value");
+            check(release_event->reserve_value() == 0,
+                  "released event cannot reserve values for another request");
+            check(!release_event->wait(trailing_signal, 100, err) &&
+                      err.find("released") != std::string::npos,
+                  "released event values cannot be used as completion evidence", err);
+            check(!release_event->signal_host(trailing_signal + 1, err) &&
+                      err.find("released") != std::string::npos,
+                  "released event rejects later host signals", err);
+
+            auto after_release = context->make_command_buffer(
+                "strata post-release event operation", err);
+            check(after_release != nullptr, "create a post-release command buffer", err);
+            if (after_release) {
+                check(!release_event->encode_wait(*after_release, 1, err) &&
+                          err.find("released") != std::string::npos,
+                      "released event rejects new GPU waits", err);
+                check(!release_event->encode_signal(*after_release, 1, err) &&
+                          err.find("released") != std::string::npos,
+                      "released event rejects new GPU signals", err);
+                after_release->discard();
+            }
+            if (staged) {
+                check(!staged->commit(err) && err.find("released") != std::string::npos,
+                      "released event rejects a previously encoded but unsubmitted wait", err);
+                staged->discard();
+            }
+        }
+    }
+
+    auto enqueued_event = context->make_events("strata enqueued released wait test", err);
+    auto completion_gate = context->make_events("strata release drain completion gate", err);
+    check(enqueued_event != nullptr, "create event for an enqueued released wait", err);
+    check(completion_gate != nullptr, "create a second gate for release-drain testing", err);
+    if (enqueued_event && completion_gate) {
+        const std::uint64_t completion_arrival = completion_gate->reserve_value();
+        const std::uint64_t completion_blocked = completion_gate->reserve_value();
+        const std::uint64_t completion_done = completion_gate->reserve_value();
+        const std::uint64_t arrived_value = enqueued_event->reserve_value();
+        const std::uint64_t blocked_value = enqueued_event->reserve_value();
+        const std::uint64_t trailing_signal = enqueued_event->reserve_value();
+        auto enqueued = context->make_command_buffer("strata enqueued released wait", err);
+        check(enqueued != nullptr, "create an enqueued command buffer with an event wait", err);
+        if (enqueued) {
+            id<MTLCommandBuffer> native_enqueued =
+                (__bridge id<MTLCommandBuffer>)enqueued->unsafe_native_handle();
+            check(enqueued_event->encode_signal(*enqueued, arrived_value, err),
+                  "encode arrival for an enqueued command buffer", err);
+            check(enqueued_event->encode_wait(*enqueued, blocked_value, err),
+                  "encode the enqueued command buffer wait", err);
+            check(enqueued_event->encode_signal(*enqueued, trailing_signal, err),
+                  "encode the enqueued command buffer trailing signal", err);
+            check(completion_gate->encode_signal(*enqueued, completion_arrival, err),
+                  "encode arrival at the independent completion gate", err);
+            check(completion_gate->encode_wait(*enqueued, completion_blocked, err),
+                  "hold the command buffer at the independent completion gate", err);
+            check(completion_gate->encode_signal(*enqueued, completion_done, err),
+                  "encode a completion signal after the independent gate", err);
+            check(enqueued->enqueue(err), "enqueue without committing the blocked command buffer", err);
+
+            std::mutex commit_gate_mutex;
+            std::condition_variable commit_gate_condition;
+            bool allow_late_commit = false;
+            std::atomic<bool> late_commit_succeeded{false};
+            std::string late_commit_error;
+            std::thread late_committer([&] {
+                {
+                    std::unique_lock<std::mutex> gate_lock(commit_gate_mutex);
+                    commit_gate_condition.wait(gate_lock, [&] { return allow_late_commit; });
+                }
+                late_commit_succeeded.store(enqueued->commit(late_commit_error),
+                                            std::memory_order_release);
+            });
+            const auto release_started = std::chrono::steady_clock::now();
+            const bool initial_release_succeeded =
+                enqueued_event->release_gpu_waits(100, err);
+            const auto release_elapsed = std::chrono::steady_clock::now() - release_started;
+            const bool release_timed_out =
+                !initial_release_succeeded &&
+                err.find("timed out draining Metal command buffers") != std::string::npos;
+            check(release_timed_out && release_elapsed >= std::chrono::milliseconds(80),
+                  "release waits for its bounded drain timeout while commit is gated", err);
+            check(!enqueued_event->signaled_value(),
+                  "timed-out release still poisons the event and releases GPU waits");
+            {
+                std::lock_guard<std::mutex> gate_lock(commit_gate_mutex);
+                allow_late_commit = true;
+            }
+            commit_gate_condition.notify_all();
+            late_committer.join();
+            check(late_commit_succeeded.load(std::memory_order_acquire),
+                  "allow a previously enqueued command buffer to commit after release",
+                  late_commit_error);
+            check(completion_gate->wait(completion_arrival, 5000, err),
+                  "late-committed command reaches its independent completion gate", err);
+            const auto held_drain_started = std::chrono::steady_clock::now();
+            const bool held_drain_succeeded =
+                enqueued_event->release_gpu_waits(100, err);
+            const auto held_drain_elapsed =
+                std::chrono::steady_clock::now() - held_drain_started;
+            check(!held_drain_succeeded &&
+                      err.find("timed out draining Metal command buffers") != std::string::npos &&
+                      held_drain_elapsed >= std::chrono::milliseconds(80),
+                  "release drain waits while the command buffer is held after its event wait", err);
+            check(completion_gate->signal_host(completion_blocked, err),
+                  "release the independent command-buffer completion gate", err);
+            std::string drain_retry_error;
+            const bool drain_retry_succeeded = enqueued_event->release_gpu_waits(
+                5000, drain_retry_error);
+            check(drain_retry_succeeded,
+                  "a later release call drains the completed command buffer",
+                  drain_retry_error);
+            check(completion_gate->wait(completion_done, 5000, err),
+                  "command buffer signals after the independent gate is released", err);
+            check(native_enqueued.status == MTLCommandBufferStatusCompleted,
+                  "released enqueued wait is complete when the drain returns");
+            check(!enqueued_event->signaled_value(),
+                  "released enqueued event exposes no completion value");
         }
     }
 

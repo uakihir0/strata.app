@@ -14,6 +14,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <pthread/qos.h>
 #include <set>
 #include <stdexcept>
@@ -624,7 +625,12 @@ bool ExpertStore::resolve_layer_after_plan(
         error = "ERR tiered layer handshake requires consecutive positive event values";
         return false;
     }
-    if (events.signaled_value() >= layer_ready_value) {
+    const std::optional<std::uint64_t> signaled_value = events.signaled_value();
+    if (!signaled_value) {
+        error = "ERR tiered layer handshake event is unavailable or was released";
+        return false;
+    }
+    if (*signaled_value >= layer_ready_value) {
         error = "ERR tiered layer-ready event value was already signaled";
         return false;
     }
