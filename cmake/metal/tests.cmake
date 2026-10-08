@@ -185,12 +185,20 @@ set_tests_properties(metal_mv_test_concurrent PROPERTIES
 
 add_executable(metal_moe_test tests/metal/metal_moe_test.mm)
 target_include_directories(metal_moe_test PRIVATE ${STRATA_METAL_GENERATED_DIR})
-target_link_libraries(metal_moe_test PRIVATE strata_metal_twins strata_metal_options)
+target_link_libraries(metal_moe_test PRIVATE
+  strata_metal_twins strata_metal_engine strata_metal_options)
 set_source_files_properties(tests/metal/metal_moe_test.mm
                             PROPERTIES OBJECT_DEPENDS ${STRATA_METALLIB_SHA256_INC})
 add_dependencies(metal_moe_test strata_metallib)
 strata_metal_test(metal_moe_test metal metal_moe_test ${STRATA_METALLIB})
-set_tests_properties(metal_moe_test PROPERTIES TIMEOUT 180)
+set_tests_properties(metal_moe_test PROPERTIES
+  TIMEOUT 180
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial")
+strata_metal_test(metal_moe_test_concurrent metal
+                  metal_moe_test ${STRATA_METALLIB} --input-set fixture)
+set_tests_properties(metal_moe_test_concurrent PROPERTIES
+  TIMEOUT 180
+  ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
 
 add_executable(metal_sampler_parity_test tests/metal/metal_sampler_parity_test.mm)
 target_include_directories(metal_sampler_parity_test PRIVATE ${STRATA_METAL_GENERATED_DIR})

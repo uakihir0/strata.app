@@ -114,6 +114,7 @@ set(STRATA_METAL_ENGINE_SOURCES
   src/metal/engine/sampler_tail.cpp
   src/metal/engine/sampler_dispatch.mm
   src/metal/engine/mv_dispatch.mm
+  src/metal/engine/moe_dispatch.cpp
   src/metal/engine/gdn_dispatch.mm
   src/metal/engine/qsa_dispatch.mm
   src/metal/engine/embed_dispatch.mm

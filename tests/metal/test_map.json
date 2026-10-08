@@ -280,6 +280,10 @@
       "label": "metal",
       "origin": "09 9.1"
     },
+    "metal_moe_test_concurrent": {
+      "label": "metal",
+      "origin": "09 9.1, 04 10.5"
+    },
     "metal_mtp_test": {
       "label": "metal",
       "origin": "09 9.1",

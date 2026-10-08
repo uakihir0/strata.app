@@ -31,6 +31,8 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/metal/context.hpp"
+#include "strata/metal/encoder.hpp"
+#include "strata/metal/moe_dispatch.hpp"
 
 #include <algorithm>
 #include <array>
@@ -38,6 +40,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <random>
@@ -246,21 +249,14 @@ bool test_route(Context& context, std::uint32_t experts,
     ids.capture_before_dispatch();
     weights.capture_before_dispatch();
 
-    const std::uint32_t divide = divide_weights ? 1u : 0u;
-    twin::Dispatch work;
-    work.grid_mode = twin::GridMode::threadgroups;
-    work.grid = {rows, 1u, 1u};
-    work.threads_per_group = {32u, 1u, 1u};
-    work.buffers = {{0u, input.view()},
-                    {1u, ids.view()},
-                    {2u, weights.view()}};
-    work.parameters = &divide;
-    work.parameter_bytes = sizeof(divide);
-    work.parameter_index = 3u;
-    const char* kernel =
-        experts == 512u ? "strata_moe_route_r16" : "strata_moe_route_r8";
-    const bool dispatched =
-        twin::dispatch_manifest(context, kernel, work, err);
+    auto command = context.make_command_buffer(label, err);
+    const bool dispatched = command &&
+        encode_moe_route(
+            context, *command, rows, experts, divide_weights,
+            {context.buffers().read_only(input.view()), ids.view(),
+             weights.view()},
+            err) &&
+        command->commit(err) && command->wait_until_completed(err);
     check(dispatched, label + " Metal dispatch", err);
     if (!dispatched) return false;
 
@@ -328,6 +324,172 @@ bool test_route(Context& context, std::uint32_t experts,
                                        expected_weights.size());
     }
     return !id_failure && !weight_failure && ids_valid && weights_normalized;
+}
+
+bool test_route_dispatch_validation(Context& context) {
+    constexpr std::string_view label = "MoE route encoder validation";
+    std::string err;
+    twin::GuardedBuffer logits;
+    twin::GuardedBuffer ids;
+    twin::GuardedBuffer weights;
+    twin::GuardedBuffer alias;
+    twin::GuardedBuffer logits_output_overlap;
+    check(logits.allocate(context, "MoE route validation logits",
+                          512u * sizeof(float), err),
+          "MoE route validation logits buffer", err);
+    check(ids.allocate(context, "MoE route validation IDs",
+                       10u * sizeof(std::int32_t), err),
+          "MoE route validation IDs buffer", err);
+    check(weights.allocate(context, "MoE route validation weights",
+                           10u * sizeof(float), err),
+          "MoE route validation weights buffer", err);
+    check(alias.allocate(context, "MoE route validation aliased outputs",
+                         10u * sizeof(float), err),
+          "MoE route validation alias buffer", err);
+    check(logits_output_overlap.allocate(
+              context, "MoE route validation logits-output overlap",
+              512u * sizeof(float) + 10u * sizeof(float), err),
+          "MoE route validation logits-output overlap buffer", err);
+    if (!logits.view() || !ids.view() || !weights.view() || !alias.view() ||
+        !logits_output_overlap.view()) {
+        return false;
+    }
+    std::fill(logits.payload().begin(), logits.payload().end(), 0u);
+    std::fill(ids.payload().begin(), ids.payload().end(), 0xa5u);
+    std::fill(weights.payload().begin(), weights.payload().end(), 0x5au);
+    std::fill(alias.payload().begin(), alias.payload().end(), 0x3cu);
+    std::fill(logits_output_overlap.payload().begin(),
+              logits_output_overlap.payload().end(), 0u);
+    const std::vector<std::uint8_t> ids_before(ids.payload().begin(),
+                                               ids.payload().end());
+    const std::vector<std::uint8_t> weights_before(weights.payload().begin(),
+                                                   weights.payload().end());
+    const std::vector<std::uint8_t> alias_before(alias.payload().begin(),
+                                                alias.payload().end());
+    const std::vector<std::uint8_t> overlap_before(
+        logits_output_overlap.payload().begin(),
+        logits_output_overlap.payload().end());
+    const ReadOnlyBufferRef logits_view =
+        context.buffers().read_only(logits.view());
+    if (!logits_view) {
+        check(false, std::string(label) + " read-only logits view");
+        return false;
+    }
+
+    const auto reject = [&](const std::string& case_label,
+                            std::uint32_t rows, std::uint32_t experts,
+                            MoeRouteBuffers buffers,
+                            std::string_view error_fragment) {
+        auto command = context.make_command_buffer(case_label, err);
+        const bool rejected = command && !encode_moe_route(
+            context, *command, rows, experts, false, buffers, err);
+        const bool discarded = command &&
+            command->unsafe_native_handle() == nullptr;
+        const bool error_matches =
+            err.find(error_fragment) != std::string::npos;
+        check(rejected && discarded && error_matches,
+              case_label + " rejects and discards transaction", err);
+        return rejected && discarded && error_matches;
+    };
+
+    const bool invalid_experts = reject(
+        "reject unsupported MoE expert count", 1u, 128u,
+        {logits_view, ids.view(), weights.view()}, "256 or 512 experts");
+    const bool zero_rows = reject(
+        "reject zero MoE route rows", 0u, 512u,
+        {logits_view, ids.view(), weights.view()}, "positive rows");
+    const bool short_logits = reject(
+        "reject undersized MoE route logits", 1u, 512u,
+        {logits_view.slice(0u, sizeof(float)), ids.view(), weights.view()},
+        "undersized");
+    const bool aliased_outputs = reject(
+        "reject overlapping MoE route outputs", 1u, 512u,
+        {logits_view, alias.view(), alias.view()}, "overlap");
+    const BufferRef overlap_base = logits_output_overlap.view();
+    const BufferRef overlap_logits =
+        overlap_base.slice(0u, 512u * sizeof(float));
+    const BufferRef partial_output =
+        overlap_base.slice(1024u, 10u * sizeof(float));
+    const bool exact_logits_ids = reject(
+        "reject exact MoE logits and IDs alias", 1u, 512u,
+        {logits_view, logits.view(), weights.view()}, "overlap");
+    const bool exact_logits_weights = reject(
+        "reject exact MoE logits and weights alias", 1u, 512u,
+        {logits_view, ids.view(), logits.view()}, "overlap");
+    const bool partial_logits_ids = reject(
+        "reject partial MoE logits and IDs alias", 1u, 512u,
+        {context.buffers().read_only(overlap_logits), partial_output,
+         weights.view()},
+        "overlap");
+    const bool partial_logits_weights = reject(
+        "reject partial MoE logits and weights alias", 1u, 512u,
+        {context.buffers().read_only(overlap_logits), ids.view(),
+         partial_output},
+        "overlap");
+    const auto reject_caller_owned = [&](const std::string& case_label,
+                                         bool reject_inside_group) {
+        std::fill(ids.payload().begin(), ids.payload().end(), 0xa5u);
+        std::fill(weights.payload().begin(), weights.payload().end(), 0x5au);
+        auto command = context.make_command_buffer(case_label, err);
+        const bool discarded = command && !Encoder::encode(
+            context, *command, case_label,
+            [&](Encoder& encoder, std::string& body_error) {
+                if (!encode_moe_route(
+                        context, encoder, 1u, 512u, false,
+                        {logits_view, ids.view(), weights.view()},
+                        body_error)) {
+                    return false;
+                }
+                if (reject_inside_group && !encoder.group_begin(body_error)) {
+                    return false;
+                }
+                return encode_moe_route(
+                    context, encoder, 1u,
+                    reject_inside_group ? 512u : 128u, false,
+                    {logits_view, ids.view(), weights.view()}, body_error);
+            },
+            err);
+        const bool command_discarded = command &&
+            command->unsafe_native_handle() == nullptr;
+        const bool outputs_unchanged =
+            std::equal(ids_before.begin(), ids_before.end(),
+                       ids.payload().begin(), ids.payload().end()) &&
+            std::equal(weights_before.begin(), weights_before.end(),
+                       weights.payload().begin(), weights.payload().end());
+        const std::string_view expected_error = reject_inside_group
+            ? "ordered dispatch boundary"
+            : "256 or 512 experts";
+        const bool error_matches = err.find(expected_error) != std::string::npos;
+        check(discarded && command_discarded && outputs_unchanged &&
+                  error_matches,
+              case_label + " propagates failure and discards earlier work", err);
+        return discarded && command_discarded && outputs_unchanged &&
+               error_matches;
+    };
+    const bool caller_owned_late_failure = reject_caller_owned(
+        "reject caller-owned late MoE route failure", false);
+    const char* const dispatch_mode = std::getenv("STRATA_METAL_DISPATCH");
+    const bool concurrent_mode = dispatch_mode != nullptr &&
+        std::string_view(dispatch_mode) == "concurrent";
+    const bool caller_owned_open_group = !concurrent_mode ||
+        reject_caller_owned(
+            "reject caller-owned MoE route in concurrent group", true);
+    const bool outputs_unchanged =
+        std::equal(ids_before.begin(), ids_before.end(), ids.payload().begin(),
+                   ids.payload().end()) &&
+        std::equal(weights_before.begin(), weights_before.end(),
+                   weights.payload().begin(), weights.payload().end()) &&
+        std::equal(alias_before.begin(), alias_before.end(),
+                   alias.payload().begin(), alias.payload().end()) &&
+        std::equal(overlap_before.begin(), overlap_before.end(),
+                   logits_output_overlap.payload().begin(),
+                   logits_output_overlap.payload().end());
+    check(outputs_unchanged,
+          std::string(label) + " leaves rejected outputs unchanged");
+    return invalid_experts && zero_rows && short_logits && aliased_outputs &&
+           exact_logits_ids && exact_logits_weights && partial_logits_ids &&
+           partial_logits_weights && caller_owned_late_failure &&
+           caller_owned_open_group && outputs_unchanged;
 }
 
 void check_literal_choices(twin::InputSet set, std::uint32_t experts,
@@ -7339,6 +7501,8 @@ int main(int argc, char** argv) {
     auto context = Context::open(context_options, err);
     check(context != nullptr, "open Metal context", err);
     if (!context) return 1;
+
+    if (!test_route_dispatch_validation(*context)) ++g_failures;
 
     std::vector<twin::InputSet> sets;
     if (options.input_set_explicit) {
