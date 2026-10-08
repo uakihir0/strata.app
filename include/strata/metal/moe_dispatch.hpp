@@ -46,6 +46,22 @@ struct MoeGroupedExpertBuffers {
     BufferRef up;
 };
 
+enum class MoeDownFormat {
+    q2_0,
+    iq4_nl,
+};
+
+struct MoeGroupedDownBuffers {
+    /// Row-major `[layer, expert, gate/up/down]` GPU-address table.
+    ReadOnlyBufferRef addresses;
+    /// Q8_1 activations, with 20 blocks for each routed expert entry.
+    ReadOnlyBufferRef activations;
+    /// `TieredMoePlan` table containing the selected layer's validated plan.
+    ReadOnlyBufferRef plans;
+    /// Each output reserves `[rows * 10, 2560]` floats in original route order.
+    BufferRef parts;
+};
+
 struct MoeSwiGLUBuffers {
     ReadOnlyBufferRef gate;
     ReadOnlyBufferRef up;
@@ -107,6 +123,26 @@ bool encode_moe_experts(Context& context, CommandBuffer& command_buffer,
                         std::uint32_t layer, MoeExpertFormat format,
                         const MoeGroupedExpertBuffers& buffers,
                         std::string& error);
+
+/// Encode the grouped routed-expert down projection for a plan produced for
+/// the same rows, experts and layer by the ordered MoE plan encoder. In tiered
+/// mode, queue this consumer only after ExpertStore successfully resolves the
+/// plan. Supports Q2_0 and IQ4_NL expert weights. GPU checks plan group,
+/// destination and row bounds before reading or writing; plan contents and
+/// selected expert addresses must still come from trusted engine outputs and
+/// remain valid until command completion. The inputs and output must be
+/// disjoint and remain alive until command completion.
+bool encode_moe_down(Context& context, Encoder& encoder,
+                     std::uint32_t rows, std::uint32_t experts,
+                     std::uint32_t layer, MoeDownFormat format,
+                     const MoeGroupedDownBuffers& buffers,
+                     std::string& error);
+/// Standalone transactional form. A validation failure discards the segment.
+bool encode_moe_down(Context& context, CommandBuffer& command_buffer,
+                     std::uint32_t rows, std::uint32_t experts,
+                     std::uint32_t layer, MoeDownFormat format,
+                     const MoeGroupedDownBuffers& buffers,
+                     std::string& error);
 
 /// Encode SwiGLU for routed MoE entries (rows * 10) or shared-expert rows.
 /// Gate and up are read-only F32 arrays of 640 values per entry. The output

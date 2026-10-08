@@ -140,12 +140,6 @@ struct MoeExpertAddress {
 };
 static_assert(sizeof(MoeExpertAddress) == 24u);
 
-struct MoeGroupedParams {
-    std::uint32_t n_expert = 0;
-    std::uint32_t layer = 0;
-};
-static_assert(sizeof(MoeGroupedParams) == 8u);
-
 int g_failures = 0;
 
 void check(bool condition, const std::string& label,
@@ -189,6 +183,42 @@ bool dispatch_grouped_experts(
               error)
         : encode_moe_experts(context, *command_buffer, rows, experts, layer,
                              format, buffers, error);
+    if (!encoded || !command_buffer->commit(error) ||
+        !command_buffer->wait_until_completed(error)) {
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
+bool dispatch_grouped_down(
+    Context& context, MoeDownFormat format, std::uint32_t rows,
+    std::uint32_t experts, std::uint32_t layer,
+    const twin::GuardedBuffer& address_buffer,
+    const twin::GuardedBuffer& input_buffer,
+    const twin::GuardedBuffer& plan_buffer,
+    const twin::GuardedBuffer& parts_buffer, std::string& error,
+    bool caller_owned = false) {
+    const MoeGroupedDownBuffers buffers{
+        context.buffers().read_only(address_buffer.view()),
+        context.buffers().read_only(input_buffer.view()),
+        context.buffers().read_only(plan_buffer.view()),
+        parts_buffer.view(),
+    };
+    auto command_buffer =
+        context.make_command_buffer("grouped MoE down twin", error);
+    if (!command_buffer) return false;
+    const bool encoded = caller_owned
+        ? Encoder::encode(
+              context, *command_buffer, "grouped MoE down twin",
+              [&](Encoder& encoder, std::string& encode_error) {
+                  return encode_moe_down(context, encoder, rows, experts,
+                                         layer, format, buffers,
+                                         encode_error);
+              },
+              error)
+        : encode_moe_down(context, *command_buffer, rows, experts, layer,
+                          format, buffers, error);
     if (!encoded || !command_buffer->commit(error) ||
         !command_buffer->wait_until_completed(error)) {
         return false;
@@ -1748,6 +1778,315 @@ bool test_swiglu_dispatch_validation(Context& context) {
            undersized_shared_gate && misaligned && misaligned_output_rejected &&
            undersized_output && gate_alias && up_alias && late_failure_rejected &&
            late_failure_discarded && late_failure_untouched &&
+           concurrent_boundary_ok;
+}
+
+bool test_moe_down_dispatch_validation(Context& context) {
+    constexpr std::uint32_t rows = 2u;
+    constexpr std::uint32_t experts = 256u;
+    constexpr std::uint32_t layer = kMoeGroupedLayer;
+    constexpr std::size_t entries =
+        static_cast<std::size_t>(rows) * kTopK;
+    constexpr std::size_t address_bytes =
+        static_cast<std::size_t>(layer + 1u) * experts *
+        sizeof(MoeExpertAddress);
+    constexpr std::size_t activation_bytes =
+        entries * (kMoeDownInputWidth / 32u) * sizeof(Q81);
+    constexpr std::size_t plan_bytes =
+        static_cast<std::size_t>(layer + 1u) * sizeof(TieredMoePlan);
+    constexpr std::size_t parts_bytes =
+        entries * kMoeDownWidth * sizeof(float);
+    const std::string label = "MoE grouped down dispatch validation";
+    std::string err;
+    twin::GuardedBuffer addresses;
+    twin::GuardedBuffer activations;
+    twin::GuardedBuffer plans;
+    twin::GuardedBuffer parts;
+    check(addresses.allocate(context, label + " addresses",
+                             address_bytes + 32u, err),
+          label + " address allocation", err);
+    check(activations.allocate(context, label + " activations",
+                               activation_bytes + 32u, err),
+          label + " activation allocation", err);
+    check(plans.allocate(context, label + " plans", plan_bytes + 32u, err),
+          label + " plan allocation", err);
+    check(parts.allocate(context, label + " parts",
+                         parts_bytes + 32u, err),
+          label + " parts allocation", err);
+    if (!addresses.view() || !activations.view() || !plans.view() ||
+        !parts.view()) {
+        return false;
+    }
+
+    const ReadOnlyBufferRef address_view =
+        context.buffers().read_only(
+            addresses.view().slice(0u, address_bytes));
+    const ReadOnlyBufferRef activation_view =
+        context.buffers().read_only(
+            activations.view().slice(0u, activation_bytes));
+    const ReadOnlyBufferRef plan_view =
+        context.buffers().read_only(plans.view().slice(0u, plan_bytes));
+    const BufferRef parts_view = parts.view().slice(0u, parts_bytes);
+    const MoeGroupedDownBuffers valid{
+        address_view, activation_view, plan_view, parts_view};
+    const std::vector<std::uint8_t> parts_before(
+        parts.payload().begin(), parts.payload().end());
+
+    const auto reject = [&](const std::string& case_label,
+                            std::uint32_t case_rows,
+                            std::uint32_t case_experts,
+                            std::uint32_t case_layer,
+                            MoeDownFormat format,
+                            const MoeGroupedDownBuffers& buffers,
+                            std::string_view expected_error) {
+        auto command = context.make_command_buffer(case_label, err);
+        const bool rejected = command && !encode_moe_down(
+            context, *command, case_rows, case_experts, case_layer, format,
+            buffers, err);
+        const bool discarded =
+            command && command->unsafe_native_handle() == nullptr;
+        const bool unchanged = std::equal(
+            parts_before.begin(), parts_before.end(), parts.payload().begin(),
+            parts.payload().end());
+        const bool error_matches =
+            err.find(expected_error) != std::string::npos;
+        check(rejected && discarded && unchanged && error_matches,
+              case_label + " rejects before dispatch and discards", err);
+        return rejected && discarded && unchanged && error_matches;
+    };
+
+    const bool zero_rows = reject(
+        label + " zero rows", 0u, experts, layer, MoeDownFormat::q2_0,
+        valid, "1..8 rows");
+    const bool too_many_rows = reject(
+        label + " too many rows", 9u, experts, layer, MoeDownFormat::q2_0,
+        valid, "1..8 rows");
+    const bool zero_experts = reject(
+        label + " zero experts", rows, 0u, layer, MoeDownFormat::q2_0,
+        valid, "1..512 experts");
+    const bool too_many_experts = reject(
+        label + " too many experts", rows, 513u, layer,
+        MoeDownFormat::q2_0, valid, "1..512 experts");
+    const bool invalid_layer = reject(
+        label + " invalid layer", rows, experts, kTieredMaxLayers,
+        MoeDownFormat::q2_0, valid, "valid layer");
+    const bool invalid_format = reject(
+        label + " invalid format", rows, experts, layer,
+        static_cast<MoeDownFormat>(99), valid, "format is unsupported");
+
+    const MoeGroupedDownBuffers short_addresses{
+        context.buffers().read_only(
+            addresses.view().slice(0u, address_bytes - 1u)),
+        activation_view, plan_view, parts_view};
+    const bool short_address = reject(
+        label + " short address table", rows, experts, layer,
+        MoeDownFormat::q2_0, short_addresses, "address table");
+    const MoeGroupedDownBuffers misaligned_addresses{
+        context.buffers().read_only(
+            addresses.view().slice(1u, address_bytes)),
+        activation_view, plan_view, parts_view};
+    const bool misaligned_address = reject(
+        label + " misaligned address table", rows, experts, layer,
+        MoeDownFormat::q2_0, misaligned_addresses, "misaligned");
+    const MoeGroupedDownBuffers short_activations{
+        address_view,
+        context.buffers().read_only(
+            activations.view().slice(0u, activation_bytes - sizeof(Q81))),
+        plan_view, parts_view};
+    const bool short_activation = reject(
+        label + " short activations", rows, experts, layer,
+        MoeDownFormat::q2_0, short_activations, "activations");
+    const MoeGroupedDownBuffers misaligned_activations{
+        address_view,
+        context.buffers().read_only(
+            activations.view().slice(1u, activation_bytes)),
+        plan_view, parts_view};
+    const bool misaligned_activation = reject(
+        label + " misaligned activations", rows, experts, layer,
+        MoeDownFormat::q2_0, misaligned_activations, "misaligned");
+    const MoeGroupedDownBuffers short_plans{
+        address_view, activation_view,
+        context.buffers().read_only(
+            plans.view().slice(0u, plan_bytes - sizeof(TieredMoePlan))),
+        parts_view};
+    const bool short_plan = reject(
+        label + " short plans", rows, experts, layer,
+        MoeDownFormat::q2_0, short_plans, "plan table");
+    const MoeGroupedDownBuffers misaligned_plans{
+        address_view, activation_view,
+        context.buffers().read_only(plans.view().slice(1u, plan_bytes)),
+        parts_view};
+    const bool misaligned_plan = reject(
+        label + " misaligned plans", rows, experts, layer,
+        MoeDownFormat::q2_0, misaligned_plans, "misaligned");
+    const MoeGroupedDownBuffers short_parts{
+        address_view, activation_view, plan_view,
+        parts.view().slice(0u, parts_bytes - sizeof(float))};
+    const bool short_output = reject(
+        label + " short output", rows, experts, layer,
+        MoeDownFormat::q2_0, short_parts, "parts output");
+    const MoeGroupedDownBuffers misaligned_parts{
+        address_view, activation_view, plan_view,
+        parts.view().slice(1u, parts_bytes)};
+    const bool misaligned_output = reject(
+        label + " misaligned output", rows, experts, layer,
+        MoeDownFormat::q2_0, misaligned_parts, "misaligned");
+
+    const ReadOnlyBufferRef parts_as_input =
+        context.buffers().read_only(parts_view);
+    const MoeGroupedDownBuffers address_output_alias{
+        parts_as_input, activation_view, plan_view, parts_view};
+    const bool address_alias = reject(
+        label + " address/output alias", rows, experts, layer,
+        MoeDownFormat::q2_0, address_output_alias, "overlap");
+    const MoeGroupedDownBuffers activation_output_alias{
+        address_view, parts_as_input, plan_view, parts_view};
+    const bool activation_alias = reject(
+        label + " activation/output alias", rows, experts, layer,
+        MoeDownFormat::q2_0, activation_output_alias, "overlap");
+    const MoeGroupedDownBuffers plan_output_alias{
+        address_view, activation_view, parts_as_input, parts_view};
+    const bool plan_alias = reject(
+        label + " plan/output alias", rows, experts, layer,
+        MoeDownFormat::q2_0, plan_output_alias, "overlap");
+    const MoeGroupedDownBuffers readonly_inputs_alias{
+        parts_as_input, parts_as_input, parts_as_input, parts_view};
+    const bool readonly_alias = reject(
+        label + " read-only input alias", rows, experts, layer,
+        MoeDownFormat::q2_0, readonly_inputs_alias, "overlap");
+
+    auto late_failure_command =
+        context.make_command_buffer(label + " late failure", err);
+    check(late_failure_command != nullptr,
+          label + " late-failure command buffer", err);
+    if (!late_failure_command) return false;
+    const bool late_failure_rejected = !Encoder::encode(
+        context, *late_failure_command, "MoE down late failure",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_moe_down(context, encoder, rows, experts, layer,
+                                 MoeDownFormat::q2_0, valid, encode_error)) {
+                return false;
+            }
+            return encode_moe_down(context, encoder, 9u, experts, layer,
+                                   MoeDownFormat::q2_0, valid, encode_error);
+        },
+        err);
+    const bool late_failure_discarded =
+        late_failure_command->unsafe_native_handle() == nullptr;
+    const bool late_failure_untouched = std::equal(
+        parts_before.begin(), parts_before.end(), parts.payload().begin(),
+        parts.payload().end());
+    check(late_failure_rejected && late_failure_discarded &&
+              late_failure_untouched &&
+              err.find("1..8 rows") != std::string::npos,
+          label + " caller-owned late failure rolls back its dispatch", err);
+
+    const auto dispatch_invalid_gpu_plan = [&](
+        const std::string& case_label, MoeDownFormat format,
+        std::int32_t expert, std::int32_t group_end,
+        std::int32_t invalid_destination) {
+        TieredMoePlan plan{};
+        plan.n_groups = 1u;
+        plan.n_entries = static_cast<std::uint32_t>(entries);
+        plan.skip = 1u;
+        plan.grp_e[0] = expert;
+        plan.grp_start[0] = 0;
+        plan.grp_start[1] = group_end;
+        for (std::uint32_t entry = 0u; entry < entries; ++entry) {
+            plan.ent_dst[entry] = static_cast<std::int32_t>(entry);
+        }
+        if (invalid_destination >= 0) {
+            plan.ent_dst[0] = invalid_destination;
+        }
+        std::fill(plans.payload().begin(), plans.payload().end(), 0u);
+        std::memcpy(plans.payload().data() +
+                        static_cast<std::size_t>(layer) * sizeof(plan),
+                    &plan, sizeof(plan));
+        std::fill(parts.payload().begin(), parts.payload().end(), 0x5au);
+        const std::vector<std::uint8_t> before(parts.payload().begin(),
+                                               parts.payload().end());
+        plans.capture_before_dispatch();
+        parts.capture_before_dispatch();
+        const bool completed = dispatch_grouped_down(
+            context, format, rows, experts, layer, addresses, activations,
+            plans, parts, err);
+        const bool unchanged = std::equal(
+            before.begin(), before.end(), parts.payload().begin(),
+            parts.payload().end());
+        const bool guards_unchanged =
+            !parts.first_unwritten_change({});
+        check(completed && unchanged && guards_unchanged,
+              case_label +
+                  " GPU rejects malformed plan without output or guard writes",
+              err);
+        return completed && unchanged && guards_unchanged;
+    };
+    const bool invalid_q2_destination = dispatch_invalid_gpu_plan(
+        label + " Q2_0 destination bound", MoeDownFormat::q2_0, 0,
+        static_cast<std::int32_t>(entries),
+        static_cast<std::int32_t>(entries));
+    const bool invalid_iq4_destination = dispatch_invalid_gpu_plan(
+        label + " IQ4_NL destination bound", MoeDownFormat::iq4_nl, 0,
+        static_cast<std::int32_t>(entries),
+        static_cast<std::int32_t>(entries));
+    const bool invalid_iq4_expert = dispatch_invalid_gpu_plan(
+        label + " IQ4_NL expert bound", MoeDownFormat::iq4_nl,
+        static_cast<std::int32_t>(experts),
+        static_cast<std::int32_t>(entries), -1);
+    const bool invalid_iq4_group_range = dispatch_invalid_gpu_plan(
+        label + " IQ4_NL group range", MoeDownFormat::iq4_nl, 0,
+        static_cast<std::int32_t>(entries + 1u), -1);
+
+    bool concurrent_boundary_ok = true;
+    const char* const dispatch_mode = std::getenv("STRATA_METAL_DISPATCH");
+    if (dispatch_mode != nullptr &&
+        std::string_view(dispatch_mode) == "concurrent") {
+        auto command =
+            context.make_command_buffer(label + " open group", err);
+        check(command != nullptr, label + " open-group command buffer", err);
+        if (!command) return false;
+        bool saw_open_group = false;
+        bool rejected_open_group = false;
+        const bool encoded = Encoder::encode(
+            context, *command, "MoE down open-group boundary",
+            [&](Encoder& encoder, std::string& encode_error) {
+                if (!encoder.group_begin(encode_error)) return false;
+                saw_open_group = encoder.concurrent_group_open();
+                if (saw_open_group) {
+                    std::string boundary_error;
+                    rejected_open_group = !encode_moe_down(
+                        context, encoder, rows, experts, layer,
+                        MoeDownFormat::q2_0, valid, boundary_error) &&
+                        boundary_error.find("ordered dispatch boundary") !=
+                            std::string::npos;
+                }
+                if (!encoder.group_end(encode_error)) return false;
+                if (!saw_open_group || !rejected_open_group) {
+                    encode_error =
+                        "MoE down did not reject an open concurrent group";
+                    return false;
+                }
+                return true;
+            },
+            err);
+        command->discard();
+        concurrent_boundary_ok =
+            encoded && saw_open_group && rejected_open_group &&
+            command->unsafe_native_handle() == nullptr;
+        check(concurrent_boundary_ok,
+              label + " rejects an open concurrent group", err);
+    }
+
+    return zero_rows && too_many_rows && zero_experts && too_many_experts &&
+           invalid_layer && invalid_format && short_address &&
+           misaligned_address && short_activation && misaligned_activation &&
+           short_plan && misaligned_plan && short_output &&
+           misaligned_output && address_alias && activation_alias &&
+           plan_alias && readonly_alias && late_failure_rejected &&
+           late_failure_discarded && late_failure_untouched &&
+           invalid_q2_destination && invalid_iq4_destination &&
+           invalid_iq4_expert &&
+           invalid_iq4_group_range &&
            concurrent_boundary_ok;
 }
 
@@ -7174,20 +7513,10 @@ bool test_moe_down_q2_0_case(
     down_weight_buffer.capture_before_dispatch();
     address_buffer.capture_before_dispatch();
 
-    const MoeGroupedParams params{experts, kMoeGroupedLayer};
-    twin::Dispatch work;
-    work.grid_mode = twin::GridMode::threadgroups;
-    work.grid = {320u, static_cast<std::uint32_t>(entry_count), 1u};
-    work.threads_per_group = {256u, 1u, 1u};
-    work.buffers = {{0u, address_buffer.view()},
-                    {1u, input_buffer.view()},
-                    {2u, plan_buffer.view()},
-                    {3u, output_buffer.view()}};
-    work.parameters = &params;
-    work.parameter_bytes = sizeof(params);
-    work.parameter_index = 4u;
-    const bool dispatched = twin::dispatch_manifest(
-        context, "strata_moe_down_q2_0", work, err);
+    const bool dispatched = dispatch_grouped_down(
+        context, MoeDownFormat::q2_0, rows, experts, kMoeGroupedLayer,
+        address_buffer, input_buffer, plan_buffer, output_buffer, err,
+        one_expert_per_entry);
     check(dispatched, label + " Metal dispatch", err);
     if (!dispatched) return false;
 
@@ -7683,20 +8012,10 @@ bool test_moe_down_iq4_nl_case(
     down_weight_buffer.capture_before_dispatch();
     address_buffer.capture_before_dispatch();
 
-    const MoeGroupedParams params{experts, kMoeGroupedLayer};
-    twin::Dispatch work;
-    work.grid_mode = twin::GridMode::threadgroups;
-    work.grid = {320u, static_cast<std::uint32_t>(entry_count), 1u};
-    work.threads_per_group = {256u, 1u, 1u};
-    work.buffers = {{0u, address_buffer.view()},
-                    {1u, input_buffer.view()},
-                    {2u, plan_buffer.view()},
-                    {3u, output_buffer.view()}};
-    work.parameters = &params;
-    work.parameter_bytes = sizeof(params);
-    work.parameter_index = 4u;
-    const bool dispatched = twin::dispatch_manifest(
-        context, "strata_moe_down_iq4_nl", work, err);
+    const bool dispatched = dispatch_grouped_down(
+        context, MoeDownFormat::iq4_nl, rows, experts, kMoeGroupedLayer,
+        address_buffer, input_buffer, plan_buffer, output_buffer, err,
+        one_expert_per_entry);
     check(dispatched, label + " Metal dispatch", err);
     if (!dispatched) return false;
 
@@ -7711,11 +8030,10 @@ bool test_moe_down_iq4_nl_case(
     }
     check(!failure, label + " down outputs U(16)");
 
-    twin::Dispatch single_work = work;
-    single_work.buffers[2].buffer = single_plan_buffer.view();
-    single_work.buffers[3].buffer = single_output_buffer.view();
-    const bool single_dispatched = twin::dispatch_manifest(
-        context, "strata_moe_down_iq4_nl", single_work, err);
+    const bool single_dispatched = dispatch_grouped_down(
+        context, MoeDownFormat::iq4_nl, rows, experts, kMoeGroupedLayer,
+        address_buffer, input_buffer, single_plan_buffer,
+        single_output_buffer, err);
     check(single_dispatched,
           label + " forced single-entry Metal dispatch", err);
     if (!single_dispatched) return false;
@@ -7815,11 +8133,10 @@ bool test_moe_down_iq4_nl_case(
         flipped_address_buffer.capture_before_dispatch();
         flipped_output_buffer.capture_before_dispatch();
 
-        twin::Dispatch flipped_work = single_work;
-        flipped_work.buffers[0].buffer = flipped_address_buffer.view();
-        flipped_work.buffers[3].buffer = flipped_output_buffer.view();
-        const bool flipped_dispatched = twin::dispatch_manifest(
-            context, "strata_moe_down_iq4_nl", flipped_work, err);
+        const bool flipped_dispatched = dispatch_grouped_down(
+            context, MoeDownFormat::iq4_nl, rows, experts,
+            kMoeGroupedLayer, flipped_address_buffer, input_buffer,
+            single_plan_buffer, flipped_output_buffer, err);
         check(flipped_dispatched,
               label + " one-bit negative-control dispatch", err);
         if (!flipped_dispatched) return false;
@@ -8134,6 +8451,7 @@ int main(int argc, char** argv) {
     if (!test_plan_dispatch_validation(*context)) ++g_failures;
     if (!test_grouped_expert_dispatch_validation(*context)) ++g_failures;
     if (!test_swiglu_dispatch_validation(*context)) ++g_failures;
+    if (!test_moe_down_dispatch_validation(*context)) ++g_failures;
 
     std::vector<twin::InputSet> sets;
     if (options.input_set_explicit) {

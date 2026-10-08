@@ -20,6 +20,10 @@ constexpr std::uint32_t kMoeRouteThreads = 32u;
 constexpr std::uint32_t kMoePlanThreads = 128u;
 constexpr std::uint32_t kMoeInputBlocksPerRow = 80u;
 constexpr std::uint32_t kMoeExpertOutputWidth = 640u;
+constexpr std::uint32_t kMoeDownInputBlocksPerEntry = 20u;
+constexpr std::uint32_t kMoeDownOutputWidth = 2560u;
+constexpr std::uint32_t kMoeDownOutputRowGroups =
+    kMoeDownOutputWidth / 8u;
 constexpr std::uint32_t kMoeExpertOutputRowGroups =
     2u * kMoeExpertOutputWidth / 8u;
 constexpr std::uint32_t kMoeSwiGLURowGroups =
@@ -37,6 +41,13 @@ struct MoeGroupedGateUpParams {
 };
 static_assert(sizeof(MoeGroupedGateUpParams) == 12u);
 static_assert(sizeof(Q81) == 36u);
+
+struct MoeGroupedDownParams {
+    std::uint32_t n_expert;
+    std::uint32_t layer;
+    std::uint32_t n_rows;
+};
+static_assert(sizeof(MoeGroupedDownParams) == 12u);
 
 struct MoePlanParams {
     std::uint32_t rows;
@@ -125,6 +136,14 @@ const char* moe_expert_kernel(MoeExpertFormat format) {
         case MoeExpertFormat::iq3_xxs: return "strata_moe_gu_iq3_xxs";
         case MoeExpertFormat::iq3_s: return "strata_moe_gu_iq3_s";
         case MoeExpertFormat::iq4_xs: return "strata_moe_gu_iq4_xs";
+    }
+    return nullptr;
+}
+
+const char* moe_down_kernel(MoeDownFormat format) {
+    switch (format) {
+        case MoeDownFormat::q2_0: return "strata_moe_down_q2_0";
+        case MoeDownFormat::iq4_nl: return "strata_moe_down_iq4_nl";
     }
     return nullptr;
 }
@@ -446,6 +465,109 @@ bool encode_moe_experts_impl(Context& context, Encoder& encoder,
                             error);
 }
 
+bool encode_moe_down_impl(Context& context, Encoder& encoder,
+                          std::uint32_t rows, std::uint32_t experts,
+                          std::uint32_t layer, MoeDownFormat format,
+                          const MoeGroupedDownBuffers& buffers,
+                          std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "grouped MoE down projection requires an ordered dispatch boundary";
+        return false;
+    }
+    if (rows == 0u || rows > 8u || experts == 0u ||
+        experts > kTieredMaxExperts || layer >= kTieredMaxLayers) {
+        error = "grouped MoE down projection requires 1..8 rows, 1..512 experts, and a valid layer";
+        return false;
+    }
+    const char* kernel = moe_down_kernel(format);
+    if (kernel == nullptr) {
+        error = "grouped MoE down format is unsupported";
+        return false;
+    }
+
+    const std::uint64_t entry_count =
+        static_cast<std::uint64_t>(rows) * kMoeTopK;
+    const std::uint64_t address_count =
+        (static_cast<std::uint64_t>(layer) + 1u) * experts;
+    const std::uint64_t plan_count =
+        static_cast<std::uint64_t>(layer) + 1u;
+    std::size_t addresses_bytes = 0u;
+    std::size_t activations_bytes = 0u;
+    std::size_t plans_bytes = 0u;
+    std::size_t parts_bytes = 0u;
+    if (entry_count > std::numeric_limits<std::uint32_t>::max() ||
+        !checked_bytes(address_count, sizeof(MoeExpertAddress),
+                       addresses_bytes) ||
+        !checked_bytes(entry_count * kMoeDownInputBlocksPerEntry,
+                       sizeof(Q81), activations_bytes) ||
+        !checked_bytes(plan_count, sizeof(TieredMoePlan), plans_bytes) ||
+        !checked_bytes(entry_count * kMoeDownOutputWidth, sizeof(float),
+                       parts_bytes)) {
+        error = "grouped MoE down shape exceeds the host byte range";
+        return false;
+    }
+
+    if (!buffers.addresses || !context.buffers().owns(buffers.addresses) ||
+        buffers.addresses.length() < addresses_bytes ||
+        buffers.addresses.offset() % alignof(MoeExpertAddress) != 0u) {
+        error = "grouped MoE down address table is stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (!buffers.activations ||
+        !context.buffers().owns(buffers.activations) ||
+        buffers.activations.length() < activations_bytes ||
+        buffers.activations.offset() % alignof(Q81) != 0u) {
+        error = "grouped MoE down Q8_1 activations are stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (!buffers.plans || !context.buffers().owns(buffers.plans) ||
+        buffers.plans.length() < plans_bytes ||
+        buffers.plans.offset() % alignof(TieredMoePlan) != 0u) {
+        error = "grouped MoE down plan table is stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (!buffers.parts || !context.buffers().owns(buffers.parts) ||
+        buffers.parts.length < parts_bytes ||
+        buffers.parts.offset % alignof(float) != 0u) {
+        error = "grouped MoE down parts output is stale, foreign, undersized or misaligned";
+        return false;
+    }
+
+    if (views_overlap(buffers.addresses, buffers.activations) ||
+        views_overlap(buffers.addresses, buffers.plans) ||
+        views_overlap(buffers.activations, buffers.plans) ||
+        views_overlap(buffers.addresses, buffers.parts) ||
+        views_overlap(buffers.activations, buffers.parts) ||
+        views_overlap(buffers.plans, buffers.parts)) {
+        error = "grouped MoE down output must not overlap its inputs";
+        return false;
+    }
+
+    const MoeGroupedDownParams params{experts, layer, rows};
+    const std::array writable{
+        EncoderBufferBinding{buffers.parts, 3u, parts_bytes,
+                             alignof(float)},
+    };
+    const std::array read_only{
+        EncoderReadOnlyBufferBinding{buffers.addresses, 0u,
+                                     addresses_bytes,
+                                     alignof(MoeExpertAddress)},
+        EncoderReadOnlyBufferBinding{buffers.activations, 1u,
+                                     activations_bytes, alignof(Q81)},
+        EncoderReadOnlyBufferBinding{buffers.plans, 2u, plans_bytes,
+                                     alignof(TieredMoePlan)},
+    };
+    const std::array bytes{
+        EncoderBytesBinding{&params, sizeof(params), 4u},
+    };
+    return encoder.dispatch(kernel, {kMoeDownOutputRowGroups,
+                                     static_cast<std::uint32_t>(entry_count),
+                                     1u},
+                            {256u, 1u, 1u}, writable, read_only, bytes, {},
+                            error);
+}
+
 bool encode_moe_swiglu_impl(Context& context, Encoder& encoder,
                             std::uint32_t rows, bool shared_expert,
                             const MoeSwiGLUBuffers& buffers,
@@ -579,6 +701,29 @@ bool encode_moe_experts(Context& context, CommandBuffer& command_buffer,
             return encode_moe_experts_impl(context, encoder, rows, experts,
                                            layer, format, buffers,
                                            encode_error);
+        },
+            error);
+}
+
+bool encode_moe_down(Context& context, Encoder& encoder,
+                     std::uint32_t rows, std::uint32_t experts,
+                     std::uint32_t layer, MoeDownFormat format,
+                     const MoeGroupedDownBuffers& buffers,
+                     std::string& error) {
+    return encode_moe_down_impl(context, encoder, rows, experts, layer,
+                                format, buffers, error);
+}
+
+bool encode_moe_down(Context& context, CommandBuffer& command_buffer,
+                     std::uint32_t rows, std::uint32_t experts,
+                     std::uint32_t layer, MoeDownFormat format,
+                     const MoeGroupedDownBuffers& buffers,
+                     std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "grouped MoE down projection",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_moe_down_impl(context, encoder, rows, experts, layer,
+                                        format, buffers, encode_error);
         },
         error);
 }

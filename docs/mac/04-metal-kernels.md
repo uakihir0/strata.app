@@ -2366,6 +2366,16 @@ subblock scale assembly and Q8_1 lane mapping.
 `addr[...].role[2] + r·d_row`, the columns are `ehq + (a0 + c)·(640/32)`, and entry a writes
 `parts[P.ent_dst[a]·2560 + r]`.
 
+The validated engine `encode_moe_down` binds the Q2_0 or IQ4_NL variant for
+T=1..8 and 1..512 active experts. It checks Context ownership, extents,
+alignment and input/output overlap, and requires an ordered dispatch boundary.
+The GPU checks the plan's row and group bounds, expert IDs, and every grouped
+output destination before reading or writing. The plan and selected down-weight
+addresses must still come from trusted engine outputs and remain valid through
+command completion. Keep this dispatch ordered after the routed SwiGLU output
+has been quantized as Q8_1. The production Window scheduler is still open, so
+this encoder does not establish end-to-end MoE inference.
+
 The Q2_0 down specialization has ten 64-value blocks per row and two Q8_1
 parts per block. It traverses 20 calls with `k = lane; k < 20; k += 32`,
 decodes Q2_0 values as the two-bit code minus one, applies

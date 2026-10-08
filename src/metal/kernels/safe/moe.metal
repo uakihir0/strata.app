@@ -281,6 +281,7 @@ struct MoeExpertAddr {
 struct MoeGroupedParams {
     uint n_expert;
     uint layer;
+    uint n_rows;
 };
 
 struct MoeGroupedGateUpParams {
@@ -290,7 +291,7 @@ struct MoeGroupedGateUpParams {
 };
 
 static_assert(sizeof(MoeExpertAddr) == 24, "MoeExpertAddr host ABI");
-static_assert(sizeof(MoeGroupedParams) == 8, "MoeGroupedParams host ABI");
+static_assert(sizeof(MoeGroupedParams) == 12, "MoeGroupedParams host ABI");
 static_assert(sizeof(MoeGroupedGateUpParams) == 12,
               "MoeGroupedGateUpParams host ABI");
 
@@ -318,6 +319,17 @@ static inline uint moe_group_entry_tokens_valid(
     for (uint entry = entry_begin; entry < entry_end; ++entry) {
         const int token = plan->ent_tok[entry];
         if (token < 0 || uint(token) >= n_rows) return 0u;
+    }
+    return 1u;
+}
+
+static inline uint moe_group_entry_destinations_valid(
+    device const MoePlan* plan, uint entry_begin, uint entry_end,
+    uint n_entries, uint lane) {
+    if (lane != 0u) return 1u;
+    for (uint entry = entry_begin; entry < entry_end; ++entry) {
+        const int destination = plan->ent_dst[entry];
+        if (destination < 0 || uint(destination) >= n_entries) return 0u;
     }
     return 1u;
 }
@@ -458,20 +470,29 @@ kernel void strata_moe_down_q2_0(
     uint3 group [[threadgroup_position_in_grid]]) {
     device const MoePlan* plan = plans + params.layer;
     const uint group_index = group.y;
-    if (group_index >= plan->n_groups) return;
+    if (!moe_group_header_valid(plan, params.n_rows, params.n_expert,
+                                group_index)) {
+        return;
+    }
 
     const uint warp = tid / 32u;
     const uint lane = tid % 32u;
     const uint row = group.x * 8u + warp;
+    if (row >= 2560u) return;
+    const uint entry_begin = uint(plan->grp_start[group_index]);
+    const uint entry_end = uint(plan->grp_start[group_index + 1u]);
+    if (simd_broadcast_first(moe_group_entry_destinations_valid(
+            plan, entry_begin, entry_end, plan->n_entries, lane)) == 0u) {
+        return;
+    }
     const MoeExpertAddr address =
         addresses[params.layer * params.n_expert +
                   uint(plan->grp_e[group_index])];
+    if (address.role[2] == nullptr) return;
     const device block_q2_0* row_weights =
         reinterpret_cast<device const block_q2_0*>(address.role[2]) +
         row * 10u;
 
-    const uint entry_begin = uint(plan->grp_start[group_index]);
-    const uint entry_end = uint(plan->grp_start[group_index + 1u]);
     for (uint first = entry_begin; first < entry_end; first += 4u) {
         const uint count = min(4u, entry_end - first);
         uint activation_offsets[4];
@@ -534,20 +555,29 @@ kernel void strata_moe_down_iq4_nl(
     uint3 group [[threadgroup_position_in_grid]]) {
     device const MoePlan* plan = plans + params.layer;
     const uint group_index = group.y;
-    if (group_index >= plan->n_groups) return;
+    if (!moe_group_header_valid(plan, params.n_rows, params.n_expert,
+                                group_index)) {
+        return;
+    }
 
     const uint warp = tid / 32u;
     const uint lane = tid % 32u;
     const uint row = group.x * 8u + warp;
+    if (row >= 2560u) return;
+    const uint entry_begin = uint(plan->grp_start[group_index]);
+    const uint entry_end = uint(plan->grp_start[group_index + 1u]);
+    if (simd_broadcast_first(moe_group_entry_destinations_valid(
+            plan, entry_begin, entry_end, plan->n_entries, lane)) == 0u) {
+        return;
+    }
     const MoeExpertAddr address =
         addresses[params.layer * params.n_expert +
                   uint(plan->grp_e[group_index])];
+    if (address.role[2] == nullptr) return;
     const device block_iq4_nl* row_weights =
         reinterpret_cast<device const block_iq4_nl*>(address.role[2]) +
         row * 20u;
 
-    const uint entry_begin = uint(plan->grp_start[group_index]);
-    const uint entry_end = uint(plan->grp_start[group_index + 1u]);
     for (uint first = entry_begin; first < entry_end; first += 4u) {
         const uint count = min(4u, entry_end - first);
         uint activation_offsets[4];
