@@ -66,10 +66,11 @@ public:
                        const TieredMoePlan& plan, ExpertLayerStats& stats,
                        std::string& error);
 
-    /// Wait for a GPU-produced shared plan, resolve its misses, then signal the
-    /// matching layer-ready value on the same monotonic event. A skipped plan
-    /// reads and validates only its four-word header. On failure, the caller
-    /// must release any GPU waits before abandoning the command buffer.
+    /// Wait for a GPU-produced shared plan, retire earlier layers whose expert
+    /// reads precede this plan event, resolve its misses, then signal the matching
+    /// layer-ready value on the same monotonic event. A skipped plan reads and
+    /// validates only its four-word header. On failure, the caller must release
+    /// any GPU waits before abandoning the command buffer.
     bool resolve_layer_after_plan(
         const std::shared_ptr<ExpertLeaseSet>& lease_set, std::uint32_t layer,
         Events& events, std::uint64_t plan_ready_value,
@@ -84,6 +85,9 @@ public:
 
 private:
     struct Impl;
+    bool resolve_layer_locked(const std::shared_ptr<ExpertLeaseSet>& lease_set,
+                              std::uint32_t layer, const TieredMoePlan& plan,
+                              ExpertLayerStats& stats, std::string& error);
     explicit ExpertStore(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
 };

@@ -411,11 +411,15 @@ std::unique_ptr<ExpertStore> ExpertStore::create(TieredStorage& storage,
 }
 
 bool ExpertStore::resolve_layer(
-                                const std::shared_ptr<ExpertLeaseSet>& lease_set,
-                                std::uint32_t layer,
-                                const TieredMoePlan& plan, ExpertLayerStats& stats,
-                                std::string& error) {
+    const std::shared_ptr<ExpertLeaseSet>& lease_set, std::uint32_t layer,
+    const TieredMoePlan& plan, ExpertLayerStats& stats, std::string& error) {
     std::lock_guard<std::mutex> operation_lock(impl_->operation_mutex);
+    return resolve_layer_locked(lease_set, layer, plan, stats, error);
+}
+
+bool ExpertStore::resolve_layer_locked(
+    const std::shared_ptr<ExpertLeaseSet>& lease_set, std::uint32_t layer,
+    const TieredMoePlan& plan, ExpertLayerStats& stats, std::string& error) {
     error.clear();
     if (!lease_set) {
         error = "ERR tiered expert resolution has no prepared command-buffer lease set";
@@ -648,6 +652,17 @@ bool ExpertStore::resolve_layer_after_plan(
         return false;
     }
     if (!events.wait(plan_ready_value, timeout_ms, error)) return false;
+    // Do not block prefetch while waiting on the GPU. Once the event arrives,
+    // serialize retirement, miss resolution and publication against prefetch.
+    std::lock_guard<std::mutex> operation_lock(impl_->operation_mutex);
+    // The plan event is encoded after every earlier layer's expert reads on this
+    // command buffer. Retire those leases now, before resolving another plan can
+    // need their parity half; command-buffer completion still releases anything
+    // retained for the current and later layers.
+    for (std::uint32_t completed_layer = 0; completed_layer < layer;
+         ++completed_layer) {
+        lease_set->retire_layer(completed_layer);
+    }
     std::atomic_thread_fence(std::memory_order_acquire);
 
     std::array<std::uint32_t, 4> header{};
@@ -681,7 +696,7 @@ bool ExpertStore::resolve_layer_after_plan(
         }
         TieredMoePlan plan{};
         std::memcpy(&plan, plan_bytes, sizeof(plan));
-        if (!resolve_layer(lease_set, layer, plan, resolved, error)) return false;
+        if (!resolve_layer_locked(lease_set, layer, plan, resolved, error)) return false;
     }
 
     if (!events.signal_host(layer_ready_value, error)) return false;

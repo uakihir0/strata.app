@@ -133,7 +133,7 @@ The names below are used throughout the documentation set. The namespace is `str
 | `WeightStore` | `src/metal/engine/weights.cpp` | Opens GGUF shards and the native pack (`index.txt` v3, `native_experts.txt` v3 or v4, `conversions.json`); maps tensors to (buffer, offset) | `weights.cpp`, `native_dense.cpp`, `native_head.cpp` |
 | `Geometry` | `src/metal/engine/geometry.cpp` | The facts the memory plan needs about a model (shard sizes, tensor tables, per-layer blob sizes, D_pack, MTP sizes, tensor types): built by `WeightStore` from the files, or read from a geometry file with `--geometry`; written with `--write-geometry` ([07](07-server-setup-port.md), section 4.4.3) | none |
 | `Plan` | `src/metal/engine/plan.cpp` | The memory plan of [05](05-memory-and-residency.md), section 3: full or tiered mode, the resident set, the slot pool, the prefill chunk; the window planning of [05](05-memory-and-residency.md), section 4.2; the PLAN line. Plain C++ with no Metal calls: it computes over `Geometry`, W, RAM and the flags, so `metal_plan_test` and `metal_window_test` need no GPU and the light `--plan-only` path (section 2.3) needs no pipelines. | the `--expert-cache auto` VRAM formula (`generate.cpp:2664-2686`) and setup's fit formulas |
-| `ExpertStore` | `src/metal/engine/experts.cpp` | Residency mode (full or tiered); the resident set; the slot pool; `MissResolver`; adaptive swaps; lookahead | `expert_source.cpp`, `expert_cache.cpp`, `remote_experts.cpp`, `pool.cpp` |
+| `ExpertStore` | `src/metal/engine/experts.cpp` | Residency mode (full or tiered); the resident set; the slot pool; `MissResolver`; plan-event-driven lease retirement; adaptive swaps; lookahead | `expert_source.cpp`, `expert_cache.cpp`, `remote_experts.cpp`, `pool.cpp` |
 | `KvStore` | `src/metal/engine/kv.cpp` | QSA K/V in fp16 / int8 / q4_0 / k8v4, indexer state and the single shared RoPE table. `ModelStorage` verifies the exact planner byte count and opens it under its outer allocation transaction for every accepted plan; callers still initialize K/V and RoPE values | KV parts of `layer.cpp` |
 | `SessionStateStorage` | `include/strata/metal/session_state.hpp`, `src/metal/engine/session_state_layout.cpp`, `src/metal/engine/session_state.cpp` | One Context-owned Shared allocation for qwen4exp's 36 GDN recurrences, 36 convolution histories and row-fastest PLE history; exact fixed-shape layout, zero-on-open, and reset guarded by tracked command-buffer completion. QSA KV/indexer state remains with `KvStore`; this owner remains attached to the session lifecycle, not `ModelStorage` | `SessionState` state carve and `session_zero` |
 | `WindowScratchLayout` / `WindowScratchStorage` | `include/strata/metal/window_scratch.hpp`, `src/metal/engine/window_scratch_layout.cpp`, `src/metal/engine/window_scratch_storage.cpp` | Device-free checked T=8 layout plus one Context-owned Shared allocation for activations, per-layer commit replay, PLE, QSA, MoE, head, sampler and sink regions. The planner reports its exact size inside `fixed_bytes`; `ModelStorage` validates the planned capacity, checks maxBufferLength and opens it under the outer allocation transaction. Storage exposes bounded named-region views; host PLE staging now writes its active prefix into the PLE region, while Window dispatch and queue-use integration remain pending | `Verifier` arena carve |
@@ -1029,14 +1029,9 @@ submission.
 
 `ExpertStore::resolve_layer_after_plan` implements the host bridge for a tiered decode plan. It waits for the plan-ready value, acquires the shared plan buffer, resolves cold experts through the existing slot cache and fetch workers, and signals the immediately following layer-ready value on that same `Events` object only after address publication succeeds. It reads only the four-word header when `skip` is set, and rejects a skipped plan that reports misses. On failure it leaves the layer-ready value unsignaled; the caller must call `Events::release_gpu_waits(timeout_ms, error)` and fail the request. That method validates its drain timeout before changing the event, advances it to `UINT64_MAX`, drains committed or enqueued command buffers that contain its waits, and permanently disables event operations. After release, `signaled_value()` returns no value and `wait()` refuses to treat the sentinel as completion. `ModelStorage::tiered_storage()` supplies the borrowed tiered storage needed to create `ExpertStore` and remains valid only for the owner's lifetime.
 
-This helper is not yet a production Window scheduler. Command-buffer layer encoding, lookahead scheduling and automatic retirement at later layer events remain open. The current fixture encodes the GPU plan kernel into a synthetic command buffer before its ready signal, then resolves that shared-buffer result.
+This helper is not yet a production Window scheduler. Command-buffer layer encoding and lookahead scheduling remain open. The fixtures encode GPU plan kernels into one synthetic command buffer and verify that a later plan-ready event retires leases from prior layers.
 
-When a later layer-ready event proves that an earlier layer's expert kernels
-have finished reading, the host retires that layer's leases before reusing its
-parity half. The window's completion callback releases any leases that were not
-retired earlier. A cache entry stays Ready after retirement, but its slot may
-be evicted to serve the next layer.
-
+After `resolve_layer_after_plan` observes layer l's plan-ready event, it retires leases for every earlier layer. The Window command buffer is serial, so this event proves that their expert reads have finished. The Window's completion callback releases any leases that remain for the current or later layers. A cache entry stays Ready after retirement, but its slot may be evicted to serve a later layer.
 The `MissResolver` thread, for each layer:
 
 1. Wait for `base + 2l + 1`, through a `MTLSharedEventListener` block or a spin on `signaledValue` (`STRATA_METAL_WAIT`).
@@ -1064,9 +1059,10 @@ Rules:
   reader of half `l % 2`, and the whole previous window, because only one expert-reading command buffer is in flight.
   So at that signal the resolver may overwrite any slot of half `l % 2`.
 - The lookahead into half `(l + 1) % 2` starts only after layer l's signal, when layer l − 1 has completed.
-- Before resolving a new plan, retire leases for every earlier layer whose GPU reads are complete. The synthetic
-  `metal_tiered_copy_test` gates the command buffer past one completed layer and proves that this releases its parity
-  capacity without ending the window.
+- Before resolving a new plan, `resolve_layer_after_plan` retires every earlier layer whose reads precede the
+  plan-ready event. `metal_window_storage_test` resolves GPU-produced plans for layers 0 and 2 in one command
+  buffer, fills layer 0's parity half, then proves layer 2's plan event frees capacity while the Window command
+  buffer is still in flight.
 - If a later change lets two windows overlap, slots must instead be pinned per window and released in the completion
   handler.
 - Timeout: if layer l's signal does not arrive within 20 s, as upstream `verify.cpp:1089-1093`, call

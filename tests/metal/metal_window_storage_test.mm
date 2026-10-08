@@ -79,9 +79,10 @@ public:
     CommandGatesCleanup(Events* layer_gate, std::uint64_t layer_value,
                         Events* completion_gate, std::uint64_t completion_value,
                         id<MTLCommandBuffer> command_buffer)
-        : layer_gate_(layer_gate), layer_value_(layer_value),
-          completion_gate_(completion_gate), completion_value_(completion_value),
-          command_buffer_(command_buffer) {}
+        : completion_gate_(completion_gate), completion_value_(completion_value),
+          command_buffer_(command_buffer) {
+        layer_gates_.emplace_back(layer_gate, layer_value);
+    }
 
     ~CommandGatesCleanup() {
         if (pending_) {
@@ -90,18 +91,30 @@ public:
         }
     }
 
+    void add_layer_gate(Events* layer_gate, std::uint64_t layer_value) {
+        layer_gates_.emplace_back(layer_gate, layer_value);
+    }
+
     bool release_layer(std::string& error) {
-        if (!layer_pending_) return true;
-        if (!layer_gate_->signal_host(layer_value_, error)) return false;
-        layer_pending_ = false;
+        if (layer_gates_.empty()) return true;
+        const auto [layer_gate, layer_value] = layer_gates_.front();
+        if (!layer_gate->signal_host(layer_value, error)) return false;
+        layer_gates_.erase(layer_gates_.begin());
         return true;
     }
 
-    void mark_layer_released() noexcept { layer_pending_ = false; }
+    void mark_layer_released() noexcept {
+        if (!layer_gates_.empty()) layer_gates_.erase(layer_gates_.begin());
+    }
 
     bool finish_and_drain(std::string& error) {
         bool succeeded = true;
-        if (layer_pending_ && !release_layer(error)) succeeded = false;
+        while (!layer_gates_.empty()) {
+            if (!release_layer(error)) {
+                succeeded = false;
+                break;
+            }
+        }
         if (completion_pending_) {
             std::string completion_error;
             if (!completion_gate_->signal_host(completion_value_, completion_error)) {
@@ -119,12 +132,10 @@ public:
     }
 
 private:
-    Events* layer_gate_ = nullptr;
-    std::uint64_t layer_value_ = 0;
+    std::vector<std::pair<Events*, std::uint64_t>> layer_gates_;
     Events* completion_gate_ = nullptr;
     std::uint64_t completion_value_ = 0;
     id<MTLCommandBuffer> command_buffer_;
-    bool layer_pending_ = true;
     bool completion_pending_ = true;
     bool pending_ = true;
 };
@@ -1141,6 +1152,8 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     const std::uint64_t arrival_value = handshake_events->reserve_value();
     const std::uint64_t release_value = handshake_events->reserve_value();
     const std::uint64_t layer_done_value = handshake_events->reserve_value();
+    const std::uint64_t later_arrival_value = handshake_events->reserve_value();
+    const std::uint64_t later_release_value = handshake_events->reserve_value();
     const std::uint64_t completion_gate_value = handshake_events->reserve_value();
     const std::array<std::int32_t, 10> resolve_ids{
         7, 7, 7, 7, 3, 3, 2, 8, 8, 8};
@@ -1155,9 +1168,13 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     require(handshake_events->encode_signal(*resolve_command, arrival_value, error) &&
                 handshake_events->encode_wait(*resolve_command, release_value, error) &&
                 handshake_events->encode_signal(*resolve_command, layer_done_value, error) &&
+                encode_moe_plan(context, *resolve_command, 1, geometry.n_expert,
+                                true, 2, gpu_plan_buffers, error) &&
+                handshake_events->encode_signal(*resolve_command, later_arrival_value, error) &&
+                handshake_events->encode_wait(*resolve_command, later_release_value, error) &&
                 handshake_events->encode_wait(*resolve_command,
                                               completion_gate_value, error),
-            "encode plan-ready and host-release events: " + error);
+            "encode two ordered GPU plans and their host-release events: " + error);
     auto resolve_leases =
         expert_store->prepare_command_buffer(*resolve_command, error);
     require(resolve_leases != nullptr,
@@ -1176,6 +1193,26 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     CommandGatesCleanup gate_cleanup(
         handshake_events.get(), release_value, handshake_events.get(),
         completion_gate_value, native_resolve);
+    gate_cleanup.add_layer_gate(handshake_events.get(), later_release_value);
+    require(handshake_events->wait(arrival_value, 5000, error),
+            "wait for first GPU-produced plan before replacing its consumed ids: " + error);
+    std::uint32_t later_resident_expert = geometry.n_expert;
+    const std::size_t later_layer_resident_offset =
+        static_cast<std::size_t>(2) * geometry.n_expert;
+    for (std::uint32_t expert = 0; expert < geometry.n_expert; ++expert) {
+        if (layout.resident[later_layer_resident_offset + expert] >= 0) {
+            later_resident_expert = expert;
+            break;
+        }
+    }
+    require(later_resident_expert < geometry.n_expert,
+            "find a layer-2 resident expert for the later GPU plan");
+    const std::array<std::int32_t, 10> later_ids = [] (std::uint32_t expert) {
+        std::array<std::int32_t, 10> ids{};
+        ids.fill(static_cast<std::int32_t>(expert));
+        return ids;
+    }(later_resident_expert);
+    std::memcpy(plan_ids_buffer.contents, later_ids.data(), sizeof(later_ids));
     ExpertLayerStats first_resolve;
     require(expert_store->resolve_layer_after_plan(
                 resolve_leases, 0, *handshake_events, arrival_value, release_value,
@@ -1228,15 +1265,27 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     require(!exhausted_half && error.find("no unpinned slot") != std::string::npos,
             "all same-parity slots stay pinned before the layer-complete handshake (lease=" +
                 std::to_string(static_cast<bool>(exhausted_half)) + ", error=" + error + ")");
-    require(gate_cleanup.release_layer(error),
-            "the resolver must already have released the submitted layer: " + error);
     require(handshake_events->wait(layer_done_value, 5000, error),
             "wait until the simulated GPU layer has consumed its expert addresses: " + error);
-    resolve_leases->retire_layer(0);
+    require(handshake_events->wait(later_arrival_value, 5000, error),
+            "wait for the later GPU plan after the earlier layer's expert reads: " + error);
+    require(writable_plans[2].n_groups == 1 &&
+                writable_plans[2].n_entries == 10 &&
+                writable_plans[2].n_miss == 0 && writable_plans[2].skip == 1,
+            "later GPU plan must confirm that its repeated layer resident needs no slot");
+    ExpertLayerStats later_stats;
+    require(expert_store->resolve_layer_after_plan(
+                resolve_leases, 2, *handshake_events, later_arrival_value,
+                later_release_value, 5000, later_stats, error),
+            "resolve a later plan and automatically retire completed prior layers: " + error);
+    gate_cleanup.mark_layer_released();
+    require(later_stats.hits == 10 && later_stats.lookups == 10 &&
+                event_has_value(*handshake_events, later_release_value),
+            "later plan handshake must retire earlier leases before signaling its layer-ready value");
     auto reused_half = storage->slot_pool()->acquire(
         0, 2, layout.experts[2].blob_bytes, error);
     require(reused_half && !reused_half.view().cache_hit,
-            "retiring a completed layer must free its parity half before command completion: " +
+            "a later plan event must automatically free completed prior-layer slots before command completion: " +
                 error);
     require(reused_half.publish(error),
             "publish a slot reused after its layer-complete handshake: " + error);
