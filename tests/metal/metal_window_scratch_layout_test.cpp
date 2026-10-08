@@ -87,6 +87,7 @@ std::vector<WindowScratchRegion> regions_of(const WindowScratchLayout& layout) {
         layout.shared_output,
         layout.shared_gate_logit,
         layout.head_mixed,
+        layout.head_q8_1,
         layout.head_logits,
         layout.sampler_history,
         layout.sampler_candidates,
@@ -169,6 +170,7 @@ void check_for_capacity(std::uint32_t capacity, std::size_t expected_bytes,
                 layout.moe_hidden_q.bytes == 8u * 10u * 20u * 36u,
             "MoE routing, plans and expert intermediates must match the shader ABI");
     require(layout.ple_norm.bytes == 8u * 10'240u * sizeof(float) &&
+                layout.head_q8_1.bytes == 8u * 80u * 36u &&
                 layout.head_logits.bytes ==
                     8u * 248'320u * sizeof(float) &&
                 layout.sampler_history.bytes ==
@@ -189,12 +191,12 @@ void check_for_capacity(std::uint32_t capacity, std::size_t expected_bytes,
 
 int main() {
     try {
-        check_for_capacity(32'768u, 47'641'344u, 256u);
-        check_for_capacity(65'536u, 47'903'488u, 256u);
-        check_for_capacity(kWindowScratchMaxCellCapacity, 49'476'352u, 256u);
-        check_for_capacity(32'768u, 47'649'536u);
-        check_for_capacity(65'536u, 47'911'680u);
-        check_for_capacity(kWindowScratchMaxCellCapacity, 49'484'544u);
+        check_for_capacity(32'768u, 47'664'384u, 256u);
+        check_for_capacity(65'536u, 47'926'528u, 256u);
+        check_for_capacity(kWindowScratchMaxCellCapacity, 49'499'392u, 256u);
+        check_for_capacity(32'768u, 47'672'576u);
+        check_for_capacity(65'536u, 47'934'720u);
+        check_for_capacity(kWindowScratchMaxCellCapacity, 49'507'584u);
 
         WindowScratchLayout compact;
         WindowScratchLayout full;

@@ -88,6 +88,7 @@ struct WindowScratchLayout {
     WindowScratchRegion shared_gate_logit;
 
     WindowScratchRegion head_mixed;
+    WindowScratchRegion head_q8_1;
     WindowScratchRegion head_logits;
     WindowScratchRegion sampler_history;
     WindowScratchRegion sampler_candidates;

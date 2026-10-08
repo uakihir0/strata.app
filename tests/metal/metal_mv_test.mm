@@ -29,6 +29,7 @@
 #include "metallib_sha256.inc"
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/mv_dispatch.hpp"
+#include "strata/metal/window_output_projection.hpp"
 #include "../../src/metal/kernels/common/types.h"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -207,6 +208,55 @@ void check(bool ok, const std::string& label, const std::string& detail = {}) {
                 detail.empty() ? "" : ": ", detail.empty() ? "" : detail.c_str());
     std::fflush(stdout);
     g_failures += !ok;
+}
+
+bool run_window_output_weight_mapping_tests() {
+    const std::array<std::uint64_t, 2> shape{
+        kWindowOutputInputWidth, kWindowOutputVocabularySize};
+    const std::array<std::pair<std::uint32_t, MatVecWeightFormat>, 3> cases{{
+        {13u, MatVecWeightFormat::q5_k},
+        {14u, MatVecWeightFormat::q6_k},
+        {23u, MatVecWeightFormat::iq4_xs},
+    }};
+    bool passed = true;
+    for (const auto& [ggml_type, expected_format] : cases) {
+        MatVecWeightFormat format{};
+        std::string error = "stale";
+        const bool accepted = window_output_weight_format(
+            ggml_type, shape, format, error);
+        check(accepted && format == expected_format && error.empty(),
+              "Window output.weight maps supported GGML type " +
+                  std::to_string(ggml_type),
+              error);
+        passed &= accepted && format == expected_format && error.empty();
+    }
+
+    MatVecWeightFormat format{};
+    std::string error;
+    const bool rejects_type =
+        !window_output_weight_format(30u, shape, format, error) &&
+        error.find("Q5_K, Q6_K or IQ4_XS") != std::string::npos;
+    check(rejects_type, "Window output.weight rejects unsupported GGML type",
+          error);
+    passed &= rejects_type;
+
+    const std::array<std::uint64_t, 2> bad_shape{
+        kWindowOutputInputWidth - 1u, kWindowOutputVocabularySize};
+    const bool rejects_shape =
+        !window_output_weight_format(13u, bad_shape, format, error) &&
+        error.find("[2560, 248320]") != std::string::npos;
+    check(rejects_shape, "Window output.weight rejects unexpected dimensions",
+          error);
+    passed &= rejects_shape;
+
+    const std::array<std::uint64_t, 1> bad_rank{
+        kWindowOutputInputWidth};
+    const bool rejects_rank =
+        !window_output_weight_format(23u, bad_rank, format, error) &&
+        error.find("[2560, 248320]") != std::string::npos;
+    check(rejects_rank, "Window output.weight rejects unexpected rank", error);
+    passed &= rejects_rank;
+    return passed;
 }
 
 void set_q5_0_code(block_q5_0& weight, std::uint32_t index, std::uint32_t code) {
@@ -13102,6 +13152,7 @@ int main(int argc, char** argv) {
     auto context = Context::open(context_options, err);
     check(context != nullptr, "open Metal context", err);
     if (!context) return 1;
+    if (!run_window_output_weight_mapping_tests()) ++g_failures;
 
     std::vector<twin::InputSet> sets;
     if (options.input_set_explicit) {

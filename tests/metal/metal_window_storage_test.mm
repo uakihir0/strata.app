@@ -13,12 +13,15 @@
 #include "strata/metal/window_ple_stage.hpp"
 #include "strata/metal/window_t1_input.hpp"
 #include "strata/metal/window_scratch.hpp"
+#include "strata/metal/window_output_projection.hpp"
 #include "strata/metal/session_state.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "window_source_lock_test_access.hpp"
+#include "oracles/iq4_xs_mv.hpp"
+#include "oracles/q8_1.hpp"
 #include "../../src/metal/kernels/common/params.h"
 #include "../../src/metal/kernels/common/types.h"
 
@@ -38,6 +41,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -58,6 +62,7 @@ constexpr std::uint32_t kGgmlTypeQ3K = 11u;
 constexpr std::uint32_t kGgmlTypeQ8_0 = 8u;
 constexpr std::uint32_t kGgmlTypeBF16 = 30u;
 constexpr std::uint32_t kGgmlTypeQ2_0 = 42u;
+constexpr std::uint32_t kGgmlTypeIQ4XS = 23u;
 
 MatVecWeightFormat fullmode_ple_key_format(std::uint32_t ggml_type) {
     switch (ggml_type) {
@@ -117,6 +122,38 @@ struct TestQ8_1 {
     std::int8_t qs[32]{};
 };
 static_assert(sizeof(TestQ8_1) == 36);
+
+void set_iq4_xs_fixture_code(block_iq4_xs& block, std::uint32_t index,
+                             std::uint32_t code) {
+    const std::uint32_t subblock = index / 32u;
+    const std::uint32_t local = index % 32u;
+    const std::uint32_t byte_index =
+        16u * subblock + (local < 16u ? local : local - 16u);
+    if (local < 16u) {
+        block.qs[byte_index] = static_cast<std::uint8_t>(
+            (block.qs[byte_index] & 0xf0u) | (code & 0x0fu));
+    } else {
+        block.qs[byte_index] = static_cast<std::uint8_t>(
+            (block.qs[byte_index] & 0x0fu) | ((code & 0x0fu) << 4u));
+    }
+}
+
+void set_iq4_xs_fixture_scale(block_iq4_xs& block, std::uint32_t subblock,
+                              std::uint32_t code) {
+    const std::uint32_t low_shift = 4u * (subblock % 2u);
+    const std::uint8_t low_mask =
+        static_cast<std::uint8_t>(0x0fu << low_shift);
+    block.scales_l[subblock / 2u] = static_cast<std::uint8_t>(
+        (block.scales_l[subblock / 2u] &
+         static_cast<std::uint8_t>(~low_mask)) |
+        static_cast<std::uint8_t>((code & 0x0fu) << low_shift));
+    const std::uint32_t high_shift = 2u * subblock;
+    const std::uint16_t high_mask =
+        static_cast<std::uint16_t>(0x03u << high_shift);
+    block.scales_h = static_cast<std::uint16_t>(
+        (block.scales_h & static_cast<std::uint16_t>(~high_mask)) |
+        static_cast<std::uint16_t>(((code >> 4u) & 0x03u) << high_shift));
+}
 
 struct TestMoeExpertAddress {
     std::uint64_t role[3]{};
@@ -473,6 +510,9 @@ struct Fixture {
     std::uint64_t router_offset = 0;
     std::uint64_t second_router_offset = 0;
     std::uint64_t dense_offset = 0;
+    std::uint64_t output_weight_offset = 0;
+    std::uint64_t output_weight_bytes = 0;
+    std::array<block_iq4_xs, 2'560u / 256u> output_weight_first_row{};
     std::uint64_t ple_offset = 0;
     std::uint64_t post_ple_offset = 0;
 };
@@ -669,7 +709,8 @@ Fixture write_fixture(const fs::path& directory, bool overlap_ple = false,
 
 Fixture write_fullmode_handoff_fixture(
     const fs::path& directory,
-    std::uint32_t ple_key_type = kGgmlTypeQ2_0) {
+    std::uint32_t ple_key_type = kGgmlTypeQ2_0,
+    bool include_output_weight = false) {
     constexpr std::uint64_t kExperts = 256u;
     constexpr std::uint64_t kGateUpElements = 2'560u * 640u;
     constexpr std::uint64_t kDownElements = 640u * 2'560u;
@@ -693,10 +734,12 @@ Fixture write_fullmode_handoff_fixture(
     };
 
     Fixture fixture;
-    fixture.path = directory /
-        ("fullmode-handoff-" + std::to_string(ple_key_type) + ".gguf");
+    const std::string fixture_suffix =
+        std::string("fullmode-handoff-") + std::to_string(ple_key_type) +
+        (include_output_weight ? "-output" : "");
+    fixture.path = directory / (fixture_suffix + ".gguf");
     fixture.dense_pack_path = directory /
-        ("fullmode-handoff-" + std::to_string(ple_key_type) + "-dense.bin");
+        (fixture_suffix + "-dense.bin");
     fixture.expert_count = kExperts;
     fixture.expert_slab_bytes = kExpertSlabBytes;
     fixture.expert_layers = 1u;
@@ -725,6 +768,10 @@ Fixture write_fullmode_handoff_fixture(
         {"per_layer_token_embd.weight",
          {strata::kernels::PLE_HEAD_DIM, kPleRows}, 20u, 0u},
     };
+    if (include_output_weight) {
+        tensors.push_back(
+            {"output.weight", {2'560u, 248'320u}, kGgmlTypeIQ4XS, 0u});
+    }
     std::unordered_map<std::string, std::uint64_t> dense_tensor_offsets;
     for (Tensor& tensor : tensors) {
         cursor = align32(cursor);
@@ -742,6 +789,11 @@ Fixture write_fullmode_handoff_fixture(
         } else if (tensor.name == "per_layer_token_embd.weight") {
             fixture.ple_offset = cursor;
             cursor += kPleBytes;
+        } else if (tensor.name == "output.weight") {
+            fixture.output_weight_offset = cursor;
+            fixture.output_weight_bytes =
+                (2'560u * 248'320u / 256u) * sizeof(block_iq4_xs);
+            cursor += fixture.output_weight_bytes;
         } else {
             std::uint64_t elements = 1u;
             for (const std::uint64_t dimension : tensor.shape) {
@@ -815,6 +867,21 @@ Fixture write_fullmode_handoff_fixture(
         write_all_at(descriptor, embedding_row.data(),
                      embedding_row.size() * sizeof(block_q3_K),
                      fixture.data_start + fixture.dense_offset);
+
+        if (include_output_weight) {
+            block_iq4_xs& first_block = fixture.output_weight_first_row.front();
+            first_block.d = strata::kernels::f16_from_f32(0.25f);
+            for (std::uint32_t subblock = 0u; subblock < 8u; ++subblock) {
+                set_iq4_xs_fixture_scale(first_block, subblock, 40u);
+            }
+            for (std::uint32_t index = 0u; index < 256u; ++index) {
+                set_iq4_xs_fixture_code(first_block, index, 15u);
+            }
+            write_all_at(
+                descriptor, fixture.output_weight_first_row.data(),
+                sizeof(fixture.output_weight_first_row),
+                fixture.data_start + fixture.output_weight_offset);
+        }
 
         constexpr std::uint64_t kPleKeyElements = 2'560u * 10'240u;
         const std::uint64_t ple_key_offset =
@@ -1053,6 +1120,11 @@ WindowSources inspect_fixture(const Fixture& fixture) {
                 {tensor->name, file.data_start() + tensor->offset,
                  strata::tensor_payload_bytes(*tensor), 0});
         }
+    }
+    if (const strata::TensorInfo* tensor = file.find("output.weight")) {
+        shard.tensors.push_back(
+            {tensor->name, file.data_start() + tensor->offset,
+             strata::tensor_payload_bytes(*tensor), 0});
     }
     const strata::TensorInfo* ple = file.find("per_layer_token_embd.weight");
     if (ple == nullptr) throw std::runtime_error("synthetic GGUF PLE tensor is missing");
@@ -4074,6 +4146,268 @@ void run_fullmode_handoff_test(Context& context,
             "no-PLE attention read consumes the pending output into finite mixed activations");
 }
 
+void run_fullmode_output_projection_test(Context& context,
+                                         const fs::path& parent_directory) {
+    constexpr std::uint32_t kRows = 1u;
+    constexpr std::size_t kOutputBytes =
+        static_cast<std::size_t>(kWindowOutputVocabularySize) * sizeof(float);
+    constexpr std::size_t kQ8Bytes =
+        (kWindowOutputInputWidth / 32u) * 36u;
+
+    const fs::path directory = parent_directory / "fullmode-output-projection";
+    fs::create_directory(directory);
+    const Fixture fixture =
+        write_fullmode_handoff_fixture(directory, kGgmlTypeQ2_0, true);
+    WindowSources sources = inspect_fixture(fixture);
+    Geometry full_geometry = owner_test_geometry(fixture, sources);
+    full_geometry.family = "qwen4exp";
+    full_geometry.model = "synthetic-fullmode-output-projection";
+    full_geometry.n_expert = 256u;
+    full_geometry.n_qsa_layers = 1u;
+    full_geometry.n_kv_head = 2u;
+    full_geometry.head_dim = 256u;
+    full_geometry.n_embd = kWindowOutputInputWidth;
+    full_geometry.vocab = kWindowOutputVocabularySize;
+    full_geometry.types = {"q2_0", "iq4_xs"};
+    full_geometry.layers[0].gate_up_type = "q2_0";
+    full_geometry.layers[0].down_type = "q2_0";
+
+    std::string error;
+    WindowPlan plan;
+    require(plan_windows(sources, context.device_facts().max_buffer_length,
+                         plan, error),
+            "plan sparse FullMode output.weight fixture: " + error);
+    auto full_mode = FullModeStorage::open(
+        context, fixture.path.string(), full_geometry, sources, plan, error);
+    require(full_mode != nullptr,
+            "open FullMode output.weight fixture: " + error);
+    FullModeTensorView output_weight;
+    require(full_mode->dense_tensor_view("output.weight", output_weight,
+                                         error) &&
+                output_weight.ggml_type == kGgmlTypeIQ4XS &&
+                output_weight.shape ==
+                    std::vector<std::uint64_t>{kWindowOutputInputWidth,
+                                               kWindowOutputVocabularySize} &&
+                output_weight.buffer.length() == fixture.output_weight_bytes,
+            "FullMode resolves the production-shaped IQ4_XS output.weight: " +
+                error);
+
+    Geometry runtime_geometry;
+    runtime_geometry.family = "qwen4exp";
+    runtime_geometry.model = "synthetic-window-runtime";
+    runtime_geometry.n_layers = kSessionModelLayers;
+    runtime_geometry.n_expert = 256u;
+    runtime_geometry.n_qsa_layers = kSessionQsaLayers;
+    runtime_geometry.n_kv_head = kSessionKvHeads;
+    runtime_geometry.head_dim = kSessionHeadWidth;
+    runtime_geometry.n_embd = kWindowOutputInputWidth;
+    runtime_geometry.vocab = kWindowOutputVocabularySize;
+    auto scratch =
+        WindowScratchStorage::open(context, runtime_geometry, 4u, error);
+    require(scratch != nullptr,
+            "allocate FullMode output projection scratch: " + error);
+
+    const WindowScratchLayout& layout = scratch->layout();
+    const BufferRef mixed = require_scratch_view(
+        context, *scratch, layout.head_mixed, "head mixed input");
+    const BufferRef q8_1 = require_scratch_view(
+        context, *scratch, layout.head_q8_1, "head Q8_1 activations");
+    const BufferRef logits = require_scratch_view(
+        context, *scratch, layout.head_logits, "head logits");
+    const BufferRef sink = require_scratch_view(
+        context, *scratch, layout.matvec_sink, "head mat-vec sink");
+    std::fill_n(static_cast<float*>(mixed.contents),
+                mixed.length / sizeof(float), 1.0f);
+    std::memset(q8_1.contents, 0xa5, q8_1.length);
+    std::memset(logits.contents, 0xa5, logits.length);
+    std::memset(sink.contents, 0xa5, sink.length);
+    BufferRef active_rows =
+        allocate_zeroed_buffer(context, "output projection active rows",
+                               sizeof(kRows));
+    std::memcpy(active_rows.contents, &kRows, sizeof(kRows));
+    const WindowOutputProjectionBuffers projection{
+        mixed, q8_1, context.buffers().read_only(active_rows), logits, sink};
+
+    auto success = context.make_command_buffer(
+        "FullMode output projection success", error);
+    require(success != nullptr,
+            "create FullMode output projection command: " + error);
+    require(Encoder::encode(
+                context, *success, "FullMode output projection",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encode_window_output_projection(
+                        context, encoder, *full_mode, kRows, projection,
+                        encode_error);
+                },
+                error),
+            "encode FullMode Q8_1-to-logits projection: " + error);
+    require(success->commit(error),
+            "commit FullMode output projection: " + error);
+    id<MTLCommandBuffer> native_success =
+        (__bridge id<MTLCommandBuffer>)success->unsafe_native_handle();
+    [native_success waitUntilCompleted];
+    require(native_success.status == MTLCommandBufferStatusCompleted,
+            "FullMode output projection command completes");
+
+    std::string oracle_error;
+    std::vector<Q81> oracle_activations;
+    require(twin::quantize_q8_1_reference(
+                std::span<const float>(
+                    static_cast<const float*>(mixed.contents),
+                    kWindowOutputInputWidth),
+                kWindowOutputInputWidth, 1u, oracle_activations,
+                oracle_error),
+            "quantize output projection oracle activations: " + oracle_error);
+    const auto* const mapped_weights =
+        static_cast<const block_iq4_xs*>(output_weight.buffer.contents());
+    require(std::memcmp(mapped_weights, fixture.output_weight_first_row.data(),
+                        sizeof(fixture.output_weight_first_row)) == 0,
+            "FullMode maps the independently retained synthetic output row");
+    std::vector<float> expected_first_logit;
+    require(twin::iq4_xs_matvec_reference(
+                std::span<const block_iq4_xs>(
+                    fixture.output_weight_first_row),
+                oracle_activations, kWindowOutputInputWidth, 1u, 1u, 1u,
+                expected_first_logit, oracle_error),
+            "evaluate the mapped first vocabulary row with the IQ4_XS oracle: " +
+                oracle_error);
+    const auto* const output = static_cast<const float*>(logits.contents);
+    require(expected_first_logit.size() == 1u && output[0] != 0.0f &&
+                output[0] == expected_first_logit[0] &&
+                output[0] > 0.0f &&
+                std::all_of(output + 1u,
+                            output + kWindowOutputVocabularySize,
+                            [](float value) { return value == 0.0f; }),
+            "mapped nonzero IQ4_XS row matches the independent Q8_1 projection oracle");
+    const auto* const logits_tail =
+        static_cast<const std::uint8_t*>(logits.contents) + kOutputBytes;
+    require(std::all_of(logits_tail,
+                        static_cast<const std::uint8_t*>(logits.contents) +
+                            logits.length,
+                        [](std::uint8_t byte) { return byte == 0xa5u; }),
+            "projection writes only the active logits row");
+    require(std::any_of(static_cast<const std::uint8_t*>(q8_1.contents),
+                        static_cast<const std::uint8_t*>(q8_1.contents) +
+                            kQ8Bytes,
+                        [](std::uint8_t byte) { return byte != 0xa5u; }),
+            "projection quantizes mixed rows into dedicated Q8_1 scratch");
+    require(*static_cast<const std::uint32_t*>(active_rows.contents) == kRows,
+            "projection preserves active-row metadata");
+    require(std::all_of(static_cast<const float*>(mixed.contents),
+                        static_cast<const float*>(mixed.contents) +
+                            mixed.length / sizeof(float),
+                        [](float value) { return value == 1.0f; }),
+            "projection preserves its F32 head input");
+
+    std::memset(q8_1.contents, 0xa5, q8_1.length);
+    std::memset(logits.contents, 0x5a, logits.length);
+    WindowOutputProjectionBuffers misaligned_output = projection;
+    misaligned_output.logits = logits.slice(2u, logits.length - 2u);
+    auto rollback = context.make_command_buffer(
+        "FullMode output projection late failure", error);
+    require(rollback != nullptr,
+            "create FullMode output projection rollback command: " + error);
+    const bool rejected_late =
+        !encode_window_output_projection(context, *rollback, *full_mode,
+                                         kRows, misaligned_output, error) &&
+        error.find("mat-vec output buffer is undersized or misaligned") !=
+            std::string::npos &&
+        rollback->unsafe_native_handle() == nullptr;
+    require(rejected_late,
+            "late output alignment failure must discard prior Q8_1 encoding: " +
+                error);
+    require(std::all_of(static_cast<const std::uint8_t*>(q8_1.contents),
+                        static_cast<const std::uint8_t*>(q8_1.contents) +
+                            q8_1.length,
+                        [](std::uint8_t byte) { return byte == 0xa5u; }) &&
+                std::all_of(
+                    static_cast<const std::uint8_t*>(logits.contents),
+                    static_cast<const std::uint8_t*>(logits.contents) +
+                        logits.length,
+                    [](std::uint8_t byte) { return byte == 0x5au; }),
+            "discarded output projection leaves quantized and logits scratch unchanged");
+
+    std::memset(q8_1.contents, 0xa5, q8_1.length);
+    std::memset(logits.contents, 0x5a, logits.length);
+    auto caller_rollback = context.make_command_buffer(
+        "FullMode output projection caller-owned late failure", error);
+    require(caller_rollback != nullptr,
+            "create caller-owned output projection rollback command: " + error);
+    const bool caller_rejected_late =
+        !Encoder::encode(
+            context, *caller_rollback,
+            "FullMode output projection caller-owned rollback",
+            [&](Encoder& encoder, std::string& encode_error) {
+                return encode_window_output_projection(
+                    context, encoder, *full_mode, kRows, misaligned_output,
+                    encode_error);
+            },
+            error) &&
+        error.find("mat-vec output buffer is undersized or misaligned") !=
+            std::string::npos &&
+        caller_rollback->unsafe_native_handle() == nullptr;
+    require(caller_rejected_late,
+            "caller-owned late mat-vec failure must discard its Q8_1 dispatch: " +
+                error);
+    require(std::all_of(static_cast<const std::uint8_t*>(q8_1.contents),
+                        static_cast<const std::uint8_t*>(q8_1.contents) +
+                            q8_1.length,
+                        [](std::uint8_t byte) { return byte == 0xa5u; }) &&
+                std::all_of(
+                    static_cast<const std::uint8_t*>(logits.contents),
+                    static_cast<const std::uint8_t*>(logits.contents) +
+                        logits.length,
+                    [](std::uint8_t byte) { return byte == 0x5au; }),
+            "discarded caller-owned projection segment leaves scratch unchanged");
+
+    WindowOutputProjectionBuffers aliased_q8 = projection;
+    aliased_q8.q8_1 = mixed.slice(0u, kQ8Bytes);
+    auto alias_command = context.make_command_buffer(
+        "FullMode output projection alias rejection", error);
+    require(alias_command != nullptr,
+            "create FullMode output projection alias command: " + error);
+    const bool rejected_alias =
+        !encode_window_output_projection(context, *alias_command, *full_mode,
+                                         kRows, aliased_q8, error) &&
+        error.find("Q8_1 scratch overlaps mixed input") !=
+            std::string::npos &&
+        alias_command->unsafe_native_handle() == nullptr;
+    require(rejected_alias,
+            "output projection must reject Q8_1/mixed alias before dispatch: " +
+                error);
+
+    BufferRef row_alias_backing = allocate_zeroed_buffer(
+        context, "output projection aliased active-row backing", kQ8Bytes);
+    require(static_cast<bool>(row_alias_backing),
+            "allocate shared backing for Q8_1 and active-row alias");
+    std::memset(row_alias_backing.contents, 0x6bu, row_alias_backing.length);
+    std::memcpy(row_alias_backing.contents, &kRows, sizeof(kRows));
+    std::vector<std::uint8_t> row_alias_before(kQ8Bytes);
+    std::memcpy(row_alias_before.data(), row_alias_backing.contents, kQ8Bytes);
+    WindowOutputProjectionBuffers aliased_row_count = projection;
+    aliased_row_count.q8_1 = row_alias_backing;
+    aliased_row_count.active_rows = context.buffers().read_only(
+        row_alias_backing.slice(0u, sizeof(kRows)));
+    auto row_alias_command = context.make_command_buffer(
+        "FullMode output projection read-only input alias rejection", error);
+    require(row_alias_command != nullptr,
+            "create output projection read-only input alias command: " + error);
+    const bool rejected_row_alias =
+        !encode_window_output_projection(
+            context, *row_alias_command, *full_mode, kRows,
+            aliased_row_count, error) &&
+        error.find("Q8_1 output overlaps a later read-only input") !=
+            std::string::npos &&
+        row_alias_command->unsafe_native_handle() == nullptr;
+    require(rejected_row_alias,
+            "output projection must reject Q8_1 aliasing active-row metadata: " +
+                error);
+    require(std::equal(row_alias_before.begin(), row_alias_before.end(),
+                       static_cast<const std::uint8_t*>(
+                           row_alias_backing.contents)),
+            "rejected read-only input alias leaves shared backing unchanged");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -4084,15 +4418,19 @@ int main(int argc, char** argv) {
         const bool fullmode_handoff_only =
             argc == 3 && std::string(argv[2]) == "--fullmode-handoff";
         const std::string mode = argc == 3 ? argv[2] : "";
+        const bool fullmode_output_projection_only =
+            mode == "--fullmode-output-projection";
         const bool fullmode_ple_handoff_only =
             mode == "--fullmode-ple-handoff" ||
             mode == "--fullmode-ple-handoff-q8" ||
             mode == "--fullmode-ple-handoff-bf16";
         require(argc == 2 || never_wrap_only || tiered_copy_only ||
             model_owner_only || fullmode_handoff_only ||
+                    fullmode_output_projection_only ||
                     fullmode_ple_handoff_only,
                 "usage: metal_window_storage_test strata.metallib "
                 "[--never-wrap|--tiered-copy|--model-owner|--fullmode-handoff|"
+                "--fullmode-output-projection|"
                 "--fullmode-ple-handoff|--fullmode-ple-handoff-q8|"
                 "--fullmode-ple-handoff-bf16]");
         if (argc == 2) test_warmup_wave_barrier();
@@ -4110,6 +4448,14 @@ int main(int argc, char** argv) {
         options.metallib = argv[1];
         auto context = Context::open(options, error);
         require(context != nullptr, "open Metal context: " + error);
+        if (fullmode_output_projection_only) {
+            run_fullmode_output_projection_test(*context, directory);
+            context.reset();
+            std::error_code ignored;
+            fs::remove_all(directory, ignored);
+            std::cout << "metal_fullmode_output_projection_test: OK\n";
+            return 0;
+        }
         WindowPlan plan;
         require(plan_windows(sources, context->device_facts().max_buffer_length, plan, error),
                 "plan synthetic GGUF with the live Metal limit: " + error);

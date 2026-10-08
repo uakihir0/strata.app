@@ -86,6 +86,7 @@ std::vector<WindowScratchRegion> regions_of(const WindowScratchLayout& layout) {
         layout.shared_output,
         layout.shared_gate_logit,
         layout.head_mixed,
+        layout.head_q8_1,
         layout.head_logits,
         layout.sampler_history,
         layout.sampler_candidates,
@@ -166,6 +167,10 @@ int main() {
                     storage->layout().cell_capacity == 65'536u &&
                     storage->layout().n_expert == geometry.n_expert,
                 "published Window scratch layout must match its checked geometry");
+        require(storage->layout().head_q8_1.bytes ==
+                    kWindowScratchTokenRows *
+                        (kSessionEmbeddingWidth / 32u) * 36u,
+                "head Q8_1 scratch must hold eight 2560-wide rows");
         BufferRef origin_view;
         require(storage->view(storage->layout().ple_input, origin_view, error) &&
                     origin_view.offset == 0u &&

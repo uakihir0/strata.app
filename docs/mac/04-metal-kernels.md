@@ -668,7 +668,8 @@ struct WindowParams {
   host lays it out once at startup for T = 8; a window of T rows uses the first T rows of each region. Each region
   starts on a 256-B boundary.
 - The arena holds, per window: the residual streams `R[T][4][2560]`, the two inject buffers, the GR intermediates
-  (`xn`, `lo`, `gate`), the Q8_1 activations, the per-layer GDN inputs that commit replays (`qkv`, `h`, `gate`,
+  (`xn`, `lo`, `gate`), the Q8_1 activations, the dedicated head Q8_1 rows
+  `head_q8_1[8][80]` of 36-byte blocks, and the per-layer GDN inputs that commit replays (`qkv`, `h`, `gate`,
   `beta` for each of the 36 GDN layers), the QSA intermediates, the router plan, the expert intermediates, the
   logits `[T][248,320]`, the PLE normalised rows `ple_norm[8][10240]` (section 4.8), the indexer tail and block
   position snapshots (section 4.6), and the sampler's history rows, candidate lists, selected lists and greedy
@@ -1373,8 +1374,20 @@ model inputs; exact in-place aliasing of residual and normalized output is allow
 called outside an open concurrent group so dependent dispatches receive barriers; the `CommandBuffer&` form
 discards the whole segment on failure. Callers provide the validated model-weight and scratch views and keep
 read-only inputs unchanged until completion. This composition is covered by a synthetic scalar-oracle test in
-serial and concurrent dispatch modes. It does not resolve FullMode tensors, bind the final vocabulary head, or
-wire the sequence into `Window::run`.
+serial and concurrent dispatch modes.
+
+`encode_window_output_projection` resolves `output.weight` through the live
+`FullModeStorage`, requires shape `[2560, 248320]`, and maps GGML Q5_K, Q6_K or
+IQ4_XS to the matching immutable dense mat-vec. It quantizes `mixed[T][2560]`
+into the dedicated `head_q8_1` scratch, then writes `logits[T][248320]` and
+padded columns to `matvec_sink` in the same ordered Encoder segment. The
+active-row word must equal T; writable scratch may not overlap the mixed input,
+mapped model weight or row-count input. The `Encoder&` form must be called
+outside an open concurrent group and its failure must escape the enclosing
+transaction. The standalone form discards the command buffer on failure.
+Keep the FullMode owner and every scratch view alive through completion. This
+completes the low-level vocabulary projection composition; `Window::run`,
+sampling, state commit and model-backed decode remain unimplemented.
 
 The MTP drafter uses `strata_gr_norm`, `strata_gr_down` and `strata_gr_up` for its two reads, and the head mixer
 kernels for its final mixer (section 5.11).
@@ -2235,6 +2248,10 @@ the existing mutable `encode_matvec` interface available to other callers.
 All inputs remain unchanged until command completion even if another mutable
 view can reach the same backing bytes. Its standalone wrapper is transactional;
 the caller-owned form must propagate failure out of its enclosing Encoder body.
+The Window output-projection coordinator resolves the actual `output.weight`
+view and composes Q8_1 activation quantization with this read-only mat-vec for
+the fixed `[2560, 248320]` head. This composition does not include the sampler
+or `Window::run`.
 The PLE post-projection path accepts read-only gamma and F16 convolution weights; its
 convolution-residual dispatch binds normalized rows,
 history, convolution weights and gated activations as read-only inputs and

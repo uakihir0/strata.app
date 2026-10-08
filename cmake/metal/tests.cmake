@@ -572,7 +572,8 @@ set_tests_properties(metal_mtp_storage_test PROPERTIES TIMEOUT 60)
 
 add_executable(metal_window_storage_test tests/metal/metal_window_storage_test.mm)
 target_link_libraries(metal_window_storage_test
-  PRIVATE strata_metal_storage_test_engine strata_metal_options)
+  PRIVATE strata_metal_storage_test_engine strata_metal_oracles
+          strata_metal_options)
 target_compile_definitions(metal_window_storage_test
   PRIVATE STRATA_METAL_TEST_LOCK_ACCESS=1)
 strata_metal_test(metal_window_storage_test metal metal_window_storage_test ${STRATA_METALLIB})
@@ -581,6 +582,10 @@ strata_metal_test(metal_tiered_copy_test metal metal_window_storage_test ${STRAT
 strata_metal_test(metal_model_storage_owner_test metal metal_window_storage_test ${STRATA_METALLIB} --model-owner)
 strata_metal_test(metal_fullmode_handoff_test metal metal_window_storage_test ${STRATA_METALLIB} --fullmode-handoff)
 set_tests_properties(metal_fullmode_handoff_test PROPERTIES TIMEOUT 180)
+strata_metal_test(metal_fullmode_output_projection_test metal
+                  metal_window_storage_test ${STRATA_METALLIB}
+                  --fullmode-output-projection)
+set_tests_properties(metal_fullmode_output_projection_test PROPERTIES TIMEOUT 180)
 strata_metal_test(metal_fullmode_ple_handoff_test metal metal_window_storage_test ${STRATA_METALLIB} --fullmode-ple-handoff)
 set_tests_properties(metal_fullmode_ple_handoff_test PROPERTIES TIMEOUT 180)
 strata_metal_test(metal_fullmode_ple_q8_handoff_test metal metal_window_storage_test ${STRATA_METALLIB} --fullmode-ple-handoff-q8)

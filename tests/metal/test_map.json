@@ -84,7 +84,7 @@
     },
     "metal_window_scratch_storage_test": {
       "label": "metal",
-      "origin": "04 4.4, D-IMPL-183"
+      "origin": "04 4.4, D-IMPL-183, D-IMPL-306"
     },
     "metal_mtp_kv_store_test": {
       "label": "metal",
@@ -120,7 +120,7 @@
     },
     "metal_window_scratch_layout_test": {
       "label": "host",
-      "origin": "04 4.4, D-IMPL-182"
+      "origin": "04 4.4, D-IMPL-182, D-IMPL-306"
     },
     "metal_window_ple_rows_test": {
       "label": "host",
@@ -137,6 +137,10 @@
     "metal_fullmode_handoff_test": {
       "label": "metal",
       "origin": "06 L9; D-IMPL-294; D-IMPL-296; REV-091; REV-093; D-IMPL-297; REV-094; D-IMPL-298; REV-095; D-IMPL-299; REV-096; D-IMPL-303; REV-100"
+    },
+    "metal_fullmode_output_projection_test": {
+      "label": "metal",
+      "origin": "04 5.1, 5.8; 06 L9; D-IMPL-306; REV-103"
     },
     "metal_fullmode_ple_handoff_test": {
       "label": "metal",
@@ -307,11 +311,11 @@
     },
     "metal_mv_test": {
       "label": "metal",
-      "origin": "09 9.1, D-IMPL-271, D-IMPL-299, REV-096, D-IMPL-305, REV-102"
+      "origin": "09 9.1, D-IMPL-271, D-IMPL-299, REV-096, D-IMPL-305, REV-102, D-IMPL-306"
     },
     "metal_mv_test_concurrent": {
       "label": "metal",
-      "origin": "09 9.1, D-IMPL-271, D-IMPL-299, REV-096, D-IMPL-305, REV-102"
+      "origin": "09 9.1, D-IMPL-271, D-IMPL-299, REV-096, D-IMPL-305, REV-102, D-IMPL-306"
     },
     "metal_never_wrap_test": {
       "label": "metal",
