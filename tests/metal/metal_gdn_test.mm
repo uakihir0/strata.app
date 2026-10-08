@@ -2,6 +2,7 @@
 #include "metallib_sha256.inc"
 #include "oracles/bf16_mv.hpp"
 #include "oracles/gdn.hpp"
+#include "oracles/moe_plan.hpp"
 #include "oracles/moe_route.hpp"
 #include "oracles/q8_0_mv.hpp"
 #include "oracles/q8_1.hpp"
@@ -10,6 +11,7 @@
 #include "strata/metal/gdn_dispatch.hpp"
 #include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/mv_dispatch.hpp"
+#include "strata/metal/tiered.hpp"
 #include "strata/metal/window_dispatch.hpp"
 #include "strata/metal/window_gdn_dispatch.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -3086,6 +3088,9 @@ bool test_window_t1_attention_gdn(Context& context) {
     twin::GuardedBuffer route_ids_storage;
     twin::GuardedBuffer route_weights_storage;
     twin::GuardedBuffer router_matvec_sink_storage;
+    twin::GuardedBuffer resident_table_storage;
+    twin::GuardedBuffer usage_table_storage;
+    twin::GuardedBuffer moe_plan_storage;
     const bool router_storage_allocated =
         router_tensor_storage.allocate(
             context, label + " BF16 router tensor", router_weight_bytes,
@@ -3100,7 +3105,15 @@ bool test_window_t1_attention_gdn(Context& context) {
             context, label + " route weights", kRouteTopK * sizeof(float),
             error) &&
         router_matvec_sink_storage.allocate(
-            context, label + " router mat-vec sink", sizeof(float), error);
+            context, label + " router mat-vec sink", sizeof(float), error) &&
+        resident_table_storage.allocate(
+            context, label + " resident table",
+            kRouterExperts * sizeof(std::int32_t), error) &&
+        usage_table_storage.allocate(
+            context, label + " usage table",
+            kRouterExperts * sizeof(float), error) &&
+        moe_plan_storage.allocate(
+            context, label + " MoE plan", sizeof(TieredMoePlan), error);
     check(router_storage_allocated, label + " router prefix scratch allocation",
           error);
     if (!router_storage_allocated) return false;
@@ -3123,6 +3136,10 @@ bool test_window_t1_attention_gdn(Context& context) {
         context.buffers().read_only(router_tensor_storage.view()),
         router_logits_storage.view(), route_ids_storage.view(),
         route_weights_storage.view(), router_matvec_sink_storage.view()};
+    const WindowT1MoePlanPrefixBuffers plan_prefix_buffers{
+        router_prefix_buffers,
+        context.buffers().read_only(resident_table_storage.view()),
+        usage_table_storage.view(), moe_plan_storage.view()};
     const auto exercise_router_prefix = [&](std::uint32_t experts) {
         std::string prefix_error;
         std::vector<float> expected_logits;
@@ -3344,6 +3361,260 @@ bool test_window_t1_attention_gdn(Context& context) {
     };
     const bool standard_router_prefix = exercise_router_prefix(512u);
     const bool coder_router_prefix = exercise_router_prefix(256u);
+
+    const auto exercise_plan_prefix = [&](std::uint32_t experts, bool tiered,
+                                          bool caller_owned) {
+        std::string prefix_error;
+        const auto expert_weights =
+            std::span<const std::uint16_t>(router_weight_values).first(
+                static_cast<std::size_t>(experts) * kRouterInputWidth);
+        std::vector<float> expected_logits;
+        const bool logits_oracle = twin::bf16_matvec_reference(
+            expert_weights, expected_mixed, N_EMBD, experts, 1u, 1u, 256u,
+            expected_logits, prefix_error);
+        check(logits_oracle,
+              label + " plan router oracle experts=" +
+                  std::to_string(experts),
+              prefix_error);
+        if (!logits_oracle) return false;
+
+        std::vector<std::int32_t> expected_ids;
+        std::vector<twin::tf> expected_route_weights;
+        const bool route_oracle = twin::moe_route_reference(
+            expected_logits, 1u, experts, false, expected_ids,
+            expected_route_weights, prefix_error);
+        check(route_oracle,
+              label + " plan route oracle experts=" +
+                  std::to_string(experts),
+              prefix_error);
+        if (!route_oracle) return false;
+
+        std::vector<std::int32_t> resident(experts);
+        std::vector<float> initial_usage(experts);
+        for (std::uint32_t expert = 0u; expert < experts; ++expert) {
+            resident[expert] = -1;
+            initial_usage[expert] =
+                static_cast<float>(expert % 17u) * 0.125f;
+        }
+        if (tiered && !expected_ids.empty()) {
+            resident[static_cast<std::uint32_t>(expected_ids.front())] = 0;
+        }
+        std::memcpy(resident_table_storage.payload().data(), resident.data(),
+                    experts * sizeof(std::int32_t));
+        std::memcpy(usage_table_storage.payload().data(), initial_usage.data(),
+                    experts * sizeof(float));
+
+        TieredMoePlan expected_plan{};
+        std::vector<float> expected_usage;
+        const bool plan_oracle = twin::moe_plan_reference(
+            expected_ids, 1u, experts, tiered, 0u, resident, initial_usage,
+            expected_plan, expected_usage, prefix_error);
+        check(plan_oracle,
+              label + " plan oracle experts=" + std::to_string(experts) +
+                  " tiered=" + std::to_string(tiered ? 1 : 0),
+              prefix_error);
+        if (!plan_oracle) return false;
+        const bool tiered_hit_and_miss =
+            !tiered || (expected_plan.n_miss > 0u &&
+                        expected_plan.n_miss < expected_plan.n_groups);
+        check(tiered_hit_and_miss,
+              label + " tiered plan contains both resident and missing groups",
+              "groups=" + std::to_string(expected_plan.n_groups) +
+                  " misses=" + std::to_string(expected_plan.n_miss));
+        if (!tiered_hit_and_miss) return false;
+
+        prepare_layer0_chain(true);
+        for (twin::GuardedBuffer* output :
+             {&router_logits_storage, &route_ids_storage,
+              &route_weights_storage, &router_matvec_sink_storage,
+              &moe_plan_storage}) {
+            std::fill(output->payload().begin(), output->payload().end(),
+                      poison);
+            output->capture_before_dispatch();
+        }
+        usage_table_storage.capture_before_dispatch();
+        resident_table_storage.capture_before_dispatch();
+        router_tensor_storage.capture_before_dispatch();
+
+        const bool completed = run_command(
+            context, label + " router and MoE plan experts=" +
+                         std::to_string(experts) + " tiered=" +
+                         std::to_string(tiered ? 1 : 0) +
+                         (caller_owned ? " caller-owned" : ""),
+            [&](CommandBuffer& command, std::string& command_error) {
+                if (!caller_owned) {
+                    return encode_window_t1_moe_plan_prefix(
+                        context, command, vocabulary_size, experts, tiered,
+                        plan_prefix_buffers, command_error);
+                }
+                return Encoder::encode(
+                    context, command, "Window T=1 caller-owned MoE plan",
+                    [&](Encoder& encoder, std::string& encode_error) {
+                        return encode_window_t1_moe_plan_prefix(
+                            context, encoder, vocabulary_size, experts, tiered,
+                            plan_prefix_buffers, encode_error);
+                    },
+                    command_error);
+            },
+            prefix_error);
+        check(completed,
+              label + " ordered router-to-plan prefix experts=" +
+                  std::to_string(experts) + " tiered=" +
+                  std::to_string(tiered ? 1 : 0),
+              prefix_error);
+        if (!completed) return false;
+
+        const auto expected_id_bytes = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(expected_ids.data()),
+            expected_ids.size() * sizeof(std::int32_t));
+        const auto ids_mismatch = twin::compare_bytes(
+            route_ids_storage.payload(), expected_id_bytes);
+        check(!ids_mismatch,
+              label + " plan consumes routed expert IDs experts=" +
+                  std::to_string(experts),
+              ids_mismatch ? ids_mismatch->reason : std::string{});
+
+        const auto expected_plan_bytes = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(&expected_plan),
+            sizeof(expected_plan));
+        const auto plan_mismatch = twin::compare_bytes(
+            moe_plan_storage.payload(), expected_plan_bytes);
+        check(!plan_mismatch,
+              label + " exact GPU plan experts=" + std::to_string(experts) +
+                  " tiered=" + std::to_string(tiered ? 1 : 0),
+              plan_mismatch ? plan_mismatch->reason : std::string{});
+
+        const auto expected_usage_bytes = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(expected_usage.data()),
+            expected_usage.size() * sizeof(float));
+        const auto usage_mismatch = twin::compare_bytes(
+            usage_table_storage.payload().first(expected_usage_bytes.size()),
+            expected_usage_bytes);
+        check(!usage_mismatch,
+              label + " exact plan usage experts=" +
+                  std::to_string(experts) + " tiered=" +
+                  std::to_string(tiered ? 1 : 0),
+              usage_mismatch ? usage_mismatch->reason : std::string{});
+
+        const std::array<twin::ByteRange, 1u> plan_written{{
+            {0u, sizeof(TieredMoePlan)}}};
+        const auto plan_guard =
+            moe_plan_storage.first_unwritten_change(plan_written);
+        const std::array<twin::ByteRange, 1u> usage_written{{
+            {0u, expected_usage_bytes.size()}}};
+        const auto usage_guard =
+            usage_table_storage.first_unwritten_change(usage_written);
+        check(!plan_guard && !usage_guard,
+              label + " plan and usage output guards",
+              plan_guard ? plan_guard->reason
+                         : usage_guard ? usage_guard->reason : std::string{});
+        const bool immutable_inputs_unchanged =
+            !resident_table_storage.first_unwritten_change({}) &&
+            !router_tensor_storage.first_unwritten_change({});
+        check(immutable_inputs_unchanged,
+              label + " plan inputs remain unchanged");
+        return !ids_mismatch && !plan_mismatch && !usage_mismatch &&
+               !plan_guard && !usage_guard && immutable_inputs_unchanged;
+    };
+    const bool standard_tiered_plan =
+        exercise_plan_prefix(512u, true, true);
+    const bool coder_full_plan =
+        exercise_plan_prefix(256u, false, false);
+
+    WindowT1MoePlanPrefixBuffers short_moe_plan = plan_prefix_buffers;
+    short_moe_plan.plans =
+        moe_plan_storage.view().slice(0u, sizeof(TieredMoePlan) - 1u);
+    prepare_layer0_chain(true);
+    for (twin::GuardedBuffer* output :
+         {&router_logits_storage, &route_ids_storage, &route_weights_storage,
+          &router_matvec_sink_storage, &moe_plan_storage}) {
+        std::fill(output->payload().begin(), output->payload().end(), poison);
+        output->capture_before_dispatch();
+    }
+    std::fill(usage_table_storage.payload().begin(),
+              usage_table_storage.payload().end(), poison);
+    usage_table_storage.capture_before_dispatch();
+    auto short_plan_command = context.make_command_buffer(
+        label + " short MoE plan", error);
+    check(short_plan_command != nullptr,
+          label + " short-plan command buffer", error);
+    if (!short_plan_command) return false;
+    const bool short_plan_rejected = !encode_window_t1_moe_plan_prefix(
+        context, *short_plan_command, vocabulary_size, 512u, true,
+        short_moe_plan, error);
+    const bool short_plan_discarded =
+        short_plan_command->unsafe_native_handle() == nullptr;
+    const bool short_plan_untouched =
+        outputs_are_poisoned() &&
+        std::all_of(router_logits_storage.payload().begin(),
+                    router_logits_storage.payload().end(),
+                    [=](std::uint8_t value) { return value == poison; }) &&
+        std::all_of(route_ids_storage.payload().begin(),
+                    route_ids_storage.payload().end(),
+                    [=](std::uint8_t value) { return value == poison; }) &&
+        std::all_of(route_weights_storage.payload().begin(),
+                    route_weights_storage.payload().end(),
+                    [=](std::uint8_t value) { return value == poison; }) &&
+        std::all_of(usage_table_storage.payload().begin(),
+                    usage_table_storage.payload().end(),
+                    [=](std::uint8_t value) { return value == poison; }) &&
+        std::all_of(moe_plan_storage.payload().begin(),
+                    moe_plan_storage.payload().end(),
+                    [=](std::uint8_t value) { return value == poison; });
+    check(short_plan_rejected && short_plan_discarded &&
+              short_plan_untouched &&
+              error.find("plan output") != std::string::npos &&
+              error.find("undersized") != std::string::npos,
+          label + " undersized plan rejects before prefix dispatch", error);
+
+    prepare_layer0_chain(true);
+    for (twin::GuardedBuffer* output :
+         {&router_logits_storage, &route_ids_storage, &route_weights_storage,
+          &router_matvec_sink_storage, &usage_table_storage,
+          &moe_plan_storage}) {
+        std::fill(output->payload().begin(), output->payload().end(), poison);
+    }
+    auto late_plan_failure_command = context.make_command_buffer(
+        label + " caller-owned late plan-prefix failure", error);
+    check(late_plan_failure_command != nullptr,
+          label + " late-plan-prefix command buffer", error);
+    if (!late_plan_failure_command) return false;
+    bool plan_prefix_encoded_before_failure = false;
+    constexpr std::string_view kInjectedLateFailure =
+        "injected failure after Window T=1 MoE plan prefix";
+    const bool late_plan_failure_rejected = !Encoder::encode(
+        context, *late_plan_failure_command,
+        "Window T=1 late MoE plan-prefix failure",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_window_t1_moe_plan_prefix(
+                    context, encoder, vocabulary_size, 512u, true,
+                    plan_prefix_buffers, encode_error)) {
+                return false;
+            }
+            plan_prefix_encoded_before_failure = true;
+            encode_error = kInjectedLateFailure;
+            return false;
+        },
+        error);
+    const bool late_plan_failure_discarded =
+        late_plan_failure_command->unsafe_native_handle() == nullptr;
+    const auto poisoned_bytes = [](const twin::GuardedBuffer& buffer) {
+        return std::all_of(buffer.payload().begin(), buffer.payload().end(),
+                           [=](std::uint8_t value) { return value == poison; });
+    };
+    const bool late_plan_failure_untouched = outputs_are_poisoned() &&
+        poisoned_bytes(router_logits_storage) &&
+        poisoned_bytes(route_ids_storage) &&
+        poisoned_bytes(route_weights_storage) &&
+        poisoned_bytes(router_matvec_sink_storage) &&
+        poisoned_bytes(usage_table_storage) &&
+        poisoned_bytes(moe_plan_storage);
+    check(late_plan_failure_rejected &&
+              plan_prefix_encoded_before_failure &&
+              late_plan_failure_discarded && late_plan_failure_untouched &&
+              error == kInjectedLateFailure,
+          label + " late caller failure rolls back the encoded router and plan",
+          error);
 
     WindowT1MoeRouterPrefixBuffers short_router_sink = router_prefix_buffers;
     short_router_sink.router_matvec_sink =
@@ -3629,7 +3900,12 @@ bool test_window_t1_attention_gdn(Context& context) {
            layer0_outputs_match && layer0_residual_matches &&
            layer0_inject2_matches && !residual_guard && !inject2_guard &&
            layer0_state_unchanged && standard_router_prefix &&
-           coder_router_prefix && short_sink_rejected &&
+           coder_router_prefix && standard_tiered_plan && coder_full_plan &&
+           short_plan_rejected && short_plan_discarded &&
+           short_plan_untouched && late_plan_failure_rejected &&
+           plan_prefix_encoded_before_failure &&
+           late_plan_failure_discarded && late_plan_failure_untouched &&
+           short_sink_rejected &&
            short_sink_discarded && short_sink_untouched && alias_rejected &&
            alias_discarded && alias_untouched &&
            router_param_alias_rejected && router_param_alias_discarded &&

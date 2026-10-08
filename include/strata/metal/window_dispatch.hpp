@@ -63,6 +63,17 @@ struct WindowT1MoeRouterPrefixBuffers {
     BufferRef router_matvec_sink;
 };
 
+/// Extend the T=1 router prefix with the GPU plan stage. The route ID output
+/// is the plan input; `resident`, `usage` and `plans` are layer-0 tables.
+/// Tiered mode stops after plan production so the caller can resolve misses
+/// before submitting any expert consumer.
+struct WindowT1MoePlanPrefixBuffers {
+    WindowT1MoeRouterPrefixBuffers router;
+    ReadOnlyBufferRef resident;
+    BufferRef usage;
+    BufferRef plans;
+};
+
 /// Encode the T=1 input stem: gather the token from WindowParams, then
 /// broadcast the embedding into the four initial GR streams. The views must
 /// remain alive and the parameter block must remain unchanged until GPU
@@ -128,5 +139,21 @@ bool encode_window_t1_moe_router_prefix(
     Context& context, CommandBuffer& command_buffer,
     std::uint32_t vocabulary_size, std::uint32_t experts,
     const WindowT1MoeRouterPrefixBuffers& buffers, std::string& error);
+
+/// Encode the T=1 layer-0 attention/GDN/FFN-read/router/route/Q8_1 prefix,
+/// then build its full-mode or tiered GPU plan in the same ordered segment.
+/// Tiered mode intentionally stops at the plan so ExpertStore can resolve it
+/// before the request scheduler submits an expert consumer. Propagate false
+/// from a caller-owned Encoder body to discard the entire segment.
+bool encode_window_t1_moe_plan_prefix(
+    Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
+    std::uint32_t experts, bool tiered,
+    const WindowT1MoePlanPrefixBuffers& buffers, std::string& error);
+/// Standalone transactional form. A late plan failure discards the router
+/// prefix too.
+bool encode_window_t1_moe_plan_prefix(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size, std::uint32_t experts, bool tiered,
+    const WindowT1MoePlanPrefixBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal
