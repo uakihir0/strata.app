@@ -2217,10 +2217,13 @@ requires the PLE residual to reuse the GR read's residual view. Its caller-owned
 after the producer in the same ordered segment; the standalone form requires the producer command
 buffer dependency to be registered with `consumer.depends_on(producer, error)`, and the producer
 to complete successfully before the consumer command buffer is submitted.
-Otherwise layer 1's attention GR
-read consumes those output and injection views as `block_out` and `inject_prev` according to
-`pending(1)`. The Window scheduler must select exactly one consumer. The coordinator validates the consumer's table identity,
-Q8_1 activations, plan, route weights and mixed input, plus the same `WindowParams.nc`. Consumer
+For the no-PLE branch, `encode_window_moe_attention_entry` binds those same output and injection
+views as the next attention read's `block_out` and `inject_prev`, requires the exact prior residual
+view, and encodes that read with `apply=true`. Its standalone form has the same command-buffer
+dependency and producer-completion requirement. The Window scheduler must select exactly one
+consumer. The full-mode MoE coordinator validates the consumer's address/resident tables, Q8_1
+activations, plan, route weights and mixed input against the producer views, including the same
+`WindowParams.nc`. Consumer
 reads may overlap producer storage only in the specific input roles declared for each handoff.
 Router weights and the resident table are checked as producer inputs, and consumer outputs and
 sinks cannot overlap them. In tiered mode the plan prefix ends at plan production; a caller must

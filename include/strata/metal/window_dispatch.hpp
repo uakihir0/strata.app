@@ -85,6 +85,16 @@ struct WindowT1MoeLayer0FullBuffers {
     MoeRoutedSharedFFNBuffers ffn;
 };
 
+/// Bind a pending layer-0 MoE write to the next layer's GR attention read.
+/// The read reuses the producer residual, combined MoE output and FFN
+/// `inject_out`; its caller-provided `block_out` and `inject_prev` are replaced
+/// by those producer views and the read runs with `apply=true`.
+struct WindowMoeAttentionEntryBuffers {
+    MoeRoutedSharedFFNBuffers previous_ffn;
+    GRReadBuffers previous_gr_read;
+    GRReadBuffers attention;
+};
+
 /// Encode the T=1 input stem: gather the token from WindowParams, then
 /// broadcast the embedding into the four initial GR streams. The views must
 /// remain alive and the parameter block must remain unchanged until GPU
@@ -191,5 +201,19 @@ bool encode_window_t1_moe_layer0_full_mode(
     std::uint32_t vocabulary_size, std::uint32_t experts,
     MoeExpertFormat gate_up_format, MoeDownFormat down_format,
     const WindowT1MoeLayer0FullBuffers& buffers, std::string& error);
+
+/// Encode the no-PLE consumer of a pending layer-0 MoE write. The next
+/// attention read must reuse the previous GR residual view. Call after the
+/// producer in the same ordered Encoder segment and propagate false from the
+/// enclosing Encoder::encode body.
+bool encode_window_moe_attention_entry(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    const WindowMoeAttentionEntryBuffers& buffers, std::string& error);
+/// Standalone form for a completed producer. Register
+/// `consumer.depends_on(producer, error)` and wait for successful producer
+/// completion before submitting the consumer command buffer.
+bool encode_window_moe_attention_entry(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    const WindowMoeAttentionEntryBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal

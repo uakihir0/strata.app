@@ -1057,6 +1057,34 @@ bool encode_window_t1_moe_layer0_full_mode(
         error);
 }
 
+bool encode_window_moe_attention_entry(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    const WindowMoeAttentionEntryBuffers& buffers, std::string& error) {
+    error.clear();
+    if (!same_view(buffers.previous_gr_read.residual,
+                   buffers.attention.residual)) {
+        error = "Window MoE attention entry must reuse the previous GR residual";
+        return false;
+    }
+
+    GRReadBuffers attention = buffers.attention;
+    attention.block_out = buffers.previous_ffn.shared.output;
+    attention.inject_prev = buffers.previous_gr_read.inject_out;
+    return encode_gr_read(context, encoder, rows, true, attention, error);
+}
+
+bool encode_window_moe_attention_entry(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    const WindowMoeAttentionEntryBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Window pending MoE attention entry",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_moe_attention_entry(
+                context, encoder, rows, buffers, encode_error);
+        },
+        error);
+}
+
 bool encode_window_embedding(Context& context, CommandBuffer& command_buffer,
                              std::uint32_t vocabulary_size,
                              EmbedRowsFormat format,

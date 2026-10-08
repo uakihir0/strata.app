@@ -3,6 +3,7 @@
 #include "strata/metal/context.hpp"
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/gr_dispatch.hpp"
+#include "strata/metal/window_dispatch.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "twin.hpp"
 
@@ -2255,11 +2256,225 @@ bool run_gr_read_pipeline_case(Context& context, std::uint32_t rows,
         }
     }
 
+    bool pending_moe_entry_matches = true;
+    if (rows == 1u && !apply) {
+        MoeRoutedSharedFFNBuffers previous_ffn{};
+        previous_ffn.shared.output = views[kBlockOut];
+        GRReadBuffers previous_gr_read{};
+        previous_gr_read.residual = views[kResidual];
+        previous_gr_read.inject_out = views[kInjectPrev];
+        GRReadBuffers attention_entry = buffers;
+        attention_entry.block_out = views[kLo];
+        attention_entry.inject_prev = views[kRs];
+        const WindowMoeAttentionEntryBuffers pending_entry{
+            previous_ffn, previous_gr_read, attention_entry};
+        const std::array<std::size_t, 2u> pending_inputs{
+            kBlockOut, kInjectPrev};
+        const std::array<std::size_t, 6u> pending_outputs{
+            kResidual, kNormalized, kRs, kLo, kInjectOut, kMixed};
+        const auto restore_pending_inputs = [&] {
+            std::memcpy(storage[kResidual].payload().data(), residual.data(),
+                        residual_count * sizeof(float));
+            for (const std::size_t index :
+                 {kNormalized, kRs, kLo, kInjectOut, kMixed}) {
+                std::fill(storage[index].payload().begin(),
+                          storage[index].payload().end(), 0xa5u);
+            }
+        };
+        const auto capture_pending_outputs = [&] {
+            std::array<std::vector<unsigned char>, pending_outputs.size()> copy;
+            for (std::size_t index = 0u; index < pending_outputs.size(); ++index) {
+                const auto payload = storage[pending_outputs[index]].payload();
+                copy[index].assign(payload.begin(), payload.end());
+            }
+            return copy;
+        };
+        const auto capture_pending_inputs = [&] {
+            std::array<std::vector<unsigned char>, pending_inputs.size()> copy;
+            for (std::size_t index = 0u; index < pending_inputs.size(); ++index) {
+                const auto payload = storage[pending_inputs[index]].payload();
+                copy[index].assign(payload.begin(), payload.end());
+            }
+            return copy;
+        };
+        const auto pending_outputs_match_reference = [&] {
+            const auto actual_norm = floats(kNormalized, residual_count);
+            const auto actual_rs = floats(kRs, inject_count);
+            const auto actual_lo = floats(kLo, low_rank_count);
+            const auto actual_inject = floats(kInjectOut, inject_count);
+            const auto actual_residual = floats(kResidual, residual_count);
+            const auto actual_mixed = floats(kMixed, block_count);
+            std::vector<twin::tf> expected_norm;
+            std::vector<twin::tf> expected_rs;
+            gr_norm_reference(residual, block_out, norm, inject_prev, rows,
+                              true, expected_norm, expected_rs);
+            std::vector<twin::tf> expected_lo;
+            std::vector<twin::tf> expected_inject;
+            gr_down_reference(actual_norm, hc_down, hc_inject, rows,
+                              expected_lo, expected_inject);
+            std::vector<twin::tf> expected_residual;
+            std::vector<twin::tf> expected_mixed;
+            gr_up_reference(residual, block_out, inject_prev, norm, actual_rs,
+                            actual_lo, hc_up, rows, true, expected_residual,
+                            expected_mixed);
+            const auto norm_diff = twin::compare_floats(
+                actual_norm, expected_norm,
+                {twin::Comparison::units, 64.0, 0.0, 0u});
+            const auto rs_diff = twin::compare_floats(
+                actual_rs, expected_rs,
+                {twin::Comparison::units, 64.0, 0.0, 0u});
+            const auto lo_diff = twin::compare_floats(
+                actual_lo, expected_lo,
+                {twin::Comparison::units, 16.0, 0.0, 0u});
+            const auto inject_diff = twin::compare_floats(
+                actual_inject, expected_inject,
+                {twin::Comparison::bits, 0.0, 0.0, 0u});
+            const auto residual_diff = twin::compare_floats(
+                actual_residual, expected_residual,
+                {twin::Comparison::units, 16.0, 0.0, 0u});
+            const auto mixed_diff = twin::compare_floats(
+                actual_mixed, expected_mixed,
+                {twin::Comparison::units, 64.0, 0.0, N_EMBD});
+            return !norm_diff && !rs_diff && !lo_diff && !inject_diff &&
+                   !residual_diff && !mixed_diff;
+        };
+
+        const auto inputs_before_consumers = capture_pending_inputs();
+        restore_pending_inputs();
+        auto producer = context.make_command_buffer(
+            label + " completed synthetic pending producer", error);
+        const bool producer_completed =
+            producer && producer->commit(error) &&
+            producer->wait_until_completed(error);
+        check(producer_completed,
+              label + " pending producer succeeds before standalone consumer",
+              error);
+        auto consumer = producer_completed
+            ? context.make_command_buffer(
+                  label + " typed no-PLE pending consumer", error)
+            : nullptr;
+        const bool dependency_registered =
+            consumer && consumer->depends_on(*producer, error);
+        check(dependency_registered,
+              label + " standalone consumer registers its producer dependency",
+              error);
+        const bool pending_encoded =
+            dependency_registered &&
+            encode_window_moe_attention_entry(
+                context, *consumer, rows, pending_entry, error);
+        check(pending_encoded,
+              label + " typed no-PLE standalone consumer encodes", error);
+        const bool pending_completed =
+            pending_encoded &&
+            submit_and_wait(consumer, label + " typed no-PLE consumer", error);
+        check(pending_completed,
+              label + " typed no-PLE standalone consumer executes", error);
+        pending_moe_entry_matches &= producer_completed &&
+                                     dependency_registered &&
+                                     pending_encoded && pending_completed;
+        const bool pending_reference_matches =
+            pending_completed && pending_outputs_match_reference();
+        check(pending_reference_matches,
+              label + " typed no-PLE consumer matches the apply=true GR oracle");
+        pending_moe_entry_matches &= pending_reference_matches;
+        const auto standalone_outputs = capture_pending_outputs();
+        const bool standalone_inputs_unchanged =
+            inputs_before_consumers == capture_pending_inputs();
+        check(standalone_inputs_unchanged,
+              label + " standalone no-PLE consumer preserves producer views");
+        pending_moe_entry_matches &= standalone_inputs_unchanged;
+
+        restore_pending_inputs();
+        auto shared_pending = context.make_command_buffer(
+            label + " typed no-PLE caller-owned consumer", error);
+        const bool shared_pending_encoded =
+            shared_pending && Encoder::encode(
+                context, *shared_pending, "typed no-PLE caller-owned segment",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encode_window_moe_attention_entry(
+                        context, encoder, rows, pending_entry, encode_error);
+                },
+                error);
+        check(shared_pending_encoded,
+              label + " typed no-PLE caller-owned consumer encodes", error);
+        const bool shared_pending_completed =
+            shared_pending_encoded &&
+            submit_and_wait(shared_pending,
+                            label + " typed no-PLE caller-owned consumer",
+                            error);
+        check(shared_pending_completed,
+              label + " typed no-PLE caller-owned consumer executes", error);
+        const auto caller_owned_outputs = capture_pending_outputs();
+        const bool caller_owned_inputs_unchanged =
+            inputs_before_consumers == capture_pending_inputs();
+        const bool caller_owned_matches =
+            shared_pending_completed &&
+            standalone_outputs == caller_owned_outputs &&
+            pending_outputs_match_reference() &&
+            caller_owned_inputs_unchanged;
+        check(caller_owned_matches,
+              label + " caller-owned no-PLE entry matches standalone outputs");
+        check(caller_owned_inputs_unchanged,
+              label + " caller-owned no-PLE consumer preserves producer views");
+        pending_moe_entry_matches &= caller_owned_matches;
+
+        const std::array<twin::ByteRange, 1u> pending_residual_written{{
+            {0u, byte_sizes[kResidual]}}};
+        const std::array<twin::ByteRange, 1u> pending_norm_written{{
+            {0u, byte_sizes[kNormalized]}}};
+        const std::array<twin::ByteRange, 1u> pending_rs_written{{
+            {0u, byte_sizes[kRs]}}};
+        const std::array<twin::ByteRange, 1u> pending_lo_written{{
+            {0u, byte_sizes[kLo]}}};
+        const std::array<twin::ByteRange, 1u> pending_inject_written{{
+            {0u, byte_sizes[kInjectOut]}}};
+        const std::array<twin::ByteRange, 1u> pending_mixed_written{{
+            {0u, byte_sizes[kMixed]}}};
+        const bool pending_entry_guards =
+            !storage[kResidual].first_unwritten_change(
+                pending_residual_written) &&
+            !storage[kNormalized].first_unwritten_change(pending_norm_written) &&
+            !storage[kRs].first_unwritten_change(pending_rs_written) &&
+            !storage[kLo].first_unwritten_change(pending_lo_written) &&
+            !storage[kInjectOut].first_unwritten_change(
+                pending_inject_written) &&
+            !storage[kMixed].first_unwritten_change(pending_mixed_written);
+        check(pending_entry_guards,
+              label + " typed no-PLE consumer stays inside output guards");
+        pending_moe_entry_matches &= pending_entry_guards;
+
+        const auto before_rejection = capture_pending_outputs();
+        WindowMoeAttentionEntryBuffers wrong_residual_entry = pending_entry;
+        wrong_residual_entry.previous_gr_read.residual = views[kNorm];
+        auto rejected_pending = context.make_command_buffer(
+            label + " mismatched no-PLE residual", error);
+        const bool wrong_residual_rejected =
+            rejected_pending &&
+            !encode_window_moe_attention_entry(
+                context, *rejected_pending, rows, wrong_residual_entry, error) &&
+            rejected_pending->unsafe_native_handle() == nullptr &&
+            error.find("previous GR residual") != std::string::npos;
+        const bool rejection_preserved_outputs =
+            before_rejection == capture_pending_outputs();
+        const bool rejection_preserved_inputs =
+            inputs_before_consumers == capture_pending_inputs();
+        check(wrong_residual_rejected,
+              label + " no-PLE entry rejects a different GR residual", error);
+        check(rejection_preserved_outputs,
+              label + " mismatched no-PLE residual preserves output buffers");
+        check(rejection_preserved_inputs,
+              label + " mismatched no-PLE residual preserves producer views");
+        pending_moe_entry_matches &= wrong_residual_rejected &&
+                                     rejection_preserved_outputs &&
+                                     rejection_preserved_inputs;
+    }
+
     return !xn_mismatch && !rs_mismatch && !lo_mismatch &&
            !inject_mismatch && !residual_mismatch && !mixed_mismatch &&
            inputs_unchanged && output_guards && shared_encoder_matches &&
            late_failure_discards && caller_owned_late_failure_discards &&
-           alias_rejected && concurrent_group_rejected;
+           alias_rejected && concurrent_group_rejected &&
+           pending_moe_entry_matches;
 }
 
 bool test_gr_read_encoder_validation(Context& context) {

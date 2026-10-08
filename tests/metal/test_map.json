@@ -262,11 +262,11 @@
     },
     "metal_gr_test": {
       "label": "metal",
-      "origin": "09 9.1"
+      "origin": "09 9.1, D-IMPL-293, REV-090"
     },
     "metal_gr_test_concurrent": {
       "label": "metal",
-      "origin": "09 9.1"
+      "origin": "09 9.1, D-IMPL-293, REV-090"
     },
     "metal_math_test": {
       "label": "metal",
