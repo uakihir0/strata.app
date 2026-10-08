@@ -694,9 +694,16 @@ Fixture write_fullmode_handoff_fixture(const fs::path& directory) {
         {"blk.0.ffn_down_exps.weight", {640u, 2'560u, kExperts}, 42u, 0u},
         {"token_embd.weight", {2'560u, 1u}, kGgmlTypeQ3K, 0u},
         {fixture.router_tensor_name, {2'560u, kExperts}, 0u, 0u},
+        {"blk.1.ple_key.weight", {2'560u, 10'240u}, 42u, 0u},
+        {"blk.1.ple_value.weight", {2'560u, 2'560u}, 30u, 0u},
+        {"blk.1.ple_norm_key.weight", {10'240u}, 0u, 0u},
+        {"blk.1.ple_norm_query.weight", {10'240u}, 0u, 0u},
+        {"blk.1.ple_norm_conv.weight", {10'240u}, 0u, 0u},
+        {"blk.1.ple_conv1d.weight", {4u, 10'240u}, 1u, 0u},
         {"per_layer_token_embd.weight",
          {strata::kernels::PLE_HEAD_DIM, kPleRows}, 20u, 0u},
     };
+    std::unordered_map<std::string, std::uint64_t> dense_tensor_offsets;
     for (Tensor& tensor : tensors) {
         cursor = align32(cursor);
         tensor.offset = cursor;
@@ -710,9 +717,33 @@ Fixture write_fullmode_handoff_fixture(const fs::path& directory) {
         } else if (tensor.name == fixture.router_tensor_name) {
             fixture.router_offset = cursor;
             cursor += kRouterSourceBytes;
-        } else {
+        } else if (tensor.name == "per_layer_token_embd.weight") {
             fixture.ple_offset = cursor;
             cursor += kPleBytes;
+        } else {
+            std::uint64_t elements = 1u;
+            for (const std::uint64_t dimension : tensor.shape) {
+                require(dimension != 0u &&
+                            elements <=
+                                std::numeric_limits<std::uint64_t>::max() /
+                                    dimension,
+                        "FullMode PLE tensor fixture shape product");
+                elements *= dimension;
+            }
+            std::uint64_t tensor_bytes = 0u;
+            if (tensor.type == 42u) {
+                require(elements % 64u == 0u,
+                        "FullMode PLE Q2_0 fixture block alignment");
+                tensor_bytes = (elements / 64u) * sizeof(block_q2_0);
+            } else if (tensor.type == 30u || tensor.type == 1u) {
+                tensor_bytes = elements * sizeof(std::uint16_t);
+            } else {
+                require(tensor.type == 0u,
+                        "FullMode PLE fixture only uses supported scalar formats");
+                tensor_bytes = elements * sizeof(float);
+            }
+            dense_tensor_offsets.emplace(tensor.name, cursor);
+            cursor += tensor_bytes;
         }
     }
     fixture.offsets = {tensors[0].offset, tensors[1].offset, tensors[2].offset};
@@ -758,6 +789,44 @@ Fixture write_fullmode_handoff_fixture(const fs::path& directory) {
         write_all_at(descriptor, embedding_row.data(),
                      embedding_row.size() * sizeof(block_q3_K),
                      fixture.data_start + fixture.dense_offset);
+
+        std::vector<block_q2_0> ple_key_blocks(
+            static_cast<std::size_t>(
+                (2'560u * 10'240u) / 64u));
+        for (block_q2_0& block : ple_key_blocks) {
+            block.d = 0x1000u;
+            std::fill_n(block.qs, std::size(block.qs), 0xaau);
+        }
+        write_all_at(
+            descriptor, ple_key_blocks.data(),
+            ple_key_blocks.size() * sizeof(block_q2_0),
+            fixture.data_start + dense_tensor_offsets.at(
+                                      "blk.1.ple_key.weight"));
+        std::vector<std::uint16_t> ple_value(
+            static_cast<std::size_t>(2'560u) * 2'560u,
+            strata::kernels::bf16_from_f32(0.0001f));
+        write_all_at(descriptor, ple_value.data(),
+                     ple_value.size() * sizeof(std::uint16_t),
+                     fixture.data_start + dense_tensor_offsets.at(
+                                               "blk.1.ple_value.weight"));
+        const std::vector<float> ple_gamma(
+            10'240u, 1.0f);
+        for (const char* tensor_name : {
+                 "blk.1.ple_norm_key.weight",
+                 "blk.1.ple_norm_query.weight",
+                 "blk.1.ple_norm_conv.weight"}) {
+            write_all_at(descriptor, ple_gamma.data(),
+                         ple_gamma.size() * sizeof(float),
+                         fixture.data_start +
+                             dense_tensor_offsets.at(tensor_name));
+        }
+        std::vector<std::uint16_t> ple_conv(
+            4u * 10'240u,
+            strata::kernels::f16_from_f32(0.125f));
+        write_all_at(descriptor, ple_conv.data(),
+                     ple_conv.size() * sizeof(std::uint16_t),
+                     fixture.data_start + dense_tensor_offsets.at(
+                                               "blk.1.ple_conv1d.weight"));
 
         // Equal zero router logits select expert IDs 0..9 in stable tie order.
         // Give those ten expert slabs finite positive Q2_0 values so the test
@@ -922,6 +991,19 @@ WindowSources inspect_fixture(const Fixture& fixture) {
         shard.tensors.push_back(
             {name, file.data_start() + tensor->offset,
              strata::tensor_payload_bytes(*tensor), 0});
+    }
+    for (const std::string& name : {
+             std::string("blk.1.ple_key.weight"),
+             std::string("blk.1.ple_value.weight"),
+             std::string("blk.1.ple_norm_key.weight"),
+             std::string("blk.1.ple_norm_query.weight"),
+             std::string("blk.1.ple_norm_conv.weight"),
+             std::string("blk.1.ple_conv1d.weight")}) {
+        if (const strata::TensorInfo* tensor = file.find(name)) {
+            shard.tensors.push_back(
+                {tensor->name, file.data_start() + tensor->offset,
+                 strata::tensor_payload_bytes(*tensor), 0});
+        }
     }
     const strata::TensorInfo* ple = file.find("per_layer_token_embd.weight");
     if (ple == nullptr) throw std::runtime_error("synthetic GGUF PLE tensor is missing");
@@ -2834,7 +2916,8 @@ void run_fullmode_handoff_test(Context& context,
     full_geometry.head_dim = 256u;
     full_geometry.n_embd = N_EMBD;
     full_geometry.vocab = kVocabulary;
-    full_geometry.types = {"f32", "iq4_nl", "q2_0", "q3_k"};
+    full_geometry.types = {
+        "bf16", "f16", "f32", "iq4_nl", "q2_0", "q3_k"};
     full_geometry.layers[0].gate_up_type = "q2_0";
     full_geometry.layers[0].down_type = "q2_0";
 
@@ -3248,53 +3331,36 @@ void run_fullmode_handoff_test(Context& context,
             static_cast<const std::uint8_t*>(ple_history.contents),
             static_cast<const std::uint8_t*>(ple_history.contents) +
                 ple_history.length);
-        const BufferRef ple_key_weights = allocate(
-            "FullMode handoff PLE Q2_0 key weights",
-            static_cast<std::size_t>(HC_DIM) * (N_EMBD / 64u) *
-                sizeof(block_q2_0));
-        const BufferRef ple_value_weights = allocate(
-            "FullMode handoff PLE BF16 value weights",
-            static_cast<std::size_t>(N_EMBD) * N_EMBD *
-                sizeof(std::uint16_t));
+        FullModeTensorView ple_key_weights;
+        require(full_mode->dense_tensor_view("blk.1.ple_key.weight",
+                                             ple_key_weights, error),
+                "resolve FullMode PLE Q2_0 key tensor: " + error);
+        FullModeTensorView ple_value_weights;
+        require(full_mode->dense_tensor_view("blk.1.ple_value.weight",
+                                             ple_value_weights, error),
+                "resolve FullMode PLE BF16 value tensor: " + error);
+        FullModeTensorView ple_key_gamma;
+        require(full_mode->dense_tensor_view("blk.1.ple_norm_key.weight",
+                                             ple_key_gamma, error),
+                "resolve FullMode PLE key gamma: " + error);
+        FullModeTensorView ple_query_gamma;
+        require(full_mode->dense_tensor_view("blk.1.ple_norm_query.weight",
+                                             ple_query_gamma, error),
+                "resolve FullMode PLE query gamma: " + error);
+        FullModeTensorView ple_conv_gamma;
+        require(full_mode->dense_tensor_view("blk.1.ple_norm_conv.weight",
+                                             ple_conv_gamma, error),
+                "resolve FullMode PLE convolution gamma: " + error);
+        FullModeTensorView ple_conv1d;
+        require(full_mode->dense_tensor_view("blk.1.ple_conv1d.weight",
+                                             ple_conv1d, error),
+                "resolve FullMode PLE convolution weights: " + error);
         const BufferRef ple_key_q8_1 = allocate(
             "FullMode handoff PLE Q8_1 key activations",
             static_cast<std::size_t>(N_EMBD / 32u) * sizeof(Q81));
         const BufferRef ple_sink =
             require_scratch_view(context, *scratch, layout.matvec_sink,
                                  "PLE mat-vec sink");
-        const BufferRef ple_key_gamma =
-            allocate("FullMode handoff PLE key gamma",
-                     static_cast<std::size_t>(HC_DIM) * sizeof(float));
-        const BufferRef ple_query_gamma =
-            allocate("FullMode handoff PLE query gamma",
-                     static_cast<std::size_t>(HC_DIM) * sizeof(float));
-        const BufferRef ple_conv_gamma =
-            allocate("FullMode handoff PLE convolution gamma",
-                     static_cast<std::size_t>(HC_DIM) * sizeof(float));
-        const BufferRef ple_conv1d = allocate(
-            "FullMode handoff PLE convolution weights",
-            static_cast<std::size_t>(HC_DIM) * 4u * sizeof(std::uint16_t));
-        auto* q2_blocks =
-            static_cast<block_q2_0*>(ple_key_weights.contents);
-        const std::size_t q2_block_count =
-            ple_key_weights.length / sizeof(block_q2_0);
-        for (std::size_t block = 0; block < q2_block_count; ++block) {
-            q2_blocks[block].d = 0x1000u;
-            std::fill_n(q2_blocks[block].qs, 16u, 0xaau);
-        }
-        std::fill_n(
-            static_cast<std::uint16_t*>(ple_value_weights.contents),
-            ple_value_weights.length / sizeof(std::uint16_t),
-            strata::kernels::bf16_from_f32(0.0001f));
-        std::fill_n(static_cast<float*>(ple_key_gamma.contents),
-                    HC_DIM, 1.0f);
-        std::fill_n(static_cast<float*>(ple_query_gamma.contents),
-                    HC_DIM, 1.0f);
-        std::fill_n(static_cast<float*>(ple_conv_gamma.contents),
-                    HC_DIM, 1.0f);
-        std::fill_n(static_cast<std::uint16_t*>(ple_conv1d.contents),
-                    ple_conv1d.length / sizeof(std::uint16_t),
-                    strata::kernels::f16_from_f32(0.125f));
         require(std::all_of(static_cast<const float*>(ple_input.contents),
                             static_cast<const float*>(ple_input.contents) +
                                 N_EMBD,
@@ -3309,13 +3375,14 @@ void run_fullmode_handoff_test(Context& context,
         ple_block = {
             ple_input,
             ple_key_q8_1,
-            ple_key_weights,
-            ple_value_weights,
+            ple_key_weights.buffer,
+            ple_value_weights.buffer,
             ple_sink,
-            gdn_active_rows,
+            context.buffers().read_only(gdn_active_rows),
             {ple_key, residual, ple_query, ple_norm, ple_value, ple_gate,
-             ple_gated, ple_history, ple_conv1d, ple_key_gamma,
-             ple_query_gamma, ple_conv_gamma},
+             ple_gated, ple_history, ple_conv1d.buffer,
+             ple_key_gamma.buffer, ple_query_gamma.buffer,
+             ple_conv_gamma.buffer},
         };
         ple_entry = {full_buffers.ffn, ffn, ple_block};
     }
@@ -3329,8 +3396,19 @@ void run_fullmode_handoff_test(Context& context,
         full_buffers.ffn, ffn, next_attention};
     WindowMoePendingConsumer pending_consumer = attention_entry;
     if (use_ple_entry) {
+        PLEBlockBuffers step_ple_block = ple_block;
+        step_ple_block.key_weights = {};
+        step_ple_block.value_weights = {};
+        step_ple_block.post.conv1d = {};
+        step_ple_block.post.key_gamma = {};
+        step_ple_block.post.query_gamma = {};
+        step_ple_block.post.conv_gamma = {};
+        const WindowMoePLEEntryBuffers step_ple_entry{
+            full_buffers.ffn, ffn, step_ple_block};
+        // The FullMode step must resolve every model tensor and replace this
+        // deliberately wrong format from the mapped model metadata.
         pending_consumer = WindowMoePendingPLEConsumer{
-            ple_entry, MatVecWeightFormat::q2_0, 1u,
+            step_ple_entry, MatVecWeightFormat::bf16, 1u,
             PLEHistoryUpdate::defer};
     }
     const WindowT1FullModeStepBuffers full_step_buffers{

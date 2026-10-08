@@ -3,6 +3,7 @@
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/window.hpp"
 
+#include <array>
 #include <initializer_list>
 #include <vector>
 
@@ -13,6 +14,11 @@ constexpr std::uint32_t kWindowEmbeddingWidth = 2'560u;
 constexpr std::uint32_t kGgmlTypeQ3K = 11u;
 constexpr std::uint32_t kGgmlTypeIQ3S = 21u;
 constexpr std::uint32_t kGgmlTypeIQ4XS = 23u;
+constexpr std::uint32_t kGgmlTypeF32 = 0u;
+constexpr std::uint32_t kGgmlTypeF16 = 1u;
+constexpr std::uint32_t kGgmlTypeQ8_0 = 8u;
+constexpr std::uint32_t kGgmlTypeBf16 = 30u;
+constexpr std::uint32_t kGgmlTypeQ2_0 = 42u;
 
 bool same_view(BufferRef left, BufferRef right) {
     return left && right && left.handle == right.handle &&
@@ -152,13 +158,16 @@ void append_ple_views(const PLEBlockBuffers& buffers,
                       std::vector<BufferRef>& writable,
                       std::vector<ReadOnlyBufferRef>& readonly) {
     for (BufferRef view :
-         {buffers.input_f32, buffers.key_q8_1, buffers.key_weights,
-          buffers.value_weights, buffers.matvec_sink, buffers.active_rows,
+         {buffers.input_f32, buffers.key_q8_1, buffers.matvec_sink,
           buffers.post.key, buffers.post.residual, buffers.post.query,
           buffers.post.ple_norm, buffers.post.value, buffers.post.gate,
-          buffers.post.gated, buffers.post.history, buffers.post.conv1d,
-          buffers.post.key_gamma, buffers.post.query_gamma,
-          buffers.post.conv_gamma}) {
+          buffers.post.gated, buffers.post.history}) {
+        append_view(view, writable, readonly);
+    }
+    for (ReadOnlyBufferRef view :
+         {buffers.key_weights, buffers.value_weights, buffers.active_rows,
+          buffers.post.conv1d, buffers.post.key_gamma,
+          buffers.post.query_gamma, buffers.post.conv_gamma}) {
         append_view(view, writable, readonly);
     }
 }
@@ -229,6 +238,86 @@ bool embedding_format(std::uint32_t ggml_type, EmbedRowsFormat& format) {
     }
 }
 
+bool resolve_ple_model_weights(const FullModeStorage& full_mode,
+                               WindowMoePendingConsumer& consumer,
+                               std::string& error) {
+    auto* const ple = std::get_if<WindowMoePendingPLEConsumer>(&consumer);
+    if (ple == nullptr) {
+        error = "PLE model-weight resolution requires the selected PLE branch";
+        return false;
+    }
+
+    FullModeTensorView key;
+    if (!full_mode.dense_tensor_view("blk.1.ple_key.weight", key, error)) {
+        return false;
+    }
+    if (key.shape != std::vector<std::uint64_t>{2'560u, 10'240u}) {
+        error = "FullMode layer-1 PLE key must have shape [2560, 10240]";
+        return false;
+    }
+    switch (key.ggml_type) {
+        case kGgmlTypeQ2_0:
+            ple->key_format = MatVecWeightFormat::q2_0;
+            break;
+        case kGgmlTypeQ8_0:
+            ple->key_format = MatVecWeightFormat::q8_0;
+            break;
+        case kGgmlTypeBf16:
+            ple->key_format = MatVecWeightFormat::bf16;
+            break;
+        default:
+            error = "FullMode layer-1 PLE key uses an unsupported native weight format";
+            return false;
+    }
+    ple->buffers.ple.key_weights = key.buffer;
+
+    FullModeTensorView value;
+    if (!full_mode.dense_tensor_view("blk.1.ple_value.weight", value,
+                                     error)) {
+        return false;
+    }
+    if (value.ggml_type != kGgmlTypeBf16 ||
+        value.shape != std::vector<std::uint64_t>{2'560u, 2'560u}) {
+        error = "FullMode layer-1 PLE value must be BF16 with shape [2560, 2560]";
+        return false;
+    }
+    ple->buffers.ple.value_weights = value.buffer;
+
+    struct TensorExpectation {
+        const char* name;
+        std::vector<std::uint64_t> shape;
+        std::uint32_t ggml_type;
+        ReadOnlyBufferRef PLEPostProjectionBuffers::*member;
+        const char* description;
+    };
+    const std::array<TensorExpectation, 4> post_weights{{
+        {"blk.1.ple_norm_key.weight", {10'240u}, kGgmlTypeF32,
+         &PLEPostProjectionBuffers::key_gamma, "key normalization"},
+        {"blk.1.ple_norm_query.weight", {10'240u}, kGgmlTypeF32,
+         &PLEPostProjectionBuffers::query_gamma, "query normalization"},
+        {"blk.1.ple_norm_conv.weight", {10'240u}, kGgmlTypeF32,
+         &PLEPostProjectionBuffers::conv_gamma, "convolution normalization"},
+        {"blk.1.ple_conv1d.weight", {4u, 10'240u}, kGgmlTypeF16,
+         &PLEPostProjectionBuffers::conv1d, "convolution"},
+    }};
+    for (const TensorExpectation& expected : post_weights) {
+        FullModeTensorView tensor;
+        if (!full_mode.dense_tensor_view(expected.name, tensor, error)) {
+            return false;
+        }
+        if (tensor.ggml_type != expected.ggml_type ||
+            tensor.shape != expected.shape) {
+            error = "FullMode layer-1 PLE " +
+                    std::string(expected.description) +
+                    " tensor has an unsupported type or shape";
+            return false;
+        }
+        ple->buffers.ple.post.*(expected.member) = tensor.buffer;
+    }
+    error.clear();
+    return true;
+}
+
 }  // namespace
 
 bool encode_window_moe_pending_consumer(
@@ -286,6 +375,11 @@ bool encode_window_t1_full_mode_step(
         error = "Window pending-MoE consumer does not match the selected PLE branch";
         return false;
     }
+    WindowMoePendingConsumer consumer = buffers.consumer;
+    if (ple_enabled &&
+        !resolve_ple_model_weights(full_mode, consumer, error)) {
+        return false;
+    }
 
     FullModeTensorView token_embedding;
     if (!full_mode.dense_tensor_view("token_embd.weight", token_embedding,
@@ -304,7 +398,7 @@ bool encode_window_t1_full_mode_step(
         return false;
     }
     if (!validate_embedding_liveness(buffers.embedding, buffers.layer0,
-                                     buffers.consumer, error)) {
+                                     consumer, error)) {
         return false;
     }
 
@@ -320,7 +414,7 @@ bool encode_window_t1_full_mode_step(
         return false;
     }
     return encode_window_moe_pending_consumer(
-        context, encoder, 1u, ple_enabled, buffers.consumer, error);
+        context, encoder, 1u, ple_enabled, consumer, error);
 }
 
 bool encode_window_t1_full_mode_step(

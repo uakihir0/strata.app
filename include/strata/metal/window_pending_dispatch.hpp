@@ -50,8 +50,13 @@ bool encode_window_moe_pending_consumer(
 /// token gather, GR stream broadcast, full-mode layer-0 MoE producer and
 /// exactly one selected pending consumer in that order. The token embedding
 /// tensor must have shape [2560, vocabulary_size] and use a supported
-/// embedding format. `buffers.layer0.producer.router.layer0.params` supplies
-/// the parameter block shared by all stages.
+/// embedding format. When `ple_enabled` is true, the step also resolves the
+/// six layer-1 PLE projection, normalization and convolution tensors from
+/// FullModeStorage, validates their types and shapes, and replaces the
+/// consumer's PLE weight views and key format. Those resolved views are
+/// backed by `full_mode`, which must remain alive until command-buffer
+/// completion. `buffers.layer0.producer.router.layer0.params` supplies the
+/// parameter block shared by all stages.
 ///
 /// Propagate false from the enclosing Encoder::encode body so a late failure
 /// discards every earlier dispatch in the step. This is a composable T=1

@@ -100,7 +100,9 @@ public:
     /// controlled by this owner.
     strata::kernels::PleTableReader* ple_reader() noexcept;
     /// Resolve a whole dense GGUF tensor to its bounded live buffer view.
-    /// Per-expert slabs and excluded tensors such as PLE are not returned.
+    /// Per-expert slabs and the separate per-layer token embedding PLE table
+    /// are not returned. Dense PLE projection, normalization, and convolution
+    /// tensors remain resolvable through this accessor.
     bool dense_tensor_view(const std::string& tensor_name,
                            FullModeTensorView& view,
                            std::string& error) const;
