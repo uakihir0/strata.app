@@ -2478,6 +2478,18 @@ production before combining. This coordinator does not build the route or
 expert plan, resolve misses, write the FFN residual, or wire the production
 Window scheduler, so it does not establish end-to-end inference.
 
+`encode_moe_shared_ffn_write` extends this composition with the layer's
+`strata_gr_post` FFN write. It uses the combine output as `block_out` and
+updates the four-stream residual in place using the supplied FFN injection.
+Residual and injection views must be disjoint from every shared-FFN input,
+scratch, output and sink before the first dispatch. The coordinator still
+assumes route weights and routed parts are ready, and does not add the Window
+layer scheduler or tiered resolver. The caller-owned form must propagate
+`false` from its enclosing Encoder callback so an error after an earlier stage
+discards the whole segment. Keep the read-only FFN inputs, injection and
+initial residual contents unchanged until command completion, and do not access
+the written scratch or outputs before completion.
+
 `encode_moe_routed_ffn` composes the routed path for T=1..8 in this order:
 grouped gate/up, routed SwiGLU, Q8_1 quantization of the 640-wide hidden rows,
 then grouped down projection into original route order. It validates every

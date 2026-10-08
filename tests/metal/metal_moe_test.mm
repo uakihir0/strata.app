@@ -2928,6 +2928,40 @@ bool dispatch_shared_combine(
     return !failure;
 }
 
+void moe_gr_post_reference(std::span<const float> residual,
+                           std::span<const float> block_out,
+                           std::span<const float> inject,
+                           std::uint32_t rows,
+                           std::vector<twin::tf>& output) {
+    constexpr std::size_t kStreams = 4u;
+    const std::size_t residual_width = kStreams * kMoeDownWidth;
+    output.resize(static_cast<std::size_t>(rows) * residual_width);
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        for (std::size_t index = 0u; index < residual_width; ++index) {
+            const std::size_t stream = index / kMoeDownWidth;
+            const std::size_t column = index % kMoeDownWidth;
+            const twin::tf scaled_inject = twin::fma(
+                twin::tf{0.25f},
+                twin::tf{inject[static_cast<std::size_t>(row) *
+                                    kStreams +
+                                stream]},
+                twin::tf{});
+            const twin::tf sigmoid =
+                twin::tf{1.0f} /
+                (twin::tf{1.0f} + twin::accurate_exp(-scaled_inject));
+            const twin::tf weight =
+                twin::fma(twin::tf{2.0f}, sigmoid, twin::tf{});
+            const std::size_t residual_index =
+                static_cast<std::size_t>(row) * residual_width + index;
+            const std::size_t block_index =
+                static_cast<std::size_t>(row) * kMoeDownWidth + column;
+            output[residual_index] = twin::fma(
+                twin::tf{block_out[block_index]}, weight,
+                twin::tf{residual[residual_index]});
+        }
+    }
+}
+
 bool test_composed_shared_ffn(
     Context& context, std::uint32_t rows, std::uint32_t nc,
     twin::InputSet set, const twin::Options& options,
@@ -2961,6 +2995,8 @@ bool test_composed_shared_ffn(
         up_sink,
         down_sink,
         shared_gate_sink,
+        residual_input,
+        injection_input,
         buffer_count,
     };
     const std::string label =
@@ -2998,6 +3034,11 @@ bool test_composed_shared_ffn(
         sizeof(float);
     const std::size_t shared_gate_sink_write_bytes =
         static_cast<std::size_t>(nc - rows) * sizeof(float);
+    const std::size_t residual_bytes =
+        static_cast<std::size_t>(rows) * 4u * kMoeDownWidth *
+        sizeof(float);
+    const std::size_t injection_bytes =
+        static_cast<std::size_t>(rows) * 4u * sizeof(float);
     constexpr std::size_t kSinkExtraBytes = 64u;
     const std::array<std::size_t, buffer_count> sizes{
         active_input_q8_bytes,
@@ -3021,6 +3062,8 @@ bool test_composed_shared_ffn(
         std::max(sizeof(float), down_sink_write_bytes) + kSinkExtraBytes,
         std::max(sizeof(float), shared_gate_sink_write_bytes) +
             kSinkExtraBytes,
+        residual_bytes,
+        injection_bytes,
     };
     const std::array<const char*, buffer_count> names{
         "Q8_1 input", "mixed input", "gate weights", "up weights",
@@ -3029,6 +3072,7 @@ bool test_composed_shared_ffn(
         "hidden output", "down Q8_1 output", "shared output",
         "shared gate logits", "combined output", "gate sink", "up sink",
         "down sink", "shared gate sink",
+        "GR residual", "GR injection",
     };
     std::array<twin::GuardedBuffer, buffer_count> storage;
     std::string error;
@@ -3062,6 +3106,28 @@ bool test_composed_shared_ffn(
                    route_weights_bytes);
     check(inputs_copied, label + " input initialization");
     if (!inputs_copied) return false;
+    std::mt19937_64 gr_rng(
+        options.seed ^ (static_cast<std::uint64_t>(rows) << 32u) ^
+        (static_cast<std::uint64_t>(set) << 48u) ^ 0x4752504f5354ull);
+    const std::vector<float> initial_residual =
+        twin::synthesize_floats(set, residual_bytes / sizeof(float), gr_rng,
+                                error);
+    if (!error.empty()) {
+        check(false, label + " GR residual synthesis", error);
+        return false;
+    }
+    const std::vector<float> inject =
+        twin::synthesize_floats(set, injection_bytes / sizeof(float), gr_rng,
+                                error);
+    if (!error.empty()) {
+        check(false, label + " GR injection synthesis", error);
+        return false;
+    }
+    const bool write_inputs_copied =
+        copy_bytes(residual_input, initial_residual.data(), residual_bytes) &&
+        copy_bytes(injection_input, inject.data(), injection_bytes);
+    check(write_inputs_copied, label + " GR write input initialization");
+    if (!write_inputs_copied) return false;
 
     const auto to_tf = [](std::span<const float> values) {
         std::vector<twin::tf> result(values.size());
@@ -3135,6 +3201,9 @@ bool test_composed_shared_ffn(
         storage[down_sink].view(),
         storage[shared_gate_sink].view(),
     };
+    const MoeSharedFFNWriteBuffers write_buffers{
+        buffers, storage[residual_input].view(),
+        storage[injection_input].view()};
 
     bool validation_ok = true;
     if (rows == 1u && set == twin::InputSet::fixture) {
@@ -3181,6 +3250,9 @@ bool test_composed_shared_ffn(
                "active-row count");
         std::memcpy(storage[active_row_data].payload().data(), &live_rows,
                     sizeof(live_rows));
+        before[active_row_data].assign(
+            storage[active_row_data].payload().begin(),
+            storage[active_row_data].payload().end());
 
         std::array<std::vector<std::uint8_t>, buffer_count> rollback_before{};
         for (std::size_t i = 0u; i < storage.size(); ++i) {
@@ -3225,6 +3297,127 @@ bool test_composed_shared_ffn(
             validation_ok = false;
         }
 
+        const auto reject_write = [&](const std::string& case_label,
+                                      const MoeSharedFFNWriteBuffers&
+                                          case_buffers,
+                                      std::string_view expected_error) {
+            auto write_command =
+                context.make_command_buffer(case_label, error);
+            const bool rejected = write_command &&
+                !encode_moe_shared_ffn_write(
+                    context, *write_command, rows, case_buffers, error);
+            const bool discarded =
+                write_command &&
+                write_command->unsafe_native_handle() == nullptr;
+            bool unchanged = true;
+            for (std::size_t i = 0u; i < storage.size(); ++i) {
+                unchanged &=
+                    std::equal(before[i].begin(), before[i].end(),
+                               storage[i].payload().begin(),
+                               storage[i].payload().end());
+            }
+            const bool error_matches =
+                error.find(expected_error) != std::string::npos;
+            check(rejected && discarded && unchanged && error_matches,
+                  case_label + " rejects before dispatch", error);
+            validation_ok &= rejected && discarded && unchanged &&
+                             error_matches;
+        };
+        MoeSharedFFNWriteBuffers residual_alias = write_buffers;
+        residual_alias.residual = storage[routed_part_data].view();
+        reject_write(label + " GR residual/read-only alias", residual_alias,
+                     "disjoint from shared FFN inputs");
+        MoeSharedFFNWriteBuffers injection_alias = write_buffers;
+        injection_alias.inject = storage[gate_output].view();
+        reject_write(label + " GR injection/shared-scratch alias",
+                     injection_alias, "disjoint from shared FFN outputs");
+        MoeSharedFFNWriteBuffers residual_injection_alias = write_buffers;
+        residual_injection_alias.inject =
+            storage[residual_input].view().slice(0u, injection_bytes);
+        reject_write(label + " GR residual/injection alias",
+                     residual_injection_alias, "residual and injection");
+
+        BufferRef adjacent_residual_injection = context.buffers().allocate(
+            label + " adjacent GR residual/injection views",
+            residual_bytes + injection_bytes, error);
+        if (!adjacent_residual_injection) {
+            check(false, label + " adjacent GR views allocation", error);
+            validation_ok = false;
+        } else {
+            std::memcpy(adjacent_residual_injection.contents,
+                        initial_residual.data(), residual_bytes);
+            std::memcpy(
+                static_cast<std::byte*>(
+                    adjacent_residual_injection.contents) + residual_bytes,
+                inject.data(), injection_bytes);
+            MoeSharedFFNWriteBuffers adjacent_views{
+                buffers,
+                adjacent_residual_injection.slice(
+                    0u, residual_bytes + injection_bytes),
+                adjacent_residual_injection.slice(
+                    residual_bytes, injection_bytes)};
+            auto adjacent_command = context.make_command_buffer(
+                label + " adjacent GR residual/injection ranges", error);
+            const bool accepted = adjacent_command &&
+                encode_moe_shared_ffn_write(
+                    context, *adjacent_command, rows, adjacent_views, error);
+            if (adjacent_command &&
+                adjacent_command->unsafe_native_handle() != nullptr) {
+                adjacent_command->discard();
+            }
+            const bool discarded =
+                adjacent_command &&
+                adjacent_command->unsafe_native_handle() == nullptr;
+            check(accepted && discarded,
+                  label + " accepts disjoint live ranges with overlapping capacity",
+                  error);
+            validation_ok &= accepted && discarded;
+        }
+
+        std::array<std::vector<std::uint8_t>, buffer_count>
+            write_rollback_before{};
+        for (std::size_t i = 0u; i < storage.size(); ++i) {
+            write_rollback_before[i].assign(storage[i].payload().begin(),
+                                            storage[i].payload().end());
+        }
+        auto write_rollback_command = context.make_command_buffer(
+            label + " caller-owned write rollback", error);
+        check(write_rollback_command != nullptr,
+              label + " caller-owned write rollback command buffer", error);
+        if (write_rollback_command) {
+            const bool rejected = !Encoder::encode(
+                context, *write_rollback_command,
+                label + " caller-owned write rollback",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    if (!encode_moe_shared_ffn_write(
+                            context, encoder, rows, write_buffers,
+                            encode_error)) {
+                        return false;
+                    }
+                    return encode_moe_shared_ffn_write(
+                        context, encoder, 0u, write_buffers, encode_error);
+                },
+                error);
+            const bool discarded = write_rollback_command
+                    ->unsafe_native_handle() == nullptr;
+            bool unchanged = true;
+            for (std::size_t i = 0u; i < storage.size(); ++i) {
+                unchanged &=
+                    std::equal(write_rollback_before[i].begin(),
+                               write_rollback_before[i].end(),
+                               storage[i].payload().begin(),
+                               storage[i].payload().end());
+            }
+            check(rejected && discarded && unchanged &&
+                      error.find("1..8 rows") != std::string::npos,
+                  label + " caller-owned GR-write failure rolls back all stages",
+                  error);
+            validation_ok &= rejected && discarded && unchanged &&
+                             error.find("1..8 rows") != std::string::npos;
+        } else {
+            validation_ok = false;
+        }
+
         const char* const dispatch_mode =
             std::getenv("STRATA_METAL_DISPATCH");
         if (dispatch_mode != nullptr &&
@@ -3241,8 +3434,8 @@ bool test_composed_shared_ffn(
                     [&](Encoder& encoder, std::string& encode_error) {
                         if (!encoder.group_begin(encode_error)) return false;
                         const bool compose_rejected =
-                            !encode_moe_shared_ffn(
-                                context, encoder, rows, buffers,
+                            !encode_moe_shared_ffn_write(
+                                context, encoder, rows, write_buffers,
                                 boundary_error) &&
                             boundary_error.find(
                                 "ordered dispatch boundaries") !=
@@ -3250,7 +3443,7 @@ bool test_composed_shared_ffn(
                         if (!encoder.group_end(encode_error)) return false;
                         if (!compose_rejected) {
                             encode_error =
-                                "shared MoE FFN accepted an open group";
+                                "shared MoE FFN/GR write accepted an open group";
                             return false;
                         }
                         encode_error = boundary_error;
@@ -3441,6 +3634,10 @@ bool test_composed_shared_ffn(
         !storage[shared_gate_logits].first_unwritten_change(gate_logits_written);
     guards_ok &=
         !storage[combined_output].first_unwritten_change(combined_written);
+    guards_ok &=
+        !storage[residual_input].first_unwritten_change({});
+    guards_ok &=
+        !storage[injection_input].first_unwritten_change({});
     guards_ok &= sink_unchanged(gate_sink, gate_sink_write_bytes, "gate sink");
     guards_ok &= sink_unchanged(up_sink, gate_sink_write_bytes, "up sink");
     guards_ok &= sink_unchanged(down_sink, down_sink_write_bytes, "down sink");
@@ -3449,7 +3646,75 @@ bool test_composed_shared_ffn(
                                 "shared-gate sink");
     check(guards_ok, label + " inputs, output ranges and guards");
     if (!validation_ok) return false;
-    return outputs_match && guards_ok;
+
+    bool write_match = true;
+    if (rows == 1u || rows == 3u || rows == 8u) {
+        for (auto& buffer : storage) buffer.capture_before_dispatch();
+        auto write_command = context.make_command_buffer(
+            label + " shared FFN and GR post", error);
+        const bool write_caller_owned =
+            rows == 1u && set == twin::InputSet::fixture;
+        const bool write_encoded = write_command && (write_caller_owned
+            ? Encoder::encode(
+                  context, *write_command, label + " shared FFN and GR post",
+                  [&](Encoder& encoder, std::string& encode_error) {
+                      return encode_moe_shared_ffn_write(
+                          context, encoder, rows, write_buffers,
+                          encode_error);
+                  },
+                  error)
+            : encode_moe_shared_ffn_write(context, *write_command, rows,
+                                          write_buffers, error));
+        const bool write_dispatched =
+            write_encoded && write_command->commit(error) &&
+            write_command->wait_until_completed(error);
+        check(write_dispatched,
+              label + (write_caller_owned
+                           ? " caller-owned shared FFN and GR write"
+                           : " standalone shared FFN and GR write"),
+              error);
+        write_match &= write_dispatched;
+        if (write_dispatched) {
+            const auto* combined_data =
+                reinterpret_cast<const float*>(
+                    storage[combined_output].payload().data());
+            std::vector<twin::tf> expected_post;
+            moe_gr_post_reference(
+                initial_residual,
+                std::span<const float>(combined_data,
+                                       combined_bytes / sizeof(float)),
+                inject, rows, expected_post);
+            const auto* actual_residual =
+                reinterpret_cast<const float*>(
+                    storage[residual_input].payload().data());
+            const auto post_failure = twin::compare_floats(
+                std::span<const float>(actual_residual,
+                                       expected_post.size()),
+                expected_post,
+                {twin::Comparison::units, 16.0, 0.0, 0u});
+            if (post_failure) {
+                twin::report_failure(label.c_str(), options, rows,
+                                     *post_failure);
+            }
+            check(!post_failure,
+                  label + " composed GR residual write U(16)");
+            write_match &= !post_failure;
+
+            const std::array<twin::ByteRange, 1> residual_written{
+                {{0u, residual_bytes}}};
+            const bool residual_guards =
+                !storage[residual_input].first_unwritten_change(
+                    residual_written);
+            const bool injection_unchanged =
+                !storage[injection_input].first_unwritten_change({});
+            check(residual_guards,
+                  label + " residual exact write range and guards");
+            check(injection_unchanged,
+                  label + " injection remains read-only with guards");
+            write_match &= residual_guards && injection_unchanged;
+        }
+    }
+    return outputs_match && guards_ok && write_match;
 }
 
 bool test_shared_expert_chain_case(

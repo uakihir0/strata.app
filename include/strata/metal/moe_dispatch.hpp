@@ -133,6 +133,14 @@ struct MoeSharedFFNBuffers {
     BufferRef shared_gate_sink;
 };
 
+struct MoeSharedFFNWriteBuffers {
+    /// The shared MoE FFN and routed combine inputs and scratch.
+    MoeSharedFFNBuffers ffn;
+    /// GR residual `[rows, 4, 2560]` and FFN injection `[rows, 4]`.
+    BufferRef residual;
+    BufferRef inject;
+};
+
 /// Encode the stable top-10 route selection for 256 or 512 experts.
 /// `divide_weights` selects the prompt-path division mode; Window decode must
 /// pass false to match the model's multiply-by-reciprocal path. The views must
@@ -283,5 +291,23 @@ bool encode_moe_shared_ffn(Context& context, CommandBuffer& command_buffer,
                            std::uint32_t rows,
                            const MoeSharedFFNBuffers& buffers,
                            std::string& error);
+
+/// Encode the shared MoE FFN/combine, then apply its output to the GR residual
+/// through `strata_gr_post` using an in-place residual write. The residual and
+/// injection must be disjoint from every shared-FFN input, scratch, output
+/// and sink. All views must remain alive until command completion; the
+/// read-only FFN inputs, injection and initial residual contents must remain
+/// unchanged until then. Do not access written scratch or output before
+/// completion. The caller-owned form must propagate false from its Encoder
+/// body so failures discard the entire segment, including earlier shared-FFN
+/// dispatches.
+bool encode_moe_shared_ffn_write(Context& context, Encoder& encoder,
+                                 std::uint32_t rows,
+                                 const MoeSharedFFNWriteBuffers& buffers,
+                                 std::string& error);
+/// Standalone transactional form. A failure discards every stage.
+bool encode_moe_shared_ffn_write(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    const MoeSharedFFNWriteBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal

@@ -2,6 +2,7 @@
 #include "strata/metal/moe_dispatch.hpp"
 
 #include "strata/metal/encoder.hpp"
+#include "strata/metal/gr_dispatch.hpp"
 #include "strata/metal/mv_dispatch.hpp"
 #include "strata/metal/tiered.hpp"
 
@@ -885,7 +886,9 @@ bool encode_moe_routed_ffn_impl(Context& context, Encoder& encoder,
 bool encode_moe_shared_ffn_impl(Context& context, Encoder& encoder,
                                 std::uint32_t rows,
                                 const MoeSharedFFNBuffers& buffers,
-                                std::string& error) {
+                                std::string& error,
+                                const MoeSharedFFNWriteBuffers* writeback =
+                                    nullptr) {
     error.clear();
     if (encoder.concurrent_group_open()) {
         error = "shared MoE FFN requires ordered dispatch boundaries";
@@ -1068,6 +1071,38 @@ bool encode_moe_shared_ffn_impl(Context& context, Encoder& encoder,
         }
     }
 
+    std::size_t residual_bytes = 0u;
+    std::size_t inject_bytes = 0u;
+    BufferRef residual_range;
+    BufferRef inject_range;
+    if (writeback != nullptr) {
+        if (!checked_bytes(static_cast<std::uint64_t>(rows) * 4u *
+                               kMoeDownOutputWidth,
+                           sizeof(float), residual_bytes) ||
+            !checked_bytes(static_cast<std::uint64_t>(rows) * 4u,
+                           sizeof(float), inject_bytes)) {
+            error = "shared MoE FFN GR write shape exceeds the host byte range";
+            return false;
+        }
+        if (!valid_output(writeback->residual, residual_bytes,
+                          alignof(float)) ||
+            !valid_output(writeback->inject, inject_bytes, alignof(float))) {
+            error = "shared MoE FFN GR residual or injection is stale, foreign, "
+                    "undersized or misaligned";
+            return false;
+        }
+        residual_range = writeback->residual.slice(0u, residual_bytes);
+        inject_range = writeback->inject.slice(0u, inject_bytes);
+        if (!residual_range || !inject_range) {
+            error = "shared MoE FFN GR write view became stale";
+            return false;
+        }
+        if (views_overlap(residual_range, inject_range)) {
+            error = "shared MoE FFN GR residual and injection must be disjoint";
+            return false;
+        }
+    }
+
     const std::array<std::pair<ReadOnlyBufferRef, std::size_t>, 9u> inputs{
         std::pair{buffers.input_activations, input_activations_bytes},
         std::pair{buffers.mixed, mixed_bytes},
@@ -1100,6 +1135,27 @@ bool encode_moe_shared_ffn_impl(Context& context, Encoder& encoder,
             if (views_overlap(input_range, writable_ranges[i])) {
                 error = "shared MoE FFN writable views must not overlap inputs";
                 return false;
+            }
+        }
+    }
+    if (writeback != nullptr) {
+        const std::array write_ranges{residual_range, inject_range};
+        for (const BufferRef& write_view : write_ranges) {
+            for (const BufferRef& shared_write : writable_ranges) {
+                if (views_overlap(write_view, shared_write)) {
+                    error = "shared MoE FFN GR write views must be disjoint "
+                            "from shared FFN outputs";
+                    return false;
+                }
+            }
+            for (const auto& [input, input_bytes] : inputs) {
+                const ReadOnlyBufferRef input_range =
+                    input.slice(0u, input_bytes);
+                if (views_overlap(input_range, write_view)) {
+                    error = "shared MoE FFN GR write views must be disjoint "
+                            "from shared FFN inputs";
+                    return false;
+                }
             }
         }
     }
@@ -1160,7 +1216,14 @@ bool encode_moe_shared_ffn_impl(Context& context, Encoder& encoder,
         context.buffers().read_only(buffers.shared_output),
         context.buffers().read_only(buffers.shared_gate_logits),
         buffers.output};
-    return encode_moe_combine_impl(context, encoder, rows, combine, error);
+    if (!encode_moe_combine_impl(context, encoder, rows, combine, error)) {
+        return false;
+    }
+    if (writeback == nullptr) return true;
+
+    const GRPostBuffers post{residual_range, writable_ranges[6],
+                             inject_range, residual_range};
+    return encode_gr_post(context, encoder, rows, post, error);
 }
 
 }  // namespace
@@ -1343,6 +1406,25 @@ bool encode_moe_shared_ffn(Context& context, CommandBuffer& command_buffer,
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_moe_shared_ffn_impl(context, encoder, rows,
                                               buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_moe_shared_ffn_write(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    const MoeSharedFFNWriteBuffers& buffers, std::string& error) {
+    return encode_moe_shared_ffn_impl(context, encoder, rows, buffers.ffn,
+                                       error, &buffers);
+}
+
+bool encode_moe_shared_ffn_write(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    const MoeSharedFFNWriteBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "shared MoE FFN and GR residual write",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_moe_shared_ffn_impl(
+                context, encoder, rows, buffers.ffn, encode_error, &buffers);
         },
         error);
 }
