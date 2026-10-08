@@ -1458,12 +1458,16 @@ Window assembly, commit scheduling and model-backed decode remain open.
 2. `strata_gdn_step_norm` in mode 1 replays rows 0..n−1 from the untouched `state` and writes it back.
 
 `encode_window_gdn_commit` composes these two operations for one layer and the accepted `n_keep` prefix in a
-single ordered segment: convolution history first, recurrent state replay second. It leaves both untouched for
-`n_keep = 0`, rejects overlapping layer views, and requires the caller-owned Encoder failure to propagate so a late
-state validation error discards the earlier history dispatch. Its scratch output binding is required by the primitive
-step kernel but is not written in commit mode. The Window scheduler still has to run each layer's commit in layer
-order. Commit must not overwrite `hist` before step 3 of the window has read it. That holds because commit runs in the
-next command buffer and after a fence (section 8).
+single ordered segment: convolution history first, recurrent state replay second. `encode_window_gdn_commit_batch`
+binds the four fixed-capacity T=8 replay regions to the 36 `SessionStateStorage` GDN ordinals and their gamma views,
+validates all extents and cross-layer aliases before encoding, then appends the per-layer commits in ordinal order.
+It leaves history and state untouched for `n_keep = 0`; the batch caller-owned Encoder failure must propagate so a
+later-layer validation error discards every earlier encoded layer. Its shared `z` and output scratch bindings are
+required by the primitive step kernel but are not read or written in commit mode. The batch API does not submit the
+command or track SessionStateStorage use; the Window owner still has to register the command-buffer use and run the
+batch after successful verification and before another window reads committed state. Commit must not overwrite
+`hist` before step 3 of the window has read it. That holds because commit runs in the next command buffer and after a
+fence (section 8).
 
 **`strata_gdn_conv_l2`**, grid (80, T) × 128, one channel per thread: `c = 128·tg.x + tid`, row `t = tg.y`.
 Threadgroup b < 32 is a q or k head (b < 16 q, 16 ≤ b < 32 k) and normalises it.
@@ -5224,6 +5228,8 @@ and foreign Context ownership.
 | `metal_util_test` | metal | `strata_util_*` | B |
 | `metal_prefill_test` | metal | `strata_pf_gr_norm`, `strata_pf_gr_norm_lo`, `strata_embed_rows_{q3_k,iq3_s,iq4_xs,bf16}`, `strata_gr_broadcast` | Prefill GR normalization T=1/3/8 covers BF16X2 modes 0/1/2 and random, edge (including an order-sensitive reduction sentinel) and fixture data against a scalar oracle that reproduces 256-thread FMA accumulation and both XOR reduction stages. Scale is U(4), high BF16 is U(1), and the low remainder is bitwise checked from the GPU scale/high outputs. Standalone and shared Encoder forms check read-only inputs, guards, invalid mode/extent/alignment/alias/ownership, and late-failure discard. The embedding gather → GR broadcast → Prefill normalization chain runs in one segment; a concurrent-group fixture verifies rejection. |
 | `metal_dispatch_modes_test` and the `model` properties | model | Section 10.4 | B |
+| `metal_window_gdn_commit_batch_test` | metal | `strata_gdn_conv_commit`, `strata_gdn_step_norm` mode 1 | T=2 accepted-prefix replay across all 36 GDN state ordinals. Per-layer convolution history uses distinct qkv rows; every recurrent state matches an independent per-layer scalar oracle. Rejects a short final gamma and a repeated state view before dispatch, verifies caller-owned transaction rollback after an earlier encoded layer, and preserves replay inputs and unused scratch |
+| `metal_window_gdn_commit_batch_test_concurrent` | metal | Same GDN commit kernels and batch fixture | Runs the same all-layer accepted-prefix fixture with `STRATA_METAL_DISPATCH=concurrent`, preserving serial layer ordering and all oracle, alias and rollback checks |
 
 The indexed-head encoder-specific rejection checks also cover row maps from a
 foreign Context, forged CPU/GPU metadata, and foreign, enqueued or committed

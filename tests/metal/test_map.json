@@ -288,6 +288,14 @@
       "label": "metal",
       "origin": "04 §5.1/§5.4/§5.9/§5.10, 04 §10.5, 09 9.1, L9 T=1 attention-GDN-FFN-router-route-Q8_1-plan-full-mode-MoE-handoffs, D-IMPL-272, D-IMPL-281, D-IMPL-290, REV-077, REV-086, D-IMPL-291, REV-087"
     },
+    "metal_window_gdn_commit_batch_test": {
+      "label": "metal",
+      "origin": "04 §5.5, 09 9.1, L10 all-layer accepted-prefix GDN commit batch, D-IMPL-309, REV-106"
+    },
+    "metal_window_gdn_commit_batch_test_concurrent": {
+      "label": "metal",
+      "origin": "04 §5.5, 09 9.1, L10 all-layer accepted-prefix GDN commit batch, D-IMPL-309, REV-106"
+    },
     "metal_gr_test": {
       "label": "metal",
       "origin": "04 §5.1/§5.4, 09 9.1, D-IMPL-293, REV-090, D-IMPL-299, REV-096, D-IMPL-304, REV-101"

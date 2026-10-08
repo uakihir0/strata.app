@@ -3,8 +3,10 @@
 
 #include "strata/metal/gdn_dispatch.hpp"
 #include "strata/metal/mv_dispatch.hpp"
+#include "strata/metal/session_state.hpp"
 
 #include <cstdint>
+#include <span>
 #include <string>
 
 namespace strata::metal {
@@ -55,6 +57,23 @@ struct WindowGDNCommitBuffers {
     BufferRef output_scratch;
 };
 
+/// Inputs for committing all supported GDN layers in their state-layout order.
+/// Each replay view is laid out [36][8][width] and stores the per-layer qkv,
+/// h, gate and beta snapshots produced by the speculative Window. `states`
+/// and `gamma` have one entry per GDN layer in `SessionStateStorage` ordinal
+/// order. `z` and `output_scratch` are the reusable active-row scratch views;
+/// commit mode does not read or write them.
+struct WindowGDNCommitBatchBuffers {
+    BufferRef qkv_replay;
+    BufferRef h_replay;
+    BufferRef gate_replay;
+    BufferRef beta_replay;
+    BufferRef z;
+    BufferRef output_scratch;
+    std::span<const GdnSessionStateViews> states;
+    std::span<const BufferRef> gamma;
+};
+
 /// Encode the accepted prefix in documented order: advance convolution history,
 /// then replay the GDN recurrence into state. Rows may be 0..8; zero is a no-op.
 /// The caller-owned form requires an ordered segment and must propagate false
@@ -69,6 +88,20 @@ bool encode_window_gdn_commit(Context& context, CommandBuffer& command_buffer,
                               std::uint32_t rows,
                               const WindowGDNCommitBuffers& buffers,
                               std::string& error);
+
+/// Encode accepted-prefix GDN history and recurrent-state commits for all 36
+/// supported GDN layers, in session-state ordinal order. Replay regions use
+/// the fixed T=8 WindowScratch capacity even when `rows` is smaller. The
+/// caller-owned form must be inside an ordered segment and propagate false
+/// from its enclosing Encoder::encode body to discard the whole batch.
+bool encode_window_gdn_commit_batch(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    const WindowGDNCommitBatchBuffers& buffers, std::string& error);
+/// Standalone transactional form; a late validation failure discards every
+/// earlier layer's history and recurrent-state commit.
+bool encode_window_gdn_commit_batch(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    const WindowGDNCommitBatchBuffers& buffers, std::string& error);
 
 /// Encode the speculative GDN block for T in 1..8 in documented order:
 /// mixed→Q8_1→qkv→conv/L2, then alpha/beta, gate projection, window

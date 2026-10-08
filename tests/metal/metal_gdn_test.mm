@@ -10,6 +10,7 @@
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/gdn_dispatch.hpp"
 #include "strata/metal/moe_dispatch.hpp"
+#include "strata/metal/session_state.hpp"
 #include "strata/metal/mv_dispatch.hpp"
 #include "strata/metal/tiered.hpp"
 #include "strata/metal/window_dispatch.hpp"
@@ -4112,6 +4113,387 @@ bool test_window_gdn_block_contract(Context& context) {
     return passed;
 }
 
+bool test_window_gdn_commit_batch(Context& context) {
+    constexpr std::uint32_t rows = 2u;
+    constexpr std::size_t layers = kSessionGdnLayers;
+    constexpr std::size_t row_capacity = 8u;
+    constexpr std::size_t qkv_row_bytes =
+        static_cast<std::size_t>(GDN_CONV_CHANNELS) * sizeof(float);
+    constexpr std::size_t gate_row_bytes =
+        static_cast<std::size_t>(GDN_V_HEADS) * sizeof(float);
+    constexpr std::size_t value_row_bytes =
+        static_cast<std::size_t>(GDN_VALUE_DIM) * sizeof(float);
+    constexpr std::size_t qkv_layer_bytes = row_capacity * qkv_row_bytes;
+    constexpr std::size_t gate_layer_bytes = row_capacity * gate_row_bytes;
+    constexpr std::size_t active_qkv_bytes =
+        static_cast<std::size_t>(rows) * qkv_row_bytes;
+    constexpr std::size_t active_gate_bytes =
+        static_cast<std::size_t>(rows) * gate_row_bytes;
+    std::string error;
+    Geometry geometry;
+    geometry.family = "qwen4exp";
+    geometry.model = "synthetic";
+    geometry.n_layers = kSessionModelLayers;
+    geometry.n_qsa_layers = kSessionQsaLayers;
+    geometry.n_kv_head = kSessionKvHeads;
+    geometry.head_dim = kSessionHeadWidth;
+    geometry.n_embd = kSessionEmbeddingWidth;
+    geometry.vocab = kSessionVocabularySize;
+    auto state_storage = SessionStateStorage::open(context, geometry, error);
+    check(state_storage != nullptr, "open batch GDN session state", error);
+    if (!state_storage) return false;
+
+    auto allocate = [&](const std::string& name, std::size_t bytes) {
+        BufferRef view = context.buffers().allocate(name, bytes, error);
+        check(static_cast<bool>(view), "allocate " + name, error);
+        return view;
+    };
+    const BufferRef qkv_replay =
+        allocate("batch GDN qkv replay", layers * qkv_layer_bytes);
+    const BufferRef h_replay =
+        allocate("batch GDN h replay", layers * qkv_layer_bytes);
+    const BufferRef gate_replay =
+        allocate("batch GDN gate replay", layers * gate_layer_bytes);
+    const BufferRef beta_replay =
+        allocate("batch GDN beta replay", layers * gate_layer_bytes);
+    const BufferRef z = allocate(
+        "batch GDN z scratch", row_capacity * value_row_bytes);
+    const BufferRef output_scratch = allocate(
+        "batch GDN output scratch", row_capacity * value_row_bytes);
+    const BufferRef gamma_storage = allocate(
+        "batch GDN gamma", layers * static_cast<std::size_t>(GDN_VALUE_DIM) *
+                               sizeof(float));
+    if (!qkv_replay || !h_replay || !gate_replay || !beta_replay || !z ||
+        !output_scratch || !gamma_storage) {
+        return false;
+    }
+
+    std::array<GdnSessionStateViews, kSessionGdnLayers> states{};
+    std::array<BufferRef, kSessionGdnLayers> gamma{};
+    const std::size_t gamma_layer_bytes = value_row_bytes;
+    for (std::uint32_t layer = 0u; layer < kSessionGdnLayers; ++layer) {
+        if (!state_storage->gdn_layer(layer, states[layer], error)) {
+            check(false, "resolve GDN session state layer", error);
+            return false;
+        }
+        gamma[layer] = gamma_storage.slice(
+            static_cast<std::size_t>(layer) * gamma_layer_bytes,
+            gamma_layer_bytes);
+        if (!gamma[layer]) {
+            check(false, "slice GDN gamma layer");
+            return false;
+        }
+        auto* history = static_cast<float*>(states[layer].conv_history.contents);
+        auto* recurrent = static_cast<float*>(states[layer].recurrent.contents);
+        std::fill_n(history, kHistoryElements, -1.0f);
+        std::fill_n(recurrent, kStateElements, 0.0f);
+        std::fill_n(static_cast<float*>(gamma[layer].contents),
+                    GDN_VALUE_DIM, 1.0f);
+    }
+
+    auto* qkv_values = static_cast<float*>(qkv_replay.contents);
+    auto* h_values = static_cast<float*>(h_replay.contents);
+    auto* gate_values = static_cast<float*>(gate_replay.contents);
+    auto* beta_values = static_cast<float*>(beta_replay.contents);
+    auto* z_values = static_cast<float*>(z.contents);
+    auto* output_values = static_cast<float*>(output_scratch.contents);
+    std::fill_n(qkv_values, layers * row_capacity * GDN_CONV_CHANNELS,
+                -71.0f);
+    std::fill_n(h_values, layers * row_capacity * GDN_CONV_CHANNELS, -72.0f);
+    std::fill_n(gate_values, layers * row_capacity * GDN_V_HEADS, -73.0f);
+    std::fill_n(beta_values, layers * row_capacity * GDN_V_HEADS, -74.0f);
+    std::fill_n(z_values, row_capacity * GDN_VALUE_DIM, 0.0f);
+    std::fill_n(output_values, row_capacity * GDN_VALUE_DIM, 19.0f);
+
+    const std::size_t active_h_layer_values =
+        static_cast<std::size_t>(rows) * GDN_CONV_CHANNELS;
+    const std::size_t active_gate_layer_values =
+        static_cast<std::size_t>(rows) * GDN_V_HEADS;
+    std::vector<float> active_h(layers * active_h_layer_values);
+    std::vector<float> active_gate(layers * active_gate_layer_values);
+    std::vector<float> active_beta(layers * active_gate_layer_values);
+    std::vector<float> active_z(static_cast<std::size_t>(rows) *
+                                GDN_VALUE_DIM, 0.0f);
+    for (std::uint32_t layer = 0u; layer < kSessionGdnLayers; ++layer) {
+        const std::size_t qkv_layer_offset =
+            static_cast<std::size_t>(layer) * row_capacity *
+            GDN_CONV_CHANNELS;
+        const std::size_t gate_layer_offset =
+            static_cast<std::size_t>(layer) * row_capacity * GDN_V_HEADS;
+        const std::size_t active_h_offset =
+            static_cast<std::size_t>(layer) * active_h_layer_values;
+        const std::size_t active_gate_offset =
+            static_cast<std::size_t>(layer) * active_gate_layer_values;
+        const float gate_sample =
+            -0.005f * static_cast<float>(layer + 1u);
+        const float beta_sample =
+            0.25f + 0.01f * static_cast<float>(layer);
+        for (std::uint32_t row = 0u; row < rows; ++row) {
+            const float qkv_sample =
+                static_cast<float>(layer + 1u) * 0.125f +
+                static_cast<float>(row) * 0.25f;
+            const std::size_t row_h_offset =
+                static_cast<std::size_t>(row) * GDN_CONV_CHANNELS;
+            const std::size_t row_gate_offset =
+                static_cast<std::size_t>(row) * GDN_V_HEADS;
+            std::fill_n(qkv_values + qkv_layer_offset +
+                            row_h_offset,
+                        GDN_CONV_CHANNELS, qkv_sample);
+            for (std::uint32_t value = 0u; value < GDN_CONV_CHANNELS;
+                 ++value) {
+                const int pattern = static_cast<int>(
+                    (value * 7u + row * 13u + layer * 17u) % 37u) - 18;
+                const float sample_value =
+                    static_cast<float>(pattern) * 0.0005f;
+                active_h[active_h_offset + row_h_offset + value] =
+                    sample_value;
+                h_values[qkv_layer_offset + row_h_offset + value] =
+                    sample_value;
+            }
+            std::fill_n(gate_values + gate_layer_offset +
+                            row_gate_offset,
+                        GDN_V_HEADS, gate_sample);
+            std::fill_n(beta_values + gate_layer_offset +
+                            row_gate_offset,
+                        GDN_V_HEADS, beta_sample);
+            std::fill_n(active_gate.data() + active_gate_offset +
+                            row_gate_offset,
+                        GDN_V_HEADS, gate_sample);
+            std::fill_n(active_beta.data() + active_gate_offset +
+                            row_gate_offset,
+                        GDN_V_HEADS, beta_sample);
+        }
+    }
+
+    WindowGDNCommitBatchBuffers buffers{
+        qkv_replay, h_replay, gate_replay, beta_replay, z, output_scratch,
+        std::span<const GdnSessionStateViews>(states),
+        std::span<const BufferRef>(gamma)};
+
+    auto state_and_history_unchanged = [&] {
+        for (const GdnSessionStateViews& state : states) {
+            const auto* history =
+                static_cast<const float*>(state.conv_history.contents);
+            const auto* recurrent =
+                static_cast<const float*>(state.recurrent.contents);
+            if (!std::all_of(history, history + kHistoryElements,
+                             [](float value) { return value == -1.0f; }) ||
+                !std::all_of(recurrent, recurrent + kStateElements,
+                             [](float value) { return value == 0.0f; })) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    bool passed = true;
+    {
+        auto command = context.make_command_buffer(
+            "Window GDN batch short final gamma", error);
+        check(command != nullptr, "create short-gamma batch command", error);
+        if (!command) return false;
+        auto short_gamma = gamma;
+        short_gamma.back() = gamma.back().slice(
+            0u, gamma_layer_bytes - sizeof(float));
+        WindowGDNCommitBatchBuffers invalid = buffers;
+        invalid.gamma = std::span<const BufferRef>(short_gamma);
+        const bool accepted = encode_window_gdn_commit_batch(
+            context, *command, rows, invalid, error);
+        const bool rejected = !accepted &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find("shorter than its active extent") != std::string::npos &&
+            state_and_history_unchanged();
+        check(rejected,
+              "batch validates the last gamma before encoding any layer",
+              error);
+        passed &= rejected;
+    }
+    {
+        auto command = context.make_command_buffer(
+            "Window GDN batch cross-layer alias", error);
+        check(command != nullptr, "create cross-layer batch command", error);
+        if (!command) return false;
+        auto aliased_states = states;
+        aliased_states.back() = aliased_states.front();
+        WindowGDNCommitBatchBuffers invalid = buffers;
+        invalid.states = std::span<const GdnSessionStateViews>(aliased_states);
+        const bool accepted = encode_window_gdn_commit_batch(
+            context, *command, rows, invalid, error);
+        const bool rejected = !accepted &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find("overlaps") != std::string::npos &&
+            state_and_history_unchanged();
+        check(rejected,
+              "batch rejects cross-layer state alias before dispatch", error);
+        passed &= rejected;
+    }
+    {
+        auto command = context.make_command_buffer(
+            "Window GDN caller-owned batch rollback", error);
+        check(command != nullptr, "create caller-owned batch command", error);
+        if (!command) return false;
+        auto short_gamma = gamma;
+        short_gamma.back() = gamma.back().slice(
+            0u, gamma_layer_bytes - sizeof(float));
+        WindowGDNCommitBatchBuffers invalid = buffers;
+        invalid.gamma = std::span<const BufferRef>(short_gamma);
+        const WindowGDNCommitBuffers first_layer{
+            states[0].conv_history,
+            qkv_replay.slice(0u, active_qkv_bytes),
+            states[0].recurrent,
+            h_replay.slice(0u, active_qkv_bytes),
+            gate_replay.slice(0u, active_gate_bytes),
+            beta_replay.slice(0u, active_gate_bytes),
+            z, gamma[0], output_scratch};
+        const bool accepted = Encoder::encode(
+            context, *command, "Window GDN batch enclosing rollback",
+            [&](Encoder& encoder, std::string& body_error) {
+                if (!encode_window_gdn_commit(context, encoder, rows,
+                                              first_layer, body_error)) {
+                    return false;
+                }
+                return encode_window_gdn_commit_batch(
+                    context, encoder, rows, invalid, body_error);
+            },
+            error);
+        const bool rolled_back = !accepted &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find("shorter than its active extent") != std::string::npos &&
+            state_and_history_unchanged();
+        check(rolled_back,
+              "caller-owned batch failure discards earlier encoded commit",
+              error);
+        passed &= rolled_back;
+    }
+
+    const bool committed = run_command(
+        context, "Window GDN all-layer accepted-prefix commit",
+        [&](CommandBuffer& command, std::string& command_error) {
+            return encode_window_gdn_commit_batch(
+                context, command, rows, buffers, command_error);
+        },
+        error);
+    check(committed, "encode and complete all-layer GDN commit", error);
+    passed &= committed;
+    if (!committed) return false;
+
+    bool histories_match = true;
+    bool states_match = true;
+    for (std::uint32_t layer = 0u; layer < kSessionGdnLayers; ++layer) {
+        const auto* actual_history =
+            static_cast<const float*>(states[layer].conv_history.contents);
+        const float row_zero =
+            static_cast<float>(layer + 1u) * 0.125f;
+        const float row_one = row_zero + 0.25f;
+        for (std::uint32_t channel = 0u; channel < GDN_CONV_CHANNELS;
+             ++channel) {
+            const std::size_t base =
+                static_cast<std::size_t>(channel) * 3u;
+            histories_match &= actual_history[base] == -1.0f &&
+                               actual_history[base + 1u] == row_zero &&
+                               actual_history[base + 2u] == row_one;
+        }
+        const auto* actual_state =
+            static_cast<const float*>(states[layer].recurrent.contents);
+        std::vector<float> expected_state(GDN_STATE_ELEMENTS, 0.0f);
+        std::vector<twin::tf> expected_output, expected_final_state;
+        const std::size_t active_h_offset =
+            static_cast<std::size_t>(layer) * active_h_layer_values;
+        const std::size_t active_gate_offset =
+            static_cast<std::size_t>(layer) * active_gate_layer_values;
+        oracle::gdn_step_norm(
+            expected_state,
+            std::span<const float>(active_h).subspan(
+                active_h_offset, active_h_layer_values),
+            std::span<const float>(active_gate).subspan(
+                active_gate_offset, active_gate_layer_values),
+            std::span<const float>(active_beta).subspan(
+                active_gate_offset, active_gate_layer_values),
+            active_z,
+            std::span<const float>(
+                static_cast<const float*>(gamma[layer].contents),
+                GDN_VALUE_DIM),
+            rows, GDNStateMode::commit, expected_output,
+            expected_final_state);
+        states_match &= compare_units(
+            std::span<const float>(actual_state, GDN_STATE_ELEMENTS),
+            expected_final_state, 512.0,
+            "all-layer GDN state replay layer " + std::to_string(layer),
+            twin::Options{}, rows);
+    }
+    check(histories_match,
+          "all 36 GDN histories advance from their own replay rows");
+    check(states_match,
+          "all 36 GDN states match the independent accepted-prefix oracle");
+    passed &= histories_match && states_match;
+
+    bool inputs_unchanged = true;
+    for (std::uint32_t layer = 0u; layer < kSessionGdnLayers; ++layer) {
+        const std::size_t qkv_offset =
+            static_cast<std::size_t>(layer) * row_capacity *
+            GDN_CONV_CHANNELS;
+        const std::size_t gate_offset =
+            static_cast<std::size_t>(layer) * row_capacity * GDN_V_HEADS;
+        for (std::uint32_t row = 0u; row < row_capacity; ++row) {
+            for (std::uint32_t column = 0u; column < GDN_CONV_CHANNELS;
+                 ++column) {
+                const std::size_t index =
+                    qkv_offset + static_cast<std::size_t>(row) *
+                                     GDN_CONV_CHANNELS +
+                    column;
+                const float expected_qkv =
+                    row < rows
+                        ? static_cast<float>(layer + 1u) * 0.125f +
+                              static_cast<float>(row) * 0.25f
+                        : -71.0f;
+                const int pattern = row < rows
+                    ? static_cast<int>(
+                          (column * 7u + row * 13u + layer * 17u) % 37u) -
+                          18
+                    : -144000;
+                const float expected_h =
+                    row < rows ? static_cast<float>(pattern) * 0.0005f
+                               : -72.0f;
+                inputs_unchanged &= qkv_values[index] == expected_qkv &&
+                                    h_values[index] == expected_h;
+            }
+            for (std::uint32_t head = 0u; head < GDN_V_HEADS; ++head) {
+                const std::size_t index =
+                    gate_offset + static_cast<std::size_t>(row) *
+                                      GDN_V_HEADS +
+                    head;
+                const float expected_gate =
+                    row < rows
+                        ? -0.005f * static_cast<float>(layer + 1u)
+                        : -73.0f;
+                const float expected_beta =
+                    row < rows
+                        ? 0.25f + 0.01f * static_cast<float>(layer)
+                        : -74.0f;
+                inputs_unchanged &=
+                    gate_values[index] == expected_gate &&
+                    beta_values[index] == expected_beta;
+            }
+        }
+    }
+    for (const BufferRef& layer_gamma : gamma) {
+        const auto* values = static_cast<const float*>(layer_gamma.contents);
+        inputs_unchanged &= std::all_of(
+            values, values + GDN_VALUE_DIM,
+            [](float value) { return value == 1.0f; });
+    }
+    inputs_unchanged &= std::all_of(
+        z_values, z_values + row_capacity * GDN_VALUE_DIM,
+        [](float value) { return value == 0.0f; });
+    inputs_unchanged &= std::all_of(
+        output_values, output_values + row_capacity * GDN_VALUE_DIM,
+        [](float value) { return value == 19.0f; });
+    check(inputs_unchanged,
+          "batch commit preserves replay inputs and unused scratch");
+    passed &= inputs_unchanged;
+    return passed;
+}
+
 bool run_set(Context& context, twin::InputSet set,
              const twin::Options& options) {
     bool passed = true;
@@ -4172,12 +4554,17 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: metal_gdn_test strata.metallib "
-                     "[--seed N] [--input-set random|edge|fixture]\n");
+                     "[--seed N] [--input-set random|edge|fixture|"
+                     "--window-gdn-commit-batch]\n");
         return 2;
     }
+    const bool gdn_commit_batch_only =
+        argc == 3 &&
+        std::string_view(argv[2]) == "--window-gdn-commit-batch";
     twin::Options options;
     std::string error;
-    if (!twin::parse_options(argc, argv, 2, options, error)) {
+    if (!gdn_commit_batch_only &&
+        !twin::parse_options(argc, argv, 2, options, error)) {
         std::fprintf(stderr, "%s\n", error.c_str());
         return 2;
     }
@@ -4193,6 +4580,14 @@ int main(int argc, char** argv) {
     auto context = Context::open(context_options, error);
     check(context != nullptr, "open Metal context", error);
     if (!context) return 1;
+    if (gdn_commit_batch_only) {
+        const bool passed = test_window_gdn_commit_batch(*context);
+        check(passed && g_failures == 0,
+              "Window GDN all-layer accepted-prefix commit");
+        std::printf("metal_window_gdn_commit_batch_test: %d failures\n",
+                    g_failures);
+        return g_failures == 0 ? 0 : 1;
+    }
     ContextOptions foreign_options = context_options;
     foreign_options.pipelines = false;
     auto foreign_context = Context::open(foreign_options, error);

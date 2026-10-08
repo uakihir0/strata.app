@@ -2,12 +2,14 @@
 #include "strata/metal/window_gdn_dispatch.hpp"
 
 #include "strata/metal/encoder.hpp"
+#include "strata/metal/window_scratch.hpp"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <string_view>
+#include <vector>
 
 #include "../kernels/common/params.h"
 
@@ -132,6 +134,16 @@ bool validate_commit_views(Context& context,
     return true;
 }
 
+bool multiply_size(std::size_t left, std::size_t right,
+                   std::size_t& result) {
+    if (left != 0u &&
+        right > std::numeric_limits<std::size_t>::max() / left) {
+        return false;
+    }
+    result = left * right;
+    return true;
+}
+
 }  // namespace
 
 bool encode_window_gdn_commit(Context& context, Encoder& encoder,
@@ -170,6 +182,202 @@ bool encode_window_gdn_commit(Context& context, CommandBuffer& command_buffer,
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_window_gdn_commit(context, encoder, rows, buffers,
                                             encode_error);
+        },
+        error);
+}
+
+bool encode_window_gdn_commit_batch(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    const WindowGDNCommitBatchBuffers& buffers, std::string& error) {
+    error.clear();
+    if (rows > kWindowScratchTokenRows) {
+        error = "Window GDN commit batch row count must be in 0..8";
+        return false;
+    }
+    if (rows == 0u) return true;
+    if (encoder.concurrent_group_open()) {
+        error =
+            "Window GDN commit batch requires an ordered concurrent-group boundary";
+        return false;
+    }
+    if (buffers.states.size() != kSessionGdnLayers ||
+        buffers.gamma.size() != kSessionGdnLayers) {
+        error = "Window GDN commit batch requires one state and gamma per GDN layer";
+        return false;
+    }
+
+    constexpr std::size_t kFloatBytes = sizeof(float);
+    constexpr std::size_t kReplayRows = kWindowScratchTokenRows;
+    std::size_t qkv_layer_bytes = 0u;
+    std::size_t gate_layer_bytes = 0u;
+    std::size_t qkv_replay_bytes = 0u;
+    std::size_t gate_replay_bytes = 0u;
+    std::size_t active_qkv_bytes = 0u;
+    std::size_t active_gate_bytes = 0u;
+    std::size_t active_value_bytes = 0u;
+    std::size_t history_bytes = 0u;
+    std::size_t state_bytes = 0u;
+    std::size_t gamma_bytes = 0u;
+    if (!multiply_size(kReplayRows, GDN_CONV_CHANNELS, qkv_layer_bytes) ||
+        !multiply_size(qkv_layer_bytes, kFloatBytes, qkv_layer_bytes) ||
+        !multiply_size(kReplayRows, GDN_V_HEADS, gate_layer_bytes) ||
+        !multiply_size(gate_layer_bytes, kFloatBytes, gate_layer_bytes) ||
+        !multiply_size(qkv_layer_bytes, kSessionGdnLayers,
+                       qkv_replay_bytes) ||
+        !multiply_size(gate_layer_bytes, kSessionGdnLayers,
+                       gate_replay_bytes) ||
+        !multiply_size(rows, GDN_CONV_CHANNELS, active_qkv_bytes) ||
+        !multiply_size(active_qkv_bytes, kFloatBytes, active_qkv_bytes) ||
+        !multiply_size(rows, GDN_V_HEADS, active_gate_bytes) ||
+        !multiply_size(active_gate_bytes, kFloatBytes, active_gate_bytes) ||
+        !multiply_size(rows, GDN_VALUE_DIM, active_value_bytes) ||
+        !multiply_size(active_value_bytes, kFloatBytes,
+                       active_value_bytes) ||
+        !multiply_size(GDN_HISTORY_ELEMENTS, kFloatBytes, history_bytes) ||
+        !multiply_size(GDN_STATE_ELEMENTS, kFloatBytes, state_bytes) ||
+        !multiply_size(GDN_VALUE_DIM, kFloatBytes, gamma_bytes)) {
+        error = "Window GDN commit batch scratch extent overflows";
+        return false;
+    }
+
+    const std::array bases{
+        NamedView{buffers.qkv_replay, "qkv replay"},
+        NamedView{buffers.h_replay, "h replay"},
+        NamedView{buffers.gate_replay, "gate replay"},
+        NamedView{buffers.beta_replay, "beta replay"},
+        NamedView{buffers.z, "z scratch"},
+        NamedView{buffers.output_scratch, "output scratch"},
+    };
+    for (std::size_t i = 0u; i < bases.size(); ++i) {
+        if (!bases[i].view || !context.buffers().owns(bases[i].view)) {
+            error = "Window GDN commit batch " +
+                    std::string(bases[i].name) +
+                    " buffer is not owned by this Context";
+            return false;
+        }
+        const std::size_t required =
+            i == 0u || i == 1u
+                ? qkv_replay_bytes
+                : i == 2u || i == 3u ? gate_replay_bytes
+                                      : active_value_bytes;
+        if (bases[i].view.length < required) {
+            error = "Window GDN commit batch " +
+                    std::string(bases[i].name) +
+                    " buffer is shorter than its required extent";
+            return false;
+        }
+        for (std::size_t j = 0u; j < i; ++j) {
+            if (views_overlap(bases[i].view, bases[j].view)) {
+                error = "Window GDN commit batch " +
+                        std::string(bases[i].name) + " buffer overlaps " +
+                        std::string(bases[j].name);
+                return false;
+            }
+        }
+    }
+
+    std::vector<WindowGDNCommitBuffers> commits;
+    commits.reserve(kSessionGdnLayers);
+    std::vector<NamedView> all_layer_views;
+    all_layer_views.reserve(static_cast<std::size_t>(kSessionGdnLayers) * 7u);
+    for (std::uint32_t layer = 0u; layer < kSessionGdnLayers; ++layer) {
+        std::size_t qkv_offset = 0u;
+        std::size_t gate_offset = 0u;
+        if (!multiply_size(layer, qkv_layer_bytes, qkv_offset) ||
+            !multiply_size(layer, gate_layer_bytes, gate_offset)) {
+            error = "Window GDN commit batch layer offset overflows";
+            return false;
+        }
+        const GdnSessionStateViews& state = buffers.states[layer];
+        const BufferRef gamma = buffers.gamma[layer];
+        const WindowGDNCommitBuffers commit{
+            state.conv_history,
+            buffers.qkv_replay.slice(qkv_offset, active_qkv_bytes),
+            state.recurrent,
+            buffers.h_replay.slice(qkv_offset, active_qkv_bytes),
+            buffers.gate_replay.slice(gate_offset, active_gate_bytes),
+            buffers.beta_replay.slice(gate_offset, active_gate_bytes),
+            buffers.z,
+            gamma,
+            buffers.output_scratch,
+        };
+        if (!validate_commit_views(context, commit, error)) {
+            error = "Window GDN commit batch layer " +
+                    std::to_string(layer) + ": " + error;
+            return false;
+        }
+        if (commit.history.length < history_bytes ||
+            commit.qkv.length < active_qkv_bytes ||
+            commit.state.length < state_bytes ||
+            commit.h.length < active_qkv_bytes ||
+            commit.gate.length < active_gate_bytes ||
+            commit.beta.length < active_gate_bytes ||
+            commit.z.length < active_value_bytes ||
+            commit.gamma.length < gamma_bytes ||
+            commit.output_scratch.length < active_value_bytes) {
+            error = "Window GDN commit batch layer " +
+                    std::to_string(layer) +
+                    " has a buffer shorter than its active extent";
+            return false;
+        }
+        commits.push_back(commit);
+        all_layer_views.push_back({commit.history, "history"});
+        all_layer_views.push_back({commit.qkv, "qkv replay"});
+        all_layer_views.push_back({commit.state, "state"});
+        all_layer_views.push_back({commit.h, "h replay"});
+        all_layer_views.push_back({commit.gate, "gate replay"});
+        all_layer_views.push_back({commit.beta, "beta replay"});
+        all_layer_views.push_back({commit.gamma, "gamma"});
+    }
+
+    for (const NamedView& base : bases) {
+        for (const NamedView& layer_view : all_layer_views) {
+            const bool is_own_replay_slice =
+                (base.name == "qkv replay" &&
+                 layer_view.name == "qkv replay") ||
+                (base.name == "h replay" &&
+                 layer_view.name == "h replay") ||
+                (base.name == "gate replay" &&
+                 layer_view.name == "gate replay") ||
+                (base.name == "beta replay" &&
+                 layer_view.name == "beta replay");
+            if (is_own_replay_slice) continue;
+            if (views_overlap(base.view, layer_view.view)) {
+                error = "Window GDN commit batch " +
+                        std::string(base.name) + " buffer overlaps a layer " +
+                        std::string(layer_view.name) + " view";
+                return false;
+            }
+        }
+    }
+    for (std::size_t i = 0u; i < all_layer_views.size(); ++i) {
+        for (std::size_t j = 0u; j < i; ++j) {
+            if (views_overlap(all_layer_views[i].view,
+                              all_layer_views[j].view)) {
+                error = "Window GDN commit batch layer view " +
+                        std::string(all_layer_views[i].name) + " overlaps " +
+                        std::string(all_layer_views[j].name);
+                return false;
+            }
+        }
+    }
+
+    for (const WindowGDNCommitBuffers& commit : commits) {
+        if (!encode_window_gdn_commit(context, encoder, rows, commit, error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool encode_window_gdn_commit_batch(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    const WindowGDNCommitBatchBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Window GDN commit batch",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_gdn_commit_batch(context, encoder, rows,
+                                                  buffers, encode_error);
         },
         error);
 }

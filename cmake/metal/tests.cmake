@@ -301,6 +301,15 @@ strata_metal_test(metal_gdn_test_concurrent metal
 set_tests_properties(metal_gdn_test_concurrent PROPERTIES
   TIMEOUT 300
   ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
+strata_metal_test(metal_window_gdn_commit_batch_test metal
+                  metal_gdn_test ${STRATA_METALLIB}
+                  --window-gdn-commit-batch)
+strata_metal_test(metal_window_gdn_commit_batch_test_concurrent metal
+                  metal_gdn_test ${STRATA_METALLIB}
+                  --window-gdn-commit-batch)
+set_tests_properties(metal_window_gdn_commit_batch_test_concurrent PROPERTIES
+  TIMEOUT 300
+  ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
 
 add_executable(metal_qsa_test tests/metal/metal_qsa_test.mm)
 target_include_directories(metal_qsa_test PRIVATE ${STRATA_METAL_GENERATED_DIR})
