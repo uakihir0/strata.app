@@ -1,6 +1,7 @@
 // Device-free assembly of Window predecessor rows for the artifact PLE hash.
 #include "strata/metal/window_ple_rows.hpp"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 
@@ -105,6 +106,86 @@ bool build_window_ple_rows(
     }
 
     output = candidate;
+    error.clear();
+    return true;
+}
+
+bool WindowPleTokenHistory::replace_committed_history(
+    std::span<const std::uint32_t> committed_prefix,
+    const Geometry& geometry, std::string& error) {
+    const auto fail = [&error](const char* message) {
+        error = message;
+        return false;
+    };
+
+    if (!is_qwen4exp_runtime_geometry(geometry)) {
+        return fail(
+            "committed PLE token history requires supported qwen4exp runtime geometry");
+    }
+    for (const std::uint32_t token : committed_prefix) {
+        if (token >= geometry.vocab) {
+            return fail("committed history token ID is outside the model vocabulary");
+        }
+    }
+
+    std::array<std::uint32_t, 2> candidate{};
+    const std::size_t count = std::min(committed_prefix.size(), candidate.size());
+    for (std::size_t index = 0; index < count; ++index) {
+        candidate[index] =
+            committed_prefix[committed_prefix.size() - count + index];
+    }
+    committed_ids_ = candidate;
+    committed_count_ = static_cast<std::uint32_t>(count);
+    error.clear();
+    return true;
+}
+
+void WindowPleTokenHistory::reset() noexcept {
+    committed_ids_.fill(0u);
+    committed_count_ = 0u;
+}
+
+std::span<const std::uint32_t>
+WindowPleTokenHistory::committed_suffix() const noexcept {
+    return {committed_ids_.data(), committed_count_};
+}
+
+bool WindowPleTokenHistory::build_rows(
+    std::span<const std::uint32_t> tokens, const Geometry& geometry,
+    WindowPleRows& output, std::string& error) const {
+    return build_window_ple_rows(tokens, committed_suffix(), geometry, output,
+                                 error);
+}
+
+bool WindowPleTokenHistory::commit_accepted_prefix(
+    std::span<const std::uint32_t> window_tokens, std::size_t accepted_count,
+    const Geometry& geometry, std::string& error) {
+    if (accepted_count > window_tokens.size()) {
+        error = "accepted token prefix exceeds the speculative window";
+        return false;
+    }
+
+    // Reuse the row builder's validation contract before publishing state.
+    // This also rejects malformed tokens in the speculative suffix rather
+    // than allowing an invalid candidate window to reach the commit boundary.
+    WindowPleRows validated_rows;
+    if (!build_rows(window_tokens, geometry, validated_rows, error)) {
+        return false;
+    }
+
+    auto candidate = committed_ids_;
+    std::uint32_t candidate_count = committed_count_;
+    for (std::size_t index = 0; index < accepted_count; ++index) {
+        if (candidate_count < candidate.size()) {
+            candidate[candidate_count++] = window_tokens[index];
+        } else {
+            candidate[0] = candidate[1];
+            candidate[1] = window_tokens[index];
+        }
+    }
+
+    committed_ids_ = candidate;
+    committed_count_ = candidate_count;
     error.clear();
     return true;
 }

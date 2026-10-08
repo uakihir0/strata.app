@@ -70,6 +70,24 @@ void require_token_rows(const WindowPleRows& actual, std::uint32_t row,
     }
 }
 
+void require_history(const WindowPleTokenHistory& history,
+                     std::span<const std::uint32_t> expected) {
+    const auto actual = history.committed_suffix();
+    require(actual.size() == expected.size(),
+            "committed token suffix has the expected length");
+    require(std::equal(actual.begin(), actual.end(), expected.begin()),
+            "committed token suffix retains the expected IDs oldest first");
+}
+
+void require_same_rows(const WindowPleRows& actual,
+                       const WindowPleRows& expected) {
+    require(actual.token_count() == expected.token_count(),
+            "integrated row builder preserves the candidate token count");
+    require(std::equal(actual.all_rows().begin(), actual.all_rows().end(),
+                       expected.all_rows().begin(), expected.all_rows().end()),
+            "integrated row IDs equal explicit construction from the suffix");
+}
+
 void test_empty_and_partial_history() {
     std::string error = "stale error";
     WindowPleRows rows;
@@ -238,6 +256,176 @@ void test_transactional_rejection_and_id_limits() {
         "Window PLE rows require supported qwen4exp runtime geometry");
 }
 
+void test_committed_token_history_and_speculative_acceptance() {
+    const Geometry geometry = supported_geometry();
+    WindowPleTokenHistory history;
+    std::string error = "stale error";
+    const std::array<std::uint32_t, 0> empty_applied_prefix{};
+    require(history.replace_committed_history(empty_applied_prefix, geometry,
+                                              error),
+            "initialize an empty history for a one-token prompt: " + error);
+    require_history(history, empty_applied_prefix);
+    const std::array<std::uint32_t, 1> single_prompt_pending_token{77u};
+    WindowPleRows integrated;
+    WindowPleRows explicit_rows;
+    require(history.build_rows(single_prompt_pending_token, geometry,
+                               integrated, error),
+            "build the first decode row of a one-token prompt: " + error);
+    require(build_window_ple_rows(single_prompt_pending_token,
+                                  empty_applied_prefix, geometry,
+                                  explicit_rows, error),
+            "build the one-token prompt from empty applied history: " + error);
+    require_same_rows(integrated, explicit_rows);
+    require_history(history, empty_applied_prefix);
+    require(history.commit_accepted_prefix(single_prompt_pending_token, 1u,
+                                           geometry, error),
+            "commit the pending one-token prompt decode: " + error);
+    require_history(history, single_prompt_pending_token);
+
+    const std::array<std::uint32_t, 3> prompt_prefix_applied{1u, 2u, 3u};
+    require(history.replace_committed_history(prompt_prefix_applied, geometry,
+                                              error),
+            "initialize only from prompt tokens already applied to state: " +
+                error);
+    const std::array<std::uint32_t, 2> prompt_suffix{2u, 3u};
+    require_history(history, prompt_suffix);
+    require(error.empty(), "successful initialization clears prior errors");
+
+    const std::array<std::uint32_t, 1> pending_prompt_token{4u};
+    require(history.build_rows(pending_prompt_token, geometry, integrated,
+                               error),
+            "build the first decode row for the pending prompt token: " +
+                error);
+    require(build_window_ple_rows(pending_prompt_token, prompt_suffix,
+                                  geometry, explicit_rows, error),
+            "build the first decode row from the applied prompt prefix: " +
+                error);
+    require_same_rows(integrated, explicit_rows);
+    require_history(history, prompt_suffix);
+    require(history.commit_accepted_prefix(pending_prompt_token, 1u, geometry,
+                                           error),
+            "advance prompt history only after its first decode commit: " +
+                error);
+    const std::array<std::uint32_t, 2> after_prompt_decode{3u, 4u};
+    require_history(history, after_prompt_decode);
+
+    const std::array<std::uint32_t, 3> speculative_window{21u, 22u, 23u};
+    require(history.build_rows(speculative_window, geometry, integrated,
+                               error),
+            "build rows from session-owned committed history: " + error);
+    require(build_window_ple_rows(speculative_window, after_prompt_decode,
+                                  geometry,
+                                  explicit_rows, error),
+            "build explicit rows for the same committed suffix: " + error);
+    require_same_rows(integrated, explicit_rows);
+    require_history(history, after_prompt_decode);
+
+    require(history.commit_accepted_prefix(speculative_window, 2u, geometry,
+                                           error),
+            "commit only the accepted speculative prefix: " + error);
+    const std::array<std::uint32_t, 2> accepted_suffix{21u, 22u};
+    require_history(history, accepted_suffix);
+
+    const std::array<std::uint32_t, 2> next_window{24u, 25u};
+    require(history.build_rows(next_window, geometry, integrated, error),
+            "build the next window after accepted-prefix commit: " + error);
+    require(build_window_ple_rows(next_window, accepted_suffix, geometry,
+                                  explicit_rows, error),
+            "build the next window from the explicit accepted suffix: " +
+                error);
+    require_same_rows(integrated, explicit_rows);
+
+    require(history.commit_accepted_prefix(next_window, 0u, geometry, error),
+            "a zero-token acceptance is a valid no-op: " + error);
+    require_history(history, accepted_suffix);
+
+    const std::array<std::uint32_t, kWindowPleMaxTokens> full_window{
+        30u, 31u, 32u, 33u, 34u, 35u, 36u, 37u};
+    require(history.commit_accepted_prefix(full_window, full_window.size(),
+                                           geometry, error),
+            "commit all accepted rows in a T=8 window: " + error);
+    const std::array<std::uint32_t, 2> full_suffix{36u, 37u};
+    require_history(history, full_suffix);
+
+    const std::array<std::uint32_t, 2> one_token_window{38u, 39u};
+    require(history.commit_accepted_prefix(one_token_window, 1u, geometry,
+                                           error),
+            "advance the suffix by exactly one accepted token: " + error);
+    const std::array<std::uint32_t, 2> one_token_suffix{37u, 38u};
+    require_history(history, one_token_suffix);
+}
+
+void test_token_history_transactional_rejection_and_reset() {
+    const Geometry geometry = supported_geometry();
+    WindowPleTokenHistory history;
+    std::string error;
+    const std::array<std::uint32_t, 2> initial{8u, 9u};
+    require(history.replace_committed_history(initial, geometry, error),
+            "establish transaction baseline: " + error);
+
+    const auto rejects_without_mutation =
+        [&](auto&& operation, const std::string& expected_error) {
+            error.clear();
+            require(!operation(), "invalid token-history operation is rejected");
+            require(error == expected_error,
+                    "invalid token-history operation reports its failure");
+            require_history(history, initial);
+        };
+
+    const std::array<std::uint32_t, 2> invalid_prompt{10u, 248'320u};
+    rejects_without_mutation(
+        [&] {
+            return history.replace_committed_history(invalid_prompt, geometry,
+                                                     error);
+        },
+        "committed history token ID is outside the model vocabulary");
+
+    Geometry wrong_geometry = geometry;
+    wrong_geometry.family = "unsupported";
+    rejects_without_mutation(
+        [&] {
+            return history.replace_committed_history(initial, wrong_geometry,
+                                                     error);
+        },
+        "committed PLE token history requires supported qwen4exp runtime geometry");
+
+    const std::array<std::uint32_t, 2> valid_window{11u, 12u};
+    rejects_without_mutation(
+        [&] {
+            return history.commit_accepted_prefix(valid_window, 3u, geometry,
+                                                   error);
+        },
+        "accepted token prefix exceeds the speculative window");
+
+    const std::array<std::uint32_t, 2> invalid_window{11u, 248'320u};
+    rejects_without_mutation(
+        [&] {
+            return history.commit_accepted_prefix(invalid_window, 1u,
+                                                   geometry, error);
+        },
+        "Window token ID is outside the model vocabulary");
+
+    rejects_without_mutation(
+        [&] {
+            WindowPleRows rows;
+            return history.build_rows(invalid_window, geometry, rows, error);
+        },
+        "Window token ID is outside the model vocabulary");
+
+    history.reset();
+    require_history(history, {});
+    const std::array<std::uint32_t, 1> first_token{0u};
+    require(history.commit_accepted_prefix(first_token, 1u, geometry, error),
+            "a reset history accepts its first committed token: " + error);
+    require_history(history, first_token);
+
+    history.reset();
+    require_history(history, {});
+    require(history.replace_committed_history({}, geometry, error),
+            "an empty committed prompt initializes empty PLE history: " + error);
+    require_history(history, {});
+}
+
 }  // namespace
 
 int main() {
@@ -245,6 +433,8 @@ int main() {
         test_empty_and_partial_history();
         test_all_window_sizes_and_eos();
         test_transactional_rejection_and_id_limits();
+        test_committed_token_history_and_speculative_acceptance();
+        test_token_history_transactional_rejection_and_reset();
     } catch (const std::exception& e) {
         std::cerr << "metal_window_ple_rows_test: " << e.what() << '\n';
         return 1;

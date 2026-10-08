@@ -43,4 +43,41 @@ bool build_window_ple_rows(
     std::span<const std::uint32_t> committed_history,
     const Geometry& geometry, WindowPleRows& output, std::string& error);
 
+/// Session-owned suffix of committed token IDs used to prepare later PLE rows.
+/// The owning Window/session must call commit_accepted_prefix only after its
+/// GPU state commit succeeds; speculative tokens do not mutate this history.
+class WindowPleTokenHistory {
+public:
+    /// Replace state from token IDs already applied to model state, retaining
+    /// only their last two IDs. For prompt startup, exclude the prompt's last
+    /// token when it is still pending as the first T=1 decode window. Invalid
+    /// input leaves the previous state intact.
+    bool replace_committed_history(
+        std::span<const std::uint32_t> committed_prefix,
+        const Geometry& geometry, std::string& error);
+
+    /// Clear the committed suffix, for example when resetting a session.
+    void reset() noexcept;
+
+    /// Return up to two committed IDs in oldest-first order.
+    std::span<const std::uint32_t> committed_suffix() const noexcept;
+
+    /// Build rows using this object's committed suffix without changing it.
+    bool build_rows(std::span<const std::uint32_t> tokens,
+                    const Geometry& geometry, WindowPleRows& output,
+                    std::string& error) const;
+
+    /// Append only the accepted prefix of a validated 1..8-token window.
+    /// Call only after the corresponding GPU state commit succeeds.
+    /// Invalid input leaves the committed suffix intact.
+    bool commit_accepted_prefix(
+        std::span<const std::uint32_t> window_tokens,
+        std::size_t accepted_count, const Geometry& geometry,
+        std::string& error);
+
+private:
+    std::uint32_t committed_count_ = 0;
+    std::array<std::uint32_t, 2> committed_ids_{};
+};
+
 }  // namespace strata::metal

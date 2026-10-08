@@ -754,6 +754,13 @@ window (section 8.5) and a prefill chunk (section 6.4) do.
   with `strata_ple_history` (section 5.3). Any other window reads it and never writes it.
 - The window keeps its normalised rows `ple_norm[T][10240]` in the arena until the commit that follows it, which
   rebuilds `hist` from the first `n_keep` of them.
+- The host's PLE row-index builder also needs the last two committed token IDs. `WindowPleTokenHistory`
+  (D-IMPL-301) retains only that oldest-first suffix: constructing rows is read-only, and a speculative window
+  advances it only after the caller confirms that the GPU state commit succeeded, using the accepted prefix.
+  Seed it only from token IDs already applied to model state. In the prompt path, the last prompt token is the
+  first T=1 decode window ([section 6.1](#61-the-chunk-loop-and-the-arena)); do not include it in the initial
+  suffix until that window commits. This token-ID suffix is separate from the floating-point `hist` above and is
+  not yet wired into `Window::run`.
 
 ### 4.9 RoPE table
 

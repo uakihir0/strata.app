@@ -124,7 +124,7 @@
     },
     "metal_window_ple_rows_test": {
       "label": "host",
-      "origin": "04 5.1, D-IMPL-185"
+      "origin": "04 5.1, D-IMPL-185, D-IMPL-301, REV-098"
     },
     "metal_tiered_layout_test": {
       "label": "host",
