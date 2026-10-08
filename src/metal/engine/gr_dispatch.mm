@@ -95,6 +95,24 @@ bool validate_buffer(Context& context, BufferRef buffer,
     return true;
 }
 
+bool validate_buffer(Context& context, ReadOnlyBufferRef buffer,
+                     std::size_t required_bytes,
+                     std::size_t alignment, std::string_view name,
+                     std::string_view family, std::string& error) {
+    if (!buffer || !context.buffers().owns(buffer)) {
+        error = std::string(family) + " " + std::string(name) +
+                " buffer is not owned by this Context";
+        return false;
+    }
+    if (alignment == 0u || buffer.length() < required_bytes ||
+        buffer.offset() % alignment != 0u) {
+        error = std::string(family) + " " + std::string(name) +
+                " buffer is missing, undersized or misaligned";
+        return false;
+    }
+    return true;
+}
+
 bool validate_cpu_backing(BufferRef buffer, std::string_view name,
                           std::string_view family, std::string& error) {
     id<MTLBuffer> native = (__bridge id<MTLBuffer>)buffer.handle;
@@ -159,6 +177,20 @@ bool buffer_views_overlap(BufferRef left, BufferRef right) {
     const bool gpu_backing_overlap = address_ranges_overlap(
         left.gpu_address, left.length, right.gpu_address, right.length);
     return same_buffer_overlap || cpu_backing_overlap || gpu_backing_overlap;
+}
+
+bool buffer_views_overlap(ReadOnlyBufferRef left, BufferRef right) {
+    const void* const left_contents = left.contents();
+    const bool cpu_backing_overlap =
+        left_contents != nullptr && right.contents != nullptr &&
+        address_ranges_overlap(
+            reinterpret_cast<std::uintptr_t>(left_contents), left.length(),
+            reinterpret_cast<std::uintptr_t>(right.contents), right.length);
+    const bool gpu_backing_overlap =
+        left.gpu_address() != 0u && right.gpu_address != 0u &&
+        address_ranges_overlap(left.gpu_address(), left.length(),
+                               right.gpu_address, right.length);
+    return cpu_backing_overlap || gpu_backing_overlap;
 }
 
 template <class Address>
@@ -279,10 +311,11 @@ bool checked_float_bytes(std::uint32_t rows, std::uint32_t n_cols,
     return true;
 }
 
+template <class Buffers>
 bool validate_weighted_rms_norm(
     Context& context, std::uint32_t rows, std::uint32_t n_cols,
     std::uint32_t gamma_period, float epsilon,
-    const WeightedRMSNormBuffers& buffers, std::size_t& input_bytes,
+    const Buffers& buffers, std::size_t& input_bytes,
     std::size_t& gamma_bytes, std::string& error) {
     if (rows == 0u) {
         error = "Weighted RMS norm row count must be positive";
@@ -327,19 +360,13 @@ bool validate_weighted_rms_norm(
         return false;
     }
 
-    const std::array bindings{
-        buffers.input, buffers.gamma, buffers.output,
-    };
-    const std::array required_bytes{input_bytes, gamma_bytes, input_bytes};
-    constexpr std::array<std::string_view, 3> names{
-        "input", "gamma", "output",
-    };
-    for (std::size_t index = 0; index < bindings.size(); ++index) {
-        if (!validate_buffer(context, bindings[index], required_bytes[index],
-                             alignof(float), names[index],
-                             "Weighted RMS norm", error)) {
-            return false;
-        }
+    if (!validate_buffer(context, buffers.input, input_bytes, alignof(float),
+                         "input", "Weighted RMS norm", error) ||
+        !validate_buffer(context, buffers.gamma, gamma_bytes, alignof(float),
+                         "gamma", "Weighted RMS norm", error) ||
+        !validate_buffer(context, buffers.output, input_bytes, alignof(float),
+                         "output", "Weighted RMS norm", error)) {
+        return false;
     }
 
     const bool exact_in_place_view =
@@ -1681,6 +1708,78 @@ bool encode_weighted_rms_norm(
     }
     return Encoder::encode(
         context, command_buffer, "Weighted RMS norm",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_weighted_rms_norm(
+                context, encoder, rows, n_cols, gamma_period, epsilon,
+                buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_weighted_rms_norm(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    std::uint32_t n_cols, std::uint32_t gamma_period, float epsilon,
+    const ReadOnlyWeightedRMSNormBuffers& buffers, std::string& error) {
+    error.clear();
+    std::size_t input_bytes = 0u;
+    std::size_t gamma_bytes = 0u;
+    if (!validate_weighted_rms_norm(
+            context, rows, n_cols, gamma_period, epsilon, buffers,
+            input_bytes, gamma_bytes, error)) {
+        return false;
+    }
+    const RMSNormParams params{n_cols, gamma_period, epsilon};
+    const std::array read_only_bindings{
+        EncoderReadOnlyBufferBinding{
+            buffers.gamma, 1u, gamma_bytes, alignof(float)},
+    };
+    const EncoderBytesBinding params_binding{&params, sizeof(params), 3u};
+    const std::array byte_bindings{params_binding};
+    const bool exact_in_place_view =
+        buffers.input.handle == buffers.output.handle &&
+        buffers.input.offset == buffers.output.offset &&
+        buffers.input.length == buffers.output.length;
+    if (exact_in_place_view) {
+        const std::array writable_bindings{
+            EncoderBufferBinding{
+                buffers.input, 0u, input_bytes, alignof(float)},
+            EncoderBufferBinding{
+                buffers.output, 2u, input_bytes, alignof(float)},
+        };
+        return encoder.dispatch(
+            "strata_rms_norm_w", {rows, 1u, 1u},
+            {kRMSNormThreads, 1u, 1u}, writable_bindings,
+            read_only_bindings, byte_bindings, {}, error);
+    }
+
+    const ReadOnlyBufferRef read_only_input =
+        context.buffers().read_only(buffers.input);
+    if (!read_only_input) {
+        error = "Weighted RMS norm input is not owned by this Context";
+        return false;
+    }
+    const std::array writable_bindings{
+        EncoderBufferBinding{
+            buffers.output, 2u, input_bytes, alignof(float)},
+    };
+    const std::array read_only_inputs{
+        EncoderReadOnlyBufferBinding{
+            read_only_input, 0u, input_bytes, alignof(float)},
+        read_only_bindings[0],
+    };
+    return encoder.dispatch(
+        "strata_rms_norm_w", {rows, 1u, 1u},
+        {kRMSNormThreads, 1u, 1u}, writable_bindings, read_only_inputs,
+        byte_bindings, {}, error);
+}
+
+bool encode_weighted_rms_norm(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    std::uint32_t n_cols, std::uint32_t gamma_period, float epsilon,
+    const ReadOnlyWeightedRMSNormBuffers& buffers, std::string& error) {
+    error.clear();
+    return Encoder::encode(
+        context, command_buffer, "Weighted RMS norm read-only gamma",
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_weighted_rms_norm(
                 context, encoder, rows, n_cols, gamma_period, epsilon,

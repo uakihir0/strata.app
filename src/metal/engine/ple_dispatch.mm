@@ -51,6 +51,24 @@ bool validate_buffer(Context& context, BufferRef buffer,
     return true;
 }
 
+bool validate_buffer(Context& context, ReadOnlyBufferRef buffer,
+                     std::size_t required_bytes, std::size_t alignment,
+                     std::string_view family, std::string_view name,
+                     std::string& error) {
+    if (!buffer || !context.buffers().owns(buffer)) {
+        error = std::string(family) + " " + std::string(name) +
+                " buffer is not owned by this Context";
+        return false;
+    }
+    if (buffer.length() < required_bytes ||
+        alignment == 0u || buffer.offset() % alignment != 0u) {
+        error = std::string(family) + " " + std::string(name) +
+                " buffer is undersized or misaligned";
+        return false;
+    }
+    return true;
+}
+
 template <class Address>
 bool address_ranges_overlap(Address left, std::size_t left_bytes,
                             Address right, std::size_t right_bytes) {
@@ -78,6 +96,24 @@ bool buffer_views_overlap(BufferRef left, BufferRef right) {
     return same_buffer_overlap || cpu_backing_overlap || gpu_backing_overlap;
 }
 
+bool buffer_views_overlap(ReadOnlyBufferRef left, BufferRef right) {
+    const void* const left_contents = left.contents();
+    const bool cpu_backing_overlap =
+        left_contents != nullptr && right.contents != nullptr &&
+        address_ranges_overlap(
+            reinterpret_cast<std::uintptr_t>(left_contents), left.length(),
+            reinterpret_cast<std::uintptr_t>(right.contents), right.length);
+    const bool gpu_backing_overlap =
+        left.gpu_address() != 0u && right.gpu_address != 0u &&
+        address_ranges_overlap(left.gpu_address(), left.length(),
+                               right.gpu_address, right.length);
+    return cpu_backing_overlap || gpu_backing_overlap;
+}
+
+bool buffer_views_overlap(BufferRef left, ReadOnlyBufferRef right) {
+    return buffer_views_overlap(right, left);
+}
+
 bool buffer_views_start_at_same_address(BufferRef left, BufferRef right) {
     return (left.handle == right.handle && left.offset == right.offset) ||
            (left.contents != nullptr && left.contents == right.contents) ||
@@ -92,12 +128,6 @@ bool validate_ple_post_projection_aliases(
         error = "PLE post-projection row count must be in 1..8";
         return false;
     }
-    const std::array views{
-        buffers.key,          buffers.residual,    buffers.query,
-        buffers.ple_norm,     buffers.value,       buffers.gate,
-        buffers.gated,        buffers.history,     buffers.conv1d,
-        buffers.key_gamma,    buffers.query_gamma, buffers.conv_gamma,
-    };
     constexpr std::size_t query_index = 2u;
     constexpr std::size_t norm_index = 3u;
     constexpr std::array<std::string_view, 12> names{
@@ -105,15 +135,47 @@ bool validate_ple_post_projection_aliases(
         "value",     "gate",       "gated",     "history",
         "conv1d",    "key gamma",  "query gamma", "conv gamma",
     };
-    for (std::size_t left = 0; left < views.size(); ++left) {
-        for (std::size_t right = left + 1u; right < views.size(); ++right) {
-            if (!buffer_views_overlap(views[left], views[right])) continue;
+    struct Role {
+        BufferRef writable;
+        ReadOnlyBufferRef readonly;
+        std::string_view name;
+    };
+    const std::array roles{
+        Role{buffers.key, {}, names[0]},
+        Role{buffers.residual, {}, names[1]},
+        Role{buffers.query, {}, names[2]},
+        Role{buffers.ple_norm, {}, names[3]},
+        Role{buffers.value, {}, names[4]},
+        Role{buffers.gate, {}, names[5]},
+        Role{buffers.gated, {}, names[6]},
+        Role{buffers.history, {}, names[7]},
+        Role{{}, buffers.conv1d, names[8]},
+        Role{{}, buffers.key_gamma, names[9]},
+        Role{{}, buffers.query_gamma, names[10]},
+        Role{{}, buffers.conv_gamma, names[11]},
+    };
+    const auto overlaps = [](const Role& left, const Role& right) {
+        if (left.writable && right.writable) {
+            return buffer_views_overlap(left.writable, right.writable);
+        }
+        if (left.readonly && right.writable) {
+            return buffer_views_overlap(left.readonly, right.writable);
+        }
+        if (left.writable && right.readonly) {
+            return buffer_views_overlap(left.writable, right.readonly);
+        }
+        return false;
+    };
+    for (std::size_t left = 0; left < roles.size(); ++left) {
+        for (std::size_t right = left + 1u; right < roles.size(); ++right) {
+            if (!overlaps(roles[left], roles[right])) continue;
             const bool documented_scratch_reuse =
                 left == query_index && right == norm_index &&
-                buffer_views_start_at_same_address(views[left], views[right]);
+                buffer_views_start_at_same_address(
+                    roles[left].writable, roles[right].writable);
             if (documented_scratch_reuse) continue;
-            error = "PLE post-projection " + std::string(names[left]) +
-                    " and " + std::string(names[right]) +
+            error = "PLE post-projection " + std::string(roles[left].name) +
+                    " and " + std::string(roles[right].name) +
                     " buffers must not overlap";
             return false;
         }
@@ -126,18 +188,23 @@ bool validate_ple_block_aliases(bool quantized_key,
                                std::string& error) {
     struct Role {
         BufferRef view;
+        ReadOnlyBufferRef readonly;
         std::string_view name;
         bool writes;
     };
     std::array<Role, 18> roles{};
     std::size_t count = 0u;
     const auto add = [&](BufferRef view, std::string_view name, bool writes) {
-        roles[count++] = {view, name, writes};
+        roles[count++] = {view, {}, name, writes};
+    };
+    const auto add_readonly = [&](ReadOnlyBufferRef view,
+                                  std::string_view name) {
+        roles[count++] = {{}, view, name, false};
     };
     add(buffers.input_f32, "input", false);
-    add(buffers.key_weights, "key weights", false);
-    add(buffers.value_weights, "value weights", false);
-    add(buffers.active_rows, "active rows", false);
+    add_readonly(buffers.key_weights, "key weights");
+    add_readonly(buffers.value_weights, "value weights");
+    add_readonly(buffers.active_rows, "active rows");
     if (quantized_key) add(buffers.key_q8_1, "key Q8_1", true);
     add(buffers.matvec_sink, "mat-vec sink", true);
 
@@ -151,14 +218,26 @@ bool validate_ple_block_aliases(bool quantized_key,
     add(buffers.post.gate, "gate", true);
     add(buffers.post.gated, "gated value", true);
     add(buffers.post.history, "history", true);
-    add(buffers.post.conv1d, "convolution weights", false);
-    add(buffers.post.key_gamma, "key gamma", false);
-    add(buffers.post.query_gamma, "query gamma", false);
-    add(buffers.post.conv_gamma, "convolution gamma", false);
+    add_readonly(buffers.post.conv1d, "convolution weights");
+    add_readonly(buffers.post.key_gamma, "key gamma");
+    add_readonly(buffers.post.query_gamma, "query gamma");
+    add_readonly(buffers.post.conv_gamma, "convolution gamma");
 
+    const auto overlaps = [](const Role& left, const Role& right) {
+        if (left.view && right.view) {
+            return buffer_views_overlap(left.view, right.view);
+        }
+        if (left.readonly && right.view) {
+            return buffer_views_overlap(left.readonly, right.view);
+        }
+        if (left.view && right.readonly) {
+            return buffer_views_overlap(left.view, right.readonly);
+        }
+        return false;
+    };
     for (std::size_t left = 0u; left < count; ++left) {
         for (std::size_t right = left + 1u; right < count; ++right) {
-            if (!buffer_views_overlap(roles[left].view, roles[right].view)) {
+            if (!overlaps(roles[left], roles[right])) {
                 continue;
             }
             const bool documented_query_norm_reuse =
@@ -319,29 +398,38 @@ bool validate_ple_conv_residual(
         static_cast<std::size_t>(HC_DIM) * PLE_HISTORY_ROWS * sizeof(float);
     constexpr std::size_t conv1d_bytes =
         static_cast<std::size_t>(HC_DIM) * 4u * sizeof(std::uint16_t);
-    const std::array bindings{
-        buffers.ple_norm, buffers.history, buffers.conv1d,
-        buffers.gated, buffers.residual,
-    };
-    const std::array required_bytes{
-        row_bytes, history_bytes, conv1d_bytes, row_bytes, row_bytes,
-    };
-    const std::array alignments{
-        alignof(float), alignof(float), alignof(std::uint16_t),
-        alignof(float), alignof(float),
-    };
-    const std::array<std::string_view, 5> names{
-        "ple_norm", "history", "conv1d", "gated", "residual",
-    };
+    const std::array bindings{buffers.residual};
+    const std::array required_bytes{row_bytes};
+    constexpr std::array<std::string_view, 1> names{"residual"};
     for (std::size_t index = 0; index < bindings.size(); ++index) {
         if (!validate_buffer(context, bindings[index], required_bytes[index],
-                             alignments[index], "PLE conv-residual",
+                             alignof(float), "PLE conv-residual",
                              names[index], error)) {
             return false;
         }
     }
-    for (std::size_t index = 0; index + 1u < bindings.size(); ++index) {
-        if (buffer_views_overlap(buffers.residual, bindings[index])) {
+    const std::array read_only_bindings{
+        buffers.ple_norm, buffers.history, buffers.conv1d, buffers.gated,
+    };
+    const std::array read_only_required_bytes{
+        row_bytes, history_bytes, conv1d_bytes, row_bytes,
+    };
+    constexpr std::array<std::string_view, 4> read_only_names{
+        "ple_norm", "history", "convolution weights", "gated",
+    };
+    constexpr std::array<std::size_t, 4> read_only_alignments{
+        alignof(float), alignof(float), alignof(std::uint16_t), alignof(float),
+    };
+    for (std::size_t index = 0; index < read_only_bindings.size(); ++index) {
+        if (!validate_buffer(context, read_only_bindings[index],
+                             read_only_required_bytes[index],
+                             read_only_alignments[index], "PLE conv-residual",
+                             read_only_names[index], error)) {
+            return false;
+        }
+    }
+    for (const ReadOnlyBufferRef& input : read_only_bindings) {
+        if (buffer_views_overlap(input, buffers.residual)) {
             error = "PLE conv-residual output must not overlap an input";
             return false;
         }
@@ -484,22 +572,25 @@ bool encode_ple_conv_residual(
         static_cast<std::size_t>(HC_DIM) * 4u * sizeof(std::uint16_t);
     const std::size_t row_bytes =
         static_cast<std::size_t>(rows) * HC_DIM * sizeof(float);
-    const std::array bindings{
-        EncoderBufferBinding{
-            buffers.ple_norm, 0u, row_bytes, alignof(float)},
-        EncoderBufferBinding{
-            buffers.history, 1u, history_bytes, alignof(float)},
-        EncoderBufferBinding{
-            buffers.conv1d, 2u, conv1d_bytes, alignof(std::uint16_t)},
-        EncoderBufferBinding{
-            buffers.gated, 3u, row_bytes, alignof(float)},
+    const std::array writable_bindings{
         EncoderBufferBinding{
             buffers.residual, 4u, row_bytes, alignof(float)},
+    };
+    const std::array readonly_bindings{
+        EncoderReadOnlyBufferBinding{
+            buffers.ple_norm, 0u, row_bytes, alignof(float)},
+        EncoderReadOnlyBufferBinding{
+            buffers.history, 1u, history_bytes, alignof(float)},
+        EncoderReadOnlyBufferBinding{
+            buffers.conv1d, 2u, conv1d_bytes, alignof(std::uint16_t)},
+        EncoderReadOnlyBufferBinding{
+            buffers.gated, 3u, row_bytes, alignof(float)},
     };
     return encoder.dispatch(
         "strata_ple_conv_residual",
         {kPLEConvResidualGroups, rows, 1u},
-        {kPLEConvResidualThreads, 1u, 1u}, bindings, {}, {}, error);
+        {kPLEConvResidualThreads, 1u, 1u}, writable_bindings,
+        readonly_bindings, {}, {}, error);
 }
 
 bool encode_ple_conv_residual(
@@ -565,22 +656,46 @@ bool encode_ple_block(
         key_activations = buffers.key_q8_1;
     }
 
-    const MatVecBuffers key_buffers{
-        key_activations, buffers.key_weights, buffers.post.key,
-        buffers.matvec_sink, buffers.active_rows,
-    };
-    if (!encode_matvec(context, encoder, key_format, N_EMBD, HC_DIM, rows,
-                       compiled_columns, key_buffers, error)) {
+    const ReadOnlyBufferRef read_only_key_activations =
+        context.buffers().read_only(key_activations);
+    if (!read_only_key_activations) {
+        error = "PLE key activations are not owned by this Context";
+        return false;
+    }
+    bool key_encoded = false;
+    if (key_format == MatVecWeightFormat::q2_0) {
+        key_encoded = encode_q2_0_matvec(
+            context, encoder, N_EMBD, HC_DIM, rows, compiled_columns,
+            {read_only_key_activations, buffers.key_weights,
+             buffers.active_rows, buffers.post.key, buffers.matvec_sink},
+            error);
+    } else if (key_format == MatVecWeightFormat::q8_0) {
+        key_encoded = encode_q8_0_matvec(
+            context, encoder, N_EMBD, HC_DIM, rows, compiled_columns,
+            {read_only_key_activations, buffers.key_weights,
+             buffers.active_rows, buffers.post.key, buffers.matvec_sink},
+            error);
+    } else if (key_format == MatVecWeightFormat::bf16) {
+        key_encoded = encode_bf16_matvec(
+            context, encoder, N_EMBD, HC_DIM, rows, compiled_columns,
+            {context.buffers().read_only(buffers.input_f32),
+             buffers.key_weights, buffers.active_rows, buffers.post.key,
+             buffers.matvec_sink},
+            error);
+    }
+    if (!key_encoded) {
         return false;
     }
 
-    const MatVecBuffers value_buffers{
-        buffers.input_f32, buffers.value_weights, buffers.post.value,
-        buffers.matvec_sink, buffers.active_rows,
+    const ReadOnlyBF16MatVecBuffers value_buffers{
+        context.buffers().read_only(buffers.input_f32),
+        buffers.value_weights,
+        buffers.active_rows,
+        buffers.post.value,
+        buffers.matvec_sink,
     };
-    if (!encode_matvec(context, encoder, MatVecWeightFormat::bf16, N_EMBD,
-                       N_EMBD, rows, compiled_columns, value_buffers,
-                       error)) {
+    if (!encode_bf16_matvec(context, encoder, N_EMBD, N_EMBD, rows,
+                            compiled_columns, value_buffers, error)) {
         return false;
     }
     return encode_ple_post_projection(context, encoder, rows, history_update,
@@ -695,8 +810,9 @@ bool encode_ple_post_projection(
     }
     if (!encode_ple_conv_residual(
             context, encoder, rows,
-            {buffers.ple_norm, buffers.history, buffers.conv1d,
-             buffers.gated, buffers.residual},
+            {context.buffers().read_only(buffers.ple_norm),
+             context.buffers().read_only(buffers.history), buffers.conv1d,
+             context.buffers().read_only(buffers.gated), buffers.residual},
             error)) {
         return false;
     }

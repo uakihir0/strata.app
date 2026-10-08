@@ -964,7 +964,8 @@ bool test_weighted_rms_norm_encoder_validation(
     BufferRef foreign_input = foreign_context.buffers().allocate(
         "Weighted RMS norm foreign-context input", input_bytes, error);
     BufferRef partial_backing = context.buffers().allocate(
-        "Weighted RMS norm partial-alias backing", input_bytes + 16u, error);
+        "Weighted RMS norm partial-alias backing",
+        std::max(input_bytes, gamma_bytes) + 16u, error);
     if (!input || !gamma || !output || !foreign_input || !partial_backing) {
         check(false, "Weighted RMS norm encoder validation buffers", error);
         rejected_command->discard();
@@ -1026,6 +1027,18 @@ bool test_weighted_rms_norm_encoder_validation(
     check(accepts_read_only_alias,
           "Weighted RMS norm permits overlapping read-only inputs", error);
     passed &= accepts_read_only_alias;
+
+    const ReadOnlyWeightedRMSNormBuffers read_only_gamma_alias{
+        partial_input,
+        context.buffers().read_only(
+            partial_backing.slice(0u, gamma_bytes)),
+        output};
+    const bool accepts_read_only_gamma_alias = encode_weighted_rms_norm(
+        context, *rejected_command, rows, n_cols, gamma_period, kEpsilon,
+        read_only_gamma_alias, error);
+    check(accepts_read_only_gamma_alias,
+          "Weighted RMS norm permits read-only input/gamma overlap", error);
+    passed &= accepts_read_only_gamma_alias;
     rejected_command->discard();
 
     auto foreign_command = foreign_context.make_command_buffer(

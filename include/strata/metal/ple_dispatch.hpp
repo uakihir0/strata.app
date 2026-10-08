@@ -24,10 +24,10 @@ struct PLEGateBuffers {
 };
 
 struct PLEConvResidualBuffers {
-    BufferRef ple_norm;
-    BufferRef history;
-    BufferRef conv1d;
-    BufferRef gated;
+    ReadOnlyBufferRef ple_norm;
+    ReadOnlyBufferRef history;
+    ReadOnlyBufferRef conv1d;
+    ReadOnlyBufferRef gated;
     BufferRef residual;
 };
 
@@ -45,23 +45,25 @@ struct PLEPostProjectionBuffers {
     BufferRef gate;
     BufferRef gated;
     BufferRef history;
-    BufferRef conv1d;
-    BufferRef key_gamma;
-    BufferRef query_gamma;
-    BufferRef conv_gamma;
+    ReadOnlyBufferRef conv1d;
+    ReadOnlyBufferRef key_gamma;
+    ReadOnlyBufferRef query_gamma;
+    ReadOnlyBufferRef conv_gamma;
 };
 
 /// Buffers for the complete decode PLE block. `input_f32` contains rows of
 /// 2560 values; `post.key` and `post.value` receive the two projections.
 /// `key_q8_1` is required for Q2_0/Q8_0 keys and unused for BF16 keys.
-/// `matvec_sink` is shared by the serial key and value projections.
+/// `matvec_sink` is shared by the serial key and value projections. Model
+/// weights, active-row metadata and post-projection model tensors are read-only
+/// views and must remain stable until command-buffer completion.
 struct PLEBlockBuffers {
     BufferRef input_f32;
     BufferRef key_q8_1;
-    BufferRef key_weights;
-    BufferRef value_weights;
+    ReadOnlyBufferRef key_weights;
+    ReadOnlyBufferRef value_weights;
     BufferRef matvec_sink;
-    BufferRef active_rows;
+    ReadOnlyBufferRef active_rows;
     PLEPostProjectionBuffers post;
 };
 
@@ -123,6 +125,8 @@ bool encode_ple_gate(Context& context, CommandBuffer& command_buffer,
 
 /// Encode batched PLE convolution and residual for rows in 1..8.
 /// `residual` is updated in place and must be disjoint from all read-only views.
+/// The normalized rows, history, convolution weights and gated activations are
+/// immutable inputs and must remain unchanged until command-buffer completion.
 /// The Encoder overload adds this dispatch to a caller-owned segment; the
 /// Window path must create its documented serial segment.
 bool encode_ple_conv_residual(

@@ -50,6 +50,14 @@ void check(bool condition, const std::string& label, const std::string& detail =
     if (!condition) ++g_failures;
 }
 
+ReadOnlyBufferRef read_only(Context& context, BufferRef buffer,
+                            const std::string& label) {
+    ReadOnlyBufferRef result = context.buffers().read_only(buffer);
+    check(static_cast<bool>(result), label,
+          result ? std::string{} : "could not create a read-only view");
+    return result;
+}
+
 bool submit_and_wait(std::unique_ptr<CommandBuffer>& command,
                      const std::string& label, std::string& error) {
     if (!command || !command->commit(error)) return false;
@@ -933,10 +941,12 @@ bool run_shared_ple_segment(Context& context,
         gate_buffer.view(),
         gated_buffer.view(),
         history_buffer.view(),
-        conv_buffer.view(),
-        key_gamma_buffer.view(),
-        query_gamma_buffer.view(),
-        conv_gamma_buffer.view(),
+        read_only(context, conv_buffer.view(), label + " conv weights view"),
+        read_only(context, key_gamma_buffer.view(), label + " key gamma view"),
+        read_only(context, query_gamma_buffer.view(),
+                  label + " query gamma view"),
+        read_only(context, conv_gamma_buffer.view(),
+                  label + " conv gamma view"),
     };
     const auto snapshot_payload = [](twin::GuardedBuffer& buffer) {
         return std::vector<std::uint8_t>(buffer.payload().begin(),
@@ -1082,8 +1092,15 @@ bool run_shared_ple_segment(Context& context,
                     }
                     if (!encode_ple_conv_residual(
                             context, segment, token_rows,
-                            {chain_norm, chain_history, conv_buffer.view(),
-                             chain_gated, chain_residual},
+                            {read_only(context, chain_norm,
+                                       label + " chain norm"),
+                             read_only(context, chain_history,
+                                       label + " chain history"),
+                             read_only(context, conv_buffer.view(),
+                                       label + " chain conv weights"),
+                             read_only(context, chain_gated,
+                                       label + " chain gated"),
+                             chain_residual},
                             chain_error)) {
                         return false;
                     }
@@ -1154,10 +1171,12 @@ bool run_shared_ple_segment(Context& context,
         reused_gate_buffer.view(),
         reused_gated_buffer.view(),
         reused_history_buffer.view(),
-        conv_buffer.view(),
-        key_gamma_buffer.view(),
-        query_gamma_buffer.view(),
-        conv_gamma_buffer.view(),
+        read_only(context, conv_buffer.view(), label + " alias conv weights"),
+        read_only(context, key_gamma_buffer.view(), label + " alias key gamma"),
+        read_only(context, query_gamma_buffer.view(),
+                  label + " alias query gamma"),
+        read_only(context, conv_gamma_buffer.view(),
+                  label + " alias conv gamma"),
     };
     error.clear();
     check(reused_query_ple_norm_buffer.poison_floats_against(
@@ -2103,18 +2122,25 @@ bool run_ple_block_projection_case(Context& context,
         guarded[gate_buffer].view(),
         guarded[gated_buffer].view(),
         guarded[history_buffer].view(),
-        guarded[conv_buffer].view(),
-        guarded[key_gamma_buffer].view(),
-        guarded[query_gamma_buffer].view(),
-        guarded[conv_gamma_buffer].view(),
+        read_only(context, guarded[conv_buffer].view(),
+                  label + " conv weights view"),
+        read_only(context, guarded[key_gamma_buffer].view(),
+                  label + " key gamma view"),
+        read_only(context, guarded[query_gamma_buffer].view(),
+                  label + " query gamma view"),
+        read_only(context, guarded[conv_gamma_buffer].view(),
+                  label + " conv gamma view"),
     };
     const PLEBlockBuffers block{
         guarded[input_buffer].view(),
         quantized_key ? guarded[q8_buffer].view() : BufferRef{},
-        guarded[key_weights_buffer].view(),
-        guarded[value_weights_buffer].view(),
+        read_only(context, guarded[key_weights_buffer].view(),
+                  label + " key weights view"),
+        read_only(context, guarded[value_weights_buffer].view(),
+                  label + " value weights view"),
         guarded[sink_buffer].view(),
-        guarded[active_rows_buffer].view(),
+        read_only(context, guarded[active_rows_buffer].view(),
+                  label + " active rows view"),
         post,
     };
     MoeRoutedSharedFFNBuffers previous_ffn{};
@@ -2739,24 +2765,40 @@ bool run_conv_residual_case(Context& context, std::uint32_t rows,
               [&](Encoder& segment, std::string& encode_error) {
                   if (!encode_ple_conv_residual(
                           context, segment, rows,
-                          {norm_buffer.view(), history_buffer.view(),
-                           conv_buffer.view(), gated_buffer.view(),
+                          {read_only(context, norm_buffer.view(),
+                                     label + " norm"),
+                           read_only(context, history_buffer.view(),
+                                     label + " history"),
+                           read_only(context, conv_buffer.view(),
+                                     label + " conv weights"),
+                           read_only(context, gated_buffer.view(),
+                                     label + " gated"),
                            residual_buffer.view()},
                           encode_error)) {
                       return false;
                   }
                   return encode_ple_conv_residual(
                       context, segment, rows,
-                      {norm_buffer.view(), history_buffer.view(),
-                       conv_buffer.view(), gated_buffer.view(),
+                      {read_only(context, norm_buffer.view(),
+                                 label + " second norm"),
+                       read_only(context, history_buffer.view(),
+                                 label + " second history"),
+                       read_only(context, conv_buffer.view(),
+                                 label + " second conv weights"),
+                       read_only(context, gated_buffer.view(),
+                                 label + " second gated"),
                        second_residual_buffer.view()},
                       encode_error);
               },
               err)
         : encode_ple_conv_residual(
               context, *command, rows,
-              {norm_buffer.view(), history_buffer.view(), conv_buffer.view(),
-               gated_buffer.view(), residual_buffer.view()},
+              {read_only(context, norm_buffer.view(), label + " norm"),
+               read_only(context, history_buffer.view(), label + " history"),
+               read_only(context, conv_buffer.view(),
+                         label + " conv weights"),
+               read_only(context, gated_buffer.view(), label + " gated"),
+               residual_buffer.view()},
               err);
     check(encoded,
           label + (shared_encoder_case
@@ -2901,22 +2943,28 @@ bool test_conv_residual_encoder_validation(
         rejected_command->discard();
         return false;
     }
-    const PLEConvResidualBuffers valid{norm, history, conv1d, gated, residual};
+    const PLEConvResidualBuffers valid{
+        read_only(context, norm, "validation norm"),
+        read_only(context, history, "validation history"),
+        read_only(context, conv1d, "validation conv weights"),
+        read_only(context, gated, "validation gated"), residual};
 
     PLEConvResidualBuffers short_norm = valid;
-    short_norm.ple_norm.length = row_bytes;
+    short_norm.ple_norm = valid.ple_norm.slice(0u, row_bytes);
     passed &= reject("PLE conv-residual encoder rejects one norm row for T=2",
                      rows, short_norm, "undersized");
     PLEConvResidualBuffers short_history = valid;
-    short_history.history.length = history_bytes - sizeof(float);
+    short_history.history =
+        valid.history.slice(0u, history_bytes - sizeof(float));
     passed &= reject("PLE conv-residual encoder rejects short history",
                      rows, short_history, "undersized");
     PLEConvResidualBuffers short_conv1d = valid;
-    short_conv1d.conv1d.length = conv1d_bytes - sizeof(std::uint16_t);
+    short_conv1d.conv1d = valid.conv1d.slice(
+        0u, conv1d_bytes - sizeof(std::uint16_t));
     passed &= reject("PLE conv-residual encoder rejects short F16 weights",
                      rows, short_conv1d, "undersized");
     PLEConvResidualBuffers short_gated = valid;
-    short_gated.gated.length = row_bytes;
+    short_gated.gated = valid.gated.slice(0u, row_bytes);
     passed &= reject("PLE conv-residual encoder rejects one gated row for T=2",
                      rows, short_gated, "undersized");
     PLEConvResidualBuffers short_residual = valid;
@@ -2927,23 +2975,23 @@ bool test_conv_residual_encoder_validation(
 
     PLEConvResidualBuffers misaligned_norm = valid;
     misaligned_norm.ple_norm =
-        norm.slice(1u, norm.length - 1u);
+        valid.ple_norm.slice(1u, valid.ple_norm.length() - 1u);
     passed &= reject("PLE conv-residual encoder rejects misaligned norm",
                      rows, misaligned_norm, "misaligned");
     PLEConvResidualBuffers misaligned_history = valid;
     misaligned_history.history =
-        history.slice(1u, history.length - 1u);
+        valid.history.slice(1u, valid.history.length() - 1u);
     passed &= reject("PLE conv-residual encoder rejects misaligned history",
                      rows, misaligned_history, "misaligned");
     PLEConvResidualBuffers misaligned_conv1d = valid;
     misaligned_conv1d.conv1d =
-        conv1d.slice(1u, conv1d.length - 1u);
+        valid.conv1d.slice(1u, valid.conv1d.length() - 1u);
     passed &= reject(
         "PLE conv-residual encoder rejects misaligned F16 weights",
         rows, misaligned_conv1d, "misaligned");
     PLEConvResidualBuffers misaligned_gated = valid;
     misaligned_gated.gated =
-        gated.slice(1u, gated.length - 1u);
+        valid.gated.slice(1u, valid.gated.length() - 1u);
     passed &= reject("PLE conv-residual encoder rejects misaligned gated",
                      rows, misaligned_gated, "misaligned");
     PLEConvResidualBuffers misaligned_residual = valid;
@@ -2953,7 +3001,8 @@ bool test_conv_residual_encoder_validation(
                      rows, misaligned_residual, "misaligned");
 
     PLEConvResidualBuffers out_of_range = valid;
-    out_of_range.ple_norm = norm.slice(norm.length, sizeof(float));
+    out_of_range.ple_norm =
+        valid.ple_norm.slice(valid.ple_norm.length(), sizeof(float));
     passed &= reject("PLE conv-residual encoder rejects norm past allocation",
                      rows, out_of_range, "not owned by this Context");
 
@@ -2967,10 +3016,17 @@ bool test_conv_residual_encoder_validation(
                                   std::size_t partial_delta) {
         BufferRef exact_input = input.slice(0u, input_bytes);
         PLEConvResidualBuffers exact = valid;
-        if (role == "ple_norm") exact.ple_norm = exact_input;
-        else if (role == "history") exact.history = exact_input;
-        else if (role == "conv1d") exact.conv1d = exact_input;
-        else exact.gated = exact_input;
+        if (role == "ple_norm") {
+            exact.ple_norm = read_only(context, exact_input, "exact norm");
+        }
+        else if (role == "history") {
+            exact.history = read_only(context, exact_input, "exact history");
+        }
+        else if (role == "conv1d") {
+            exact.conv1d = read_only(
+                context, exact_input, "exact-alias conv weights");
+        }
+        else exact.gated = read_only(context, exact_input, "exact gated");
         exact.residual = alias_residual;
         passed &= reject("PLE conv-residual encoder rejects exact residual/" +
                              role + " overlap",
@@ -2979,10 +3035,19 @@ bool test_conv_residual_encoder_validation(
         BufferRef partial_input =
             shifted_view(alias_backing, input_bytes, partial_delta);
         PLEConvResidualBuffers partial = valid;
-        if (role == "ple_norm") partial.ple_norm = partial_input;
-        else if (role == "history") partial.history = partial_input;
-        else if (role == "conv1d") partial.conv1d = partial_input;
-        else partial.gated = partial_input;
+        if (role == "ple_norm") {
+            partial.ple_norm =
+                read_only(context, partial_input, "partial norm");
+        }
+        else if (role == "history") {
+            partial.history =
+                read_only(context, partial_input, "partial history");
+        }
+        else if (role == "conv1d") {
+            partial.conv1d = read_only(
+                context, partial_input, "partial-alias conv weights");
+        }
+        else partial.gated = read_only(context, partial_input, "partial gated");
         partial.residual = alias_residual;
         passed &= reject("PLE conv-residual encoder rejects partial residual/" +
                              role + " overlap",
@@ -2998,8 +3063,14 @@ bool test_conv_residual_encoder_validation(
     missing_metadata_norm.length = value_bytes;
     missing_metadata_norm.contents = nullptr;
     missing_metadata_norm.gpu_address = 0u;
+    const ReadOnlyBufferRef forged_read_only =
+        context.buffers().read_only(missing_metadata_norm);
+    check(!forged_read_only,
+          "PLE conv-residual rejects forged read-only buffer metadata");
     PLEConvResidualBuffers missing_metadata_alias{
-        missing_metadata_norm, history, conv1d, gated, alias_residual};
+        forged_read_only, valid.history,
+        read_only(context, conv1d, "alias-test conv weights"), valid.gated,
+        alias_residual};
     passed &= reject(
         "PLE conv-residual rejects forged CPU/GPU metadata",
         rows, missing_metadata_alias, "not owned by this Context");
@@ -3020,7 +3091,8 @@ bool test_conv_residual_encoder_validation(
         return false;
     }
     PLEConvResidualBuffers foreign_buffers = valid;
-    foreign_buffers.ple_norm = foreign_norm;
+    foreign_buffers.ple_norm =
+        read_only(*foreign_context, foreign_norm, "foreign norm");
     auto foreign_buffer_command = context.make_command_buffer(
         "PLE conv-residual foreign-buffer validation", error);
     if (!foreign_buffer_command) {
@@ -3116,9 +3188,10 @@ bool test_conv_residual_encoder_validation(
               "PLE conv-residual overlapping-input command buffer", error);
         return false;
     }
+    const ReadOnlyBufferRef shared_view =
+        read_only(context, shared_read_only, "shared read-only input");
     PLEConvResidualBuffers read_only_alias{
-        shared_read_only, shared_read_only, shared_read_only,
-        shared_read_only, separate_residual};
+        shared_view, shared_view, shared_view, shared_view, separate_residual};
     const bool accepted_read_only_overlap = encode_ple_conv_residual(
         context, *read_only_command, rows, read_only_alias, error);
     check(accepted_read_only_overlap,

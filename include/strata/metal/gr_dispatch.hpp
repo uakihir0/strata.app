@@ -142,10 +142,19 @@ struct WeightedRMSNormBuffers {
     BufferRef output;
 };
 
+/// Read-only model gamma input for weighted RMS normalization. Keep `gamma`
+/// unchanged until command-buffer completion. For disjoint input and output,
+/// both input and gamma are read-only bindings and may overlap. Exact in-place
+/// input/output remains supported when gamma is disjoint from the output.
+struct ReadOnlyWeightedRMSNormBuffers {
+    BufferRef input;
+    ReadOnlyBufferRef gamma;
+    BufferRef output;
+};
+
 /// Encode `strata_rms_norm_w` for documented widths and gamma periods.
 /// Exact input/output view alias is allowed; all other output overlap is
-/// rejected. The gamma input may overlap the read-only input view. The
-/// Encoder overload adds this dispatch to a caller-owned segment.
+/// rejected. The Encoder overload adds this dispatch to a caller-owned segment.
 bool encode_weighted_rms_norm(
     Context& context, Encoder& encoder, std::uint32_t rows,
     std::uint32_t n_cols, std::uint32_t gamma_period, float epsilon,
@@ -154,6 +163,17 @@ bool encode_weighted_rms_norm(
     Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
     std::uint32_t n_cols, std::uint32_t gamma_period, float epsilon,
     const WeightedRMSNormBuffers& buffers, std::string& error);
+/// Read-only-gamma overload for immutable model weights.
+/// If input and output are disjoint, they are bound read-only and gamma may
+/// overlap input. With exact input/output aliasing, gamma must be disjoint.
+bool encode_weighted_rms_norm(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    std::uint32_t n_cols, std::uint32_t gamma_period, float epsilon,
+    const ReadOnlyWeightedRMSNormBuffers& buffers, std::string& error);
+bool encode_weighted_rms_norm(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    std::uint32_t n_cols, std::uint32_t gamma_period, float epsilon,
+    const ReadOnlyWeightedRMSNormBuffers& buffers, std::string& error);
 
 /// Encode the GR head mixer's pre-gated reduction for rows in 1..8.
 /// Read-only `xn` and `gate` views may overlap; `mixed` must be disjoint.
