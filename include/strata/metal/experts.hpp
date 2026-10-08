@@ -69,8 +69,11 @@ public:
     /// Wait for a GPU-produced shared plan, retire earlier layers whose expert
     /// reads precede this plan event, resolve its misses, then signal the matching
     /// layer-ready value on the same monotonic event. A skipped plan reads and
-    /// validates only its four-word header. On failure, the caller must release
-    /// any GPU waits before abandoning the command buffer.
+    /// validates only its four-word header. On failure, this leaves the layer-ready
+    /// event unsignaled. Before releasing any queued GPU wait, the caller must ensure
+    /// the waiting command buffer has no unsafe consumers after that wait, or that
+    /// those consumers are guarded against request failure; releasing a wait does not
+    /// cancel later GPU commands.
     bool resolve_layer_after_plan(
         const std::shared_ptr<ExpertLeaseSet>& lease_set, std::uint32_t layer,
         Events& events, std::uint64_t plan_ready_value,

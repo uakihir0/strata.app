@@ -49,7 +49,12 @@
       "ctest:metal_plan_test",
       "ctest:metal_mtp_bind_layout_test"
     ],
-    "REQ-MEM-05": [],
+    "REQ-MEM-05": [
+      "ctest:metal_slot_pool_test",
+      "ctest:metal_tiered_copy_test",
+      "ctest:direct_file_async_test",
+      "ctest:metal_plan_test"
+    ],
     "REQ-MEM-06": [
       "ctest:metal_never_wrap_test",
       "ctest:metal_tiered_copy_test"

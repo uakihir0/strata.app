@@ -127,7 +127,7 @@ The names below are used throughout the documentation set. The namespace is `str
 | `Buffers` | `src/metal/host/buffers.mm` | Shared buffers; no-copy windows over mapped files (16 KiB-aligned, each ≤ `maxBufferLength`); a bump arena with fixed addresses | `pinned.cu`, every `cudaHostAlloc` / `cudaMalloc` site |
 | Generic Encoder | `include/strata/metal/encoder.hpp`, `src/metal/host/encoder.mm` | Creates one labeled compute encoder per segment under the Context fence; validates manifest geometry, pipeline limits, Context-owned buffer views, and exact resource slots from pipeline binding reflection; clears stale slots and caps inline bytes at 4 KiB per segment. `EncoderReadOnlyBufferBinding` carries `ReadOnlyBufferRef` to MSL `const` inputs and rejects overlap with writable views through handle, CPU-backing, or GPU-address ranges. `STRATA_METAL_DISPATCH` selects serial or concurrent encoding; concurrent dispatches get a buffer barrier after each singleton or declared independent group. A failed body or validation discards the unsubmitted command buffer. Typed coordinators encode the T=1 Window input stem, layer-0 attention/GDN/FFN read and router→route→Q8_1 prefix; MoE plan has a validated standalone encoder, while experts, later Window layers, MTP and Prefill production paths remain pending. | CUDA launch sites and stream capture |
 | MoE route and plan encoders | `include/strata/metal/moe_dispatch.hpp`, `src/metal/engine/moe_dispatch.cpp` | Validates top-10 routing for 256/512 experts and plan grouping for T=1..8 with active expert strides from 1 to 512, each with standalone transactional or caller-owned Encoder forms. Router logits and plan IDs/residency bind read-only; the plan validates layer-strided table extents and rejects every writable overlap. Window selects multiply-by-reciprocal route weights and Prefill selects division. `encode_window_t1_moe_router_prefix` orders the read-only BF16 router, Window route and Q8_1 input row after layer 0. Plan dispatch has its own oracle tests and an event-gated GPU-plan-to-resolver fixture; expert execution and the production `MissResolver` scheduler remain separate | `native_router.cu`, `native_moe.cu` |
-| `Events` | `src/metal/host/events.mm` | Monotonic `MTLSharedEvent` values for the tiered layer handshake; `release_gpu_waits(timeout_ms)` releases blocked command buffers and permanently retires a failed event | `doorbell_*`, `wait_flag_ge`, `cudaEvent*` |
+| `Events` | `src/metal/host/events.mm` | Monotonic `MTLSharedEvent` values for the tiered layer handshake; `release_gpu_waits(timeout_ms)` satisfies queued waits and permanently retires a failed event but does not cancel commands after those waits | `doorbell_*`, `wait_flag_ge`, `cudaEvent*` |
 | `PipelineCache` | `src/metal/host/pipeline_cache.mm` | The `MTLBinaryArchive` of compiled pipelines in `~/Library/Caches/strata/`: its name, load, update and pruning ([08](08-build-and-distribution.md), section 10.1) | `CUDA_MODULE_LOADING=EAGER` and the driver's JIT cache |
 | `Capture` | `src/metal/host/capture.mm` | `--metal-capture`: a GPU trace of the first decode window ([08](08-build-and-distribution.md), section 10.2) | none (Nsight is external) |
 | `WeightStore` | `src/metal/engine/weights.cpp` | Opens GGUF shards and the native pack (`index.txt` v3, `native_experts.txt` v3 or v4, `conversions.json`); maps tensors to (buffer, offset) | `weights.cpp`, `native_dense.cpp`, `native_head.cpp` |
@@ -1027,7 +1027,7 @@ leases to that set before signaling the layer-ready event. This keeps slot
 addresses pinned even though plan resolution happens after command-buffer
 submission.
 
-`ExpertStore::resolve_layer_after_plan` implements the host bridge for a tiered decode plan. It waits for the plan-ready value, acquires the shared plan buffer, resolves cold experts through the existing slot cache and fetch workers, and signals the immediately following layer-ready value on that same `Events` object only after address publication succeeds. It reads only the four-word header when `skip` is set, and rejects a skipped plan that reports misses. On failure it leaves the layer-ready value unsignaled; the caller must call `Events::release_gpu_waits(timeout_ms, error)` and fail the request. That method validates its drain timeout before changing the event, advances it to `UINT64_MAX`, drains committed or enqueued command buffers that contain its waits, and permanently disables event operations. After release, `signaled_value()` returns no value and `wait()` refuses to treat the sentinel as completion. `ModelStorage::tiered_storage()` supplies the borrowed tiered storage needed to create `ExpertStore` and remains valid only for the owner's lifetime.
+`ExpertStore::resolve_layer_after_plan` implements the host bridge for a tiered decode plan. It waits for the plan-ready value, acquires the shared plan buffer, resolves cold experts through the existing slot cache and fetch workers, and signals the immediately following layer-ready value on that same `Events` object only after address publication succeeds. It reads only the four-word header when `skip` is set, and rejects a skipped plan that reports misses. On failure it leaves the layer-ready value unsignaled. `Events::release_gpu_waits(timeout_ms, error)` satisfies waits already encoded for that event; it does not cancel commands after those waits. The caller must fail the request and ensure each waiting command buffer has no unsafe downstream consumer, or that every such consumer is guarded against request failure, before releasing a wait. The current single-Window-command-buffer outline does not meet that failure-safety condition, so production failure cleanup remains open. When safe to release, the method validates its drain timeout, advances the event to `UINT64_MAX`, drains committed or enqueued command buffers that contain its waits, and permanently disables event operations. After release, `signaled_value()` returns no value and `wait()` refuses to treat the sentinel as completion. `ModelStorage::tiered_storage()` supplies the borrowed tiered storage needed to create `ExpertStore` and remains valid only for the owner's lifetime.
 
 This helper is not yet a production Window scheduler. Command-buffer layer encoding and lookahead scheduling remain open. The fixtures encode GPU plan kernels into one synthetic command buffer and verify that a later plan-ready event retires leases from prior layers.
 
@@ -1060,13 +1060,16 @@ Rules:
   So at that signal the resolver may overwrite any slot of half `l % 2`.
 - The lookahead into half `(l + 1) % 2` starts only after layer l's signal, when layer l − 1 has completed.
 - Before resolving a new plan, `resolve_layer_after_plan` retires every earlier layer whose reads precede the
-  plan-ready event. `metal_window_storage_test` resolves GPU-produced plans for layers 0 and 2 in one command
-  buffer, fills layer 0's parity half, then proves layer 2's plan event frees capacity while the Window command
+  plan-ready event. `metal_tiered_copy_test` runs `metal_window_storage_test --tiered-copy`, which resolves
+  GPU-produced plans for layers 0 and 2 in one command buffer, dispatches a real IQ2_XS gate consumer for
+  layer 0, fills that parity half, then proves layer 2's plan event frees capacity while the Window command
   buffer is still in flight.
 - If a later change lets two windows overlap, slots must instead be pinned per window and released in the completion
   handler.
-- Timeout: if layer l's signal does not arrive within 20 s, as upstream `verify.cpp:1089-1093`, call
-  `release_gpu_waits` (section 14) and fail the request with `ERR gpu error: window timeout`.
+- Timeout: if layer l's signal does not arrive within 20 s, as upstream `verify.cpp:1089-1093`, fail the request.
+  Do not call `release_gpu_waits` (section 14) while a queued command buffer can run unguarded expert reads after
+  that wait; production failure cleanup must first provide a per-layer command-buffer boundary or a GPU-visible
+  failure guard.
 - Cost model: 48 hops per window. The latency of one hop is measurement M-1. At 20 µs a hop costs about 1 ms per
   window, and the misses' I/O costs more. Gate G2 decides whether that is acceptable.
 
@@ -1124,7 +1127,7 @@ These keep the upstream names and semantics from `verify.hpp`:
 | `set_commit_async(bool)` | 126 | Kept |
 | `wait_commit()` | 129 | Waits for the commit command buffer, through its completion or an event value |
 | `diag()` | 62 | Last window: T, pos0, the layer the `MissResolver` reached, event values |
-| `release_gpu_waits(timeout_ms)` | 68 | Sets the event to `UINT64_MAX`, waits up to the timeout for committed or enqueued command buffers containing its waits to complete, and retires the event permanently (section 14) |
+| `release_gpu_waits(timeout_ms)` | 68 | Sets the event to `UINT64_MAX`, satisfying its queued waits but not cancelling later commands; callers must ensure downstream work is absent or guarded before release. It then waits up to the timeout for committed or enqueued command buffers containing its waits to complete and retires the event permanently (section 14) |
 
 Dropped: `set_stage`, `set_next`, `handoff_floats` (layer split); `set_split` (`--spec-split`); `set_pcie_mode`.
 
@@ -1431,10 +1434,13 @@ If the engine is `busy` and `beats` has not changed for the limit, the watchdog 
    - the memory line `memory: R MiB resident, S MiB in swap, A MiB RAM available; F major page faults so far`, filled
      from `process_memory()` and `available_memory()`. Upstream prints zeros here on macOS.
    - Mac addition: `gpu: last command buffer "<label>" status <status>, W MiB budget, A MiB allocated`.
-3. It calls `release_gpu_waits` for each window event. Each event advances to `UINT64_MAX`, which releases its encoded
-   `encodeWaitForEvent` operations, then waits up to the supplied timeout for committed command buffers containing those
-   waits to complete. Released events are permanently unusable, and `wait()` does not provide completion evidence. In full mode nothing
-   is waiting on the host. Then the watchdog calls `std::abort()`.
+3. It calls `release_gpu_waits` only for events whose waiting command buffers have no unguarded GPU consumer after the
+   wait. Each event advances to `UINT64_MAX`, which satisfies its encoded `encodeWaitForEvent` operations but does not
+   cancel later commands, then waits up to the supplied timeout for committed command buffers containing those waits to
+   complete. If a window command buffer contains an unguarded expert consumer after the wait, the watchdog must abort
+   without releasing that event until the scheduler provides a safe boundary or GPU-visible failure guard. Released
+   events are permanently unusable, and `wait()` does not provide completion evidence. In full mode nothing is waiting
+   on the host. Then the watchdog calls `std::abort()`.
 
 ### 14.3 Crash report instead of a minidump
 
@@ -1451,7 +1457,7 @@ No in-process stack walking is required.
 
 | Timeout | Mac |
 | --- | --- |
-| Upstream verify host loop, 20 s without a ring | `MissResolver` waits at most 20 s for each layer signal. Full-mode window waits use `waitUntilSignaledValue:timeoutMS:` with 20 s, or a timed wait on the completion. On timeout, `release_gpu_waits`, then `ERR gpu error: window timeout`, then exit 1. |
+| Upstream verify host loop, 20 s without a ring | `MissResolver` waits at most 20 s for each layer signal. Full-mode window waits use `waitUntilSignaledValue:timeoutMS:` with 20 s, or a timed wait on the completion. On timeout, fail the request. Release GPU waits only after proving that queued commands after each wait are absent or guarded; the current single-command-buffer tiered outline does not satisfy that condition. |
 | Pool self-watchdog, `kStall` 60 s | Deleted with the pool |
 | GPU-side timeout | A command buffer that runs too long is ended by the system with `MTLCommandBufferErrorTimeout` and handled as a GPU error (section 2.4). The Metal-only test in [09-testing-and-validation.md](09-testing-and-validation.md) checks that a 33 ms window, and a 32K prefill chunk, never come close. L-12 ([04](04-metal-kernels.md), section 11) finds the limit; if a chunk at C = 32,768 comes within half of it, the prompt path encodes each layer as its own command buffer ([04](04-metal-kernels.md), section 6.1). |
 | `STRATA_TEST_VERIFY_STALL` | Kept. `STRATA_TEST_VERIFY_STALL=N` withholds the last layer's signal of the N-th window, so `MissResolver` (tiered) or the window wait (full) stalls. With the default `STRATA_WATCHDOG_S`, the 20 s timeout of this table ends the engine first; with a limit below 20 s, the watchdog of section 14.2 does. `metal_watchdog_test` runs both cases. |

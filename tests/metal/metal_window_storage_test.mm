@@ -4,6 +4,7 @@
 #include "strata/metal/model_storage.hpp"
 #include "strata/metal/kv.hpp"
 #include "strata/metal/experts.hpp"
+#include "strata/metal/encoder.hpp"
 #include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/window_ple_stage.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -16,11 +17,13 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -74,33 +77,62 @@ bool event_has_value(const Events& events, std::uint64_t expected) {
     return value && *value == expected;
 }
 
+bool event_has_reached_value(const Events& events, std::uint64_t expected) {
+    const auto value = events.signaled_value();
+    return value && *value >= expected;
+}
+
+struct TestQ8_1 {
+    std::uint16_t ds[2]{};
+    std::int8_t qs[32]{};
+};
+static_assert(sizeof(TestQ8_1) == 36);
+
+struct TestMoeExpertAddress {
+    std::uint64_t role[3]{};
+};
+static_assert(sizeof(TestMoeExpertAddress) == 24);
+
+struct TestMoeGroupedParams {
+    std::uint32_t n_expert = 0;
+    std::uint32_t layer = 0;
+};
+static_assert(sizeof(TestMoeGroupedParams) == 8);
+
 class CommandGatesCleanup {
 public:
-    CommandGatesCleanup(Events* layer_gate, std::uint64_t layer_value,
-                        Events* completion_gate, std::uint64_t completion_value,
-                        id<MTLCommandBuffer> command_buffer)
-        : completion_gate_(completion_gate), completion_value_(completion_value),
-          command_buffer_(command_buffer) {
-        layer_gates_.emplace_back(layer_gate, layer_value);
+    CommandGatesCleanup(Events* layer_gate, std::uint64_t layer_arrival_value,
+                        std::uint64_t layer_release_value,
+                        Events* completion_gate,
+                        std::uint64_t completion_arrival_value,
+                        std::uint64_t completion_value,
+                        id<MTLCommandBuffer> command_buffer,
+                        std::function<void()> prepare_failed_release = {})
+        : events_(layer_gate), completion_gate_(completion_gate),
+          completion_arrival_value_(completion_arrival_value),
+          completion_value_(completion_value), command_buffer_(command_buffer),
+          prepare_failed_release_(std::move(prepare_failed_release)) {
+        layer_gates_.push_back(
+            {layer_gate, layer_arrival_value, layer_release_value});
     }
 
     ~CommandGatesCleanup() {
         if (pending_) {
-            std::string ignored;
-            (void)finish_and_drain(ignored);
+            std::string cleanup_error;
+            if (!finish_and_drain_impl(cleanup_error, true)) {
+                std::cerr << "Metal test command-buffer cleanup failed: "
+                          << cleanup_error << '\n';
+            }
         }
     }
 
-    void add_layer_gate(Events* layer_gate, std::uint64_t layer_value) {
-        layer_gates_.emplace_back(layer_gate, layer_value);
+    void add_layer_gate(Events* layer_gate, std::uint64_t arrival_value,
+                        std::uint64_t release_value) {
+        layer_gates_.push_back({layer_gate, arrival_value, release_value});
     }
 
     bool release_layer(std::string& error) {
-        if (layer_gates_.empty()) return true;
-        const auto [layer_gate, layer_value] = layer_gates_.front();
-        if (!layer_gate->signal_host(layer_value, error)) return false;
-        layer_gates_.erase(layer_gates_.begin());
-        return true;
+        return release_layer_impl(error, false);
     }
 
     void mark_layer_released() noexcept {
@@ -108,17 +140,65 @@ public:
     }
 
     bool finish_and_drain(std::string& error) {
+        return finish_and_drain_impl(error, false);
+    }
+
+private:
+    struct LayerGate {
+        Events* events = nullptr;
+        std::uint64_t arrival_value = 0;
+        std::uint64_t release_value = 0;
+    };
+
+    bool release_layer_impl(std::string& error, bool failed_request) {
+        if (layer_gates_.empty()) return true;
+        const LayerGate gate = layer_gates_.front();
+        if (gate.events == nullptr ||
+            !gate.events->wait(gate.arrival_value, 5000, error)) {
+            if (failed_request) {
+                if (failure_guard_prepared_) {
+                    (void)release_after_safe_failure(error);
+                } else {
+                    (void)release_after_terminal_command_buffer(error);
+                }
+            }
+            return false;
+        }
+        if (failed_request && !failure_guard_prepared_) {
+            if (prepare_failed_release_) prepare_failed_release_();
+            failure_guard_prepared_ = true;
+        }
+        if (!gate.events->signal_host(gate.release_value, error)) {
+            if (failed_request) (void)release_after_safe_failure(error);
+            return false;
+        }
+        layer_gates_.erase(layer_gates_.begin());
+        return true;
+    }
+
+    bool finish_and_drain_impl(std::string& error, bool failed_request) {
         bool succeeded = true;
         while (!layer_gates_.empty()) {
-            if (!release_layer(error)) {
+            if (!release_layer_impl(error, failed_request)) {
                 succeeded = false;
                 break;
             }
         }
         if (completion_pending_) {
             std::string completion_error;
-            if (!completion_gate_->signal_host(completion_value_, completion_error)) {
+            const bool completion_arrived =
+                completion_gate_->wait(completion_arrival_value_, 5000,
+                                       completion_error);
+            if (!completion_arrived ||
+                !completion_gate_->signal_host(completion_value_, completion_error)) {
                 if (error.empty()) error = completion_error;
+                if (failed_request) {
+                    if (failure_guard_prepared_) {
+                        (void)release_after_safe_failure(error);
+                    } else {
+                        (void)release_after_terminal_command_buffer(error);
+                    }
+                }
                 succeeded = false;
             } else {
                 completion_pending_ = false;
@@ -127,16 +207,51 @@ public:
         if (succeeded) {
             [command_buffer_ waitUntilCompleted];
             pending_ = false;
+            if (command_buffer_.status == MTLCommandBufferStatusError) {
+                error = "Metal test command buffer failed while draining";
+                return false;
+            }
         }
         return succeeded;
     }
 
-private:
-    std::vector<std::pair<Events*, std::uint64_t>> layer_gates_;
+    bool release_after_terminal_command_buffer(std::string& error) {
+        const MTLCommandBufferStatus status = command_buffer_.status;
+        if (status != MTLCommandBufferStatusCompleted &&
+            status != MTLCommandBufferStatusError) {
+            return false;
+        }
+        std::string drain_error;
+        if (!events_->release_gpu_waits(5000, drain_error)) {
+            if (!error.empty()) error += "; ";
+            error += "terminal command-buffer wait release failed: " + drain_error;
+            return false;
+        }
+        pending_ = false;
+        return true;
+    }
+
+    bool release_after_safe_failure(std::string& error) {
+        if (events_ == nullptr) return false;
+        std::string drain_error;
+        if (!events_->release_gpu_waits(5000, drain_error)) {
+            if (!error.empty()) error += "; ";
+            error += "terminal guarded-wait release failed: " + drain_error;
+            return false;
+        }
+        pending_ = false;
+        return true;
+    }
+
+    std::vector<LayerGate> layer_gates_;
+    Events* events_ = nullptr;
     Events* completion_gate_ = nullptr;
+    std::uint64_t completion_arrival_value_ = 0;
     std::uint64_t completion_value_ = 0;
     id<MTLCommandBuffer> command_buffer_;
+    std::function<void()> prepare_failed_release_;
     bool completion_pending_ = true;
+    bool failure_guard_prepared_ = false;
     bool pending_ = true;
 };
 
@@ -321,7 +436,9 @@ struct Fixture {
     std::string second_router_tensor_name;
     std::uint64_t second_router_source_bytes = 0;
     std::uint64_t second_router_row_bytes = 0;
+    std::uint32_t expert_layers = 1;
     std::array<std::uint64_t, 3> offsets{};
+    std::vector<std::array<std::uint64_t, 3>> layer_offsets;
     std::uint64_t router_offset = 0;
     std::uint64_t second_router_offset = 0;
     std::uint64_t dense_offset = 0;
@@ -332,7 +449,8 @@ struct Fixture {
 Fixture write_fixture(const fs::path& directory, bool overlap_ple = false,
                       bool bridge_ple = false, bool include_router = true,
                       std::uint32_t router_layer = 0,
-                      bool include_second_router = false) {
+                      bool include_second_router = false,
+                      std::uint32_t expert_layers = 1) {
     constexpr std::uint64_t kExpertSlabBytes = 18ull * 3'641;
     constexpr std::uint64_t kExperts = 9;
     constexpr std::uint64_t kTensorBytes = kExperts * kExpertSlabBytes;
@@ -342,6 +460,8 @@ Fixture write_fixture(const fs::path& directory, bool overlap_ple = false,
     constexpr std::uint64_t kPleBytes = kPleRows * strata::kernels::PLE_ROW_BYTES;
     constexpr std::uint64_t kPostPleBytes = 1'024 * sizeof(float);
     Fixture fixture;
+    require(expert_layers != 0, "synthetic fixture must contain an expert layer");
+    fixture.expert_layers = expert_layers;
     fixture.dense_pack_path = directory / "dense.bin";
     fixture.expert_slab_bytes = kExpertSlabBytes;
     fixture.router_bytes = include_router ? kRouterBytes : 0;
@@ -352,27 +472,29 @@ Fixture write_fixture(const fs::path& directory, bool overlap_ple = false,
         include_router && include_second_router ? 2'560 * sizeof(std::uint16_t) : 0;
     fixture.dense_pack_bytes = fixture.router_row_bytes +
                                fixture.second_router_row_bytes;
-    const std::array<std::string, 6> names = {
-        "blk.0.ffn_gate_exps.weight",
-        "blk.0.ffn_up_exps.weight",
-        "blk.0.ffn_down_exps.weight",
-        "token_embd.weight",
-        "blk." + std::to_string(router_layer) + ".ffn_gate_inp.weight",
-        "per_layer_token_embd.weight",
-    };
-    fixture.path = directory / (include_second_router ? "multi-router.gguf" :
+    fixture.path = directory / (expert_layers > 1 ? "multi-layer.gguf" :
+                                include_second_router ? "multi-router.gguf" :
                                 overlap_ple ? "overlap.gguf" :
                                 bridge_ple ? "bridge.gguf" :
                                 include_router ? "tiny.gguf" : "plain.gguf");
-    fixture.router_tensor_name = names[4];
+    fixture.router_tensor_name =
+        "blk." + std::to_string(router_layer) + ".ffn_gate_inp.weight";
     fixture.second_router_tensor_name =
         include_second_router ? "blk." + std::to_string(router_layer) +
                                     ".ffn_gate_inp_shexp.weight"
                               : "";
-    fixture.offsets[0] = (fixture.router_bytes + 31) & ~std::uint64_t{31};
-    fixture.offsets[1] = (fixture.offsets[0] + kTensorBytes + 31) & ~std::uint64_t{31};
-    fixture.offsets[2] = (fixture.offsets[1] + kTensorBytes + 31) & ~std::uint64_t{31};
-    fixture.dense_offset = (fixture.offsets[2] + kTensorBytes + 31) & ~std::uint64_t{31};
+    fixture.layer_offsets.resize(expert_layers);
+    std::uint64_t next_expert_offset =
+        (fixture.router_bytes + 31) & ~std::uint64_t{31};
+    for (std::uint32_t layer = 0; layer < expert_layers; ++layer) {
+        for (std::size_t role = 0; role < 3; ++role) {
+            fixture.layer_offsets[layer][role] = next_expert_offset;
+            next_expert_offset =
+                (next_expert_offset + kTensorBytes + 31) & ~std::uint64_t{31};
+        }
+    }
+    fixture.offsets = fixture.layer_offsets.front();
+    fixture.dense_offset = next_expert_offset;
     fixture.ple_offset = fixture.dense_offset + kDenseBytes;
     if (overlap_ple) fixture.ple_offset -= 32;
     fixture.post_ple_offset = (fixture.ple_offset + kPleBytes + 31) & ~std::uint64_t{31};
@@ -387,35 +509,44 @@ Fixture write_fixture(const fs::path& directory, bool overlap_ple = false,
     std::vector<std::uint8_t> bytes;
     put_u32(bytes, 0x46554747u);
     put_u32(bytes, 3);
-    put_u64(bytes, 5 + static_cast<std::uint64_t>(include_router) +
+    put_u64(bytes, 2 + static_cast<std::uint64_t>(expert_layers) * 3 +
+                       static_cast<std::uint64_t>(include_router) +
                        static_cast<std::uint64_t>(include_router &&
                                                   include_second_router) +
                        static_cast<std::uint64_t>(bridge_ple));
     put_u64(bytes, 0);
-    for (std::size_t i = 0; i < 3; ++i) {
-        put_string(bytes, names[i]);
-        put_u32(bytes, 3);
-        put_u64(bytes, 64);
-        put_u64(bytes, 3'641);
-        put_u64(bytes, kExperts);
-        put_u32(bytes, 42);
-        put_u64(bytes, fixture.offsets[i]);
+    const std::array<std::string, 3> role_names = {
+        "ffn_gate_exps.weight",
+        "ffn_up_exps.weight",
+        "ffn_down_exps.weight",
+    };
+    for (std::uint32_t layer = 0; layer < expert_layers; ++layer) {
+        for (std::size_t role = 0; role < role_names.size(); ++role) {
+            put_string(bytes, "blk." + std::to_string(layer) + "." +
+                                  role_names[role]);
+            put_u32(bytes, 3);
+            put_u64(bytes, 64);
+            put_u64(bytes, 3'641);
+            put_u64(bytes, kExperts);
+            put_u32(bytes, 42);
+            put_u64(bytes, fixture.layer_offsets[layer][role]);
+        }
     }
-    put_string(bytes, names[3]);
+    put_string(bytes, "token_embd.weight");
     put_u32(bytes, 2);
     put_u64(bytes, 64);
     put_u64(bytes, 64);
     put_u32(bytes, 0);
     put_u64(bytes, fixture.dense_offset);
     if (include_router) {
-        put_string(bytes, names[4]);
+        put_string(bytes, fixture.router_tensor_name);
         put_u32(bytes, 2);
         put_u64(bytes, 2'560);
         put_u64(bytes, kExperts);
         put_u32(bytes, 0);
         put_u64(bytes, fixture.router_offset);
     }
-    put_string(bytes, names[5]);
+    put_string(bytes, "per_layer_token_embd.weight");
     put_u32(bytes, 2);
     put_u64(bytes, strata::kernels::PLE_HEAD_DIM);
     put_u64(bytes, kPleRows);
@@ -445,13 +576,18 @@ Fixture write_fixture(const fs::path& directory, bool overlap_ple = false,
     }
     bytes.resize(static_cast<std::size_t>(fixture.data_start + data_end), 0);
     fixture.file_size = bytes.size();
-    for (std::size_t tensor = 0; tensor < 3; ++tensor) {
-        for (std::uint64_t expert = 0; expert < kExperts; ++expert) {
-            const std::size_t begin = static_cast<std::size_t>(
-                fixture.data_start + fixture.offsets[tensor] + expert * kExpertSlabBytes);
-            std::fill(bytes.begin() + static_cast<std::ptrdiff_t>(begin),
-                      bytes.begin() + static_cast<std::ptrdiff_t>(begin + kExpertSlabBytes),
-                      static_cast<std::uint8_t>(0x30 + tensor * kExperts + expert));
+    for (std::uint32_t layer = 0; layer < expert_layers; ++layer) {
+        for (std::size_t tensor = 0; tensor < 3; ++tensor) {
+            for (std::uint64_t expert = 0; expert < kExperts; ++expert) {
+                const std::size_t begin = static_cast<std::size_t>(
+                    fixture.data_start + fixture.layer_offsets[layer][tensor] +
+                    expert * kExpertSlabBytes);
+                const auto value = static_cast<std::uint8_t>(
+                    0x30 + layer * 27 + tensor * kExperts + expert);
+                std::fill(bytes.begin() + static_cast<std::ptrdiff_t>(begin),
+                          bytes.begin() + static_cast<std::ptrdiff_t>(begin + kExpertSlabBytes),
+                          value);
+            }
         }
     }
     const std::size_t dense_begin =
@@ -564,26 +700,33 @@ WindowSources inspect_fixture(const Fixture& fixture) {
     shard.file_size = file.file_size();
     shard.file_device_id = shard_lock.file_device_id;
     shard.file_object_id = shard_lock.file_object_id;
-    const std::array<std::string, 4> names = {
-        "blk.0.ffn_gate_exps.weight",
-        "blk.0.ffn_up_exps.weight",
-        "blk.0.ffn_down_exps.weight",
-        "token_embd.weight",
+    const std::array<std::string, 3> expert_roles = {
+        "ffn_gate_exps.weight",
+        "ffn_up_exps.weight",
+        "ffn_down_exps.weight",
     };
-    for (const std::string& name : names) {
+    for (std::uint32_t layer = 0; layer < fixture.expert_layers; ++layer) {
+        for (const std::string& role : expert_roles) {
+            const std::string name =
+                "blk." + std::to_string(layer) + "." + role;
+            const strata::TensorInfo* tensor = file.find(name);
+            if (tensor == nullptr) {
+                throw std::runtime_error("synthetic GGUF tensor is missing: " + name);
+            }
+            const std::uint64_t payload = strata::tensor_payload_bytes(*tensor);
+            shard.tensors.push_back(
+                {name, file.data_start() + tensor->offset, payload,
+                 payload / fixture.expert_count});
+        }
+    }
+    for (const std::string& name : {std::string("token_embd.weight")}) {
         const strata::TensorInfo* tensor = file.find(name);
         if (tensor == nullptr) {
             throw std::runtime_error("synthetic GGUF tensor is missing");
         }
-        if (name == "token_embd.weight") {
-            shard.tensors.push_back(
-                {name, file.data_start() + tensor->offset, strata::tensor_payload_bytes(*tensor), 0});
-            continue;
-        }
-        const std::uint64_t payload = strata::tensor_payload_bytes(*tensor);
         shard.tensors.push_back(
-            {name, file.data_start() + tensor->offset, payload,
-             payload / fixture.expert_count});
+            {name, file.data_start() + tensor->offset,
+             strata::tensor_payload_bytes(*tensor), 0});
     }
     const strata::TensorInfo* ple = file.find("per_layer_token_embd.weight");
     if (ple == nullptr) throw std::runtime_error("synthetic GGUF PLE tensor is missing");
@@ -755,25 +898,29 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     geometry.head_dim = 1;
     geometry.n_embd = 1;
     geometry.vocab = 1;
+    geometry.n_layers = 3;
     geometry.types = {"f32", "iq2_xs"};
-    geometry.layers = {{
+    const LayerGeometry tiered_layer{
         3 * fixture.expert_slab_bytes,
         "iq2_xs",
         "iq2_xs",
-    }};
+    };
+    geometry.layers = {tiered_layer, tiered_layer, tiered_layer};
 
     PlanResult memory_plan;
     memory_plan.fits = true;
     memory_plan.mode = "tiered";
-    memory_plan.resident_order = {{0, 7}, {0, 2}};
+    memory_plan.resident_order = {
+        {0, 7}, {0, 2}, {1, 7}, {1, 2}, {2, 7}, {2, 2},
+    };
     memory_plan.experts_resident = memory_plan.resident_order.size();
     memory_plan.experts_resident_bytes =
         memory_plan.resident_order.size() * geometry.layers[0].blob_bytes;
     const std::uint64_t max_blob = geometry.layers[0].blob_bytes;
     const std::uint64_t slot_stride =
         (max_blob + kWindowPageBytes - 1) / kWindowPageBytes * kWindowPageBytes;
-    memory_plan.slots =
-        2 * (geometry.n_expert - memory_plan.resident_order.size());
+    const std::uint64_t max_layer_misses = geometry.n_expert - 2;
+    memory_plan.slots = 2 * max_layer_misses;
     memory_plan.slot_bytes = memory_plan.slots * slot_stride;
     memory_plan.free_bytes = 10'000;
 
@@ -937,10 +1084,8 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
                 resident_arena && resident_arena.length == layout.resident_arena_bytes &&
                 slot_arena && slot_arena.length == memory_plan.slot_bytes &&
                 storage->slot_pool() != nullptr &&
-                storage->slot_pool()->half_capacity(0) ==
-                    geometry.n_expert - memory_plan.resident_order.size() &&
-                storage->slot_pool()->half_capacity(1) ==
-                    geometry.n_expert - memory_plan.resident_order.size(),
+                storage->slot_pool()->half_capacity(0) == max_layer_misses &&
+                storage->slot_pool()->half_capacity(1) == max_layer_misses,
             "tiered arenas and ping-pong slot pool must match their planned sizes and alignments");
 
     strata::GgufFile source_file(fixture.path.string());
@@ -1026,7 +1171,10 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     const auto* resident = static_cast<const std::int32_t*>(resident_table.contents);
     const auto* plans = static_cast<const TieredMoePlan*>(plan_buffer.contents);
     require(resident[7] == 0 && resident[2] == 1 && resident[0] == -1 &&
-                resident[geometry.n_expert] == 0 &&
+                resident[geometry.n_expert + 7] == 2 &&
+                resident[geometry.n_expert + 2] == 3 &&
+                resident[2 * geometry.n_expert + 7] == 4 &&
+                resident[2 * geometry.n_expert + 2] == 5 &&
                 addresses[7 * 3] == layout.experts[7].resident_addresses[0] &&
                 addresses[7 * 3 + 1] == layout.experts[7].resident_addresses[1] &&
                 addresses[7 * 3 + 2] == layout.experts[7].resident_addresses[2] &&
@@ -1151,6 +1299,8 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     require(handshake_events != nullptr, "create layer-handshake test event: " + error);
     const std::uint64_t arrival_value = handshake_events->reserve_value();
     const std::uint64_t release_value = handshake_events->reserve_value();
+    const std::uint64_t consumer_arrival_value = handshake_events->reserve_value();
+    const std::uint64_t consumer_release_value = handshake_events->reserve_value();
     const std::uint64_t layer_done_value = handshake_events->reserve_value();
     const std::uint64_t later_arrival_value = handshake_events->reserve_value();
     const std::uint64_t later_release_value = handshake_events->reserve_value();
@@ -1167,7 +1317,81 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
             "encode GPU plan before signaling plan-ready: " + error);
     require(handshake_events->encode_signal(*resolve_command, arrival_value, error) &&
                 handshake_events->encode_wait(*resolve_command, release_value, error) &&
-                handshake_events->encode_signal(*resolve_command, layer_done_value, error) &&
+                handshake_events->encode_signal(*resolve_command,
+                                                consumer_arrival_value, error) &&
+                handshake_events->encode_wait(*resolve_command,
+                                              consumer_release_value, error),
+            "encode the first plan-ready and host-release events: " + error);
+
+    constexpr std::size_t kInputBlocks = 80;
+    constexpr std::size_t kOutputEntries = 10;
+    constexpr std::size_t kOutputWidth = 640;
+    constexpr std::size_t kIQ2XSBlockBytes = 74;
+    constexpr std::size_t kGateRowsInDispatch = 8;
+    constexpr std::size_t kBytesReadPerExpertRole =
+        kGateRowsInDispatch * 10 * kIQ2XSBlockBytes;
+    constexpr std::size_t kOutputBytes =
+        kOutputEntries * kOutputWidth * sizeof(float);
+    require(fixture.expert_slab_bytes >= kBytesReadPerExpertRole,
+            "the bounded GPU gate dispatch must fit inside each synthetic IQ2_XS role slab");
+    std::array<TestQ8_1, kInputBlocks> activations{};
+    for (TestQ8_1& activation : activations) {
+        activation.ds[0] = 0x3c00;  // IEEE-754 half 1.0.
+        std::fill(activation.qs, activation.qs + 32, 1);
+    }
+    BufferRef activation_buffer = context.buffers().allocate(
+        "tiered plan consumer Q8_1 activations",
+        sizeof(activations), error);
+    BufferRef gate_output = context.buffers().allocate(
+        "tiered plan consumer gate output", kOutputBytes, error);
+    BufferRef up_output = context.buffers().allocate(
+        "tiered plan consumer up output", kOutputBytes, error);
+    require(activation_buffer && gate_output && up_output,
+            "allocate buffers for the GPU expert-address consumer: " + error);
+    std::memcpy(activation_buffer.contents, activations.data(),
+                sizeof(activations));
+    const float poison = std::numeric_limits<float>::quiet_NaN();
+    std::fill_n(static_cast<float*>(gate_output.contents),
+                kOutputEntries * kOutputWidth, poison);
+    std::fill_n(static_cast<float*>(up_output.contents),
+                kOutputEntries * kOutputWidth, poison);
+    const ReadOnlyBufferRef address_input =
+        context.buffers().read_only(storage->expert_address_table());
+    const ReadOnlyBufferRef activation_input =
+        context.buffers().read_only(activation_buffer);
+    const ReadOnlyBufferRef plan_input =
+        context.buffers().read_only(storage->plan_buffer());
+    require(address_input && activation_input && plan_input,
+            "create read-only GPU expert consumer inputs: " + error);
+    const std::array<EncoderReadOnlyBufferBinding, 3> consumer_inputs = {{
+        {address_input, 0,
+         static_cast<std::size_t>(geometry.n_layers) * geometry.n_expert *
+             sizeof(TestMoeExpertAddress),
+         alignof(TestMoeExpertAddress)},
+        {activation_input, 1, sizeof(activations), alignof(TestQ8_1)},
+        {plan_input, 2, sizeof(TieredMoePlan), alignof(std::uint32_t)},
+    }};
+    const std::array<EncoderBufferBinding, 2> consumer_outputs = {{
+        {gate_output, 3, kOutputBytes, alignof(float)},
+        {up_output, 4, kOutputBytes, alignof(float)},
+    }};
+    const TestMoeGroupedParams consumer_params{geometry.n_expert, 0};
+    const EncoderBytesBinding params_binding{
+        &consumer_params, sizeof(consumer_params), 5};
+    // One x group reads gate rows 0..7 only; the up projection starts at x=80.
+    require(Encoder::encode(
+                context, *resolve_command, "tiered expert address consumer",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encoder.dispatch(
+                        "strata_moe_gu_iq2_xs", {1, resolve_plan.n_groups, 1},
+                        {256, 1, 1}, consumer_outputs, consumer_inputs,
+                        std::span<const EncoderBytesBinding>(&params_binding, 1),
+                        {}, encode_error);
+                },
+                error),
+            "encode the GPU IQ2_XS consumer of resolved expert addresses: " +
+                error);
+    require(handshake_events->encode_signal(*resolve_command, layer_done_value, error) &&
                 encode_moe_plan(context, *resolve_command, 1, geometry.n_expert,
                                 true, 2, gpu_plan_buffers, error) &&
                 handshake_events->encode_signal(*resolve_command, later_arrival_value, error) &&
@@ -1190,10 +1414,21 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
         (__bridge id<MTLCommandBuffer>)resolve_command->unsafe_native_handle();
     require(resolve_command->commit(error),
             "submit plan-producing command buffer: " + error);
+    bool consumer_gate_released = false;
     CommandGatesCleanup gate_cleanup(
-        handshake_events.get(), release_value, handshake_events.get(),
-        completion_gate_value, native_resolve);
-    gate_cleanup.add_layer_gate(handshake_events.get(), later_release_value);
+        handshake_events.get(), arrival_value, release_value,
+        handshake_events.get(), later_arrival_value, completion_gate_value,
+        native_resolve, [&] {
+            if (!consumer_gate_released) {
+                // Prevent test cleanup from running the queued expert kernel
+                // with unresolved addresses after releasing an earlier wait.
+                writable_plans[0].n_groups = 0;
+            }
+        });
+    gate_cleanup.add_layer_gate(handshake_events.get(), consumer_arrival_value,
+                                consumer_release_value);
+    gate_cleanup.add_layer_gate(handshake_events.get(), later_arrival_value,
+                                later_release_value);
     require(handshake_events->wait(arrival_value, 5000, error),
             "wait for first GPU-produced plan before replacing its consumed ids: " + error);
     std::uint32_t later_resident_expert = geometry.n_expert;
@@ -1219,12 +1454,14 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
                 5000, first_resolve, error),
             "resolve the shared GPU plan and release the waiting layer: " + error);
     gate_cleanup.mark_layer_released();
-    require(event_has_value(*handshake_events, release_value) &&
+    require(handshake_events->wait(consumer_arrival_value, 5000, error),
+            "hold the GPU expert consumer at its test gate before reading slots: " + error);
+    require(event_has_value(*handshake_events, consumer_arrival_value) &&
                 std::memcmp(writable_plans, &resolve_plan, sizeof(resolve_plan)) == 0 &&
                 first_resolve.hits == 5 && first_resolve.lookups == 10 &&
                 first_resolve.ram_blobs + first_resolve.file_blobs == 2 &&
                 first_resolve.file_bytes == first_resolve.file_blobs * blob,
-            "handshake must publish misses before signaling and count routed hits");
+            "handshake must publish misses before the blocked GPU consumer and count routed hits");
 
     for (const std::uint32_t expert_id : {3u, 8u}) {
         auto lease = storage->slot_pool()->lookup_ready(
@@ -1263,10 +1500,31 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     auto exhausted_half = storage->slot_pool()->acquire(
         0, 2, layout.experts[2].blob_bytes, error);
     require(!exhausted_half && error.find("no unpinned slot") != std::string::npos,
-            "all same-parity slots stay pinned before the layer-complete handshake (lease=" +
+            "all same-parity slots stay pinned while the GPU consumer is gated before its reads (lease=" +
                 std::to_string(static_cast<bool>(exhausted_half)) + ", error=" + error + ")");
+    require(gate_cleanup.release_layer(error),
+            "release the gated GPU expert consumer after proving its slots stay pinned: " +
+                error);
+    gate_cleanup.mark_layer_released();
+    consumer_gate_released = true;
     require(handshake_events->wait(layer_done_value, 5000, error),
-            "wait until the simulated GPU layer has consumed its expert addresses: " + error);
+            "wait until the GPU IQ2_XS layer has consumed its expert addresses: " + error);
+    const auto* gate_values = static_cast<const float*>(gate_output.contents);
+    const auto* up_values = static_cast<const float*>(up_output.contents);
+    std::size_t finite_gate_outputs = 0;
+    for (std::size_t entry = 0; entry < kOutputEntries; ++entry) {
+        for (std::size_t row = 0; row < 8; ++row) {
+            const std::size_t index = entry * kOutputWidth + row;
+            finite_gate_outputs += std::isfinite(gate_values[index]);
+        }
+    }
+    require(finite_gate_outputs == kOutputEntries * 8 &&
+                std::isnan(gate_values[kOutputWidth + 8]) &&
+                std::isnan(up_values[0]),
+            "the GPU expert consumer must overwrite its routed gate outputs before layer retirement (finite outputs=" +
+                std::to_string(finite_gate_outputs) + ", first gate=" +
+                std::to_string(gate_values[0]) + ", first up=" +
+                std::to_string(up_values[0]) + ")");
     require(handshake_events->wait(later_arrival_value, 5000, error),
             "wait for the later GPU plan after the earlier layer's expert reads: " + error);
     require(writable_plans[2].n_groups == 1 &&
@@ -1296,6 +1554,85 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     other_layer_pins.clear();
     reused_half.reset();
 
+    const std::array<std::int32_t, 10> cleanup_ids{
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7};
+    std::memcpy(plan_ids_buffer.contents, cleanup_ids.data(), sizeof(cleanup_ids));
+    std::fill_n(static_cast<float*>(gate_output.contents),
+                kOutputEntries * kOutputWidth, poison);
+    std::fill_n(static_cast<float*>(up_output.contents),
+                kOutputEntries * kOutputWidth, poison);
+    auto cleanup_events =
+        context.make_events("tiered failed-request cleanup gates", error);
+    require(cleanup_events != nullptr,
+            "create failed-request cleanup test events: " + error);
+    const std::uint64_t cleanup_plan_arrival = cleanup_events->reserve_value();
+    const std::uint64_t cleanup_plan_release = cleanup_events->reserve_value();
+    const std::uint64_t cleanup_consumer_arrival = cleanup_events->reserve_value();
+    const std::uint64_t cleanup_consumer_release = cleanup_events->reserve_value();
+    const std::uint64_t cleanup_layer_done = cleanup_events->reserve_value();
+    const std::uint64_t cleanup_completion = cleanup_events->reserve_value();
+    auto cleanup_command =
+        context.make_command_buffer("tiered failed-request cleanup", error);
+    require(cleanup_command != nullptr,
+            "create failed-request cleanup command buffer: " + error);
+    require(encode_moe_plan(context, *cleanup_command, 1, geometry.n_expert,
+                            true, 0, gpu_plan_buffers, error) &&
+                cleanup_events->encode_signal(*cleanup_command,
+                                              cleanup_plan_arrival, error) &&
+                cleanup_events->encode_wait(*cleanup_command,
+                                            cleanup_plan_release, error),
+            "encode cleanup plan and its host gate: " + error);
+    require(Encoder::encode(
+                context, *cleanup_command, "failed-request guarded consumer",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encoder.dispatch(
+                        "strata_moe_gu_iq2_xs", {1, 1, 1}, {256, 1, 1},
+                        consumer_outputs, consumer_inputs,
+                        std::span<const EncoderBytesBinding>(&params_binding, 1),
+                        {}, encode_error);
+                },
+                error) &&
+                cleanup_events->encode_signal(*cleanup_command,
+                                              cleanup_consumer_arrival, error) &&
+                cleanup_events->encode_wait(*cleanup_command,
+                                            cleanup_consumer_release, error) &&
+                cleanup_events->encode_signal(*cleanup_command,
+                                              cleanup_layer_done, error) &&
+                cleanup_events->encode_wait(*cleanup_command,
+                                            cleanup_completion, error),
+            "encode guarded consumer and staged cleanup gates: " + error);
+    auto cleanup_leases =
+        expert_store->prepare_command_buffer(*cleanup_command, error);
+    require(cleanup_leases != nullptr,
+            "prepare failed-request cleanup completion callback: " + error);
+    id<MTLCommandBuffer> native_cleanup =
+        (__bridge id<MTLCommandBuffer>)cleanup_command->unsafe_native_handle();
+    require(cleanup_command->commit(error),
+            "submit failed-request cleanup command buffer: " + error);
+    bool cleanup_guard_applied = false;
+    {
+        CommandGatesCleanup failed_request_cleanup(
+            cleanup_events.get(), cleanup_plan_arrival, cleanup_plan_release,
+            cleanup_events.get(), cleanup_layer_done, cleanup_completion,
+            native_cleanup, [&] {
+                writable_plans[0].n_groups = 0;
+                cleanup_guard_applied = true;
+            });
+        failed_request_cleanup.add_layer_gate(
+            cleanup_events.get(), cleanup_consumer_arrival,
+            cleanup_consumer_release);
+        require(cleanup_events->wait(cleanup_plan_arrival, 5000, error),
+                "wait for the failed request's GPU plan before cleanup: " + error);
+    }
+    require(cleanup_guard_applied &&
+                cleanup_events->wait(cleanup_layer_done, 5000, error) &&
+                native_cleanup.status == MTLCommandBufferStatusCompleted &&
+                std::all_of(static_cast<const float*>(gate_output.contents),
+                            static_cast<const float*>(gate_output.contents) +
+                                kOutputEntries * kOutputWidth,
+                            [](float value) { return std::isnan(value); }),
+            "failed-request cleanup must guard the consumer after plan arrival, drain every staged wait, and leave outputs untouched");
+
     const std::array<std::int32_t, 10> skip_ids{
         7, 7, 7, 7, 7, 7, 7, 7, 7, 7};
     std::memcpy(plan_ids_buffer.contents, skip_ids.data(), sizeof(skip_ids));
@@ -1319,9 +1656,10 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     id<MTLCommandBuffer> native_skip =
         (__bridge id<MTLCommandBuffer>)skip_command->unsafe_native_handle();
     require(skip_command->commit(error), "submit skipped-plan command buffer: " + error);
-    CommandGatesCleanup skip_cleanup(handshake_events.get(), skip_release,
-                                     handshake_events.get(), skip_completion,
-                                     native_skip);
+    CommandGatesCleanup skip_cleanup(handshake_events.get(), skip_arrival,
+                                     skip_release,
+                                     handshake_events.get(), skip_done,
+                                     skip_completion, native_skip);
     require(handshake_events->wait(skip_arrival, 5000, error),
             "wait for GPU all-resident plan before poisoning ignored arrays: " + error);
     require(writable_plans[0].n_groups == 1 &&
@@ -1341,8 +1679,14 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     skip_cleanup.mark_layer_released();
     require(skipped_stats.hits == 10 && skipped_stats.lookups == 10 &&
                 skipped_stats.ram_blobs == 0 && skipped_stats.file_blobs == 0 &&
-                event_has_value(*handshake_events, skip_release),
-            "a skipped plan must report resident hits and signal the host release");
+                event_has_reached_value(*handshake_events, skip_release),
+            "a skipped plan must report resident hits and signal the host release (hits=" +
+                std::to_string(skipped_stats.hits) + ", lookups=" +
+                std::to_string(skipped_stats.lookups) + ", ram=" +
+                std::to_string(skipped_stats.ram_blobs) + ", file=" +
+                std::to_string(skipped_stats.file_blobs) + ", released=" +
+                std::to_string(event_has_reached_value(*handshake_events, skip_release)) +
+                ", error=" + error + ")");
     require(handshake_events->wait(skip_done, 5000, error),
             "wait for skipped layer completion: " + error);
     skip_leases->retire_layer(0);
@@ -1379,9 +1723,10 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
         (__bridge id<MTLCommandBuffer>)invalid_handshake_command->unsafe_native_handle();
     require(invalid_handshake_command->commit(error),
             "submit invalid skipped-plan command buffer: " + error);
-    CommandGatesCleanup invalid_cleanup(handshake_events.get(), invalid_release,
-                                       handshake_events.get(), invalid_completion,
-                                       native_invalid);
+    CommandGatesCleanup invalid_cleanup(handshake_events.get(), invalid_arrival,
+                                       invalid_release,
+                                       handshake_events.get(), invalid_done,
+                                       invalid_completion, native_invalid);
     ExpertLayerStats invalid_handshake_stats;
     require(!expert_store->resolve_layer_after_plan(
                 invalid_handshake_leases, 0, *handshake_events,
@@ -1434,8 +1779,8 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     id<MTLCommandBuffer> native_cache =
         (__bridge id<MTLCommandBuffer>)cache_command->unsafe_native_handle();
     [native_cache waitUntilCompleted];
-    require(context.buffers().allocation_count() == 7,
-            "tiered mode must allocate its three arenas and four tables, without GGUF windows");
+    require(context.buffers().allocation_count() == 11,
+            "tiered mode must allocate its three arenas, four tables, GPU-plan input and GPU-reader fixtures, without GGUF windows");
     require_not_overlapping_gguf_mapping(dense_arena, source_file, "tiered dense arena");
     require_not_overlapping_gguf_mapping(resident_arena, source_file, "tiered resident arena");
     require_not_overlapping_gguf_mapping(slot_arena, source_file, "tiered slot arena");
@@ -1498,6 +1843,7 @@ Geometry owner_test_geometry(const Fixture& fixture, const WindowSources& source
 }
 
 PlanResult owner_test_full_plan(const Geometry& geometry, const DeviceFacts& facts) {
+    constexpr std::uint64_t kFixedAllowanceBytes = 256ull * 1024 * 1024;
     PlanResult plan;
     plan.fits = true;
     plan.mode = "full";
@@ -1506,6 +1852,7 @@ PlanResult owner_test_full_plan(const Geometry& geometry, const DeviceFacts& fac
     plan.available_bytes = -1;
     plan.context = 13;
     plan.kv = KvFormat::Int8;
+    plan.fixed_bytes = kFixedAllowanceBytes;
     QsaKvLayout kv_layout;
     std::string kv_error;
     require(make_qsa_kv_layout(plan.context, plan.kv, kv_layout, kv_error),
@@ -1526,7 +1873,8 @@ PlanResult owner_test_full_plan(const Geometry& geometry, const DeviceFacts& fac
         }
     }
     plan.total_bytes = plan.dense_bytes + plan.unread_bytes + plan.pack_bytes +
-                       plan.kv_bytes + plan.experts_resident_bytes;
+                       plan.fixed_bytes + plan.kv_bytes +
+                       plan.experts_resident_bytes;
     plan.ram_bytes_used = plan.total_bytes - plan.unread_bytes;
     plan.anonymous_bytes_used = plan.ram_bytes_used;
     plan.free_bytes = static_cast<std::int64_t>(plan.w_bytes - plan.total_bytes);
@@ -1534,6 +1882,7 @@ PlanResult owner_test_full_plan(const Geometry& geometry, const DeviceFacts& fac
 }
 
 PlanResult owner_test_tiered_plan(const Geometry& geometry, const DeviceFacts& facts) {
+    constexpr std::uint64_t kFixedAllowanceBytes = 256ull * 1024 * 1024;
     PlanResult plan;
     plan.fits = true;
     plan.mode = "tiered";
@@ -1542,6 +1891,7 @@ PlanResult owner_test_tiered_plan(const Geometry& geometry, const DeviceFacts& f
     plan.available_bytes = -1;
     plan.context = 13;
     plan.kv = KvFormat::Int8;
+    plan.fixed_bytes = kFixedAllowanceBytes;
     QsaKvLayout kv_layout;
     std::string kv_error;
     require(make_qsa_kv_layout(plan.context, plan.kv, kv_layout, kv_error),
@@ -1562,8 +1912,9 @@ PlanResult owner_test_tiered_plan(const Geometry& geometry, const DeviceFacts& f
         (max_blob + kWindowPageBytes - 1) / kWindowPageBytes * kWindowPageBytes;
     plan.slots = 2 * (geometry.n_expert - plan.experts_resident);
     plan.slot_bytes = plan.slots * slot_stride;
-    plan.total_bytes = plan.dense_bytes + plan.pack_bytes + plan.kv_bytes +
-                       plan.slot_bytes + plan.experts_resident_bytes;
+    plan.total_bytes = plan.dense_bytes + plan.pack_bytes + plan.fixed_bytes +
+                       plan.kv_bytes + plan.slot_bytes +
+                       plan.experts_resident_bytes;
     plan.ram_bytes_used = plan.total_bytes;
     plan.anonymous_bytes_used = plan.ram_bytes_used;
     plan.free_bytes = static_cast<std::int64_t>(plan.w_bytes - plan.total_bytes);
@@ -1727,7 +2078,8 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
                                invalid_router_plan, error) == nullptr &&
                 error.find("supported F32 router") != std::string::npos &&
                 context.buffers().allocation_count() == allocations_before_full,
-            "full-mode owner must reject a converted router whose block exceeds geometry");
+            "full-mode owner must reject a converted router whose block exceeds geometry: " +
+                error);
     const PlanResult invalid_router_tiered_plan =
         owner_test_tiered_plan(invalid_router_geometry, facts);
     require(TieredStorage::open(context, invalid_router_fixture.path.string(),
@@ -2239,7 +2591,9 @@ int main(int argc, char** argv) {
         char* directory_name = mkdtemp(directory_template);
         require(directory_name != nullptr, "create temporary fixture directory");
         const fs::path directory(directory_name);
-        const Fixture fixture = write_fixture(directory);
+        const Fixture fixture = write_fixture(
+            directory, false, false, true, 0, false,
+            tiered_copy_only ? 3u : 1u);
         WindowSources sources = inspect_fixture(fixture);
         std::string error;
 
