@@ -1627,6 +1627,14 @@ void run() {
         std::cerr << "  wrong-type diagnostic: " << error << '\n';
     check(wrong_type_rejected && error.find("disallowed type") != std::string::npos,
           "inventory rejects a valid GGML type assigned to the wrong tensor role");
+    SyntheticModel q8_ple_key = make_model(
+        temp.path / "q8-ple-key", {}, {}, "blk.1.ple_key.weight", false,
+        kExperts, false, {}, 8u);
+    const bool q8_ple_key_accepted = inspect(q8_ple_key, geometry, error);
+    if (!q8_ple_key_accepted)
+        std::cerr << "  Q8_0 PLE key diagnostic: " << error << '\n';
+    check(q8_ple_key_accepted,
+          "inventory accepts native Q8_0 PLE key tensors");
     SyntheticModel unsupported_experts =
         make_model(temp.path / "unsupported-experts", {}, {}, {}, false, 10);
     check(!inspect(unsupported_experts, geometry, error) &&

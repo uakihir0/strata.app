@@ -1788,7 +1788,7 @@ bool validate_qwen_tensor_type(const strata::TensorInfo& tensor, std::string& er
         {"indexer.k_proj.weight", {30}},
         {"indexer.q_norm.weight", {0}},
         {"indexer.k_norm.weight", {0}},
-        {"ple_key.weight", {30, 42}},
+        {"ple_key.weight", {8, 30, 42}},
         {"ple_value.weight", {30}},
         {"ple_norm_key.weight", {0}},
         {"ple_norm_query.weight", {0}},
