@@ -590,6 +590,10 @@ strata_metal_test(metal_fullmode_output_head_test metal
                   metal_window_storage_test ${STRATA_METALLIB}
                   --fullmode-output-head)
 set_tests_properties(metal_fullmode_output_head_test PROPERTIES TIMEOUT 180)
+strata_metal_test(metal_fullmode_output_sampling_test metal
+                  metal_window_storage_test ${STRATA_METALLIB}
+                  --fullmode-output-sampling)
+set_tests_properties(metal_fullmode_output_sampling_test PROPERTIES TIMEOUT 180)
 strata_metal_test(metal_fullmode_ple_handoff_test metal metal_window_storage_test ${STRATA_METALLIB} --fullmode-ple-handoff)
 set_tests_properties(metal_fullmode_ple_handoff_test PROPERTIES TIMEOUT 180)
 strata_metal_test(metal_fullmode_ple_q8_handoff_test metal metal_window_storage_test ${STRATA_METALLIB} --fullmode-ple-handoff-q8)

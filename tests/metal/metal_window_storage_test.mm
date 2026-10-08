@@ -15,6 +15,8 @@
 #include "strata/metal/window_scratch.hpp"
 #include "strata/metal/window_output_projection.hpp"
 #include "strata/metal/window_output_head.hpp"
+#include "strata/metal/window_output_sampling.hpp"
+#include "strata/metal/window_params.hpp"
 #include "strata/metal/session_state.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -31,6 +33,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -4786,6 +4789,513 @@ void run_fullmode_output_head_test(Context& context,
             "caller-owned rollback preserves all head scratch bytes");
 }
 
+float reference_window_sampler_uniform(std::uint64_t seed,
+                                       std::uint64_t counter) {
+    std::array<std::uint32_t, 4> words{
+        static_cast<std::uint32_t>(counter),
+        static_cast<std::uint32_t>(counter >> 32u),
+        static_cast<std::uint32_t>(seed),
+        static_cast<std::uint32_t>(seed >> 32u)};
+    for (std::uint32_t round = 0u; round < 10u; ++round) {
+        const std::uint64_t product0 =
+            std::uint64_t{0x9e3779b9u} * words[0];
+        const std::uint64_t product1 =
+            std::uint64_t{0xbb67ae85u} * words[2];
+        words = {
+            static_cast<std::uint32_t>(product1 >> 32u) ^ words[1] ^ round,
+            static_cast<std::uint32_t>(product1),
+            static_cast<std::uint32_t>(product0 >> 32u) ^ words[3],
+            static_cast<std::uint32_t>(product0)};
+    }
+    return static_cast<float>(words[0] >> 8u) * (1.0f / 16777216.0f);
+}
+
+TailPick reference_window_sampler_tail(
+    std::span<const SampCandidate> candidates,
+    const WindowSamplerSettings& settings, std::uint64_t seed,
+    std::uint64_t counter) {
+    const std::size_t k = candidates.size();
+    std::array<float, 64> logits{};
+    std::array<double, 64> probabilities{};
+    for (std::size_t index = 0u; index < k; ++index) {
+        logits[index] = std::bit_cast<float>(candidates[index].logit_bits);
+    }
+
+    std::size_t keep = k;
+    if (settings.top_p < 1.0f) {
+        float maximum = logits[0];
+        for (std::size_t index = 1u; index < k; ++index) {
+            maximum = std::fmax(maximum, logits[index]);
+        }
+        double sum = 0.0;
+        for (std::size_t index = 0u; index < k; ++index) {
+            probabilities[index] = std::exp(
+                static_cast<double>(logits[index]) -
+                static_cast<double>(maximum));
+            sum += probabilities[index];
+        }
+        for (std::size_t index = 0u; index < k; ++index) {
+            probabilities[index] /= sum;
+        }
+        double cumulative = 0.0;
+        std::size_t cut = k;
+        for (std::size_t index = 0u; index < k; ++index) {
+            cumulative += probabilities[index];
+            if (cumulative >= static_cast<double>(settings.top_p)) {
+                cut = index + 1u;
+                break;
+            }
+        }
+        if (cut < static_cast<std::size_t>(settings.min_keep)) {
+            cut = std::min(k, static_cast<std::size_t>(settings.min_keep));
+        }
+        keep = cut;
+    }
+    if (settings.min_p > 0.0f) {
+        const float threshold =
+            logits[0] + std::log(settings.min_p);
+        for (std::size_t index = 0u; index < keep; ++index) {
+            if (logits[index] < threshold) {
+                keep = index;
+                break;
+            }
+        }
+    }
+
+    const float inverse_temperature =
+        1.0f / settings.temperature;
+    float scaled_maximum = logits[0] * inverse_temperature;
+    for (std::size_t index = 1u; index < keep; ++index) {
+        scaled_maximum =
+            std::fmax(scaled_maximum,
+                      logits[index] * inverse_temperature);
+    }
+    double sum = 0.0;
+    for (std::size_t index = 0u; index < keep; ++index) {
+        probabilities[index] = std::exp(
+            static_cast<double>(logits[index] * inverse_temperature) -
+            static_cast<double>(scaled_maximum));
+        sum += probabilities[index];
+    }
+    for (std::size_t index = 0u; index < keep; ++index) {
+        probabilities[index] /= sum;
+    }
+
+    const float uniform = reference_window_sampler_uniform(seed, counter);
+    std::size_t picked = keep - 1u;
+    double cumulative = 0.0;
+    for (std::size_t index = 0u; index < keep; ++index) {
+        cumulative += probabilities[index];
+        if (static_cast<double>(uniform) < cumulative) {
+            picked = index;
+            break;
+        }
+    }
+    return {candidates[picked].id,
+            static_cast<float>(probabilities[picked])};
+}
+
+void run_fullmode_output_sampling_test(Context& context,
+                                       const fs::path& parent_directory) {
+    constexpr std::uint32_t kRows = 2u;
+    constexpr std::size_t kActiveLogitsBytes =
+        static_cast<std::size_t>(kRows) * kWindowOutputVocabularySize *
+        sizeof(float);
+    constexpr std::size_t kActiveCandidatesBytes =
+        static_cast<std::size_t>(kRows) * 64u * sizeof(SampCandidate);
+
+    const fs::path directory = parent_directory / "fullmode-output-sampling";
+    fs::create_directory(directory);
+    const Fixture fixture = write_fullmode_handoff_fixture(
+        directory, kGgmlTypeQ2_0, true, true);
+    WindowSources sources = inspect_fixture(fixture);
+    Geometry full_geometry = owner_test_geometry(fixture, sources);
+    full_geometry.family = "qwen4exp";
+    full_geometry.model = "synthetic-fullmode-output-sampling";
+    full_geometry.n_expert = 256u;
+    full_geometry.n_qsa_layers = 1u;
+    full_geometry.n_kv_head = 2u;
+    full_geometry.head_dim = 256u;
+    full_geometry.n_embd = kWindowOutputInputWidth;
+    full_geometry.vocab = kWindowOutputVocabularySize;
+    full_geometry.types = {"q2_0", "bf16", "f32", "iq4_xs"};
+    full_geometry.layers[0].gate_up_type = "q2_0";
+    full_geometry.layers[0].down_type = "q2_0";
+
+    std::string error;
+    WindowPlan plan;
+    require(plan_windows(sources, context.device_facts().max_buffer_length,
+                         plan, error),
+            "plan FullMode output-sampling fixture: " + error);
+    auto full_mode = FullModeStorage::open(
+        context, fixture.path.string(), full_geometry, sources, plan, error);
+    require(full_mode != nullptr,
+            "open FullMode output-sampling fixture: " + error);
+
+    Geometry runtime_geometry;
+    runtime_geometry.family = "qwen4exp";
+    runtime_geometry.model = "synthetic-window-runtime";
+    runtime_geometry.n_layers = kSessionModelLayers;
+    runtime_geometry.n_expert = 256u;
+    runtime_geometry.n_qsa_layers = kSessionQsaLayers;
+    runtime_geometry.n_kv_head = kSessionKvHeads;
+    runtime_geometry.head_dim = kSessionHeadWidth;
+    runtime_geometry.n_embd = kWindowOutputInputWidth;
+    runtime_geometry.vocab = kWindowOutputVocabularySize;
+    auto scratch =
+        WindowScratchStorage::open(context, runtime_geometry, 4u, error);
+    require(scratch != nullptr,
+            "allocate FullMode output-sampling scratch: " + error);
+    auto params_ring = WindowParamsRing::open(context, error);
+    require(params_ring != nullptr,
+            "open FullMode output-sampling WindowParamsRing: " + error);
+
+    const std::array<std::uint32_t, kRows> tokens{0u};
+    WindowSamplerSettings settings{};
+    settings.temperature = 0.8f;
+    settings.top_p = 1.0f;
+    settings.min_p = 0.0f;
+    settings.penalty_repeat = 1.0f;
+    settings.penalty_freq = 0.0f;
+    settings.penalty_present = 0.0f;
+    settings.top_k = 4;
+    settings.min_keep = 1;
+    settings.greedy = 0;
+    WindowSamplerSettings second_settings{};
+    second_settings.temperature = 0.37f;
+    second_settings.top_p = 0.6f;
+    second_settings.min_p = 0.15f;
+    second_settings.penalty_repeat = 1.25f;
+    second_settings.penalty_freq = 0.1f;
+    second_settings.penalty_present = 0.2f;
+    second_settings.top_k = 2;
+    second_settings.min_keep = 2;
+    second_settings.greedy = 0;
+    second_settings.hist_off = 5u;
+    second_settings.hist_len = 1u;
+    const std::array<WindowSamplerSettings, kRows> samplers{
+        settings, second_settings};
+    BufferRef params = params_ring->build_slot(
+        0u, 10u, tokens, samplers, 0u, 0x12345678u, 0x9abcdef0u, error);
+    require(static_cast<bool>(params),
+            "build sampled WindowParams slot: " + error);
+
+    const WindowScratchLayout& layout = scratch->layout();
+    BufferRef residual = require_scratch_view(
+        context, *scratch, layout.residual, "output-sampling residual");
+    const std::array scratch_regions{
+        layout.head_normalized, layout.head_low_rank, layout.head_gate,
+        layout.head_mixed, layout.head_q8_1, layout.head_logits,
+        layout.sampler_candidates, layout.sampler_selection,
+        layout.sampler_output, layout.matvec_sink,
+    };
+    std::vector<BufferRef> writable_scratch;
+    writable_scratch.reserve(scratch_regions.size());
+    for (std::size_t index = 0u; index < scratch_regions.size(); ++index) {
+        BufferRef view = require_scratch_view(
+            context, *scratch, scratch_regions[index],
+            "output-sampling writable region " + std::to_string(index));
+        std::memset(view.contents, 0xa5, view.length);
+        writable_scratch.push_back(view);
+    }
+    BufferRef history = require_scratch_view(
+        context, *scratch, layout.sampler_history,
+        "output-sampling history");
+    std::memset(history.contents, 0, history.length);
+    static_cast<std::int32_t*>(history.contents)[5u] = 1;
+    std::fill_n(static_cast<float*>(residual.contents),
+                residual.length / sizeof(float), 1.0f);
+
+    auto command = context.make_command_buffer(
+        "FullMode output sampling success", error);
+    require(command != nullptr,
+            "create FullMode output-sampling command: " + error);
+    WindowOutputSamplingResult encoded;
+    require(encode_window_output_sampling(
+                context, *command, *full_mode, *scratch, residual, params,
+                encoded, error),
+            "encode FullMode head and sampled candidates: " + error);
+    require(encoded.rows == kRows &&
+                encoded.logits.length == kActiveLogitsBytes &&
+                encoded.selected_candidates.length ==
+                    kActiveCandidatesBytes,
+            "publish only active logits and candidate rows");
+    require(command->commit(error),
+            "commit FullMode output-sampling command: " + error);
+
+    std::vector<TailPick> picks;
+    require(sample_window_output_tail(context, *command, params, encoded,
+                                      picks, error),
+            "run CPU sampling tail after GPU candidate completion: " + error);
+    require(picks.size() == kRows,
+            "CPU tail returns one sampled result per active row");
+    auto* const selected =
+        static_cast<SampCandidate*>(
+            encoded.selected_candidates.contents);
+    const std::uint64_t seed =
+        (static_cast<std::uint64_t>(0x9abcdef0u) << 32u) | 0x12345678u;
+    const auto* const logits =
+        static_cast<const float*>(encoded.logits.contents);
+    const std::array<SampCandidate, 4u> expected_row0{{
+        {0, std::bit_cast<std::uint32_t>(logits[0u])},
+        {1, std::bit_cast<std::uint32_t>(0.0f)},
+        {2, std::bit_cast<std::uint32_t>(0.0f)},
+        {3, std::bit_cast<std::uint32_t>(0.0f)},
+    }};
+    const std::array<SampCandidate, 2u> expected_row1{{
+        {0, std::bit_cast<std::uint32_t>(
+                logits[kWindowOutputVocabularySize])},
+        {2, std::bit_cast<std::uint32_t>(0.0f)},
+    }};
+    const std::array<std::span<const SampCandidate>, kRows>
+        expected_candidates{
+            std::span<const SampCandidate>(expected_row0),
+            std::span<const SampCandidate>(expected_row1)};
+    for (std::uint32_t row = 0u; row < kRows; ++row) {
+        const std::size_t candidate_offset =
+            static_cast<std::size_t>(row) * 64u;
+        const std::uint32_t requested_k =
+            static_cast<std::uint32_t>(samplers[row].top_k);
+        const auto fixture_candidates = expected_candidates[row];
+        require(fixture_candidates.size() == requested_k &&
+                    logits[static_cast<std::size_t>(row) *
+                               kWindowOutputVocabularySize] > 0.0f &&
+                    std::all_of(
+                        logits + static_cast<std::size_t>(row) *
+                                     kWindowOutputVocabularySize +
+                            1u,
+                        logits + (static_cast<std::size_t>(row) + 1u) *
+                                     kWindowOutputVocabularySize,
+                        [](float value) { return value == 0.0f; }),
+                "synthetic fixture logits match row " + std::to_string(row));
+        for (std::size_t candidate_index = 0u;
+             candidate_index < fixture_candidates.size(); ++candidate_index) {
+            require(selected[candidate_offset + candidate_index].id ==
+                        fixture_candidates[candidate_index].id &&
+                        selected[candidate_offset + candidate_index]
+                                .logit_bits ==
+                            fixture_candidates[candidate_index].logit_bits,
+                    "GPU top-k candidate matches independent fixture row " +
+                        std::to_string(row) + " index " +
+                        std::to_string(candidate_index));
+        }
+        const TailPick expected = reference_window_sampler_tail(
+            fixture_candidates, samplers[row], seed, 10u + row);
+        require(picks[row].id == expected.id &&
+                    picks[row].probability == expected.probability &&
+                    std::isfinite(picks[row].probability) &&
+                    picks[row].probability > 0.0f &&
+                    picks[row].probability <= 1.0f,
+                "CPU tail matches the independent row-specific sampler oracle for row " +
+                    std::to_string(row));
+    }
+    std::vector<TailPick> guarded_picks{{-7, 0.25f}};
+    const SampCandidate original_first_candidate = selected[0u];
+    selected[0u].logit_bits =
+        std::bit_cast<std::uint32_t>(
+            std::numeric_limits<float>::quiet_NaN());
+    const bool rejected_nonfinite_candidate =
+        !sample_window_output_tail(context, *command, params, encoded,
+                                   guarded_picks, error) &&
+        error.find("non-finite candidate logit") != std::string::npos &&
+        guarded_picks.size() == 1u && guarded_picks[0].id == -7 &&
+        guarded_picks[0].probability == 0.25f;
+    require(rejected_nonfinite_candidate,
+            "CPU tail rejects non-finite GPU candidates without publishing picks: " +
+                error);
+    selected[0u] = original_first_candidate;
+
+    selected[0u].logit_bits =
+        std::bit_cast<std::uint32_t>(
+            std::numeric_limits<float>::max());
+    const bool rejected_nonfinite_probability =
+        !sample_window_output_tail(context, *command, params, encoded,
+                                   guarded_picks, error) &&
+        error.find("produced an invalid probability") != std::string::npos &&
+        guarded_picks.size() == 1u && guarded_picks[0].id == -7 &&
+        guarded_picks[0].probability == 0.25f;
+    require(rejected_nonfinite_probability,
+            "CPU tail rejects overflowed probability without publishing picks: " +
+                error);
+    selected[0u] = original_first_candidate;
+
+    auto* const mutable_window_params =
+        static_cast<strata::metal::WindowParams*>(params.contents);
+    const std::uint32_t original_rows = mutable_window_params->T;
+    mutable_window_params->T = std::numeric_limits<std::uint32_t>::max();
+    const bool rejected_wrapped_row_count =
+        !sample_window_output_tail(context, *command, params, encoded,
+                                   guarded_picks, error) &&
+        error.find("row count must be in 1..8") != std::string::npos &&
+        guarded_picks.size() == 1u && guarded_picks[0].id == -7 &&
+        guarded_picks[0].probability == 0.25f;
+    require(rejected_wrapped_row_count,
+            "CPU tail rejects oversized T without looping or publishing picks: " +
+                error);
+    mutable_window_params->T = original_rows;
+
+    const auto snapshot_bytes = [](BufferRef view) {
+        std::vector<std::uint8_t> bytes(view.length);
+        std::memcpy(bytes.data(), view.contents, view.length);
+        return bytes;
+    };
+    const auto snapshot_writable_scratch = [&] {
+        std::vector<std::vector<std::uint8_t>> before;
+        before.reserve(writable_scratch.size());
+        for (BufferRef view : writable_scratch) {
+            std::memset(view.contents, 0x5a, view.length);
+            before.push_back(snapshot_bytes(view));
+        }
+        return before;
+    };
+    const auto require_scratch_unchanged =
+        [&](const std::vector<std::vector<std::uint8_t>>& before,
+            const std::string& label) {
+            for (std::size_t index = 0u;
+                 index < writable_scratch.size(); ++index) {
+                const BufferRef view = writable_scratch[index];
+                require(std::equal(
+                            before[index].begin(), before[index].end(),
+                            static_cast<const std::uint8_t*>(view.contents)),
+                        label + " preserves writable scratch " +
+                            std::to_string(index));
+            }
+        };
+    const auto before_alias = snapshot_writable_scratch();
+    BufferRef aliased_residual = require_scratch_view(
+        context, *scratch, layout.sampler_candidates,
+        "residual/sampler-candidate alias");
+    auto alias_command = context.make_command_buffer(
+        "FullMode output sampling residual alias rejection", error);
+    require(alias_command != nullptr,
+            "create output-sampling residual alias command: " + error);
+    WindowOutputSamplingResult alias_result;
+    const bool rejected_alias =
+        !encode_window_output_sampling(
+            context, *alias_command, *full_mode, *scratch, aliased_residual,
+            params, alias_result, error) &&
+        error.find("residual overlaps sampler output scratch") !=
+            std::string::npos &&
+        alias_command->unsafe_native_handle() == nullptr &&
+        alias_result.rows == 0u && !alias_result.logits &&
+        !alias_result.selected_candidates;
+    require(rejected_alias,
+            "residual/candidate alias must be rejected before head dispatch: " +
+                error);
+    require_scratch_unchanged(before_alias,
+                              "residual/candidate alias rejection");
+
+    std::memset(history.contents, 0, history.length);
+    BufferRef invalid_params = params_ring->build_slot(
+        1u, 10u, tokens, samplers, 0u, 0x12345678u, 0x9abcdef0u, error);
+    require(static_cast<bool>(invalid_params),
+            "build rollback WindowParams slot: " + error);
+    auto* const invalid_window_params =
+        static_cast<strata::metal::WindowParams*>(
+            invalid_params.contents);
+    invalid_window_params->samp[0].penalty_repeat = 0.0f;
+    const auto before_invalid_setting = snapshot_writable_scratch();
+    auto invalid_setting_command = context.make_command_buffer(
+        "FullMode invalid sampler settings preflight", error);
+    require(invalid_setting_command != nullptr,
+            "create invalid sampler settings command: " + error);
+    WindowOutputSamplingResult invalid_setting_result;
+    const bool rejected_invalid_setting =
+        !encode_window_output_sampling(
+            context, *invalid_setting_command, *full_mode, *scratch, residual,
+            invalid_params, invalid_setting_result, error) &&
+        error.find("repeat penalty must be greater than zero") !=
+            std::string::npos &&
+        invalid_setting_command->unsafe_native_handle() == nullptr &&
+        invalid_setting_result.rows == 0u &&
+        !invalid_setting_result.logits &&
+        !invalid_setting_result.selected_candidates;
+    require(rejected_invalid_setting,
+            "invalid sampler settings fail before head dispatch: " + error);
+    require_scratch_unchanged(before_invalid_setting,
+                              "invalid sampler setting rejection");
+
+    invalid_window_params->samp[0].penalty_repeat = 1.0f;
+    invalid_window_params->samp[0].temperature =
+        std::numeric_limits<float>::denorm_min();
+    auto tiny_temperature_command = context.make_command_buffer(
+        "FullMode unscalable sampler temperature preflight", error);
+    require(tiny_temperature_command != nullptr,
+            "create unscalable temperature command: " + error);
+    WindowOutputSamplingResult tiny_temperature_result;
+    const bool rejected_tiny_temperature =
+        !encode_window_output_sampling(
+            context, *tiny_temperature_command, *full_mode, *scratch,
+            residual, invalid_params, tiny_temperature_result, error) &&
+        error.find("temperature is too small") != std::string::npos &&
+        tiny_temperature_command->unsafe_native_handle() == nullptr &&
+        tiny_temperature_result.rows == 0u &&
+        !tiny_temperature_result.logits &&
+        !tiny_temperature_result.selected_candidates;
+    require(rejected_tiny_temperature,
+            "temperature without a finite reciprocal fails before dispatch: " +
+                error);
+    require_scratch_unchanged(before_invalid_setting,
+                              "unscalable temperature rejection");
+
+    invalid_params = params_ring->build_slot(
+        1u, 10u, tokens, samplers, 0u, 0x12345678u, 0x9abcdef0u, error);
+    require(static_cast<bool>(invalid_params),
+            "rebuild rollback WindowParams slot: " + error);
+    auto* const late_invalid_window_params =
+        static_cast<strata::metal::WindowParams*>(
+            invalid_params.contents);
+    late_invalid_window_params->samp[0].hist_off =
+        std::numeric_limits<std::uint32_t>::max();
+    late_invalid_window_params->samp[0].hist_len = 1u;
+    const auto before_late_failure = snapshot_writable_scratch();
+    auto rollback = context.make_command_buffer(
+        "FullMode output sampling late sampler failure", error);
+    require(rollback != nullptr,
+            "create FullMode output-sampling rollback command: " + error);
+    WindowOutputSamplingResult rejected_result;
+    const bool rejected_late =
+        !encode_window_output_sampling(
+            context, *rollback, *full_mode, *scratch, residual,
+            invalid_params, rejected_result, error) &&
+        error.find("sampler row history exceeds its buffer") !=
+            std::string::npos &&
+        rollback->unsafe_native_handle() == nullptr &&
+        rejected_result.rows == 0u && !rejected_result.logits &&
+        !rejected_result.selected_candidates;
+    require(rejected_late,
+            "late sampler validation must discard the encoded output head: " +
+                error);
+    require_scratch_unchanged(before_late_failure,
+                              "discarded head/sampler transaction");
+
+    auto caller_owned_rollback = context.make_command_buffer(
+        "FullMode caller-owned output sampling late failure", error);
+    require(caller_owned_rollback != nullptr,
+            "create caller-owned output-sampling rollback command: " + error);
+    WindowOutputSamplingResult caller_owned_result;
+    const bool caller_owned_rejected =
+        !Encoder::encode(
+            context, *caller_owned_rollback,
+            "FullMode caller-owned output-sampling rollback",
+            [&](Encoder& encoder, std::string& encode_error) {
+                return encode_window_output_sampling(
+                    context, encoder, *full_mode, *scratch, residual,
+                    invalid_params, caller_owned_result, encode_error);
+            },
+            error) &&
+        error.find("sampler row history exceeds its buffer") !=
+            std::string::npos &&
+        caller_owned_rollback->unsafe_native_handle() == nullptr &&
+        caller_owned_result.rows == 0u && !caller_owned_result.logits &&
+        !caller_owned_result.selected_candidates;
+    require(caller_owned_rejected,
+            "caller-owned late sampler failure must discard the whole segment: " +
+                error);
+    require_scratch_unchanged(before_late_failure,
+                              "discarded caller-owned transaction");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -4800,6 +5310,8 @@ int main(int argc, char** argv) {
             mode == "--fullmode-output-projection";
         const bool fullmode_output_head_only =
             mode == "--fullmode-output-head";
+        const bool fullmode_output_sampling_only =
+            mode == "--fullmode-output-sampling";
         const bool fullmode_ple_handoff_only =
             mode == "--fullmode-ple-handoff" ||
             mode == "--fullmode-ple-handoff-q8" ||
@@ -4808,10 +5320,12 @@ int main(int argc, char** argv) {
             model_owner_only || fullmode_handoff_only ||
                     fullmode_output_projection_only ||
                     fullmode_output_head_only ||
+                    fullmode_output_sampling_only ||
                     fullmode_ple_handoff_only,
                 "usage: metal_window_storage_test strata.metallib "
                 "[--never-wrap|--tiered-copy|--model-owner|--fullmode-handoff|"
                 "--fullmode-output-projection|--fullmode-output-head|"
+                "--fullmode-output-sampling|"
                 "--fullmode-ple-handoff|--fullmode-ple-handoff-q8|"
                 "--fullmode-ple-handoff-bf16]");
         if (argc == 2) test_warmup_wave_barrier();
@@ -4843,6 +5357,14 @@ int main(int argc, char** argv) {
             std::error_code ignored;
             fs::remove_all(directory, ignored);
             std::cout << "metal_fullmode_output_head_test: OK\n";
+            return 0;
+        }
+        if (fullmode_output_sampling_only) {
+            run_fullmode_output_sampling_test(*context, directory);
+            context.reset();
+            std::error_code ignored;
+            fs::remove_all(directory, ignored);
+            std::cout << "metal_fullmode_output_sampling_test: OK\n";
             return 0;
         }
         WindowPlan plan;

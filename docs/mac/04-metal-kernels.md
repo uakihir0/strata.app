@@ -1389,7 +1389,8 @@ outside an open concurrent group and its failure must escape the enclosing
 transaction. The standalone form discards the command buffer on failure.
 Keep the FullMode owner and every scratch view alive through completion. This
 completes the low-level vocabulary projection composition; `Window::run`,
-sampling, state commit and model-backed decode remain unimplemented.
+production scheduling, accepted-prefix state commit and model-backed decode
+remain unimplemented.
 
 `encode_window_output_head` resolves the live mixer tensors with exact shapes
 and types: F32 `[10240]` for `output_hc_norm.weight`, BF16 `[10240, 320]` for
@@ -1401,7 +1402,9 @@ overlap with later Q8_1/logits writes. Its standalone form discards the whole
 transaction on failure; callers using the Encoder form must propagate failure.
 The sparse FullMode test validates the mixer output and logits against scalar
 oracles and checks rollback when `output.weight` is missing. Production
-`Window::run`, sampling, state commit and shipped-model parity remain open.
+`Window::run`, accepted-prefix state commit and shipped-model parity remain
+open; sampling is available through `encode_window_output_sampling` but is not
+connected to the production Window scheduler.
 
 The MTP drafter uses `strata_gr_norm`, `strata_gr_down` and `strata_gr_up` for its two reads, and the head mixer
 kernels for its final mixer (section 5.11).
@@ -2267,8 +2270,17 @@ view and composes Q8_1 activation quantization with this read-only mat-vec for
 the fixed `[2560, 248320]` head. `encode_window_output_head` now resolves the
 FullMode `output_hc_norm`, `output_hc_down` and `output_hc_up` tensors and
 composes the final mixer through logits in one transaction, using dedicated
-named intermediate scratch. Neither composition includes the sampler or a
-production `Window::run` call site.
+named intermediate scratch. `encode_window_output_sampling` appends the
+penalty-aware split top-k and merge to that same transaction using the
+`WindowParams` sampler rows and named history, candidate and selection scratch.
+It rejects non-finite settings, out-of-range top-p/min-p, non-positive repeat
+penalties, and unsupported top-k/min-keep/greedy values before encoding.
+After successful command completion, `sample_window_output_tail` waits and
+runs the existing CPU FP64 sampler tail for every active row. History contents
+and all owners remain caller-managed through completion. The tail rejects
+non-finite candidate logits or invalid probabilities without publishing a
+partial result. This is a standalone composition API; production `Window::run`,
+accepted-prefix state commit and model-backed parity remain open.
 The PLE post-projection path accepts read-only gamma and F16 convolution weights; its
 convolution-residual dispatch binds normalized rows,
 history, convolution weights and gated activations as read-only inputs and

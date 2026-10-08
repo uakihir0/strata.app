@@ -132,6 +132,7 @@ set(STRATA_METAL_ENGINE_SOURCES
   src/metal/engine/window_t1_input.cpp
   src/metal/engine/window_head_mixer.mm
   src/metal/engine/window_output_head.mm
+  src/metal/engine/window_output_sampling.mm
   src/metal/engine/window_output_projection.mm
   src/metal/engine/mtp.cpp
   src/metal/engine/mtp_storage.cpp
