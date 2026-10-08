@@ -163,6 +163,10 @@ BufferRef Buffers::allocate(const std::string& label, std::size_t bytes, std::st
     return {handle, buffer.contents, buffer.gpuAddress, bytes, 0, validity};
 }
 
+ReadOnlyBufferRef Buffers::read_only(BufferRef buffer) const {
+    return owns(buffer) ? ReadOnlyBufferRef(buffer) : ReadOnlyBufferRef{};
+}
+
 bool Buffers::owns(ReadOnlyBufferRef buffer) const {
     return buffer && owns(buffer.buffer_);
 }

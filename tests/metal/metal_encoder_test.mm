@@ -11,10 +11,16 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
+#include <unistd.h>
 #include <string>
 #include <vector>
 
 using namespace strata::metal;
+
+static_assert(std::is_same_v<decltype(std::declval<const ReadOnlyBufferRef&>().contents()),
+                             const void*>);
+static_assert(!std::is_convertible_v<ReadOnlyBufferRef, BufferRef>);
 
 namespace {
 
@@ -189,6 +195,46 @@ bool run_inline_and_threadgroup_bindings(Context& context) {
     return all_sums_match;
 }
 
+bool run_read_only_input_binding(Context& context) {
+    std::string error;
+    BufferRef input = allocate(context, "encoder read-only input", kFloatBytes, error);
+    BufferRef output = allocate(context, "encoder read-only output", kFloatBytes, error);
+    check(input && output, "allocate read-only binding buffers", error);
+    if (!input || !output) return false;
+    auto* const input_values = static_cast<std::uint32_t*>(input.contents);
+    auto* const output_values = static_cast<std::uint32_t*>(output.contents);
+    for (std::size_t index = 0; index < kElementCount; ++index) {
+        input_values[index] = static_cast<std::uint32_t>(index * 7u + 3u);
+        output_values[index] = 0;
+    }
+    const ReadOnlyBufferRef readonly = context.buffers().read_only(input);
+    const EncoderReadOnlyBufferBinding read{readonly, 0, kFloatBytes,
+                                            alignof(std::uint32_t)};
+    const EncoderBufferBinding write{output, 1, kFloatBytes,
+                                     alignof(std::uint32_t)};
+    auto command = context.make_command_buffer("encoder read-only input", error);
+    check(command != nullptr, "create read-only binding command buffer", error);
+    if (!command) return false;
+    const bool encoded = Encoder::encode(
+        context, *command, "encoder read-only input segment",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encoder.dispatch(
+                "strata_selftest_copy_u32", {4, 1, 1}, {256, 1, 1},
+                std::span<const EncoderBufferBinding>(&write, 1),
+                std::span<const EncoderReadOnlyBufferBinding>(&read, 1), {}, {},
+                encode_error);
+        }, error);
+    check(encoded, "encode a const MSL input with ReadOnlyBufferRef", error);
+    if (!encoded || !command->commit(error) || !command->wait_until_completed(error)) {
+        check(false, "complete read-only input copy", error);
+        return false;
+    }
+    const bool copied = std::equal(input_values, input_values + kElementCount,
+                                   output_values);
+    check(copied, "read-only input dispatch copies exact values");
+    return copied;
+}
+
 using FailureBody = Encoder::Body;
 
 bool expect_encode_failure(Context& context, const char* label,
@@ -336,10 +382,97 @@ bool test_failure_lifecycle(Context& context, BufferRef valid_buffer) {
     return true;
 }
 
+bool run_cross_handle_alias_tests(Context& context) {
+    std::string error;
+    const long page_size = getpagesize();
+    if (page_size <= 0) {
+        check(false, "query page size for shared-backing alias fixture");
+        return false;
+    }
+    const std::size_t page = static_cast<std::size_t>(page_size);
+    const std::size_t bytes = ((2 * kFloatBytes + page - 1) / page) * page;
+    void* backing = nullptr;
+    if (posix_memalign(&backing, page, bytes) != 0 || backing == nullptr) {
+        check(false, "allocate page-aligned shared-backing alias fixture");
+        return false;
+    }
+    std::shared_ptr<void> backing_lifetime(backing, [](void* address) {
+        std::free(address);
+    });
+    BufferRef input_handle = context.buffers().wrap_no_copy(
+        "encoder alias input handle", backing, bytes, backing_lifetime, error);
+    BufferRef output_handle = context.buffers().wrap_no_copy(
+        "encoder alias output handle", backing, bytes, backing_lifetime, error);
+    const bool distinct_handles = input_handle && output_handle &&
+                                  input_handle.handle != output_handle.handle &&
+                                  input_handle.contents == output_handle.contents;
+    check(distinct_handles,
+          "create distinct MTLBuffer handles over one CPU backing range", error);
+    if (!distinct_handles) return false;
+
+    auto* values = static_cast<std::uint32_t*>(backing);
+    for (std::size_t index = 0; index < 2 * kElementCount; ++index) {
+        values[index] = index < kElementCount
+                            ? static_cast<std::uint32_t>(index * 11u + 5u)
+                            : 0u;
+    }
+    const bool overlapping_rejected = expect_encode_failure(
+        context, "reject read-only alias across distinct MTLBuffer handles",
+        [input_handle, output_handle, &context](Encoder& encoder,
+                                                std::string& encode_error) {
+            const EncoderReadOnlyBufferBinding read{
+                context.buffers().read_only(input_handle.slice(0, kFloatBytes)),
+                0, kFloatBytes, alignof(std::uint32_t)};
+            const EncoderBufferBinding write{
+                output_handle.slice(0, kFloatBytes), 1, kFloatBytes,
+                alignof(std::uint32_t)};
+            return encoder.dispatch(
+                "strata_selftest_copy_u32", {4, 1, 1}, {256, 1, 1},
+                std::span<const EncoderBufferBinding>(&write, 1),
+                std::span<const EncoderReadOnlyBufferBinding>(&read, 1), {}, {},
+                encode_error);
+        }, "serial", "read-only input overlaps a writable");
+
+    const ReadOnlyBufferRef disjoint_input =
+        context.buffers().read_only(input_handle.slice(0, kFloatBytes));
+    const EncoderReadOnlyBufferBinding read{
+        disjoint_input, 0, kFloatBytes, alignof(std::uint32_t)};
+    const EncoderBufferBinding write{
+        output_handle.slice(kFloatBytes, kFloatBytes), 1, kFloatBytes,
+        alignof(std::uint32_t)};
+    auto command = context.make_command_buffer("encoder disjoint shared backing", error);
+    check(command != nullptr, "create disjoint shared-backing command buffer", error);
+    if (!command) return false;
+    const bool encoded = Encoder::encode(
+        context, *command, "encoder disjoint shared-backing segment",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encoder.dispatch(
+                "strata_selftest_copy_u32", {4, 1, 1}, {256, 1, 1},
+                std::span<const EncoderBufferBinding>(&write, 1),
+                std::span<const EncoderReadOnlyBufferBinding>(&read, 1), {}, {},
+                encode_error);
+        }, error);
+    check(encoded, "accept disjoint read/write views over shared backing", error);
+    if (!encoded || !command->commit(error) || !command->wait_until_completed(error)) {
+        check(false, "complete disjoint shared-backing copy", error);
+        return false;
+    }
+    const bool copied = std::equal(values, values + kElementCount,
+                                   values + kElementCount);
+    check(copied, "disjoint shared-backing input and output copy exact values");
+    return overlapping_rejected && encoded && copied;
+}
+
 bool test_validation(Context& context, Context& foreign_context,
                      BufferRef valid_buffer, BufferRef short_buffer,
                      BufferRef misaligned_buffer, BufferRef foreign_buffer) {
     bool passed = true;
+    const bool foreign_readonly_rejected =
+        !context.buffers().read_only(foreign_buffer);
+    check(foreign_readonly_rejected,
+          "read-only view creation rejects a foreign Context buffer");
+    passed &= foreign_readonly_rejected;
+    passed &= run_cross_handle_alias_tests(context);
     const auto one_dispatch = [valid_buffer](Encoder& encoder, std::string& error) {
         return dispatch_add(encoder, valid_buffer, error);
     };
@@ -451,6 +584,27 @@ bool test_validation(Context& context, Context& foreign_context,
         check(false, "device threadgroup-memory limit permits overflow rejection");
         passed = false;
     }
+
+    passed &= expect_encode_failure(context, "reject misaligned read-only input",
+        [misaligned_buffer, &context](Encoder& encoder, std::string& error) {
+            const EncoderReadOnlyBufferBinding read{
+                context.buffers().read_only(misaligned_buffer), 0, kFloatBytes,
+                alignof(float)};
+            return encoder.dispatch(
+                "strata_selftest_copy_u32", {4, 1, 1}, {256, 1, 1}, {},
+                std::span<const EncoderReadOnlyBufferBinding>(&read, 1), {}, {}, error);
+        }, "serial", "undersized or misaligned");
+
+    passed &= expect_encode_failure(context, "reject read-only input aliasing a writable view",
+        [valid_buffer, &context](Encoder& encoder, std::string& error) {
+            const EncoderReadOnlyBufferBinding read{
+                context.buffers().read_only(valid_buffer), 0, kFloatBytes, alignof(float)};
+            const EncoderBufferBinding write = float_binding(valid_buffer, 1, kFloatBytes);
+            return encoder.dispatch(
+                "strata_selftest_copy_u32", {4, 1, 1}, {256, 1, 1},
+                std::span<const EncoderBufferBinding>(&write, 1),
+                std::span<const EncoderReadOnlyBufferBinding>(&read, 1), {}, {}, error);
+        }, "serial", "read-only input overlaps a writable");
 
     passed &= expect_encode_failure(context, "reject unmatched concurrent group end",
         [](Encoder& encoder, std::string& error) {
@@ -582,6 +736,7 @@ int main(int argc, char** argv) {
     passed &= serial_outputs == concurrent_outputs;
     passed &= serial_outputs == default_outputs;
     passed &= run_inline_and_threadgroup_bindings(*context);
+    passed &= run_read_only_input_binding(*context);
 
     BufferRef valid = allocate(*context, "encoder validation buffer", kFloatBytes, error);
     BufferRef short_buffer = allocate(*context, "encoder short buffer", 64, error);

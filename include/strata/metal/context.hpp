@@ -221,6 +221,7 @@ private:
 
     friend class Buffers;
     friend class FullModeStorage;
+    friend class Encoder;
 };
 
 /// Owns a Metal command buffer until this C++ handle is destroyed. Use enqueue()
@@ -379,6 +380,8 @@ public:
     std::uint64_t allocated_size() const;
     /// True when this generation-checked view references an MTLBuffer retained by this pool.
     bool owns(BufferRef buffer) const;
+    /// Borrow a read-only view of a live Context-owned allocation, or empty if foreign/stale.
+    ReadOnlyBufferRef read_only(BufferRef buffer) const;
     /// Read-only view equivalent; validates its private underlying generation token.
     bool owns(ReadOnlyBufferRef buffer) const;
     /// Monotonic identity for a live owned buffer handle; zero when it is not owned.

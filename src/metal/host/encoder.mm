@@ -96,6 +96,35 @@ bool validate_buffer(Context& context, const EncoderBufferBinding& binding,
     return true;
 }
 
+template <typename Address>
+bool address_ranges_overlap(Address first, std::size_t first_length,
+                            Address second, std::size_t second_length) {
+    if (first_length == 0 || second_length == 0) return false;
+    const Address limit = std::numeric_limits<Address>::max();
+    if (first_length > limit - first || second_length > limit - second) return true;
+    const Address first_end = first + static_cast<Address>(first_length);
+    const Address second_end = second + static_cast<Address>(second_length);
+    return first < second_end && second < first_end;
+}
+
+bool buffer_views_overlap(const BufferRef& first, const BufferRef& second) {
+    if (first.handle == second.handle &&
+        address_ranges_overlap(first.offset, first.length,
+                               second.offset, second.length)) {
+        return true;
+    }
+    if (first.contents != nullptr && second.contents != nullptr &&
+        address_ranges_overlap(reinterpret_cast<std::uintptr_t>(first.contents),
+                               first.length,
+                               reinterpret_cast<std::uintptr_t>(second.contents),
+                               second.length)) {
+        return true;
+    }
+    return first.gpu_address != 0 && second.gpu_address != 0 &&
+           address_ranges_overlap(first.gpu_address, first.length,
+                                  second.gpu_address, second.length);
+}
+
 bool claim_index(std::vector<std::uint32_t>& indices, std::uint32_t index) {
     if (std::find(indices.begin(), indices.end(), index) != indices.end()) return false;
     indices.push_back(index);
@@ -207,6 +236,18 @@ bool Encoder::dispatch(
     std::span<const EncoderBytesBinding> bytes,
     std::span<const EncoderThreadgroupMemory> threadgroup_memory,
     std::string& error) {
+    return dispatch(kernel, grid, threads_per_group, buffers,
+                    std::span<const EncoderReadOnlyBufferBinding>{}, bytes,
+                    threadgroup_memory, error);
+}
+
+bool Encoder::dispatch(
+    std::string_view kernel, EncoderSize grid, EncoderSize threads_per_group,
+    std::span<const EncoderBufferBinding> buffers,
+    std::span<const EncoderReadOnlyBufferBinding> read_only_buffers,
+    std::span<const EncoderBytesBinding> bytes,
+    std::span<const EncoderThreadgroupMemory> threadgroup_memory,
+    std::string& error) {
     if (impl_ == nullptr || impl_->failed) {
         error = "Metal compute encoder is unavailable after an earlier failure";
         return false;
@@ -241,7 +282,7 @@ bool Encoder::dispatch(
     }
 
     std::vector<std::uint32_t> argument_indices;
-    argument_indices.reserve(buffers.size() + bytes.size());
+    argument_indices.reserve(buffers.size() + read_only_buffers.size() + bytes.size());
     for (const EncoderBufferBinding& binding : buffers) {
         if (!claim_index(argument_indices, binding.index)) {
             return fail("Metal dispatch has duplicate buffer argument indices");
@@ -249,6 +290,23 @@ bool Encoder::dispatch(
         if (!validate_buffer(impl_->context, binding, error)) {
             impl_->failed = true;
             return false;
+        }
+    }
+    for (const EncoderReadOnlyBufferBinding& binding : read_only_buffers) {
+        if (!claim_index(argument_indices, binding.index)) {
+            return fail("Metal dispatch has duplicate read-only buffer argument indices");
+        }
+        const EncoderBufferBinding validation_binding{
+            binding.buffer.buffer_, binding.index, binding.required_bytes,
+            binding.alignment};
+        if (!validate_buffer(impl_->context, validation_binding, error)) {
+            impl_->failed = true;
+            return false;
+        }
+        for (const EncoderBufferBinding& writable : buffers) {
+            if (buffer_views_overlap(binding.buffer.buffer_, writable.buffer)) {
+                return fail("Metal dispatch read-only input overlaps a writable buffer view");
+            }
         }
     }
     for (const EncoderBytesBinding& binding : bytes) {
@@ -326,6 +384,13 @@ bool Encoder::dispatch(
         id<MTLBuffer> native = (__bridge id<MTLBuffer>)binding.buffer.handle;
         [impl_->encoder setBuffer:native
                            offset:static_cast<NSUInteger>(binding.buffer.offset)
+                          atIndex:static_cast<NSUInteger>(binding.index)];
+    }
+    for (const EncoderReadOnlyBufferBinding& binding : read_only_buffers) {
+        const BufferRef buffer = binding.buffer.buffer_;
+        id<MTLBuffer> native = (__bridge id<MTLBuffer>)buffer.handle;
+        [impl_->encoder setBuffer:native
+                           offset:static_cast<NSUInteger>(buffer.offset)
                           atIndex:static_cast<NSUInteger>(binding.index)];
     }
     for (const EncoderBytesBinding& binding : bytes) {

@@ -26,6 +26,15 @@ struct EncoderBufferBinding {
     std::size_t alignment = 1;
 };
 
+/// A read-only buffer argument. Use only for MSL `const` buffer parameters;
+/// one dispatch may not bind an overlapping writable view of the same buffer.
+struct EncoderReadOnlyBufferBinding {
+    ReadOnlyBufferRef buffer;
+    std::uint32_t index = 0;
+    std::size_t required_bytes = 1;
+    std::size_t alignment = 1;
+};
+
 struct EncoderBytesBinding {
     /// Copied inline payload; the total across a segment is limited to 4096 bytes.
     const void* bytes = nullptr;
@@ -58,6 +67,14 @@ public:
     bool dispatch(std::string_view kernel, EncoderSize grid,
                   EncoderSize threads_per_group,
                   std::span<const EncoderBufferBinding> buffers,
+                  std::span<const EncoderBytesBinding> bytes,
+                  std::span<const EncoderThreadgroupMemory> threadgroup_memory,
+                  std::string& error);
+    /// Overload for kernels with explicitly read-only MSL buffer inputs.
+    bool dispatch(std::string_view kernel, EncoderSize grid,
+                  EncoderSize threads_per_group,
+                  std::span<const EncoderBufferBinding> buffers,
+                  std::span<const EncoderReadOnlyBufferBinding> read_only_buffers,
                   std::span<const EncoderBytesBinding> bytes,
                   std::span<const EncoderThreadgroupMemory> threadgroup_memory,
                   std::string& error);
