@@ -96,7 +96,7 @@
     },
     "metal_weight_store_test": {
       "label": "host",
-      "origin": "06 H5"
+      "origin": "06 H5, D-IMPL-299, REV-096"
     },
     "metal_mtp_storage_fixture": {
       "label": "host",
@@ -132,15 +132,15 @@
     },
     "metal_window_storage_test": {
       "label": "metal",
-      "origin": "05 U3; 06 9.3; D-IMPL-290; REV-086; D-IMPL-291; REV-087"
+      "origin": "05 U3; 06 9.3; D-IMPL-290; REV-086; D-IMPL-291; REV-087; D-IMPL-299; REV-096"
     },
     "metal_fullmode_handoff_test": {
       "label": "metal",
-      "origin": "06 L9; D-IMPL-294; D-IMPL-296; REV-091; REV-093; D-IMPL-297; REV-094; D-IMPL-298; REV-095"
+      "origin": "06 L9; D-IMPL-294; D-IMPL-296; REV-091; REV-093; D-IMPL-297; REV-094; D-IMPL-298; REV-095; D-IMPL-299; REV-096"
     },
     "metal_fullmode_ple_handoff_test": {
       "label": "metal",
-      "origin": "06 L9; D-IMPL-295; D-IMPL-296; REV-092; REV-093; D-IMPL-297; REV-094; D-IMPL-298; REV-095"
+      "origin": "06 L9; D-IMPL-295; D-IMPL-296; REV-092; REV-093; D-IMPL-297; REV-094; D-IMPL-298; REV-095; D-IMPL-299; REV-096"
     },
     "metal_model_storage_owner_test": {
       "label": "metal",
@@ -270,11 +270,11 @@
     },
     "metal_gr_test": {
       "label": "metal",
-      "origin": "09 9.1, D-IMPL-293, REV-090"
+      "origin": "09 9.1, D-IMPL-293, REV-090, D-IMPL-299, REV-096"
     },
     "metal_gr_test_concurrent": {
       "label": "metal",
-      "origin": "09 9.1, D-IMPL-293, REV-090"
+      "origin": "09 9.1, D-IMPL-293, REV-090, D-IMPL-299, REV-096"
     },
     "metal_math_test": {
       "label": "metal",
@@ -299,11 +299,11 @@
     },
     "metal_mv_test": {
       "label": "metal",
-      "origin": "09 9.1, D-IMPL-271"
+      "origin": "09 9.1, D-IMPL-271, D-IMPL-299, REV-096"
     },
     "metal_mv_test_concurrent": {
       "label": "metal",
-      "origin": "09 9.1, D-IMPL-271"
+      "origin": "09 9.1, D-IMPL-271, D-IMPL-299, REV-096"
     },
     "metal_never_wrap_test": {
       "label": "metal",
@@ -311,11 +311,11 @@
     },
     "metal_ple_test": {
       "label": "metal",
-      "origin": "04 §5.1/§5.3, 09 9.1, D-IMPL-292, REV-088"
+      "origin": "04 §5.1/§5.3, 09 9.1, D-IMPL-292, REV-088, D-IMPL-299, REV-096"
     },
     "metal_ple_test_concurrent": {
       "label": "metal",
-      "origin": "04 §5.1/§5.3, 09 9.1, D-IMPL-292, REV-088"
+      "origin": "04 §5.1/§5.3, 09 9.1, D-IMPL-292, REV-088, D-IMPL-299, REV-096"
     },
     "metal_prefill_test": {
       "label": "metal",

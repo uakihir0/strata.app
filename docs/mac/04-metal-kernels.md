@@ -947,7 +947,14 @@ caller-owned `Encoder`, with each downstream oracle consuming the preceding
 GPU output. An instrumented chain reuses `query` as `ple_norm` and snapshots
 the query norm before overwrite; its results are checked bitwise against the
 reference. The coordinator also succeeds with that exact scratch alias through
-its standalone command-buffer wrapper.
+its standalone command-buffer wrapper. The FullMode T=1 PLE handoff resolves
+the key, value, gamma and convolution tensors through `FullModeStorage` and
+passes their checked `ReadOnlyBufferRef` views into the block. Its integration
+fixture clears the caller-provided model views and deliberately declares the
+wrong key format, then verifies that the step resolves the mapped tensor
+metadata and bindings. The sparse GGUF fixture uses deterministic values in the
+production types and shapes; it tests the mapped-view path but does not provide
+real-model parity.
 
 **`strata_ple_gate`**, grid (T·4) × 512. Threadgroup r handles row `t = r / 4`, stream `c = r % 4`. `scale` is the host
 constant `1.0f / std::sqrt(2560.0f)`, passed with `setBytes`.
@@ -1267,8 +1274,8 @@ Both `encode_weighted_rms_norm` overloads validate positive rows, the documented
 allocation ranges, Context ownership and the 1024-thread manifest geometry. The `Encoder&` overload appends one
 dispatch to a caller-owned compute segment; the standalone `CommandBuffer&` overload routes through
 `Encoder::encode`. Exact input/output view alias is supported for in-place normalization; partial input/output and
-every output/gamma overlap are rejected. The read-only input and gamma views may overlap. Window, Prefill and MTP
-do not call this encoder yet.
+every output/gamma overlap are rejected. The read-only input and gamma views may overlap. The FullMode T=1 PLE
+branch uses the read-only-gamma overload; other Window, Prefill and MTP call sites remain pending.
 
 **`strata_gr_down_silu`**, grid ⌈n_values / 256⌉ × 256, in place on `lo[T][320]`, with `n_values = 320·T`
 passed as a `setBytes` constant:
@@ -2198,7 +2205,14 @@ outputs must be disjoint from every input and one another. This supports the con
 weight view without changing the existing mutable mat-vec API. `encode_q8_0_matvec` provides the
 same read-only binding contract for Q8_1 activations, Q8_0 weights and live-row metadata, with
 F32 output and padded-column sink views. It supports the shared-expert projections without
-converting full-mode model views back to mutable `BufferRef`. The validated
+converting full-mode model views back to mutable `BufferRef`.
+`encode_q2_0_matvec` provides the same read-only contract for Q8_1 activations,
+Q2_0 weights and live-row metadata, including the FullMode T=1 PLE key
+projection; its scalar-oracle test covers rows with 65 Q2_0 blocks. The PLE
+post-projection path accepts read-only gamma and F16 convolution weights; its
+convolution-residual dispatch binds normalized rows,
+history, convolution weights and gated activations as read-only inputs and
+keeps only the residual writable. The validated
 `encode_moe_shared_ffn` coordinator now composes the shared-expert chain and
 combine. The full-mode layer-0 coordinator reaches those stages through the
 routed/shared composition so it can bind the routed parts in the same transaction.
@@ -2238,8 +2252,11 @@ residual application. `metal_fullmode_ple_handoff_test` exercises that producer 
 entry in one ordered segment, then compares its PLE outputs and residual against a direct GR-post
 plus PLE-entry reference. It builds row IDs from the test token and committed history, then stages
 the sixteen IQ4_NL rows from the synthetic FullMode GGUF's mapped PLE table through
-`stage_window_ple_input`; its PLE projection weights remain synthetic. These branch-specific tests
-do not select a production scheduler branch or establish model-backed decode parity.
+`stage_window_ple_input`. It resolves the PLE projection, normalization and
+convolution weights from deterministic, correctly typed tensors in that sparse
+GGUF fixture and binds them through `ReadOnlyBufferRef`. These branch-specific
+tests do not select a production scheduler branch or establish parity against a
+real model artifact.
 Both tests route through `encode_window_moe_pending_consumer`, which requires the selected
 `ple_enabled` tag to match a variant containing exactly one consumer payload. The mismatch case is
 rejected before dispatch. They now call `encode_window_t1_full_mode_step`, which resolves the
@@ -5126,7 +5143,7 @@ and foreign Context ownership.
 | `metal_qsa_selection_test_concurrent` | metal | Same binary and fixtures as `metal_qsa_selection_test` | Runs all fixtures with `STRATA_METAL_DISPATCH=concurrent`, including shared score dispatch and validation, and checks outputs against their oracles after command-buffer completion |
 | `metal_attn_test` | metal | `strata_attn_chunk_<mode>`, `strata_attn_merge`, fp16/int8/q4_0/k8v4 KV modes | All four modes: standalone random T=1..8 and edge/fixture T=8 against an ordered scalar oracle at U(32); shared-Encoder chunk→merge fixture cases at T=1 and T=8 (one and two chunks) against the same oracle; fixture row independence for T=8 versus isolated rows; ID strides 1/63/64/2051 across one- and many-chunk cases; negative, capacity-boundary and future-cell IDs are masked, including exact-zero empty chunks; shared and standalone validation cover inconsistent StepRows, short views, aliases, foreign Context and forged metadata; a late merge failure discards the earlier chunk dispatch and leaves output untouched; input immutability and guards; shared-Encoder selection scores→top-k→attention T=1/T=8 cases pass GPU-produced IDs directly to attention for all four KV modes, then apply O-class FWHT for q4_0/k8v4 and the gate; a varied-prefix T=8 fixture also covers live widths 1/2/4/5/64/65/2048/2051 and verifies untouched ID suffixes; a separate eight-cell cache exercises live widths 1..8 with the fixed 2051-ID stride; scalar score/ID/attention/gate oracles and guards are checked |
 | `metal_attn_test_concurrent` | metal | Same binary and fixtures as `metal_attn_test` | Runs shared chunk→merge composition, validation and late-failure discard with `STRATA_METAL_DISPATCH=concurrent`; the dependent passes remain ordered by the Encoder barrier; the selection→attention coordinator also rejects calls inside an open concurrent dispatch group |
-| `metal_mv_test` | metal | `strata_q_q8_1`, every `strata_mv_<fmt>_n<NC>` and `_n1_x`, `strata_mv_bf16_b<BS>_n<NC>` | B. The weights' dequantisation is also checked against ggml's. Engine encoders quantize Q8_1 against the scalar oracle and check nonzero engine results for every dense quantized format and BF16 against their scalar mat-vec oracles. Engine routing covers NC=1/2/4/8, large-K Q4_0 NC=2 (R=1), BF16 NC=8 (256 threads), padded output and sink handling, and a same-command-buffer Q8_1→Q2_0 chain. The indexed draft-head encoder checks nonzero Q5_K, Q6_K and IQ4_XS results at n_in=2560 against their scalar oracles with an unsorted, non-contiguous row map; it rejects negative and out-of-range indices, invalid row counts, signed and shader-index overflow, unsupported formats, a wrong live-row value, short or misaligned maps, and output/sink overlap with the map. Guards and read-only input preservation are checked. Dense encoder rejection cases cover forged CPU/GPU-view metadata, mismatched row count, invalid NC, Q8_1 input/output overlap, and mat-vec output/sink overlap with activations, weights, active-row metadata, and each other. Both same-handle subviews and distinct no-copy handles sharing a CPU backing are covered; an adjacent Q8_1 view is accepted. Production MTP stage-21 wiring and the L-15 indexed-read measurement remain open. |
+| `metal_mv_test` | metal | `strata_q_q8_1`, every `strata_mv_<fmt>_n<NC>` and `_n1_x`, `strata_mv_bf16_b<BS>_n<NC>` | B. The weights' dequantisation is also checked against ggml's. Engine encoders quantize Q8_1 against the scalar oracle and check nonzero engine results for every dense quantized format and BF16 against their scalar mat-vec oracles. Engine routing covers NC=1/2/4/8, large-K Q4_0 NC=2 (R=1), BF16 NC=8 (256 threads), padded output and sink handling, and a same-command-buffer Q8_1→Q2_0 chain. The indexed draft-head encoder checks nonzero Q5_K, Q6_K and IQ4_XS results at n_in=2560 against their scalar oracles with an unsorted, non-contiguous row map; it rejects negative and out-of-range indices, invalid row counts, signed and shader-index overflow, unsupported formats, a wrong live-row value, short or misaligned maps, and output/sink overlap with the map. Guards and read-only input preservation are checked. Dense encoder rejection cases cover forged CPU/GPU-view metadata, mismatched row count, invalid NC, Q8_1 input/output overlap, and mat-vec output/sink overlap with activations, weights, active-row metadata, and each other. Both same-handle subviews and distinct no-copy handles sharing a CPU backing are covered; an adjacent Q8_1 view is accepted. A read-only Q2_0-by-Q8_1 path checks overlapping read-only views, disjoint writable output/sink ranges and a 65-block input row against its scalar oracle. Production MTP stage-21 wiring and the L-15 indexed-read measurement remain open. |
 | `metal_moe_test`, `metal_moe_test_concurrent` | metal | `strata_moe_route` (`r16`, `r8`), exact weight-mode probe, `strata_moe_plan` (T=1..8, full/tiered), `strata_moe_swiglu` and `strata_shx_swiglu` (T=1..8), `strata_moe_combine` (T=1..8), grouped `strata_moe_gu_q2_0`, `strata_moe_gu_iq1_m`, `strata_moe_gu_iq2_xxs`, `strata_moe_gu_iq2_xs`, `strata_moe_gu_iq2_s`, `strata_moe_gu_iq3_xxs`, `strata_moe_gu_iq3_s`, `strata_moe_gu_iq4_xs`, `strata_moe_down_q2_0` and `strata_moe_down_iq4_nl` (256/512 experts, T=1..8) across random, edge and fixture inputs; a synthetic shared-expert GPU chain feeds Q8_1 input quantization through Q8_0 gate/up, shared SwiGLU, Q8_1 hidden requantization, Q8_0 down, BF16 gate and combine for T=1..8, checking each intermediate against scalar references and checking partial-batch sinks and guards; both SwiGLU entry points are checked against the scalar oracle, including the 128-value tail in the shared-expert grid; combine pins fused-rank accumulation with an analytic golden and checks the final shared multiply/add bitwise against a same-dispatch sigmoid probe; IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS check 80 unique gate/up expert groups; both down kernels check 80 permuted expert IDs and `ent_dst` restoration; IQ4_NL down also checks exact two-part FMA-sensitive answers, grouped-versus-single-entry bit parity and a weight-bit negative control; remaining L7: production shared-expert dispatch and inference integration | Exact route IDs and plan bytes, independent tie/order fixtures, route weights, routed/shared SwiGLU U(16), combine U(16) plus contraction checks, grouped gate/up and down U(16), fixed IQ4_NL two-part codebook goldens, 80-group endpoints, singleton parity, negative-control sensitivity and `ent_dst` permutation, plus address-table/guard checks; exact multiply/divide mode bits. Explicit `--input-set real` is reported as skipped (CTest exit 77) until REV-002's model pack and CUDA dump fixture are available; route oracle cases use the validated route encoder, every grouped gate/up format runs through the validated engine encoder, and validation rejects bad shapes/formats, short or misaligned views, input/output aliases and caller-owned late-failure rollback; the concurrent CTest also checks open-group refusal |
 | `metal_mtp_test` | metal | `strata_mtp_*`, `strata_q_q8_0_scaled` | Quantiser, ids and selection B; `mtp_swiglu_s2`, `mtp_row_top_prob` U(16); expert mat-vecs B |
 | `metal_sampler_parity_test`, `metal_sampler_parity_test_concurrent` | metal | Section 5.12's greedy, split-part, split-merge, composite sampled, coupled-penalty and CPU-tail twin on random, edge and fixture inputs for T=1..8 and model/maximum vocabularies; standalone and shared Encoder paths match the scalar references; concurrent tests reject dependent merge/sample calls in an open group and verify segment discard, including discard of a prior split-part dispatch; shared coupled-penalty→sampled composition and 248,320/262,144 vocabulary merge scratch are checked in one Encoder segment; fixtures 16 and 17 are deterministic semantic ports, with host fixture 15 in `sampler_tail_test`; literal upstream fixtures 1-14 and 18 and production sampler integration remain open under REV-028 | Candidate IDs/logit bits and CPU-tail tokens/probabilities exact |
