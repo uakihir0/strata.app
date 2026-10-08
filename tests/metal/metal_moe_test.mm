@@ -1514,18 +1514,29 @@ bool test_swiglu_case(Context& context, std::uint32_t rows,
     up_buffer.capture_before_dispatch();
     output_buffer.capture_before_dispatch();
 
-    twin::Dispatch work;
-    work.grid_mode = twin::GridMode::threadgroups;
-    work.grid = {3u, entries, 1u};
-    work.threads_per_group = {256u, 1u, 1u};
-    work.buffers = {{0u, gate_buffer.view()},
-                    {1u, up_buffer.view()},
-                    {2u, output_buffer.view()}};
-    const char* kernel =
-        shared_expert ? "strata_shx_swiglu" : "strata_moe_swiglu";
-    const bool dispatched =
-        twin::dispatch_manifest(context, kernel, work, err);
-    check(dispatched, label + " Metal dispatch", err);
+    const MoeSwiGLUBuffers buffers{
+        context.buffers().read_only(gate_buffer.view()),
+        context.buffers().read_only(up_buffer.view()), output_buffer.view()};
+    auto command = context.make_command_buffer(label, err);
+    const bool caller_owned =
+        rows == 1u && set == twin::InputSet::fixture;
+    const bool encoded = command && (caller_owned
+        ? Encoder::encode(
+              context, *command, label,
+              [&](Encoder& encoder, std::string& encode_error) {
+                  return encode_moe_swiglu(context, encoder, rows,
+                                           shared_expert, buffers,
+                                           encode_error);
+              },
+              err)
+        : encode_moe_swiglu(context, *command, rows, shared_expert, buffers,
+                            err));
+    const bool dispatched = encoded && command->commit(err) &&
+                            command->wait_until_completed(err);
+    check(dispatched,
+          label + (caller_owned ? " caller-owned engine encoder"
+                                : " standalone engine encoder"),
+          err);
     if (!dispatched) return false;
 
     const auto* actual_data =
@@ -1556,6 +1567,188 @@ bool test_swiglu_inputs(Context& context, twin::InputSet set,
         completed &= test_swiglu_case(context, rows, set, options, false);
     }
     return completed;
+}
+
+bool test_swiglu_dispatch_validation(Context& context) {
+    constexpr std::uint32_t kRows = 1u;
+    constexpr std::size_t kRoutedBytes =
+        80u * 640u * sizeof(float);
+    constexpr std::size_t kOneRowRoutedBytes =
+        10u * 640u * sizeof(float);
+    constexpr std::size_t kSharedRowBytes = 640u * sizeof(float);
+    constexpr std::uint8_t kPoison = 0xa5u;
+    const std::string label = "MoE SwiGLU encoder validation";
+    std::string err;
+
+    twin::GuardedBuffer gate;
+    twin::GuardedBuffer up;
+    twin::GuardedBuffer output;
+    if (!gate.allocate(context, label + " gate", kRoutedBytes, err) ||
+        !up.allocate(context, label + " up", kRoutedBytes * 2u, err) ||
+        !output.allocate(context, label + " output", kRoutedBytes + 1u,
+                         err)) {
+        check(false, label + " buffers", err);
+        return false;
+    }
+    std::fill(gate.payload().begin(), gate.payload().end(), 0u);
+    std::fill(up.payload().begin(), up.payload().end(), 0u);
+    std::fill(output.payload().begin(), output.payload().end(), kPoison);
+
+    const ReadOnlyBufferRef gate_view =
+        context.buffers().read_only(gate.view());
+    const ReadOnlyBufferRef up_view =
+        context.buffers().read_only(up.view().slice(0u, kRoutedBytes));
+    const MoeSwiGLUBuffers valid{gate_view, up_view, output.view()};
+    const std::vector<std::uint8_t> gate_before(gate.payload().begin(),
+                                                gate.payload().end());
+    const std::vector<std::uint8_t> up_before(up.payload().begin(),
+                                              up.payload().end());
+    const std::vector<std::uint8_t> output_before(output.payload().begin(),
+                                                 output.payload().end());
+
+    const auto reject = [&](const std::string& case_label,
+                            std::uint32_t rows, bool shared_expert,
+                            const MoeSwiGLUBuffers& buffers,
+                            std::string_view expected_error) {
+        auto command = context.make_command_buffer(case_label, err);
+        const bool rejected = command && !encode_moe_swiglu(
+            context, *command, rows, shared_expert, buffers, err);
+        const bool discarded = command &&
+            command->unsafe_native_handle() == nullptr;
+        const bool unchanged =
+            std::equal(gate_before.begin(), gate_before.end(),
+                       gate.payload().begin(), gate.payload().end()) &&
+            std::equal(up_before.begin(), up_before.end(), up.payload().begin(),
+                       up.payload().end()) &&
+            std::equal(output_before.begin(), output_before.end(),
+                       output.payload().begin(), output.payload().end());
+        const bool error_matches =
+            err.find(expected_error) != std::string::npos;
+        check(rejected && discarded && unchanged && error_matches,
+              case_label + " rejects before dispatch and discards", err);
+        return rejected && discarded && unchanged && error_matches;
+    };
+
+    const bool zero_rows = reject("reject zero-row MoE SwiGLU", 0u, false,
+                                  valid, "1..8 rows");
+    const bool too_many_rows = reject("reject over-capacity MoE SwiGLU", 9u,
+                                      false, valid, "1..8 rows");
+    const MoeSwiGLUBuffers short_gate{
+        gate_view.slice(0u, kOneRowRoutedBytes - sizeof(float)), up_view,
+        output.view()};
+    const bool undersized_gate = reject(
+        "reject short MoE SwiGLU gate", kRows, false, short_gate, "gate input");
+    const MoeSwiGLUBuffers short_shared_gate{
+        gate_view.slice(0u, kSharedRowBytes - sizeof(float)), up_view,
+        output.view()};
+    const bool undersized_shared_gate = reject(
+        "reject short shared-expert SwiGLU gate", kRows, true,
+        short_shared_gate, "gate input");
+    const MoeSwiGLUBuffers misaligned_up{
+        gate_view,
+        context.buffers().read_only(
+            up.view().slice(1u, kOneRowRoutedBytes)),
+        output.view()};
+    const bool misaligned = reject("reject misaligned MoE SwiGLU input",
+                                   kRows, false, misaligned_up, "misaligned");
+    const MoeSwiGLUBuffers misaligned_output{
+        gate_view, up_view,
+        output.view().slice(1u, kOneRowRoutedBytes)};
+    const bool misaligned_output_rejected = reject(
+        "reject misaligned MoE SwiGLU output", kRows, false,
+        misaligned_output, "misaligned");
+    const MoeSwiGLUBuffers short_output{
+        gate_view, up_view,
+        output.view().slice(0u, kOneRowRoutedBytes - sizeof(float))};
+    const bool undersized_output = reject(
+        "reject short MoE SwiGLU output", kRows, false, short_output,
+        "output");
+    const MoeSwiGLUBuffers gate_output_alias{
+        gate_view, up_view, gate.view()};
+    const bool gate_alias = reject("reject MoE SwiGLU gate/output alias",
+                                   kRows, false, gate_output_alias, "overlap");
+    const MoeSwiGLUBuffers partial_up_output_alias{
+        gate_view, up_view,
+        up.view().slice(sizeof(float), kOneRowRoutedBytes)};
+    const bool up_alias = reject(
+        "reject partial MoE SwiGLU up/output alias", kRows, false,
+        partial_up_output_alias, "overlap");
+
+    std::fill(output.payload().begin(), output.payload().end(), kPoison);
+    auto late_failure_command = context.make_command_buffer(
+        label + " caller-owned late failure", err);
+    check(late_failure_command != nullptr,
+          label + " late-failure command buffer", err);
+    if (!late_failure_command) return false;
+    const bool late_failure_rejected = !Encoder::encode(
+        context, *late_failure_command, "MoE SwiGLU late failure",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_moe_swiglu(context, encoder, kRows, false, valid,
+                                   encode_error)) {
+                return false;
+            }
+            return encode_moe_swiglu(context, encoder, 9u, false, valid,
+                                     encode_error);
+        },
+        err);
+    const bool late_failure_discarded =
+        late_failure_command->unsafe_native_handle() == nullptr;
+    const bool late_failure_untouched =
+        std::all_of(output.payload().begin(), output.payload().end(),
+                    [=](std::uint8_t value) { return value == kPoison; });
+    check(late_failure_rejected && late_failure_discarded &&
+              late_failure_untouched &&
+              err.find("1..8 rows") != std::string::npos,
+          label + " caller-owned late failure rolls back its earlier dispatch",
+          err);
+
+    bool concurrent_boundary_ok = true;
+    const char* const dispatch_mode = std::getenv("STRATA_METAL_DISPATCH");
+    if (dispatch_mode != nullptr &&
+        std::string_view(dispatch_mode) == "concurrent") {
+        auto group_command = context.make_command_buffer(
+            label + " open concurrent group", err);
+        check(group_command != nullptr,
+              label + " open-group command buffer", err);
+        if (!group_command) return false;
+        bool saw_open_group = false;
+        bool rejected_open_group = false;
+        const bool group_encoded = Encoder::encode(
+            context, *group_command, "MoE SwiGLU open-group boundary",
+            [&](Encoder& encoder, std::string& encode_error) {
+                if (!encoder.group_begin(encode_error)) return false;
+                saw_open_group = encoder.concurrent_group_open();
+                if (saw_open_group) {
+                    std::string boundary_error;
+                    rejected_open_group = !encode_moe_swiglu(
+                        context, encoder, kRows, false, valid,
+                        boundary_error) &&
+                        boundary_error.find("ordered dispatch boundary") !=
+                            std::string::npos;
+                }
+                if (!encoder.group_end(encode_error)) return false;
+                if (!saw_open_group || !rejected_open_group) {
+                    encode_error =
+                        "MoE SwiGLU did not reject an open concurrent group";
+                    return false;
+                }
+                return true;
+            },
+            err);
+        group_command->discard();
+        concurrent_boundary_ok = group_encoded && saw_open_group &&
+                                 rejected_open_group &&
+                                 group_command->unsafe_native_handle() ==
+                                     nullptr;
+        check(concurrent_boundary_ok,
+              label + " rejects an open concurrent group", err);
+    }
+
+    return zero_rows && too_many_rows && undersized_gate &&
+           undersized_shared_gate && misaligned && misaligned_output_rejected &&
+           undersized_output && gate_alias && up_alias && late_failure_rejected &&
+           late_failure_discarded && late_failure_untouched &&
+           concurrent_boundary_ok;
 }
 
 bool test_shared_swiglu_inputs(Context& context, twin::InputSet set,
@@ -7940,6 +8133,7 @@ int main(int argc, char** argv) {
     if (!test_route_dispatch_validation(*context)) ++g_failures;
     if (!test_plan_dispatch_validation(*context)) ++g_failures;
     if (!test_grouped_expert_dispatch_validation(*context)) ++g_failures;
+    if (!test_swiglu_dispatch_validation(*context)) ++g_failures;
 
     std::vector<twin::InputSet> sets;
     if (options.input_set_explicit) {

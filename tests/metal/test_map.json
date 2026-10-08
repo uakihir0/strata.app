@@ -278,11 +278,11 @@
     },
     "metal_moe_test": {
       "label": "metal",
-      "origin": "09 9.1, D-IMPL-273, REV-069, D-IMPL-280, REV-076"
+      "origin": "09 9.1, D-IMPL-273, REV-069, D-IMPL-280, REV-076, D-IMPL-282, REV-078"
     },
     "metal_moe_test_concurrent": {
       "label": "metal",
-      "origin": "09 9.1, 04 10.5, D-IMPL-273, REV-069, D-IMPL-280, REV-076"
+      "origin": "09 9.1, 04 10.5, D-IMPL-273, REV-069, D-IMPL-280, REV-076, D-IMPL-282, REV-078"
     },
     "metal_mtp_test": {
       "label": "metal",

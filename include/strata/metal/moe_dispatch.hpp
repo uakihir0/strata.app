@@ -46,6 +46,12 @@ struct MoeGroupedExpertBuffers {
     BufferRef up;
 };
 
+struct MoeSwiGLUBuffers {
+    ReadOnlyBufferRef gate;
+    ReadOnlyBufferRef up;
+    BufferRef output;
+};
+
 /// Encode the stable top-10 route selection for 256 or 512 experts.
 /// `divide_weights` selects the prompt-path division mode; Window decode must
 /// pass false to match the model's multiply-by-reciprocal path. The views must
@@ -101,5 +107,19 @@ bool encode_moe_experts(Context& context, CommandBuffer& command_buffer,
                         std::uint32_t layer, MoeExpertFormat format,
                         const MoeGroupedExpertBuffers& buffers,
                         std::string& error);
+
+/// Encode SwiGLU for routed MoE entries (rows * 10) or shared-expert rows.
+/// Gate and up are read-only F32 arrays of 640 values per entry. The output
+/// must be disjoint from both inputs and remain alive until command completion.
+/// Keep this ordered before the Q8_1 quantization of the resulting values.
+bool encode_moe_swiglu(Context& context, Encoder& encoder,
+                       std::uint32_t rows, bool shared_expert,
+                       const MoeSwiGLUBuffers& buffers,
+                       std::string& error);
+/// Standalone transactional form. A validation failure discards the segment.
+bool encode_moe_swiglu(Context& context, CommandBuffer& command_buffer,
+                       std::uint32_t rows, bool shared_expert,
+                       const MoeSwiGLUBuffers& buffers,
+                       std::string& error);
 
 }  // namespace strata::metal

@@ -22,6 +22,8 @@ constexpr std::uint32_t kMoeInputBlocksPerRow = 80u;
 constexpr std::uint32_t kMoeExpertOutputWidth = 640u;
 constexpr std::uint32_t kMoeExpertOutputRowGroups =
     2u * kMoeExpertOutputWidth / 8u;
+constexpr std::uint32_t kMoeSwiGLURowGroups =
+    (kMoeExpertOutputWidth + 255u) / 256u;
 
 struct MoeExpertAddress {
     std::uint64_t role[3]{};
@@ -444,6 +446,74 @@ bool encode_moe_experts_impl(Context& context, Encoder& encoder,
                             error);
 }
 
+bool encode_moe_swiglu_impl(Context& context, Encoder& encoder,
+                            std::uint32_t rows, bool shared_expert,
+                            const MoeSwiGLUBuffers& buffers,
+                            std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "MoE SwiGLU requires an ordered dispatch boundary";
+        return false;
+    }
+    if (rows == 0u || rows > 8u) {
+        error = "MoE SwiGLU requires 1..8 rows";
+        return false;
+    }
+
+    const std::uint64_t entries =
+        static_cast<std::uint64_t>(rows) *
+        (shared_expert ? 1u : kMoeTopK);
+    std::size_t output_bytes = 0u;
+    if (entries > std::numeric_limits<std::uint32_t>::max() ||
+        !checked_bytes(entries * kMoeExpertOutputWidth, sizeof(float),
+                       output_bytes)) {
+        error = "MoE SwiGLU shape exceeds the host byte range";
+        return false;
+    }
+    if (!buffers.gate || !context.buffers().owns(buffers.gate) ||
+        buffers.gate.length() < output_bytes ||
+        buffers.gate.offset() % alignof(float) != 0u) {
+        error = "MoE SwiGLU gate input is stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (!buffers.up || !context.buffers().owns(buffers.up) ||
+        buffers.up.length() < output_bytes ||
+        buffers.up.offset() % alignof(float) != 0u) {
+        error = "MoE SwiGLU up input is stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (!buffers.output || !context.buffers().owns(buffers.output) ||
+        buffers.output.length < output_bytes ||
+        buffers.output.offset % alignof(float) != 0u) {
+        error = "MoE SwiGLU output is stale, foreign, undersized or misaligned";
+        return false;
+    }
+    if (views_overlap(buffers.gate, buffers.output) ||
+        views_overlap(buffers.up, buffers.output)) {
+        error = "MoE SwiGLU output must not overlap either input";
+        return false;
+    }
+
+    const char* kernel = shared_expert
+        ? "strata_shx_swiglu"
+        : "strata_moe_swiglu";
+    const std::array writable{
+        EncoderBufferBinding{buffers.output, 2u, output_bytes,
+                             alignof(float)},
+    };
+    const std::array read_only{
+        EncoderReadOnlyBufferBinding{buffers.gate, 0u, output_bytes,
+                                     alignof(float)},
+        EncoderReadOnlyBufferBinding{buffers.up, 1u, output_bytes,
+                                     alignof(float)},
+    };
+    return encoder.dispatch(kernel,
+                            {kMoeSwiGLURowGroups,
+                             static_cast<std::uint32_t>(entries), 1u},
+                            {256u, 1u, 1u}, writable, read_only, {}, {},
+                            error);
+}
+
 }  // namespace
 
 bool encode_moe_route(Context& context, Encoder& encoder,
@@ -509,6 +579,28 @@ bool encode_moe_experts(Context& context, CommandBuffer& command_buffer,
             return encode_moe_experts_impl(context, encoder, rows, experts,
                                            layer, format, buffers,
                                            encode_error);
+        },
+        error);
+}
+
+bool encode_moe_swiglu(Context& context, Encoder& encoder,
+                       std::uint32_t rows, bool shared_expert,
+                       const MoeSwiGLUBuffers& buffers,
+                       std::string& error) {
+    return encode_moe_swiglu_impl(context, encoder, rows, shared_expert,
+                                  buffers, error);
+}
+
+bool encode_moe_swiglu(Context& context, CommandBuffer& command_buffer,
+                       std::uint32_t rows, bool shared_expert,
+                       const MoeSwiGLUBuffers& buffers,
+                       std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "MoE SwiGLU",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_moe_swiglu_impl(context, encoder, rows,
+                                          shared_expert, buffers,
+                                          encode_error);
         },
         error);
 }

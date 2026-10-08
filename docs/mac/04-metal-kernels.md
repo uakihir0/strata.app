@@ -2347,6 +2347,12 @@ still come from trusted engine outputs and remain valid until command
 completion. The production Window scheduler remains open, so this API and its
 kernel twins do not establish end-to-end MoE inference.
 
+`encode_moe_swiglu` validates read-only gate/up F32 views and a disjoint output
+for routed expert entries (`rows * 10`) or shared-expert rows, with `rows` in
+1..8. It dispatches `strata_moe_swiglu` or `strata_shx_swiglu` using three
+256-thread groups to cover all 640 columns. Keep it ordered after the gate/up
+projection and before Q8_1 quantization of the resulting rows.
+
 The IQ4_XS specialization uses ten 136-byte blocks per row. Lanes traverse
 `k = lane; k < 80; k += 32`, with `block = k / 8` and `part = k % 8`.
 Each part decodes its 6-bit scale from `scales_l` and `scales_h`, decodes the
