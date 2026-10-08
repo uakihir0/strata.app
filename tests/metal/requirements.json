@@ -91,6 +91,7 @@
     ],
     "REQ-MOD-03": [
       "ctest:mtp_reader_test",
+      "ctest:mtp_reader_vocabulary_test",
       "python:tools/test_artifact_set_lock.py",
       "python:tools/test_mtp_fetch.py",
       "python:tools/test_mtp_pack.py",

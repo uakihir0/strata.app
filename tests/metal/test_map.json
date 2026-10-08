@@ -142,6 +142,10 @@
       "label": "host",
       "origin": "03 R2-R8"
     },
+    "mtp_reader_vocabulary_test": {
+      "label": "host",
+      "origin": "03 R10"
+    },
     "model_types_test": {
       "label": "host",
       "origin": "03 R2-R8"
@@ -480,8 +484,7 @@
     },
     "mtp_reader_test": {
       "label": "model",
-      "origin": "03 R10",
-      "planned": "R10"
+      "origin": "03 R10"
     },
     "ple_oracle_model_test": {
       "label": "model",

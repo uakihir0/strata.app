@@ -1685,6 +1685,11 @@ void run() {
     write_conversions(model);
 
     make_mtp_runtime(model);
+    fs::resize_file(model.mtp / "experts.bin", kMtpExpertsBytes - 1u);
+    check(!inspect(model, geometry, error, true) &&
+              error.find("MTP runtime file sizes do not match") != std::string::npos,
+          "MTP inspection rejects an experts.bin truncated by one byte");
+    make_mtp_runtime(model);
     const fs::path mtp_set_lock = artifact_lock_path(model.mtp);
     ensure_artifact_lock_exists(mtp_set_lock);
     const fs::path fifo_experts_path = model.mtp / "experts.bin";

@@ -468,6 +468,17 @@ strata_metal_test(ple_constants_test host ${Python3_EXECUTABLE}
 strata_metal_test(dense_vs_gguf_test model ${Python3_EXECUTABLE}
                   ${CMAKE_SOURCE_DIR}/tools/metal/check_dense_vs_gguf.py)
 set_tests_properties(dense_vs_gguf_test PROPERTIES TIMEOUT 1800)
+add_executable(mtp_reader_model_test tests/metal/mtp_reader_model_test.cpp
+               src/metal/engine/weights.cpp src/metal/engine/geometry.cpp
+               src/metal/engine/window_plan.cpp src/metal/engine/mtp.cpp
+               src/metal/engine/mtp_bind_layout.cpp)
+target_compile_definitions(mtp_reader_model_test PRIVATE
+                           STRATA_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/data")
+target_link_libraries(mtp_reader_model_test PRIVATE
+                      strata_metal_platform strata_metal_options)
+strata_metal_test(mtp_reader_vocabulary_test host mtp_reader_model_test --vocabulary-self-test)
+strata_metal_test(mtp_reader_test model mtp_reader_model_test --models)
+set_tests_properties(mtp_reader_test PROPERTIES TIMEOUT 1800)
 add_executable(metal_window_test tests/metal/metal_window_test.cpp
                src/metal/engine/window_plan.cpp src/metal/engine/window.cpp)
 target_include_directories(metal_window_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
