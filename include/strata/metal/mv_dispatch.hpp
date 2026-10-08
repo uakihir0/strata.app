@@ -77,6 +77,17 @@ struct ReadOnlyQ8_0MatVecBuffers {
     BufferRef sink;
 };
 
+struct ReadOnlyQ2_0MatVecBuffers {
+    // Q8_1 activation rows and packed Q2_0 weights are MSL const inputs.
+    ReadOnlyBufferRef activations;
+    ReadOnlyBufferRef weights;
+    // Host-visible uint32 value equal to active_columns.
+    ReadOnlyBufferRef active_rows;
+    // Active output columns are packed row-major; padded columns go to sink.
+    BufferRef output;
+    BufferRef sink;
+};
+
 struct IndexedHeadMatVecBuffers {
     MatVecBuffers matvec;
     // Host-visible int32 row indices: output row -> full-head weight row.
@@ -141,6 +152,26 @@ bool encode_q8_0_matvec(Context& context, Encoder& encoder,
                         std::uint32_t active_columns,
                         std::uint32_t compiled_columns,
                         const ReadOnlyQ8_0MatVecBuffers& buffers,
+                        std::string& error);
+
+/// Encode the Q2_0-by-Q8_1 projection with immutable model and activation
+/// inputs. `n_in` must be divisible by 64. Supports compiled widths 1, 2, 4
+/// or 8 and the Q2_0 kernel catalogue. Read-only inputs may alias each other;
+/// output and sink must not overlap any input or each other. Keep all
+/// read-only inputs, including `active_rows`, unchanged until completion.
+/// Propagate false from a caller-owned Encoder body so earlier dispatches in
+/// its unsubmitted segment are discarded.
+bool encode_q2_0_matvec(Context& context, CommandBuffer& command_buffer,
+                        std::uint32_t n_in, std::uint32_t n_out,
+                        std::uint32_t active_columns,
+                        std::uint32_t compiled_columns,
+                        const ReadOnlyQ2_0MatVecBuffers& buffers,
+                        std::string& error);
+bool encode_q2_0_matvec(Context& context, Encoder& encoder,
+                        std::uint32_t n_in, std::uint32_t n_out,
+                        std::uint32_t active_columns,
+                        std::uint32_t compiled_columns,
+                        const ReadOnlyQ2_0MatVecBuffers& buffers,
                         std::string& error);
 
 /// Encode the indexed draft-vocabulary head for Q5_K, Q6_K or IQ4_XS.

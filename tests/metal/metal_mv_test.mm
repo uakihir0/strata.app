@@ -10464,6 +10464,610 @@ bool run_readonly_q8_0_matvec_encoder(Context& context) {
            inputs_unchanged && output_guards;
 }
 
+bool run_readonly_q2_0_matvec_encoder(Context& context) {
+    constexpr std::uint32_t n_in = 256u;
+    constexpr std::uint32_t n_out = 7u;
+    constexpr std::uint32_t active_columns = 3u;
+    constexpr std::uint32_t compiled_columns = 4u;
+    constexpr std::uint32_t q2_blocks_per_row = n_in / 64u;
+    constexpr std::uint32_t q8_blocks_per_row = n_in / 32u;
+    constexpr std::uint32_t max_columns = 8u;
+    constexpr std::size_t activation_capacity_bytes =
+        static_cast<std::size_t>(max_columns) * q8_blocks_per_row *
+        sizeof(Q81);
+    constexpr std::size_t weight_bytes =
+        static_cast<std::size_t>(n_out) * q2_blocks_per_row *
+        sizeof(block_q2_0);
+    constexpr std::size_t output_capacity_bytes =
+        static_cast<std::size_t>(max_columns) * n_out * sizeof(float);
+    constexpr std::size_t sink_capacity_bytes =
+        static_cast<std::size_t>(max_columns - 1u) * n_out * sizeof(float);
+    constexpr std::size_t output_bytes =
+        static_cast<std::size_t>(active_columns) * n_out * sizeof(float);
+    constexpr std::size_t sink_written_bytes =
+        static_cast<std::size_t>(compiled_columns - active_columns) * n_out *
+        sizeof(float);
+    constexpr std::size_t minimum_sink_bytes = sizeof(float);
+    const std::string label = "read-only Q2_0 mat-vec";
+    std::string error;
+
+    std::vector<float> source_inputs(
+        static_cast<std::size_t>(max_columns) * n_in);
+    for (std::size_t index = 0u; index < source_inputs.size(); ++index) {
+        const int code = static_cast<int>((index * 23u + 9u) % 109u) - 54;
+        source_inputs[index] = static_cast<float>(code) * 0.0078125f;
+    }
+    std::vector<Q81> activations;
+    check(twin::quantize_q8_1_reference(
+              source_inputs, n_in, max_columns, activations, error),
+          label + " activation oracle", error);
+    if (activations.size() !=
+        static_cast<std::size_t>(max_columns) * q8_blocks_per_row) {
+        return false;
+    }
+
+    std::vector<block_q2_0> weights(
+        static_cast<std::size_t>(n_out) * q2_blocks_per_row);
+    for (std::size_t block = 0u; block < weights.size(); ++block) {
+        weights[block].d =
+            strata::kernels::f16_from_f32(0.0625f + (block % 5u) * 0.03125f);
+        for (std::size_t byte = 0u; byte < sizeof(weights[block].qs); ++byte) {
+            weights[block].qs[byte] =
+                static_cast<std::uint8_t>((block * 37u + byte * 53u + 11u) &
+                                          0xffu);
+        }
+    }
+
+    std::vector<float> expected;
+    const auto active_width_activations = std::span<const Q81>(
+        activations.data(),
+        static_cast<std::size_t>(compiled_columns) * q8_blocks_per_row);
+    check(twin::q2_0_matvec_reference(
+              weights, active_width_activations, n_in, n_out, compiled_columns,
+              active_columns, expected, error),
+          label + " scalar oracle", error);
+    if (expected.size() !=
+        static_cast<std::size_t>(compiled_columns) * n_out) {
+        return false;
+    }
+
+    twin::GuardedBuffer input_buffer;
+    twin::GuardedBuffer weight_buffer;
+    twin::GuardedBuffer output_buffer;
+    twin::GuardedBuffer sink_buffer;
+    twin::GuardedBuffer active_rows_buffer;
+    check(input_buffer.allocate(context, label + " activations",
+                                activation_capacity_bytes + sizeof(float),
+                                error),
+          label + " activation allocation", error);
+    check(weight_buffer.allocate(context, label + " weights",
+                                 weight_bytes + sizeof(std::uint16_t), error),
+          label + " weight allocation", error);
+    check(output_buffer.allocate(context, label + " output",
+                                 output_capacity_bytes, error),
+          label + " output allocation", error);
+    check(sink_buffer.allocate(context, label + " sink",
+                               sink_capacity_bytes, error),
+          label + " sink allocation", error);
+    check(active_rows_buffer.allocate(context, label + " active rows",
+                                      output_capacity_bytes, error),
+          label + " active-row allocation", error);
+    if (!input_buffer.view() || !weight_buffer.view() ||
+        !output_buffer.view() || !sink_buffer.view() ||
+        !active_rows_buffer.view()) {
+        return false;
+    }
+    std::memcpy(input_buffer.payload().data(), activations.data(),
+                activation_capacity_bytes);
+    std::memcpy(weight_buffer.payload().data(), weights.data(), weight_bytes);
+    const std::uint32_t live_rows = active_columns;
+    std::memcpy(active_rows_buffer.payload().data(), &live_rows,
+                sizeof(live_rows));
+    const std::vector<std::uint8_t> output_poison(output_capacity_bytes,
+                                                  0xa5u);
+    const std::vector<std::uint8_t> sink_poison(sink_capacity_bytes, 0xa5u);
+    const auto reset_outputs = [&] {
+        std::memcpy(output_buffer.payload().data(), output_poison.data(),
+                    output_capacity_bytes);
+        std::memcpy(sink_buffer.payload().data(), sink_poison.data(),
+                    sink_capacity_bytes);
+    };
+    reset_outputs();
+    input_buffer.capture_before_dispatch();
+    weight_buffer.capture_before_dispatch();
+    output_buffer.capture_before_dispatch();
+    sink_buffer.capture_before_dispatch();
+    active_rows_buffer.capture_before_dispatch();
+
+    const ReadOnlyQ2_0MatVecBuffers buffers{
+        context.buffers().read_only(input_buffer.view()),
+        context.buffers().read_only(weight_buffer.view()),
+        context.buffers().read_only(
+            active_rows_buffer.view().slice(0u, sizeof(live_rows))),
+        output_buffer.view().slice(0u, output_bytes),
+        sink_buffer.view().slice(0u, sink_written_bytes)};
+    const auto expected_output = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(expected.data()), output_bytes);
+    const auto expected_sink = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(expected.data()) + output_bytes,
+        sink_written_bytes);
+
+    auto standalone =
+        context.make_command_buffer(label + " standalone", error);
+    check(standalone != nullptr, label + " standalone command buffer", error);
+    if (!standalone) return false;
+    const bool standalone_encoded = encode_q2_0_matvec(
+        context, *standalone, n_in, n_out, active_columns, compiled_columns,
+        buffers, error);
+    check(standalone_encoded, label + " standalone encoding", error);
+    if (!standalone_encoded) return false;
+    const bool standalone_completed =
+        wait_for_engine_command(*standalone, label + " standalone", error);
+    check(standalone_completed, label + " standalone completion", error);
+    if (!standalone_completed) return false;
+    const auto standalone_output_mismatch =
+        twin::compare_bytes(output_buffer.payload().first(output_bytes),
+                            expected_output);
+    const auto standalone_sink_mismatch =
+        twin::compare_bytes(sink_buffer.payload().first(sink_written_bytes),
+                            expected_sink);
+    check(!standalone_output_mismatch, label + " standalone exact output",
+          standalone_output_mismatch ? standalone_output_mismatch->reason
+                                     : std::string{});
+    check(!standalone_sink_mismatch,
+          label + " standalone exact padded output",
+          standalone_sink_mismatch ? standalone_sink_mismatch->reason
+                                   : std::string{});
+
+    reset_outputs();
+    auto shared = context.make_command_buffer(label + " caller-owned", error);
+    check(shared != nullptr, label + " caller-owned command buffer", error);
+    if (!shared) return false;
+    const bool shared_encoded = Encoder::encode(
+        context, *shared, label + " caller-owned segment",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_q2_0_matvec(
+                context, encoder, n_in, n_out, active_columns,
+                compiled_columns, buffers, encode_error);
+        },
+        error);
+    check(shared_encoded, label + " caller-owned encoding", error);
+    if (!shared_encoded) return false;
+    const bool shared_completed =
+        wait_for_engine_command(*shared, label + " caller-owned", error);
+    check(shared_completed, label + " caller-owned completion", error);
+    if (!shared_completed) return false;
+    const auto shared_output_mismatch =
+        twin::compare_bytes(output_buffer.payload().first(output_bytes),
+                            expected_output);
+    const auto shared_sink_mismatch =
+        twin::compare_bytes(sink_buffer.payload().first(sink_written_bytes),
+                            expected_sink);
+    check(!shared_output_mismatch, label + " caller-owned exact output",
+          shared_output_mismatch ? shared_output_mismatch->reason
+                                 : std::string{});
+    check(!shared_sink_mismatch, label + " caller-owned exact padded output",
+          shared_sink_mismatch ? shared_sink_mismatch->reason
+                               : std::string{});
+
+    const auto expect_rejected = [&](
+        const std::string& case_label,
+        const ReadOnlyQ2_0MatVecBuffers& candidate, std::uint32_t case_n_in,
+        std::uint32_t case_active_columns,
+        std::uint32_t case_compiled_columns, std::string_view error_fragment) {
+        auto command = context.make_command_buffer(case_label, error);
+        check(command != nullptr, case_label + " command buffer", error);
+        if (!command) return false;
+        const bool encoded = encode_q2_0_matvec(
+            context, *command, case_n_in, n_out, case_active_columns,
+            case_compiled_columns, candidate, error);
+        const bool rejected =
+            !encoded && error.find(error_fragment) != std::string::npos &&
+            command->unsafe_native_handle() == nullptr;
+        check(rejected, case_label + " rejects and discards command buffer",
+              error);
+        return rejected;
+    };
+
+    bool rejected_cases = true;
+    ReadOnlyQ2_0MatVecBuffers short_weights = buffers;
+    short_weights.weights = buffers.weights.slice(0u, weight_bytes - 1u);
+    rejected_cases &= expect_rejected(label + " undersized weights",
+                                      short_weights, n_in, active_columns,
+                                      compiled_columns, "undersized");
+    ReadOnlyQ2_0MatVecBuffers misaligned_weights = buffers;
+    misaligned_weights.weights = context.buffers().read_only(
+        weight_buffer.view().slice(1u, weight_bytes));
+    rejected_cases &= expect_rejected(label + " misaligned weights",
+                                      misaligned_weights, n_in, active_columns,
+                                      compiled_columns, "misaligned");
+    ReadOnlyQ2_0MatVecBuffers misaligned_activations = buffers;
+    misaligned_activations.activations = context.buffers().read_only(
+        input_buffer.view().slice(sizeof(float), activation_capacity_bytes));
+    rejected_cases &= expect_rejected(
+        label + " misaligned activations", misaligned_activations, n_in,
+        active_columns, compiled_columns, "misaligned");
+    ReadOnlyQ2_0MatVecBuffers misaligned_rows = buffers;
+    misaligned_rows.active_rows = context.buffers().read_only(
+        active_rows_buffer.view().slice(1u, sizeof(live_rows)));
+    rejected_cases &= expect_rejected(label + " misaligned active rows",
+                                      misaligned_rows, n_in, active_columns,
+                                      compiled_columns, "misaligned");
+
+    const std::uint32_t wrong_rows = active_columns - 1u;
+    std::memcpy(active_rows_buffer.payload().data(), &wrong_rows,
+                sizeof(wrong_rows));
+    rejected_cases &= expect_rejected(
+        label + " wrong active-row value", buffers, n_in, active_columns,
+        compiled_columns, "does not match active columns");
+    std::memcpy(active_rows_buffer.payload().data(), &live_rows,
+                sizeof(live_rows));
+    active_rows_buffer.capture_before_dispatch();
+    rejected_cases &= expect_rejected(label + " invalid input width", buffers,
+                                      65u, active_columns, compiled_columns,
+                                      "divisible by 64");
+    rejected_cases &= expect_rejected(
+        label + " unsupported compiled width", buffers, n_in, active_columns,
+        3u, "compiled column width");
+
+    ReadOnlyQ2_0MatVecBuffers activation_output_alias = buffers;
+    activation_output_alias.output =
+        input_buffer.view().slice(0u, output_bytes);
+    rejected_cases &= expect_rejected(label + " activation/output alias",
+                                      activation_output_alias, n_in,
+                                      active_columns, compiled_columns,
+                                      "overlap");
+    ReadOnlyQ2_0MatVecBuffers weight_sink_alias = buffers;
+    weight_sink_alias.sink = weight_buffer.view().slice(0u, sink_written_bytes);
+    rejected_cases &= expect_rejected(label + " weight/sink alias",
+                                      weight_sink_alias, n_in, active_columns,
+                                      compiled_columns, "overlap");
+    ReadOnlyQ2_0MatVecBuffers rows_output_alias = buffers;
+    rows_output_alias.output =
+        active_rows_buffer.view().slice(0u, output_bytes);
+    rejected_cases &= expect_rejected(label + " active-row/output alias",
+                                      rows_output_alias, n_in, active_columns,
+                                      compiled_columns, "overlap");
+    ReadOnlyQ2_0MatVecBuffers output_sink_alias = buffers;
+    output_sink_alias.sink =
+        output_buffer.view().slice(0u, sink_written_bytes);
+    rejected_cases &= expect_rejected(label + " output/sink alias",
+                                      output_sink_alias, n_in, active_columns,
+                                      compiled_columns, "overlap");
+
+    twin::GuardedBuffer aliased_inputs_buffer;
+    check(aliased_inputs_buffer.allocate(
+              context, label + " aliased read-only inputs",
+              activation_capacity_bytes, error),
+          label + " aliased-input allocation", error);
+    if (!aliased_inputs_buffer.view()) return false;
+    std::memset(aliased_inputs_buffer.payload().data(), 0,
+                activation_capacity_bytes);
+    const ReadOnlyBufferRef aliased_view =
+        context.buffers().read_only(aliased_inputs_buffer.view());
+    ReadOnlyQ2_0MatVecBuffers aliased_inputs = buffers;
+    aliased_inputs.activations = aliased_view;
+    aliased_inputs.weights = aliased_view;
+    std::vector<Q81> zero_activations(
+        static_cast<std::size_t>(compiled_columns) * q8_blocks_per_row);
+    std::vector<block_q2_0> zero_weights(
+        static_cast<std::size_t>(n_out) * q2_blocks_per_row);
+    std::vector<float> zero_expected;
+    check(twin::q2_0_matvec_reference(
+              zero_weights, zero_activations, n_in, n_out, compiled_columns,
+              active_columns, zero_expected, error),
+          label + " aliased-input oracle", error);
+    reset_outputs();
+    auto alias_command =
+        context.make_command_buffer(label + " read-only input alias", error);
+    check(alias_command != nullptr, label + " alias command buffer", error);
+    if (!alias_command) return false;
+    const bool alias_encoded = encode_q2_0_matvec(
+        context, *alias_command, n_in, n_out, active_columns,
+        compiled_columns, aliased_inputs, error);
+    check(alias_encoded, label + " permits read-only input overlap", error);
+    if (!alias_encoded) return false;
+    const bool alias_completed =
+        wait_for_engine_command(*alias_command, label + " input alias", error);
+    check(alias_completed, label + " input-alias completion", error);
+    if (!alias_completed) return false;
+    const std::size_t zero_output_bytes = output_bytes;
+    const std::size_t zero_sink_bytes = sink_written_bytes;
+    const auto zero_expected_output = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(zero_expected.data()),
+        zero_output_bytes);
+    const auto zero_expected_sink = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(zero_expected.data()) +
+            zero_output_bytes,
+        zero_sink_bytes);
+    const auto alias_output_mismatch =
+        twin::compare_bytes(output_buffer.payload().first(zero_output_bytes),
+                            zero_expected_output);
+    const auto alias_sink_mismatch =
+        twin::compare_bytes(sink_buffer.payload().first(zero_sink_bytes),
+                            zero_expected_sink);
+    check(!alias_output_mismatch,
+          label + " overlapping inputs match the zero oracle",
+          alias_output_mismatch ? alias_output_mismatch->reason
+                                : std::string{});
+    check(!alias_sink_mismatch,
+          label + " overlapping-input sink matches the zero oracle",
+          alias_sink_mismatch ? alias_sink_mismatch->reason
+                              : std::string{});
+
+    bool widths_pass = true;
+    for (const std::uint32_t width :
+         std::array<std::uint32_t, 4>{1u, 2u, 4u, 8u}) {
+        const std::uint32_t one_live_row = 1u;
+        std::memcpy(active_rows_buffer.payload().data(), &one_live_row,
+                    sizeof(one_live_row));
+        active_rows_buffer.capture_before_dispatch();
+        ReadOnlyQ2_0MatVecBuffers width_buffers = buffers;
+        width_buffers.active_rows = context.buffers().read_only(
+            active_rows_buffer.view().slice(0u, sizeof(one_live_row)));
+        width_buffers.output = output_buffer.view().slice(
+            0u, static_cast<std::size_t>(n_out) * sizeof(float));
+        width_buffers.sink = sink_buffer.view().slice(
+            0u, std::max(minimum_sink_bytes,
+                         static_cast<std::size_t>(width - 1u) * n_out *
+                             sizeof(float)));
+        std::vector<float> width_expected;
+        const auto width_activations = std::span<const Q81>(
+            activations.data(),
+            static_cast<std::size_t>(width) * q8_blocks_per_row);
+        const bool oracle_ready = twin::q2_0_matvec_reference(
+            weights, width_activations, n_in, n_out, width, 1u,
+            width_expected, error);
+        check(oracle_ready, label + " NC=" + std::to_string(width) +
+                                " scalar oracle",
+              error);
+        if (!oracle_ready) return false;
+        reset_outputs();
+        auto width_command = context.make_command_buffer(
+            label + " NC=" + std::to_string(width), error);
+        check(width_command != nullptr,
+              label + " NC=" + std::to_string(width) + " command buffer",
+              error);
+        if (!width_command) return false;
+        const bool encoded = encode_q2_0_matvec(
+            context, *width_command, n_in, n_out, 1u, width, width_buffers,
+            error);
+        check(encoded, label + " NC=" + std::to_string(width) + " encoding",
+              error);
+        if (!encoded) return false;
+        const bool completed = wait_for_engine_command(
+            *width_command, label + " NC=" + std::to_string(width), error);
+        check(completed,
+              label + " NC=" + std::to_string(width) + " completion", error);
+        if (!completed) return false;
+        const std::size_t width_output_bytes =
+            static_cast<std::size_t>(n_out) * sizeof(float);
+        const std::size_t width_sink_bytes =
+            static_cast<std::size_t>(width - 1u) * n_out * sizeof(float);
+        const auto width_expected_output = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(width_expected.data()),
+            width_output_bytes);
+        const auto width_expected_sink = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(width_expected.data()) +
+                width_output_bytes,
+            width_sink_bytes);
+        const auto width_output_mismatch = twin::compare_bytes(
+            output_buffer.payload().first(width_output_bytes),
+            width_expected_output);
+        const auto width_sink_mismatch = twin::compare_bytes(
+            sink_buffer.payload().first(width_sink_bytes),
+            width_expected_sink);
+        check(!width_output_mismatch,
+              label + " NC=" + std::to_string(width) +
+                  " output matches scalar oracle",
+              width_output_mismatch ? width_output_mismatch->reason
+                                    : std::string{});
+        check(!width_sink_mismatch,
+              label + " NC=" + std::to_string(width) +
+                  " sink matches scalar oracle",
+              width_sink_mismatch ? width_sink_mismatch->reason
+                                  : std::string{});
+        widths_pass &= !width_output_mismatch && !width_sink_mismatch;
+    }
+
+    constexpr std::uint32_t large_n_in = 4'160u;
+    constexpr std::uint32_t large_n_out = 3u;
+    constexpr std::uint32_t large_columns = 2u;
+    constexpr std::uint32_t large_q2_blocks = large_n_in / 64u;
+    constexpr std::uint32_t large_q8_blocks = large_n_in / 32u;
+    constexpr std::size_t large_activation_bytes =
+        static_cast<std::size_t>(large_columns) * large_q8_blocks *
+        sizeof(Q81);
+    constexpr std::size_t large_weight_bytes =
+        static_cast<std::size_t>(large_n_out) * large_q2_blocks *
+        sizeof(block_q2_0);
+    constexpr std::size_t large_output_bytes =
+        static_cast<std::size_t>(large_n_out) * sizeof(float);
+    constexpr std::size_t large_sink_bytes =
+        static_cast<std::size_t>(large_n_out) * sizeof(float);
+    std::vector<float> large_source(
+        static_cast<std::size_t>(large_columns) * large_n_in);
+    for (std::size_t index = 0u; index < large_source.size(); ++index) {
+        const int code = static_cast<int>((index * 19u + 5u) % 101u) - 50;
+        large_source[index] = static_cast<float>(code) * 0.0078125f;
+    }
+    std::vector<Q81> large_activations;
+    check(twin::quantize_q8_1_reference(
+              large_source, large_n_in, large_columns, large_activations,
+              error),
+          label + " large-K activation oracle", error);
+    if (large_activations.size() !=
+        static_cast<std::size_t>(large_columns) * large_q8_blocks) {
+        return false;
+    }
+    std::vector<block_q2_0> large_weights(
+        static_cast<std::size_t>(large_n_out) * large_q2_blocks);
+    for (std::size_t block = 0u; block < large_weights.size(); ++block) {
+        large_weights[block].d =
+            strata::kernels::f16_from_f32(0.03125f + (block % 7u) * 0.015625f);
+        for (std::size_t byte = 0u;
+             byte < sizeof(large_weights[block].qs); ++byte) {
+            large_weights[block].qs[byte] =
+                static_cast<std::uint8_t>((block * 13u + byte * 31u + 7u) &
+                                          0xffu);
+        }
+    }
+    std::vector<float> large_expected;
+    check(twin::q2_0_matvec_reference(
+              large_weights, large_activations, large_n_in, large_n_out,
+              large_columns, 1u, large_expected, error),
+          label + " large-K scalar oracle", error);
+    twin::GuardedBuffer large_input_buffer;
+    twin::GuardedBuffer large_weight_buffer;
+    twin::GuardedBuffer large_output_buffer;
+    twin::GuardedBuffer large_sink_buffer;
+    twin::GuardedBuffer large_rows_buffer;
+    check(large_input_buffer.allocate(context, label + " large-K activations",
+                                      large_activation_bytes, error),
+          label + " large-K activation allocation", error);
+    check(large_weight_buffer.allocate(context, label + " large-K weights",
+                                       large_weight_bytes, error),
+          label + " large-K weight allocation", error);
+    check(large_output_buffer.allocate(context, label + " large-K output",
+                                       large_output_bytes, error),
+          label + " large-K output allocation", error);
+    check(large_sink_buffer.allocate(context, label + " large-K sink",
+                                     large_sink_bytes, error),
+          label + " large-K sink allocation", error);
+    check(large_rows_buffer.allocate(context, label + " large-K active rows",
+                                     sizeof(std::uint32_t), error),
+          label + " large-K active-row allocation", error);
+    if (!large_input_buffer.view() || !large_weight_buffer.view() ||
+        !large_output_buffer.view() || !large_sink_buffer.view() ||
+        !large_rows_buffer.view()) {
+        return false;
+    }
+    std::memcpy(large_input_buffer.payload().data(), large_activations.data(),
+                large_activation_bytes);
+    std::memcpy(large_weight_buffer.payload().data(), large_weights.data(),
+                large_weight_bytes);
+    const std::uint32_t large_live_rows = 1u;
+    std::memcpy(large_rows_buffer.payload().data(), &large_live_rows,
+                sizeof(large_live_rows));
+    large_input_buffer.capture_before_dispatch();
+    large_weight_buffer.capture_before_dispatch();
+    large_output_buffer.capture_before_dispatch();
+    large_sink_buffer.capture_before_dispatch();
+    large_rows_buffer.capture_before_dispatch();
+    const ReadOnlyQ2_0MatVecBuffers large_buffers{
+        context.buffers().read_only(large_input_buffer.view()),
+        context.buffers().read_only(large_weight_buffer.view()),
+        context.buffers().read_only(large_rows_buffer.view()),
+        large_output_buffer.view(), large_sink_buffer.view()};
+    auto large_command =
+        context.make_command_buffer(label + " large-K", error);
+    check(large_command != nullptr, label + " large-K command buffer", error);
+    if (!large_command) return false;
+    const bool large_encoded = encode_q2_0_matvec(
+        context, *large_command, large_n_in, large_n_out, 1u, large_columns,
+        large_buffers, error);
+    check(large_encoded, label + " 65-block row encoding", error);
+    if (!large_encoded) return false;
+    const bool large_completed =
+        wait_for_engine_command(*large_command, label + " large-K", error);
+    check(large_completed, label + " large-K completion", error);
+    if (!large_completed) return false;
+    const std::size_t large_sink_written_bytes =
+        static_cast<std::size_t>(large_columns - 1u) * large_n_out *
+        sizeof(float);
+    const auto large_expected_output = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(large_expected.data()),
+        large_output_bytes);
+    const auto large_expected_sink = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(large_expected.data()) +
+            large_output_bytes,
+        large_sink_written_bytes);
+    const auto large_output_mismatch = twin::compare_bytes(
+        large_output_buffer.payload(), large_expected_output);
+    const auto large_sink_mismatch = twin::compare_bytes(
+        large_sink_buffer.payload().first(large_sink_written_bytes),
+        large_expected_sink);
+    check(!large_output_mismatch,
+          label + " large-K NC=2 output matches scalar oracle",
+          large_output_mismatch ? large_output_mismatch->reason
+                                : std::string{});
+    check(!large_sink_mismatch,
+          label + " large-K NC=2 sink matches scalar oracle",
+          large_sink_mismatch ? large_sink_mismatch->reason
+                              : std::string{});
+    const bool large_inputs_unchanged =
+        !large_input_buffer.first_unwritten_change({}) &&
+        !large_weight_buffer.first_unwritten_change({}) &&
+        !large_rows_buffer.first_unwritten_change({});
+    check(large_inputs_unchanged,
+          label + " large-K read-only bytes remain unchanged");
+
+    reset_outputs();
+    const std::uint32_t one_live_row = 1u;
+    std::memcpy(active_rows_buffer.payload().data(), &one_live_row,
+                sizeof(one_live_row));
+    active_rows_buffer.capture_before_dispatch();
+    ReadOnlyQ2_0MatVecBuffers late_failure = buffers;
+    late_failure.active_rows = context.buffers().read_only(
+        active_rows_buffer.view().slice(0u, sizeof(one_live_row)));
+    late_failure.output =
+        output_buffer.view().slice(0u, static_cast<std::size_t>(n_out) *
+                                          sizeof(float));
+    late_failure.sink =
+        sink_buffer.view().slice(0u, minimum_sink_bytes);
+    late_failure.weights = short_weights.weights;
+    ReadOnlyQ2_0MatVecBuffers rollback_valid = late_failure;
+    rollback_valid.weights = buffers.weights;
+    auto rollback = context.make_command_buffer(label + " late failure", error);
+    check(rollback != nullptr, label + " rollback command buffer", error);
+    if (!rollback) return false;
+    const bool rollback_encoded = Encoder::encode(
+        context, *rollback, label + " rollback segment",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_q2_0_matvec(context, encoder, n_in, n_out, 1u, 1u,
+                                    rollback_valid, encode_error)) {
+                return false;
+            }
+            return encode_q2_0_matvec(context, encoder, n_in, n_out, 1u, 1u,
+                                      late_failure, encode_error);
+        },
+        error);
+    const bool rollback_discarded =
+        !rollback_encoded && rollback->unsafe_native_handle() == nullptr &&
+        error.find("undersized") != std::string::npos;
+    check(rollback_discarded,
+          label + " caller-owned late failure discards prior dispatch",
+          error);
+    const bool rollback_outputs_untouched =
+        std::equal(output_poison.begin(), output_poison.end(),
+                   output_buffer.payload().begin()) &&
+        std::equal(sink_poison.begin(), sink_poison.end(),
+                   sink_buffer.payload().begin());
+    check(rollback_outputs_untouched,
+          label + " rolled-back output and sink remain untouched");
+
+    const bool inputs_unchanged =
+        !input_buffer.first_unwritten_change({}) &&
+        !weight_buffer.first_unwritten_change({}) &&
+        !active_rows_buffer.first_unwritten_change({});
+    const std::array<twin::ByteRange, 1> output_written =
+        {{{0u, static_cast<std::size_t>(n_out) * sizeof(float)}}};
+    const std::array<twin::ByteRange, 1> sink_written =
+        {{{0u, minimum_sink_bytes}}};
+    const bool output_guards =
+        !output_buffer.first_unwritten_change(output_written) &&
+        !sink_buffer.first_unwritten_change(sink_written);
+    check(inputs_unchanged, label + " read-only bytes remain unchanged");
+    check(output_guards, label + " output and sink guards remain unchanged");
+    return !standalone_output_mismatch && !standalone_sink_mismatch &&
+           !shared_output_mismatch && !shared_sink_mismatch && rejected_cases &&
+           !alias_output_mismatch && !alias_sink_mismatch && widths_pass &&
+           !large_output_mismatch && !large_sink_mismatch &&
+           large_inputs_unchanged && rollback_discarded &&
+           rollback_outputs_untouched &&
+           inputs_unchanged && output_guards;
+}
+
 bool run_readonly_bf16_matvec_encoder(Context& context) {
     constexpr std::uint32_t n_in = 320u;
     constexpr std::uint32_t n_out = 7u;
@@ -12396,6 +13000,7 @@ int main(int argc, char** argv) {
     if (!run_readonly_bf16_matvec_encoder(*context)) ++g_failures;
     if (!run_readonly_bf16_router_width(*context)) ++g_failures;
     if (!run_readonly_q8_0_matvec_encoder(*context)) ++g_failures;
+    if (!run_readonly_q2_0_matvec_encoder(*context)) ++g_failures;
     if (!run_indexed_head_engine_encoders(*context)) ++g_failures;
     if (!run_q8_1_to_q2_0_engine_chain(*context)) ++g_failures;
     std::printf("metal_mv_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
