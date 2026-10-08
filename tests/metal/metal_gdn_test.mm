@@ -1,13 +1,19 @@
 // Metal twins for the GDN block and its validated encoders (docs/mac/04 §5.5).
 #include "metallib_sha256.inc"
 #include "oracles/gdn.hpp"
+#include "oracles/q8_0_mv.hpp"
+#include "oracles/q8_1.hpp"
 #include "strata/metal/context.hpp"
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/gdn_dispatch.hpp"
+#include "strata/metal/mv_dispatch.hpp"
+#include "strata/metal/window_gdn_dispatch.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "twin.hpp"
 
 #include "../../src/metal/kernels/common/params.h"
+#include "../../src/metal/kernels/common/types.h"
 
 #import <Metal/Metal.h>
 
@@ -1714,6 +1720,543 @@ bool test_conv_commit_shared_encoder_validation(
     return passed;
 }
 
+bool compare_float_bytes(std::span<const float> actual,
+                         std::span<const float> expected,
+                         const std::string& label,
+                         const twin::Options& options,
+                         std::uint32_t rows) {
+    const auto actual_bytes = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(actual.data()),
+        actual.size_bytes());
+    const auto expected_bytes = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(expected.data()),
+        expected.size_bytes());
+    const auto mismatch = twin::compare_bytes(actual_bytes, expected_bytes);
+    if (mismatch) twin::report_failure(label.c_str(), options, rows, *mismatch);
+    check(!mismatch, label + " exact bytes");
+    return !mismatch;
+}
+
+std::vector<Q81> pad_q8_1_rows(std::span<const Q81> active,
+                                std::uint32_t width, std::uint32_t rows,
+                                std::uint32_t compiled_columns) {
+    const std::size_t blocks_per_row = width / 32u;
+    std::vector<Q81> padded(
+        static_cast<std::size_t>(compiled_columns) * blocks_per_row);
+    std::copy(active.begin(), active.end(), padded.begin());
+    for (std::uint32_t row = rows; row < compiled_columns; ++row) {
+        std::copy_n(active.begin(), blocks_per_row,
+                    padded.begin() + static_cast<std::size_t>(row) *
+                                         blocks_per_row);
+    }
+    return padded;
+}
+
+void fill_q8_0_weights(std::span<block_q8_0> weights,
+                       std::uint32_t n_in, std::uint32_t salt) {
+    const std::uint32_t blocks_per_row = n_in / 32u;
+    for (std::size_t index = 0u; index < weights.size(); ++index) {
+        block_q8_0& block = weights[index];
+        block.d = strata::kernels::f16_from_f32(1.0f / 128.0f);
+        for (std::uint32_t lane = 0u; lane < 32u; ++lane) {
+            const std::uint32_t output_row =
+                static_cast<std::uint32_t>(index / blocks_per_row);
+            const int code = static_cast<int>(
+                (output_row * 11u + static_cast<std::uint32_t>(index) * 3u +
+                 lane * 5u + salt) % 9u) - 4;
+            block.qs[lane] = static_cast<std::int8_t>(code);
+        }
+    }
+}
+
+bool run_window_gdn_block(Context& context, std::uint32_t rows,
+                          bool shared_encoder,
+                          const twin::Options& options) {
+    const std::string label = "Window GDN block T=" + std::to_string(rows) +
+                              (shared_encoder ? " shared-encoder" : "");
+    if (rows == 0u || rows > 8u) return false;
+    const std::size_t mixed_count =
+        static_cast<std::size_t>(rows) * N_EMBD;
+    const std::size_t qkv_count =
+        static_cast<std::size_t>(rows) * kChannels;
+    const std::size_t gate_count =
+        static_cast<std::size_t>(rows) * kHeads;
+    const std::size_t value_count =
+        static_cast<std::size_t>(rows) * kValueDim;
+    const std::size_t q8_mixed_count =
+        mixed_count / 32u;
+    const std::size_t q8_value_count =
+        value_count / 32u;
+    const std::size_t qkv_weight_count =
+        static_cast<std::size_t>(kChannels) * (N_EMBD / 32u);
+    const std::size_t gate_weight_count =
+        static_cast<std::size_t>(kValueDim) * (N_EMBD / 32u);
+    const std::size_t output_weight_count =
+        static_cast<std::size_t>(N_EMBD) * (kValueDim / 32u);
+    const std::size_t ab_weight_count =
+        static_cast<std::size_t>(N_EMBD) * kHeads;
+    const std::uint32_t active_columns =
+        rows <= 1u ? 1u : rows <= 2u ? 2u : rows <= 4u ? 4u : 8u;
+    const std::size_t sink_count = std::max<std::size_t>(
+        1u, static_cast<std::size_t>(kChannels) *
+                (active_columns - rows));
+
+    std::mt19937_64 rng(options.seed ^ (std::uint64_t{rows} << 40u) ^
+                        0x57494e444f574744ull);
+    std::vector<float> mixed(mixed_count);
+    std::vector<float> history(kHistoryElements);
+    std::vector<float> conv_weights(
+        static_cast<std::size_t>(kChannels) * GDN_CONV_KERNEL);
+    std::vector<float> initial_state(kStateElements);
+    std::vector<std::uint16_t> alpha(ab_weight_count);
+    std::vector<std::uint16_t> beta_weights(ab_weight_count);
+    std::vector<float> dt_bias(kHeads);
+    std::vector<float> a_values(kHeads);
+    std::vector<float> gamma(kHeadDim);
+    for (std::uint32_t i = 0u; i < mixed.size(); ++i) {
+        mixed[i] = sample(twin::InputSet::fixture, rng, i, 0.2f);
+    }
+    for (std::uint32_t i = 0u; i < history.size(); ++i) {
+        history[i] = sample(twin::InputSet::fixture, rng, i + 17u, 0.04f);
+    }
+    for (std::uint32_t i = 0u; i < conv_weights.size(); ++i) {
+        conv_weights[i] = sample(twin::InputSet::fixture, rng, i + 31u, 0.05f);
+    }
+    for (std::uint32_t i = 0u; i < initial_state.size(); ++i) {
+        initial_state[i] = sample(twin::InputSet::fixture, rng, i + 47u, 0.01f);
+    }
+    for (std::uint32_t i = 0u; i < alpha.size(); ++i) {
+        const int code = static_cast<int>((i * 7u + 3u) % 9u) - 4;
+        alpha[i] = strata::kernels::bf16_from_f32(
+            static_cast<float>(code) * (1.0f / 8192.0f));
+        beta_weights[i] = strata::kernels::bf16_from_f32(
+            static_cast<float>(4 - code) * (1.0f / 8192.0f));
+    }
+    for (std::uint32_t i = 0u; i < kHeads; ++i) {
+        dt_bias[i] = static_cast<float>(static_cast<int>(i % 5u) - 2) * 0.01f;
+        a_values[i] = -0.04f - static_cast<float>(i % 3u) * 0.01f;
+    }
+    for (std::uint32_t i = 0u; i < gamma.size(); ++i) {
+        gamma[i] = 0.75f + static_cast<float>(i % 11u) * (1.0f / 32.0f);
+    }
+
+    twin::GuardedBuffer mixed_buffer, history_buffer, state_buffer;
+    twin::GuardedBuffer qkv_weight_buffer, conv_weight_buffer;
+    twin::GuardedBuffer alpha_buffer, beta_weight_buffer, dt_buffer, a_buffer;
+    twin::GuardedBuffer gate_weight_buffer, gamma_buffer, output_weight_buffer;
+    twin::GuardedBuffer xq_buffer, qkv_buffer, h_buffer;
+    twin::GuardedBuffer gate_buffer, beta_buffer, z_buffer, y_buffer, yq_buffer;
+    twin::GuardedBuffer block_out_buffer, sink_buffer, active_rows_buffer;
+    std::string error;
+    const auto alloc = [&](twin::GuardedBuffer& buffer, const char* suffix,
+                           std::size_t bytes) {
+        const bool ok = buffer.allocate(context, label + " " + suffix,
+                                        bytes, error);
+        check(ok, label + " " + suffix + " allocation", error);
+        return ok;
+    };
+    if (!alloc(mixed_buffer, "mixed", mixed_count * sizeof(float)) ||
+        !alloc(history_buffer, "history", history.size() * sizeof(float)) ||
+        !alloc(state_buffer, "state", initial_state.size() * sizeof(float)) ||
+        !alloc(qkv_weight_buffer, "qkv weights",
+               qkv_weight_count * sizeof(block_q8_0)) ||
+        !alloc(conv_weight_buffer, "convolution weights",
+               conv_weights.size() * sizeof(float)) ||
+        !alloc(alpha_buffer, "alpha weights",
+               ab_weight_count * sizeof(std::uint16_t)) ||
+        !alloc(beta_weight_buffer, "beta weights",
+               ab_weight_count * sizeof(std::uint16_t)) ||
+        !alloc(dt_buffer, "dt bias", dt_bias.size() * sizeof(float)) ||
+        !alloc(a_buffer, "a", a_values.size() * sizeof(float)) ||
+        !alloc(gate_weight_buffer, "gate weights",
+               gate_weight_count * sizeof(block_q8_0)) ||
+        !alloc(gamma_buffer, "gamma", gamma.size() * sizeof(float)) ||
+        !alloc(output_weight_buffer, "output weights",
+               output_weight_count * sizeof(block_q8_0)) ||
+        !alloc(xq_buffer, "xq", q8_mixed_count * sizeof(Q81)) ||
+        !alloc(qkv_buffer, "qkv", qkv_count * sizeof(float)) ||
+        !alloc(h_buffer, "h", qkv_count * sizeof(float)) ||
+        !alloc(gate_buffer, "gate", gate_count * sizeof(float)) ||
+        !alloc(beta_buffer, "beta", gate_count * sizeof(float)) ||
+        !alloc(z_buffer, "z", value_count * sizeof(float)) ||
+        !alloc(y_buffer, "y", value_count * sizeof(float)) ||
+        !alloc(yq_buffer, "yq", q8_value_count * sizeof(Q81)) ||
+        !alloc(block_out_buffer, "block output",
+               mixed_count * sizeof(float)) ||
+        !alloc(sink_buffer, "matvec sink", sink_count * sizeof(float)) ||
+        !alloc(active_rows_buffer, "active rows", sizeof(std::uint32_t))) {
+        return false;
+    }
+
+    std::memcpy(mixed_buffer.payload().data(), mixed.data(),
+                mixed.size() * sizeof(float));
+    std::memcpy(history_buffer.payload().data(), history.data(),
+                history.size() * sizeof(float));
+    std::memcpy(state_buffer.payload().data(), initial_state.data(),
+                initial_state.size() * sizeof(float));
+    std::memcpy(conv_weight_buffer.payload().data(), conv_weights.data(),
+                conv_weights.size() * sizeof(float));
+    std::memcpy(alpha_buffer.payload().data(), alpha.data(),
+                alpha.size() * sizeof(std::uint16_t));
+    std::memcpy(beta_weight_buffer.payload().data(), beta_weights.data(),
+                beta_weights.size() * sizeof(std::uint16_t));
+    std::memcpy(dt_buffer.payload().data(), dt_bias.data(),
+                dt_bias.size() * sizeof(float));
+    std::memcpy(a_buffer.payload().data(), a_values.data(),
+                a_values.size() * sizeof(float));
+    std::memcpy(gamma_buffer.payload().data(), gamma.data(),
+                gamma.size() * sizeof(float));
+    fill_q8_0_weights(typed<block_q8_0>(qkv_weight_buffer), N_EMBD, 1u);
+    fill_q8_0_weights(typed<block_q8_0>(gate_weight_buffer), N_EMBD, 4u);
+    fill_q8_0_weights(typed<block_q8_0>(output_weight_buffer), kValueDim, 7u);
+    std::memcpy(active_rows_buffer.payload().data(), &rows, sizeof(rows));
+
+    const std::array output_buffers{
+        &xq_buffer, &qkv_buffer, &h_buffer, &gate_buffer, &beta_buffer,
+        &z_buffer, &y_buffer, &yq_buffer, &block_out_buffer, &sink_buffer};
+    for (twin::GuardedBuffer* buffer : output_buffers) {
+        std::fill(buffer->payload().begin(), buffer->payload().end(), 0xa5u);
+    }
+    const std::array all_buffers{
+        &mixed_buffer, &history_buffer, &state_buffer, &qkv_weight_buffer,
+        &conv_weight_buffer, &alpha_buffer, &beta_weight_buffer, &dt_buffer,
+        &a_buffer, &gate_weight_buffer, &gamma_buffer, &output_weight_buffer,
+        &xq_buffer, &qkv_buffer, &h_buffer, &gate_buffer, &beta_buffer,
+        &z_buffer, &y_buffer, &yq_buffer, &block_out_buffer, &sink_buffer,
+        &active_rows_buffer};
+    for (twin::GuardedBuffer* buffer : all_buffers) {
+        buffer->capture_before_dispatch();
+    }
+
+    const WindowGDNBlockBuffers buffers{
+        mixed_buffer.view(), history_buffer.view(), state_buffer.view(),
+        MatVecWeightFormat::q8_0, qkv_weight_buffer.view(),
+        conv_weight_buffer.view(), alpha_buffer.view(), beta_weight_buffer.view(),
+        dt_buffer.view(), a_buffer.view(), MatVecWeightFormat::q8_0,
+        gate_weight_buffer.view(), gamma_buffer.view(),
+        MatVecWeightFormat::q8_0, output_weight_buffer.view(), xq_buffer.view(),
+        qkv_buffer.view(), h_buffer.view(), gate_buffer.view(), beta_buffer.view(),
+        z_buffer.view(), y_buffer.view(), yq_buffer.view(), block_out_buffer.view(),
+        sink_buffer.view(), active_rows_buffer.view()};
+
+    if (rows == 1u && !shared_encoder) {
+        WindowGDNBlockBuffers aliased = buffers;
+        aliased.history = aliased.mixed;
+        std::string alias_error;
+        auto alias_command = context.make_command_buffer(
+            "Window GDN cross-stage alias", alias_error);
+        check(alias_command != nullptr,
+              label + " cross-stage alias command buffer", alias_error);
+        if (!alias_command) return false;
+        const bool accepted_alias = encode_window_gdn_block(
+            context, *alias_command, rows, aliased, alias_error);
+        const bool alias_rejected =
+            !accepted_alias &&
+            alias_command->unsafe_native_handle() == nullptr &&
+            alias_error.find("history buffer overlaps mixed") !=
+                std::string::npos;
+        check(alias_rejected,
+              label + " rejects mixed/history cross-stage alias", alias_error);
+        if (!alias_rejected) return false;
+    }
+
+    const bool dispatched = run_command(
+        context, label,
+        [&](CommandBuffer& command, std::string& encode_error) {
+            if (!shared_encoder) {
+                return encode_window_gdn_block(context, command, rows, buffers,
+                                               encode_error);
+            }
+            return Encoder::encode(
+                context, command, "shared Window GDN block",
+                [&](Encoder& encoder, std::string& body_error) {
+                    return encode_window_gdn_block(context, encoder, rows,
+                                                   buffers, body_error);
+                },
+                encode_error);
+        },
+        error);
+    if (!dispatched) return false;
+
+    bool passed = true;
+    const std::size_t xq_bytes = q8_mixed_count * sizeof(Q81);
+    std::vector<Q81> expected_xq;
+    passed &= twin::quantize_q8_1_reference(mixed, N_EMBD, rows,
+                                            expected_xq, error);
+    check(passed, label + " CPU mixed Q8_1 oracle", error);
+    const auto actual_xq_bytes = xq_buffer.payload().first(xq_bytes);
+    const auto expected_xq_bytes = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(expected_xq.data()), xq_bytes);
+    const auto xq_mismatch = twin::compare_bytes(actual_xq_bytes,
+                                                 expected_xq_bytes);
+    if (xq_mismatch) {
+        twin::report_failure(label.c_str(), options, rows, *xq_mismatch);
+    }
+    check(!xq_mismatch, label + " mixed Q8_1 matches scalar oracle");
+    passed &= !xq_mismatch;
+
+    const auto actual_xq = typed<const Q81>(xq_buffer).first(q8_mixed_count);
+    const auto padded_xq = pad_q8_1_rows(actual_xq, N_EMBD, rows,
+                                         active_columns);
+    const auto qkv_weights = typed<const block_q8_0>(qkv_weight_buffer);
+    std::vector<float> expected_qkv;
+    const bool qkv_oracle = twin::q8_0_matvec_reference(
+        qkv_weights, padded_xq, N_EMBD, kChannels, active_columns, rows,
+        expected_qkv, error);
+    check(qkv_oracle, label + " qkv scalar matvec oracle", error);
+    const auto actual_qkv =
+        typed<const float>(qkv_buffer).first(qkv_count);
+    const bool qkv_match = qkv_oracle && compare_float_bytes(
+        actual_qkv, std::span<const float>(expected_qkv).first(qkv_count),
+        label + " qkv projection", options, rows);
+    passed &= qkv_match;
+
+    std::vector<twin::tf> expected_h;
+    oracle::gdn_conv_l2(history, actual_qkv, conv_weights, rows, expected_h);
+    const auto actual_h = typed<const float>(h_buffer).first(qkv_count);
+    passed &= compare_units(actual_h, expected_h, 128.0,
+                            label + " convolution and q/k L2", options, rows);
+
+    std::vector<twin::tf> expected_gate, expected_beta;
+    oracle::gdn_ab(mixed, alpha, beta_weights, dt_bias, a_values, rows,
+                   expected_gate, expected_beta);
+    const auto actual_gate = typed<const float>(gate_buffer).first(gate_count);
+    const auto actual_beta = typed<const float>(beta_buffer).first(gate_count);
+    passed &= compare_units(actual_gate, expected_gate, 256.0,
+                            label + " alpha/beta gate", options, rows);
+    passed &= compare_units(actual_beta, expected_beta, 128.0,
+                            label + " beta projection", options, rows);
+
+    std::vector<float> expected_z;
+    const auto gate_weights = typed<const block_q8_0>(gate_weight_buffer);
+    const bool z_oracle = twin::q8_0_matvec_reference(
+        gate_weights, padded_xq, N_EMBD, kValueDim, active_columns, rows,
+        expected_z, error);
+    check(z_oracle, label + " gate scalar matvec oracle", error);
+    const auto actual_z = typed<const float>(z_buffer).first(value_count);
+    const bool z_match = z_oracle && compare_float_bytes(
+        actual_z, std::span<const float>(expected_z).first(value_count),
+        label + " gate projection", options, rows);
+    passed &= z_match;
+
+    std::vector<float> oracle_state = initial_state;
+    std::vector<twin::tf> expected_y, expected_final_state;
+    oracle::gdn_step_norm(oracle_state, actual_h, actual_gate, actual_beta,
+                          actual_z, gamma, rows, GDNStateMode::window,
+                          expected_y, expected_final_state);
+    const auto actual_y = typed<const float>(y_buffer).first(value_count);
+    passed &= compare_units(actual_y, expected_y, 512.0,
+                            label + " window recurrence and norm", options,
+                            rows);
+    const bool state_unchanged =
+        std::memcmp(state_buffer.payload().data(), initial_state.data(),
+                    initial_state.size() * sizeof(float)) == 0;
+    check(state_unchanged, label + " window keeps recurrent state unchanged");
+    passed &= state_unchanged;
+
+    std::vector<Q81> expected_yq;
+    const bool yq_oracle = twin::quantize_q8_1_reference(
+        actual_y, kValueDim, rows, expected_yq, error);
+    check(yq_oracle, label + " output Q8_1 scalar oracle", error);
+    const std::size_t yq_bytes = q8_value_count * sizeof(Q81);
+    const auto yq_mismatch = twin::compare_bytes(
+        yq_buffer.payload().first(yq_bytes),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(expected_yq.data()),
+            yq_bytes));
+    if (yq_mismatch) {
+        twin::report_failure(label.c_str(), options, rows, *yq_mismatch);
+    }
+    check(yq_oracle && !yq_mismatch,
+          label + " output Q8_1 matches scalar oracle");
+    passed &= yq_oracle && !yq_mismatch;
+
+    std::vector<float> expected_block_out;
+    const auto output_weights =
+        typed<const block_q8_0>(output_weight_buffer);
+    const auto actual_yq = typed<const Q81>(yq_buffer).first(q8_value_count);
+    const auto padded_yq = pad_q8_1_rows(actual_yq, kValueDim, rows,
+                                         active_columns);
+    const bool output_oracle = twin::q8_0_matvec_reference(
+        output_weights, padded_yq, kValueDim, N_EMBD, active_columns, rows,
+        expected_block_out, error);
+    check(output_oracle, label + " output scalar matvec oracle", error);
+    const auto actual_block_out =
+        typed<const float>(block_out_buffer).first(mixed_count);
+    const bool output_match = output_oracle && compare_float_bytes(
+        actual_block_out,
+        std::span<const float>(expected_block_out).first(mixed_count),
+        label + " output projection", options, rows);
+    passed &= output_match;
+    const std::size_t padded_output_count =
+        static_cast<std::size_t>(active_columns - rows) * N_EMBD;
+    bool sink_match = output_oracle;
+    if (output_oracle && padded_output_count != 0u) {
+        sink_match = compare_float_bytes(
+            typed<const float>(sink_buffer).first(padded_output_count),
+            std::span<const float>(expected_block_out).subspan(
+                mixed_count, padded_output_count),
+            label + " padded output projection", options, rows);
+    }
+    passed &= sink_match;
+
+    const std::array<twin::ByteRange, 1> xq_written{{{0u, xq_bytes}}};
+    const std::array<twin::ByteRange, 1> qkv_written{{
+        {0u, qkv_count * sizeof(float)}}};
+    const std::array<twin::ByteRange, 1> gate_written{{
+        {0u, gate_count * sizeof(float)}}};
+    const std::array<twin::ByteRange, 1> value_written{{
+        {0u, value_count * sizeof(float)}}};
+    const std::array<twin::ByteRange, 1> yq_written{{{0u, yq_bytes}}};
+    const std::array<twin::ByteRange, 1> out_written{{
+        {0u, mixed_count * sizeof(float)}}};
+    passed &= !xq_buffer.first_unwritten_change(xq_written);
+    passed &= !qkv_buffer.first_unwritten_change(qkv_written);
+    passed &= !h_buffer.first_unwritten_change(qkv_written);
+    passed &= !gate_buffer.first_unwritten_change(gate_written);
+    passed &= !beta_buffer.first_unwritten_change(gate_written);
+    passed &= !z_buffer.first_unwritten_change(value_written);
+    passed &= !y_buffer.first_unwritten_change(value_written);
+    passed &= !yq_buffer.first_unwritten_change(yq_written);
+    passed &= !block_out_buffer.first_unwritten_change(out_written);
+    const std::array<twin::ByteRange, 1> sink_written{{
+        {0u, static_cast<std::size_t>(active_columns - rows) * kChannels *
+                 sizeof(float)}}};
+    passed &= !sink_buffer.first_unwritten_change(sink_written);
+    for (const auto* input_buffer : {
+             &mixed_buffer, &history_buffer, &state_buffer, &qkv_weight_buffer,
+             &conv_weight_buffer, &alpha_buffer, &beta_weight_buffer,
+             &dt_buffer, &a_buffer, &gate_weight_buffer, &gamma_buffer,
+             &output_weight_buffer, &active_rows_buffer}) {
+        passed &= !input_buffer->first_unwritten_change({});
+    }
+    check(passed, label + " guards and read-only inputs");
+
+    if (rows == 2u) {
+        const auto short_gamma = gamma_buffer.view().slice(
+            0u, gamma.size() * sizeof(float) - sizeof(float));
+        WindowGDNBlockBuffers late_failure = buffers;
+        late_failure.gamma = short_gamma;
+        for (twin::GuardedBuffer* buffer : output_buffers) {
+            std::fill(buffer->payload().begin(), buffer->payload().end(), 0xa5u);
+            buffer->capture_before_dispatch();
+        }
+        auto command = context.make_command_buffer(
+            "Window GDN command-buffer late failure", error);
+        check(command != nullptr, label + " late-failure command buffer", error);
+        if (!command) return false;
+        const bool accepted_command = encode_window_gdn_block(
+            context, *command, rows, late_failure, error);
+        const bool command_discarded =
+            !accepted_command && command->unsafe_native_handle() == nullptr &&
+            error.find("gamma") != std::string::npos;
+        check(command_discarded,
+              label + " command-buffer late failure discards prior stages",
+              error);
+        passed &= command_discarded;
+        bool command_outputs_untouched = true;
+        for (twin::GuardedBuffer* buffer : output_buffers) {
+            command_outputs_untouched &=
+                !buffer->first_unwritten_change({});
+        }
+        check(command_outputs_untouched,
+              label + " command-buffer rollback leaves all outputs untouched");
+        passed &= command_outputs_untouched;
+
+        for (twin::GuardedBuffer* buffer : output_buffers) {
+            std::fill(buffer->payload().begin(), buffer->payload().end(), 0xa5u);
+            buffer->capture_before_dispatch();
+        }
+        auto shared_command = context.make_command_buffer(
+            "Window GDN caller-owned late failure", error);
+        check(shared_command != nullptr,
+              label + " caller-owned late-failure command buffer", error);
+        if (!shared_command) return false;
+        const bool accepted_shared = Encoder::encode(
+            context, *shared_command, "Window GDN caller-owned rollback",
+            [&](Encoder& encoder, std::string& body_error) {
+                return encode_window_gdn_block(context, encoder, rows,
+                                               late_failure, body_error);
+            },
+            error);
+        const bool shared_discarded =
+            !accepted_shared &&
+            shared_command->unsafe_native_handle() == nullptr &&
+            error.find("gamma") != std::string::npos;
+        check(shared_discarded,
+              label + " caller-owned late failure discards prior stages",
+              error);
+        passed &= shared_discarded;
+        bool shared_outputs_untouched = true;
+        for (twin::GuardedBuffer* buffer : output_buffers) {
+            shared_outputs_untouched &=
+                !buffer->first_unwritten_change({});
+        }
+        check(shared_outputs_untouched,
+              label + " caller-owned rollback leaves all outputs untouched");
+        passed &= shared_outputs_untouched;
+
+        const char* const dispatch_mode = std::getenv("STRATA_METAL_DISPATCH");
+        if (dispatch_mode != nullptr &&
+            std::string_view(dispatch_mode) == "concurrent") {
+            auto group_command = context.make_command_buffer(
+                "Window GDN concurrent-group boundary", error);
+            check(group_command != nullptr,
+                  label + " concurrent-group command buffer", error);
+            if (!group_command) return false;
+            bool saw_open_group = false;
+            bool rejected = false;
+            const bool group_encoded = Encoder::encode(
+                context, *group_command, "Window GDN group boundary",
+                [&](Encoder& encoder, std::string& body_error) {
+                    if (!encoder.group_begin(body_error)) return false;
+                    saw_open_group = encoder.concurrent_group_open();
+                    if (saw_open_group) {
+                        std::string block_error;
+                        rejected = !encode_window_gdn_block(
+                            context, encoder, rows, buffers, block_error) &&
+                            block_error.find("ordered concurrent-group boundary") !=
+                                std::string::npos;
+                    }
+                    if (!encoder.group_end(body_error)) return false;
+                    if (!saw_open_group || !rejected) {
+                        body_error = "Window GDN did not reject an open concurrent group";
+                        return false;
+                    }
+                    return true;
+                },
+                error);
+            const bool group_contract = group_encoded && saw_open_group && rejected;
+            check(group_contract,
+                  label + " rejects dependent dispatch in open concurrent group",
+                  error);
+            if (group_command) group_command->discard();
+            passed &= group_contract;
+        }
+    }
+    return passed;
+}
+
+bool test_window_gdn_block_contract(Context& context) {
+    bool passed = true;
+    const WindowGDNBlockBuffers empty{};
+    for (const std::uint32_t rows : {0u, 9u}) {
+        std::string error;
+        auto command = context.make_command_buffer(
+            "Window GDN invalid row count", error);
+        check(command != nullptr, "Window GDN invalid-row command buffer", error);
+        if (!command) return false;
+        const bool accepted = encode_window_gdn_block(
+            context, *command, rows, empty, error);
+        const bool rejected = !accepted &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find("row count must be in 1..8") != std::string::npos;
+        check(rejected, "Window GDN rejects T=" + std::to_string(rows), error);
+        passed &= rejected;
+    }
+    return passed;
+}
+
 bool run_set(Context& context, twin::InputSet set,
              const twin::Options& options) {
     bool passed = true;
@@ -1760,6 +2303,9 @@ bool run_set(Context& context, twin::InputSet set,
     if (set == twin::InputSet::fixture) {
         passed &= run_step_norm_set(context, set, options,
                                     EdgeProfile::regular, true);
+        passed &= run_window_gdn_block(context, 1u, false, options);
+        passed &= run_window_gdn_block(context, 2u, true, options);
+        passed &= run_window_gdn_block(context, 3u, false, options);
     }
     return passed;
 }
@@ -1800,6 +2346,7 @@ int main(int argc, char** argv) {
     if (!foreign_context) return 1;
 
     bool passed = test_encoder_validation(*context, *foreign_context);
+    passed &= test_window_gdn_block_contract(*context);
     passed &= test_conv_l2_shared_encoder_validation(
         context_options, *foreign_context);
     passed &= test_ab_shared_encoder_validation(context_options,

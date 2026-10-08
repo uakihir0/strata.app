@@ -256,6 +256,10 @@
       "label": "metal",
       "origin": "04 10.5"
     },
+    "metal_gdn_test_concurrent": {
+      "label": "metal",
+      "origin": "04 10.5"
+    },
     "metal_gr_test": {
       "label": "metal",
       "origin": "09 9.1"

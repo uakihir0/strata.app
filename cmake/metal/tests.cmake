@@ -288,6 +288,11 @@ set_source_files_properties(tests/metal/metal_gdn_test.mm
 add_dependencies(metal_gdn_test strata_metallib)
 strata_metal_test(metal_gdn_test metal metal_gdn_test ${STRATA_METALLIB})
 set_tests_properties(metal_gdn_test PROPERTIES TIMEOUT 300)
+strata_metal_test(metal_gdn_test_concurrent metal
+                  metal_gdn_test ${STRATA_METALLIB} --input-set fixture)
+set_tests_properties(metal_gdn_test_concurrent PROPERTIES
+  TIMEOUT 300
+  ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
 
 add_executable(metal_qsa_test tests/metal/metal_qsa_test.mm)
 target_include_directories(metal_qsa_test PRIVATE ${STRATA_METAL_GENERATED_DIR})
