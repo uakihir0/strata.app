@@ -169,15 +169,16 @@ bool validate_buffer(Context& context, BufferRef buffer,
 bool validate_read_only_buffer(Context& context, ReadOnlyBufferRef buffer,
                                std::size_t required_bytes,
                                std::size_t alignment, std::string_view name,
+                               std::string_view operation,
                                std::string& error) {
     if (!buffer || !context.buffers().owns(buffer)) {
-        error = "read-only BF16 mat-vec " + std::string(name) +
+        error = std::string(operation) + " " + std::string(name) +
                 " buffer is not owned by this Context";
         return false;
     }
     if (alignment == 0u || buffer.length() < required_bytes ||
         buffer.offset() % alignment != 0u) {
-        error = "read-only BF16 mat-vec " + std::string(name) +
+        error = std::string(operation) + " " + std::string(name) +
                 " buffer is undersized or misaligned";
         return false;
     }
@@ -192,7 +193,7 @@ bool validate_read_only_buffer(Context& context, ReadOnlyBufferRef buffer,
         (gpu_address != 0u &&
          required_bytes >
              std::numeric_limits<std::uint64_t>::max() - gpu_address)) {
-        error = "read-only BF16 mat-vec " + std::string(name) +
+        error = std::string(operation) + " " + std::string(name) +
                 " buffer has invalid or misaligned backing metadata";
         return false;
     }
@@ -458,13 +459,15 @@ bool encode_bf16_matvec_impl(
     constexpr std::size_t weight_alignment = alignof(std::uint32_t);
     if (!validate_read_only_buffer(context, buffers.activations,
                                    activation_bytes, activation_alignment,
-                                   "activations", error) ||
+                                   "activations",
+                                   "read-only BF16 mat-vec", error) ||
         !validate_read_only_buffer(context, buffers.weights, weight_bytes,
-                                   weight_alignment, "weights", error) ||
+                                   weight_alignment, "weights",
+                                   "read-only BF16 mat-vec", error) ||
         !validate_read_only_buffer(context, buffers.active_rows,
                                    sizeof(std::uint32_t),
                                    alignof(std::uint32_t), "active-row count",
-                                   error) ||
+                                   "read-only BF16 mat-vec", error) ||
         !validate_buffer(context, buffers.output, output_bytes,
                          alignof(float), "read-only BF16 output", error) ||
         !validate_buffer(context, buffers.sink, sink_bytes, alignof(float),
@@ -528,6 +531,157 @@ bool encode_bf16_matvec_impl(
     };
     return encoder.dispatch(kernel_name, {n_out, 1u, 1u},
                             {block_size, 1u, 1u}, writable_bindings,
+                            read_only_bindings, inline_bytes, {}, error);
+}
+
+bool encode_q8_0_matvec_impl(
+    Context& context, Encoder& encoder, std::uint32_t n_in,
+    std::uint32_t n_out, std::uint32_t active_columns,
+    std::uint32_t compiled_columns,
+    const ReadOnlyQ8_0MatVecBuffers& buffers, std::string& error) {
+    constexpr std::string_view operation = "read-only Q8_0 mat-vec";
+    error.clear();
+    if (n_in == 0u || n_in > kMaxMatVecWidth ||
+        n_in % kQ8_1BlockValues != 0u) {
+        error = std::string(operation) +
+                " n_in must be in 32..16640 and divisible by 32";
+        return false;
+    }
+    if (n_out == 0u) {
+        error = std::string(operation) + " n_out must be positive";
+        return false;
+    }
+    if (compiled_columns != 1u && compiled_columns != 2u &&
+        compiled_columns != 4u && compiled_columns != 8u) {
+        error = std::string(operation) +
+                " compiled column width must be 1, 2, 4 or 8";
+        return false;
+    }
+    if (active_columns == 0u || active_columns > compiled_columns) {
+        error = std::string(operation) +
+                " active columns must be in 1..compiled column width";
+        return false;
+    }
+
+    std::uint64_t blocks_per_row = n_in / kQ8_1BlockValues;
+    std::uint64_t weight_count = 0u;
+    std::uint64_t input_count = 0u;
+    std::uint64_t output_count = 0u;
+    std::uint64_t compiled_output_count = 0u;
+    if (!checked_mul(n_out, blocks_per_row, weight_count) ||
+        !checked_mul(active_columns, blocks_per_row, input_count) ||
+        !checked_mul(active_columns, n_out, output_count) ||
+        !checked_mul(compiled_columns, n_out, compiled_output_count) ||
+        weight_count > kShaderIndexCapacity ||
+        input_count > kShaderIndexCapacity ||
+        compiled_output_count > kShaderIndexCapacity) {
+        error = std::string(operation) +
+                " flattened index exceeds the 32-bit shader range";
+        return false;
+    }
+
+    std::size_t activation_bytes = 0u;
+    std::size_t weight_bytes = 0u;
+    std::size_t output_bytes = 0u;
+    std::size_t sink_bytes = 0u;
+    const std::uint64_t sink_count =
+        static_cast<std::uint64_t>(compiled_columns - active_columns) *
+        n_out;
+    const std::uint64_t required_sink_count =
+        sink_count == 0u ? 1u : sink_count;
+    if (!checked_bytes(input_count, kQ8_1BlockBytes, activation_bytes) ||
+        !checked_bytes(weight_count, sizeof(block_q8_0), weight_bytes) ||
+        !checked_bytes(output_count, sizeof(float), output_bytes) ||
+        !checked_bytes(required_sink_count, sizeof(float), sink_bytes)) {
+        error = std::string(operation) +
+                " buffer size overflows the host byte range";
+        return false;
+    }
+
+    constexpr std::uint32_t threads_x = kMatVecThreadsX;
+    constexpr std::uint32_t threads_y = kMatVecThreadsY;
+    const std::uint32_t rows_per_group =
+        blocks_per_row < 32u ? 4u : 1u;
+    const std::uint32_t grid_x =
+        static_cast<std::uint32_t>(
+            (static_cast<std::uint64_t>(n_out) + rows_per_group - 1u) /
+            rows_per_group);
+    const std::string kernel_name =
+        "strata_mv_q8_0_n" + std::to_string(compiled_columns);
+    id<MTLComputePipelineState> pipeline = nil;
+    if (!validate_pipeline(context, kernel_name.c_str(), threads_x,
+                           threads_y, operation, pipeline, error)) {
+        return false;
+    }
+
+    constexpr std::size_t activation_alignment = 256u;
+    constexpr std::size_t weight_alignment = alignof(std::uint16_t);
+    if (!validate_read_only_buffer(context, buffers.activations,
+                                   activation_bytes, activation_alignment,
+                                   "activations", operation, error) ||
+        !validate_read_only_buffer(context, buffers.weights, weight_bytes,
+                                   weight_alignment, "weights", operation,
+                                   error) ||
+        !validate_read_only_buffer(context, buffers.active_rows,
+                                   sizeof(std::uint32_t),
+                                   alignof(std::uint32_t), "active-row count",
+                                   operation, error) ||
+        !validate_buffer(context, buffers.output, output_bytes,
+                         alignof(float), "read-only Q8_0 output", error) ||
+        !validate_buffer(context, buffers.sink, sink_bytes, alignof(float),
+                         "read-only Q8_0 sink", error)) {
+        return false;
+    }
+
+    std::uint32_t live_rows = 0u;
+    std::memcpy(&live_rows, buffers.active_rows.contents(), sizeof(live_rows));
+    if (live_rows != active_columns) {
+        error = std::string(operation) +
+                " active-row count does not match active columns";
+        return false;
+    }
+
+    if (read_only_buffer_ranges_overlap(buffers.activations, activation_bytes,
+                                        buffers.output, output_bytes) ||
+        read_only_buffer_ranges_overlap(buffers.weights, weight_bytes,
+                                        buffers.output, output_bytes) ||
+        read_only_buffer_ranges_overlap(buffers.active_rows,
+                                        sizeof(std::uint32_t), buffers.output,
+                                        output_bytes) ||
+        read_only_buffer_ranges_overlap(buffers.activations, activation_bytes,
+                                        buffers.sink, sink_bytes) ||
+        read_only_buffer_ranges_overlap(buffers.weights, weight_bytes,
+                                        buffers.sink, sink_bytes) ||
+        read_only_buffer_ranges_overlap(buffers.active_rows,
+                                        sizeof(std::uint32_t), buffers.sink,
+                                        sink_bytes) ||
+        buffer_ranges_overlap(buffers.output, output_bytes, buffers.sink,
+                              sink_bytes)) {
+        error = std::string(operation) +
+                " outputs must not overlap an input or each other";
+        return false;
+    }
+
+    const MatVecParams params{n_in, n_out};
+    const std::array writable_bindings{
+        EncoderBufferBinding{buffers.output, 2u, output_bytes, alignof(float)},
+        EncoderBufferBinding{buffers.sink, 3u, sink_bytes, alignof(float)},
+    };
+    const std::array read_only_bindings{
+        EncoderReadOnlyBufferBinding{buffers.activations, 0u,
+                                     activation_bytes,
+                                     activation_alignment},
+        EncoderReadOnlyBufferBinding{buffers.weights, 1u, weight_bytes,
+                                     weight_alignment},
+        EncoderReadOnlyBufferBinding{buffers.active_rows, 4u,
+                                     sizeof(std::uint32_t),
+                                     alignof(std::uint32_t)},
+    };
+    const std::array inline_bytes{
+        EncoderBytesBinding{&params, sizeof(params), 5u},
+    };
+    return encoder.dispatch(kernel_name, {grid_x, 1u, 1u},
+                            {threads_x, threads_y, 1u}, writable_bindings,
                             read_only_bindings, inline_bytes, {}, error);
 }
 
@@ -871,6 +1025,33 @@ bool encode_bf16_matvec(Context& context, Encoder& encoder,
     return encode_bf16_matvec_impl(context, encoder, n_in, n_out,
                                     active_columns, compiled_columns,
                                     buffers, error);
+}
+
+bool encode_q8_0_matvec(Context& context, CommandBuffer& command_buffer,
+                        std::uint32_t n_in, std::uint32_t n_out,
+                        std::uint32_t active_columns,
+                        std::uint32_t compiled_columns,
+                        const ReadOnlyQ8_0MatVecBuffers& buffers,
+                        std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "read-only Q8_0 mat-vec",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_q8_0_matvec(context, encoder, n_in, n_out,
+                                      active_columns, compiled_columns,
+                                      buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_q8_0_matvec(Context& context, Encoder& encoder,
+                        std::uint32_t n_in, std::uint32_t n_out,
+                        std::uint32_t active_columns,
+                        std::uint32_t compiled_columns,
+                        const ReadOnlyQ8_0MatVecBuffers& buffers,
+                        std::string& error) {
+    return encode_q8_0_matvec_impl(context, encoder, n_in, n_out,
+                                    active_columns, compiled_columns, buffers,
+                                    error);
 }
 
 bool encode_indexed_head_matvec(

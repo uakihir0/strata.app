@@ -2189,7 +2189,11 @@ encode Q8_1 and its mat-vec in the same serial segment, with the wrapper discard
 later-stage validation fails. `encode_bf16_matvec` additionally accepts F32 activations, BF16 weights
 and the active-row count as `ReadOnlyBufferRef`; read-only inputs may overlap each other, while both
 outputs must be disjoint from every input and one another. This supports the const full-mode router
-weight view without changing the existing mutable mat-vec API. The T=1 Window router prefix orders
+weight view without changing the existing mutable mat-vec API. `encode_q8_0_matvec` provides the
+same read-only binding contract for Q8_1 activations, Q8_0 weights and live-row metadata, with
+F32 output and padded-column sink views. It supports the shared-expert projections without
+converting full-mode model views back to mutable `BufferRef`; the shared-expert chain and combine
+are still not composed into the production Window path. The T=1 Window router prefix orders
 the layer-0 attention/GDN/FFN read, 256/512-expert BF16 router, multiply-by-reciprocal top-10 route
 and Q8_1 quantization of `mixed` in one segment. It slices the live-row count from `WindowParams.nc`
 and reuses GDN's `xq` only after the GDN reads finish. `encode_window_t1_moe_plan_prefix` extends
