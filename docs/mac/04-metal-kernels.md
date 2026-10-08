@@ -2231,6 +2231,11 @@ establish plan readiness, resolve misses through `ExpertStore`, retain expert le
 completion, and then call the no-write routed/shared consumer for layer 0.
 There is no production scheduler that performs this sequence. Later Window layers, the indexed
 draft-head API, and Prefill dispatch remain pending.
+`metal_fullmode_handoff_test` exercises the full-mode producer and the no-PLE attention consumer
+in one ordered segment using a sparse 256-expert GGUF fixture. It checks the produced route,
+nonzero routed/shared output, consumer outputs against a direct GR-read reference, and exactly-once
+residual application. This fixture does not integrate the PLE branch, select a scheduler branch,
+or establish model-backed decode parity.
 
 ### 5.10 MoE: router, plan, experts, shared expert and combine
 

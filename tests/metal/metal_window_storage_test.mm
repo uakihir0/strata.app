@@ -8,9 +8,14 @@
 #include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/window_dispatch.hpp"
 #include "strata/metal/window_ple_stage.hpp"
+#include "strata/metal/window_scratch.hpp"
+#include "strata/metal/session_state.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "window_source_lock_test_access.hpp"
+#include "../../src/metal/kernels/common/params.h"
+#include "../../src/metal/kernels/common/types.h"
 
 #include <Metal/Metal.h>
 #include <libproc.h>
@@ -635,6 +640,145 @@ Fixture write_fixture(const fs::path& directory, bool overlap_ple = false,
     dense.write(reinterpret_cast<const char*>(packed_router.data()),
                 static_cast<std::streamsize>(packed_router.size()));
     if (!dense) throw std::runtime_error("failed writing synthetic dense pack fixture");
+    return fixture;
+}
+
+Fixture write_fullmode_handoff_fixture(const fs::path& directory) {
+    constexpr std::uint64_t kExperts = 256u;
+    constexpr std::uint64_t kGateUpElements = 2'560u * 640u;
+    constexpr std::uint64_t kDownElements = 640u * 2'560u;
+    constexpr std::uint64_t kExpertSlabBytes =
+        (kGateUpElements / 64u) * sizeof(block_q2_0);
+    constexpr std::uint64_t kRouterSourceBytes =
+        2'560u * kExperts * sizeof(float);
+    constexpr std::uint64_t kRouterPackedBytes =
+        2'560u * kExperts * sizeof(std::uint16_t);
+    constexpr std::uint64_t kPleRows = 728u;
+    constexpr std::uint64_t kPleBytes =
+        kPleRows * strata::kernels::PLE_ROW_BYTES;
+    static_assert(kGateUpElements == kDownElements);
+    static_assert(kExpertSlabBytes == 460'800u);
+
+    struct Tensor {
+        std::string name;
+        std::vector<std::uint64_t> shape;
+        std::uint32_t type = 0;
+        std::uint64_t offset = 0;
+    };
+
+    Fixture fixture;
+    fixture.path = directory / "fullmode-handoff.gguf";
+    fixture.dense_pack_path = directory / "fullmode-handoff-dense.bin";
+    fixture.expert_count = kExperts;
+    fixture.expert_slab_bytes = kExpertSlabBytes;
+    fixture.expert_layers = 1u;
+    fixture.router_tensor_name = "blk.0.ffn_gate_inp.weight";
+    fixture.router_bytes = kRouterSourceBytes;
+    fixture.router_row_bytes = kRouterPackedBytes;
+    fixture.dense_pack_bytes = kRouterPackedBytes;
+    fixture.layer_offsets.resize(1u);
+
+    const auto align32 = [](std::uint64_t value) {
+        return (value + 31u) & ~std::uint64_t{31u};
+    };
+    std::uint64_t cursor = 0;
+    std::vector<Tensor> tensors{
+        {"blk.0.ffn_gate_exps.weight", {2'560u, 640u, kExperts}, 42u, 0u},
+        {"blk.0.ffn_up_exps.weight", {2'560u, 640u, kExperts}, 42u, 0u},
+        {"blk.0.ffn_down_exps.weight", {640u, 2'560u, kExperts}, 42u, 0u},
+        {"token_embd.weight", {1u, 1u}, 0u, 0u},
+        {fixture.router_tensor_name, {2'560u, kExperts}, 0u, 0u},
+        {"per_layer_token_embd.weight",
+         {strata::kernels::PLE_HEAD_DIM, kPleRows}, 20u, 0u},
+    };
+    for (Tensor& tensor : tensors) {
+        cursor = align32(cursor);
+        tensor.offset = cursor;
+        if (tensor.name.ends_with("ffn_gate_exps.weight") ||
+            tensor.name.ends_with("ffn_up_exps.weight") ||
+            tensor.name.ends_with("ffn_down_exps.weight")) {
+            cursor += kExperts * kExpertSlabBytes;
+        } else if (tensor.name == "token_embd.weight") {
+            fixture.dense_offset = cursor;
+            cursor += sizeof(float);
+        } else if (tensor.name == fixture.router_tensor_name) {
+            fixture.router_offset = cursor;
+            cursor += kRouterSourceBytes;
+        } else {
+            fixture.ple_offset = cursor;
+            cursor += kPleBytes;
+        }
+    }
+    fixture.offsets = {tensors[0].offset, tensors[1].offset, tensors[2].offset};
+    fixture.layer_offsets[0] = fixture.offsets;
+    fixture.data_start = 0;
+    std::vector<std::uint8_t> header;
+    put_u32(header, 0x46554747u);
+    put_u32(header, 3u);
+    put_u64(header, tensors.size());
+    put_u64(header, 0u);
+    for (const Tensor& tensor : tensors) {
+        put_string(header, tensor.name);
+        put_u32(header, static_cast<std::uint32_t>(tensor.shape.size()));
+        for (const std::uint64_t dimension : tensor.shape) {
+            put_u64(header, dimension);
+        }
+        put_u32(header, tensor.type);
+        put_u64(header, tensor.offset);
+    }
+    fixture.data_start = align32(header.size());
+    fixture.file_size = fixture.data_start + cursor;
+
+    const int descriptor =
+        ::open(fixture.path.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC,
+               0600);
+    require(descriptor >= 0, "create sparse full-mode handoff GGUF fixture");
+    try {
+        write_all_at(descriptor, header.data(), header.size(), 0u);
+        require(fixture.file_size <=
+                    static_cast<std::uint64_t>(
+                        std::numeric_limits<off_t>::max()) &&
+                    ::ftruncate(descriptor,
+                                static_cast<off_t>(fixture.file_size)) == 0,
+                "size sparse full-mode handoff GGUF fixture");
+
+        // Equal zero router logits select expert IDs 0..9 in stable tie order.
+        // Give those ten expert slabs finite positive Q2_0 values so the test
+        // exercises nonzero routed as well as shared FFN output.
+        std::vector<block_q2_0> slab(
+            static_cast<std::size_t>(kExpertSlabBytes / sizeof(block_q2_0)));
+        for (block_q2_0& block : slab) {
+            block.d = 0x1000u;
+            std::fill_n(block.qs, 16u, 0xaau);
+        }
+        for (std::size_t role = 0; role < fixture.offsets.size(); ++role) {
+            for (std::uint64_t expert = 0; expert < 10u; ++expert) {
+                write_all_at(
+                    descriptor, slab.data(),
+                    slab.size() * sizeof(block_q2_0),
+                    fixture.data_start + fixture.offsets[role] +
+                        expert * kExpertSlabBytes);
+            }
+        }
+    } catch (...) {
+        (void)::close(descriptor);
+        std::error_code ignored;
+        fs::remove(fixture.path, ignored);
+        throw;
+    }
+    require(::close(descriptor) == 0,
+            "close sparse full-mode handoff GGUF fixture");
+
+    const int pack_descriptor =
+        ::open(fixture.dense_pack_path.c_str(),
+               O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+    require(pack_descriptor >= 0,
+            "create sparse full-mode handoff dense pack");
+    const bool pack_sized =
+        ::ftruncate(pack_descriptor,
+                    static_cast<off_t>(fixture.dense_pack_bytes)) == 0;
+    (void)::close(pack_descriptor);
+    require(pack_sized, "size sparse full-mode handoff dense pack");
     return fixture;
 }
 
@@ -2594,6 +2738,603 @@ void run_multi_converted_view_offset_test(Context& context,
     }
 }
 
+BufferRef allocate_zeroed_buffer(Context& context, const std::string& label,
+                                 std::size_t bytes) {
+    std::string error;
+    BufferRef buffer = context.buffers().allocate(label, bytes, error);
+    require(static_cast<bool>(buffer), "allocate " + label + ": " + error);
+    std::memset(buffer.contents, 0, buffer.length);
+    return buffer;
+}
+
+BufferRef require_scratch_view(Context& context,
+                               const WindowScratchStorage& scratch,
+                               WindowScratchRegion region,
+                               const std::string& label) {
+    (void)context;
+    BufferRef view;
+    std::string error;
+    require(scratch.view(region, view, error),
+            "resolve Window scratch " + label + ": " + error);
+    return view;
+}
+
+void run_fullmode_handoff_test(Context& context,
+                               const fs::path& parent_directory) {
+    constexpr std::uint32_t kExperts = 256u;
+    constexpr std::uint32_t kVocabulary = 248'320u;
+    constexpr std::uint32_t kRows = 1u;
+    constexpr std::size_t kGrRows = HC_DIM;
+    constexpr std::size_t kGrLowRank = HC_LOW_RANK;
+    constexpr std::size_t kGdnQ8Blocks = N_EMBD / 32u;
+    constexpr std::size_t kSharedQ8Blocks = 2'560u / 32u;
+    constexpr std::size_t kMoeQ8Blocks = 640u / 32u;
+    static_assert(sizeof(block_q8_0) == 34u);
+
+    const fs::path directory = parent_directory / "fullmode-handoff";
+    fs::create_directory(directory);
+    const Fixture fixture = write_fullmode_handoff_fixture(directory);
+    WindowSources sources = inspect_fixture(fixture);
+    Geometry full_geometry = owner_test_geometry(fixture, sources);
+    full_geometry.family = "qwen4exp";
+    full_geometry.model = "synthetic-fullmode-handoff";
+    full_geometry.n_qsa_layers = 1u;
+    full_geometry.n_kv_head = 2u;
+    full_geometry.head_dim = 256u;
+    full_geometry.n_embd = N_EMBD;
+    full_geometry.vocab = kVocabulary;
+    full_geometry.types = {"f32", "iq4_nl", "q2_0"};
+    full_geometry.layers[0].gate_up_type = "q2_0";
+    full_geometry.layers[0].down_type = "q2_0";
+
+    std::string error;
+    WindowPlan plan;
+    require(plan_windows(sources, context.device_facts().max_buffer_length,
+                         plan, error),
+            "plan sparse 256-expert full-mode fixture: " + error);
+    auto full_mode = FullModeStorage::open(
+        context, fixture.path.string(), full_geometry, sources, plan, error);
+    require(full_mode != nullptr,
+            "open sparse production-shaped FullModeStorage: " + error);
+
+    Geometry runtime_geometry;
+    runtime_geometry.family = "qwen4exp";
+    runtime_geometry.model = "synthetic-window-runtime";
+    runtime_geometry.n_layers = 48u;
+    runtime_geometry.n_expert = kExperts;
+    runtime_geometry.n_qsa_layers = 12u;
+    runtime_geometry.n_kv_head = 2u;
+    runtime_geometry.head_dim = 256u;
+    runtime_geometry.n_embd = N_EMBD;
+    runtime_geometry.vocab = kVocabulary;
+    auto scratch =
+        WindowScratchStorage::open(context, runtime_geometry, 4u, error);
+    require(scratch != nullptr,
+            "allocate production-shaped Window scratch: " + error);
+    auto session =
+        SessionStateStorage::open(context, runtime_geometry, error);
+    require(session != nullptr,
+            "allocate production-shaped session state: " + error);
+    GdnSessionStateViews gdn_state;
+    require(session->gdn_layer(0u, gdn_state, error),
+            "resolve layer-0 GDN session views: " + error);
+
+    auto params_ring = WindowParamsRing::open(context, error);
+    require(params_ring != nullptr,
+            "open full-mode handoff WindowParamsRing: " + error);
+    const std::array<std::uint32_t, kRows> tokens{1u};
+    const std::array<WindowSamplerSettings, kRows> samplers{};
+    const BufferRef params = params_ring->build_slot(
+        0u, 1u, tokens, samplers, 0u, 0x11223344u, 0x55667788u, error);
+    require(static_cast<bool>(params),
+            "build ordinary T=1 handoff parameters: " + error);
+
+    const WindowScratchLayout& layout = scratch->layout();
+    const BufferRef residual =
+        require_scratch_view(context, *scratch, layout.residual, "residual");
+    const BufferRef mixed =
+        require_scratch_view(context, *scratch, layout.mixed, "mixed");
+    const BufferRef block_output =
+        require_scratch_view(context, *scratch, layout.block_output,
+                              "block output");
+    const BufferRef inject =
+        require_scratch_view(context, *scratch, layout.inject, "injection");
+    const BufferRef inject2 =
+        require_scratch_view(context, *scratch, layout.inject2,
+                              "second injection");
+    const BufferRef gr_lo =
+        require_scratch_view(context, *scratch, layout.gr_lo, "GR low rank");
+    const BufferRef gr_rs =
+        require_scratch_view(context, *scratch, layout.gr_rs, "GR rs");
+    const BufferRef gr_xn =
+        require_scratch_view(context, *scratch, layout.gr_xn, "GR normalized");
+    const BufferRef xq =
+        require_scratch_view(context, *scratch, layout.xq, "GDN Q8_1");
+    const BufferRef gdn_qkv =
+        require_scratch_view(context, *scratch, layout.gdn_qkv_replay,
+                              "GDN QKV");
+    const BufferRef gdn_h =
+        require_scratch_view(context, *scratch, layout.gdn_h_replay,
+                              "GDN H");
+    const BufferRef gdn_gate =
+        require_scratch_view(context, *scratch, layout.gdn_gate_replay,
+                              "GDN gate");
+    const BufferRef gdn_beta =
+        require_scratch_view(context, *scratch, layout.gdn_beta_replay,
+                              "GDN beta");
+    const BufferRef gdn_z =
+        require_scratch_view(context, *scratch, layout.gdn_z, "GDN Z");
+    const BufferRef gdn_y =
+        require_scratch_view(context, *scratch, layout.gdn_y, "GDN Y");
+    const BufferRef gdn_yq = allocate_zeroed_buffer(
+        context, "full-mode handoff GDN Y Q8_1",
+        (static_cast<std::size_t>(GDN_VALUE_DIM) / 32u) * sizeof(Q81));
+    const BufferRef router_logits =
+        require_scratch_view(context, *scratch, layout.router_logits,
+                              "router logits");
+    const BufferRef router_ids =
+        require_scratch_view(context, *scratch, layout.router_ids,
+                              "router IDs");
+    const BufferRef router_weights =
+        require_scratch_view(context, *scratch, layout.router_weights,
+                              "router weights");
+    const BufferRef moe_plans =
+        require_scratch_view(context, *scratch, layout.moe_plans, "MoE plans");
+    const BufferRef moe_gate =
+        require_scratch_view(context, *scratch, layout.moe_gate, "MoE gate");
+    const BufferRef moe_up =
+        require_scratch_view(context, *scratch, layout.moe_up, "MoE up");
+    const BufferRef moe_hidden =
+        require_scratch_view(context, *scratch, layout.moe_hidden,
+                              "MoE hidden");
+    const BufferRef moe_hidden_q =
+        require_scratch_view(context, *scratch, layout.moe_hidden_q,
+                              "MoE hidden Q8_1");
+    const BufferRef moe_parts =
+        require_scratch_view(context, *scratch, layout.moe_parts, "MoE parts");
+    const BufferRef shared_gate =
+        require_scratch_view(context, *scratch, layout.shared_gate,
+                              "shared gate");
+    const BufferRef shared_up =
+        require_scratch_view(context, *scratch, layout.shared_up, "shared up");
+    const BufferRef shared_hidden =
+        require_scratch_view(context, *scratch, layout.shared_hidden,
+                              "shared hidden");
+    const BufferRef shared_hidden_q =
+        require_scratch_view(context, *scratch, layout.shared_hidden_q,
+                              "shared hidden Q8_1");
+    const BufferRef shared_output =
+        require_scratch_view(context, *scratch, layout.shared_output,
+                              "shared down output");
+    const BufferRef shared_gate_logit =
+        require_scratch_view(context, *scratch, layout.shared_gate_logit,
+                              "shared gate logit");
+    const BufferRef pending_output =
+        require_scratch_view(context, *scratch, layout.ple_input,
+                              "pending MoE output");
+    const BufferRef attention_entry_mixed =
+        require_scratch_view(context, *scratch, layout.ple_value,
+                              "next attention mixed");
+    const BufferRef next_attention_block_decoy =
+        require_scratch_view(context, *scratch, layout.ple_query,
+                              "attention block-output decoy");
+    const BufferRef next_attention_inject_decoy =
+        require_scratch_view(context, *scratch, layout.ple_gate,
+                              "attention injection decoy");
+    const BufferRef gdn_sink =
+        allocate_zeroed_buffer(context, "full-mode handoff GDN sink",
+                               sizeof(float));
+    const BufferRef gdn_active_rows = allocate_zeroed_buffer(
+        context, "full-mode handoff GDN active rows", sizeof(std::uint32_t));
+    const BufferRef router_sink =
+        allocate_zeroed_buffer(context, "full-mode handoff router sink",
+                               sizeof(float));
+    const ReadOnlyBufferRef active_rows =
+        context.buffers().read_only(params).slice(
+            offsetof(strata::metal::WindowParams, nc),
+            sizeof(std::uint32_t));
+    require(static_cast<bool>(active_rows),
+            "form the WindowParams.nc live-row input");
+    std::memcpy(gdn_active_rows.contents, &kRows, sizeof(kRows));
+
+    auto allocate = [&](const std::string& label, std::size_t bytes) {
+        return allocate_zeroed_buffer(context, label, bytes);
+    };
+    auto attention_norm =
+        allocate("full-mode handoff attention norm", kGrRows * sizeof(float));
+    auto attention_down = allocate(
+        "full-mode handoff attention down weights",
+        kGrLowRank * kGrRows * sizeof(std::uint16_t));
+    auto attention_inject_weights = allocate(
+        "full-mode handoff attention injection weights",
+        4u * kGrRows * sizeof(std::uint16_t));
+    auto attention_up = allocate(
+        "full-mode handoff attention up weights",
+        kGrRows * kGrLowRank * sizeof(std::uint16_t));
+    auto ffn_norm =
+        allocate("full-mode handoff FFN norm", kGrRows * sizeof(float));
+    auto ffn_down = allocate("full-mode handoff FFN down weights",
+                             kGrLowRank * kGrRows * sizeof(std::uint16_t));
+    auto ffn_inject_weights = allocate(
+        "full-mode handoff FFN injection weights",
+        4u * kGrRows * sizeof(std::uint16_t));
+    auto ffn_up = allocate("full-mode handoff FFN up weights",
+                           kGrRows * kGrLowRank * sizeof(std::uint16_t));
+    auto next_attention_norm = allocate(
+        "full-mode handoff next attention norm",
+        kGrRows * sizeof(float));
+    auto next_attention_down = allocate(
+        "full-mode handoff next attention down weights",
+        kGrLowRank * kGrRows * sizeof(std::uint16_t));
+    auto next_attention_inject_weights = allocate(
+        "full-mode handoff next attention injection weights",
+        4u * kGrRows * sizeof(std::uint16_t));
+    auto next_attention_up = allocate(
+        "full-mode handoff next attention up weights",
+        kGrRows * kGrLowRank * sizeof(std::uint16_t));
+
+    auto qkv_weights = allocate(
+        "full-mode handoff GDN QKV weights",
+        static_cast<std::size_t>(GDN_CONV_CHANNELS) * kGdnQ8Blocks *
+            sizeof(block_q8_0));
+    auto conv_weights = allocate(
+        "full-mode handoff GDN convolution weights",
+        static_cast<std::size_t>(GDN_CONV_CHANNELS) * GDN_CONV_KERNEL *
+            sizeof(float));
+    auto alpha = allocate(
+        "full-mode handoff GDN alpha",
+        static_cast<std::size_t>(N_EMBD) * GDN_V_HEADS *
+            sizeof(std::uint16_t));
+    auto beta_weights = allocate(
+        "full-mode handoff GDN beta weights",
+        static_cast<std::size_t>(N_EMBD) * GDN_V_HEADS *
+            sizeof(std::uint16_t));
+    auto dt_bias = allocate("full-mode handoff GDN dt bias",
+                            GDN_V_HEADS * sizeof(float));
+    auto gdn_a = allocate("full-mode handoff GDN A",
+                           GDN_V_HEADS * sizeof(float));
+    auto gate_weights = allocate(
+        "full-mode handoff GDN gate weights",
+        static_cast<std::size_t>(GDN_VALUE_DIM) * kGdnQ8Blocks *
+            sizeof(block_q8_0));
+    auto gamma = allocate("full-mode handoff GDN gamma",
+                          GDN_HEAD_DIM * sizeof(float));
+    auto output_weights = allocate(
+        "full-mode handoff GDN output weights",
+        static_cast<std::size_t>(N_EMBD) *
+            (GDN_VALUE_DIM / 32u) * sizeof(block_q8_0));
+
+    auto shared_gate_weights = allocate(
+        "full-mode handoff shared gate weights",
+        static_cast<std::size_t>(640u) * kSharedQ8Blocks *
+            sizeof(block_q8_0));
+    auto shared_up_weights = allocate(
+        "full-mode handoff shared up weights",
+        static_cast<std::size_t>(640u) * kSharedQ8Blocks *
+            sizeof(block_q8_0));
+    auto shared_down_weights = allocate(
+        "full-mode handoff shared down weights",
+        static_cast<std::size_t>(2'560u) * kMoeQ8Blocks *
+            sizeof(block_q8_0));
+    auto shared_gate_input_weights = allocate(
+        "full-mode handoff shared gate-input weights",
+        2'560u * sizeof(std::uint16_t));
+    auto shared_gate_sink = allocate(
+        "full-mode handoff shared gate sink", sizeof(float));
+    auto shared_gate_projection_sink =
+        allocate("full-mode handoff shared gate projection sink",
+                 sizeof(float));
+    auto shared_up_sink =
+        allocate("full-mode handoff shared up sink", sizeof(float));
+    auto shared_down_sink =
+        allocate("full-mode handoff shared down sink", sizeof(float));
+
+    std::fill_n(static_cast<float*>(residual.contents),
+                4u * N_EMBD, 0.02f);
+    std::fill_n(static_cast<float*>(attention_norm.contents),
+                attention_norm.length / sizeof(float), 1.0f);
+    std::fill_n(static_cast<float*>(ffn_norm.contents),
+                ffn_norm.length / sizeof(float), 1.0f);
+    std::fill_n(static_cast<float*>(next_attention_norm.contents),
+                next_attention_norm.length / sizeof(float), 1.0f);
+    std::fill_n(static_cast<float*>(gamma.contents),
+                gamma.length / sizeof(float), 1.0f);
+    auto fill_q8_0 = [](BufferRef buffer, std::uint16_t scale_bits,
+                        std::int8_t value) {
+        auto* blocks = static_cast<block_q8_0*>(buffer.contents);
+        const std::size_t count = buffer.length / sizeof(block_q8_0);
+        for (std::size_t block = 0; block < count; ++block) {
+            blocks[block].d = scale_bits;
+            std::fill_n(blocks[block].qs, 32u, value);
+        }
+    };
+    // Positive Q8_0 shared weights make the pending combined output observably
+    // nonzero alongside the selected nonzero Q2_0 routed experts.
+    fill_q8_0(shared_gate_weights, 0x1c00u, 1);
+    fill_q8_0(shared_up_weights, 0x1c00u, 1);
+    fill_q8_0(shared_down_weights, 0x1c00u, 1);
+    std::fill_n(
+        static_cast<std::uint16_t*>(ffn_inject_weights.contents),
+        ffn_inject_weights.length / sizeof(std::uint16_t),
+        strata::kernels::bf16_from_f32(0.125f));
+    require(next_attention_inject_decoy.length >= 4u * sizeof(float),
+            "next attention injection decoy covers the T=1 stream values");
+    std::fill_n(static_cast<float*>(next_attention_inject_decoy.contents),
+                4u, 4.0f);
+    std::fill_n(static_cast<std::uint16_t*>(shared_gate_input_weights.contents),
+                shared_gate_input_weights.length / sizeof(std::uint16_t),
+                strata::kernels::bf16_from_f32(0.01f));
+    std::memset(pending_output.contents, 0xa5, pending_output.length);
+    const std::vector<std::uint8_t> initial_residual(
+        static_cast<const std::uint8_t*>(residual.contents),
+        static_cast<const std::uint8_t*>(residual.contents) +
+            residual.length);
+
+    FullModeTensorView router_view;
+    require(full_mode->dense_tensor_view(fixture.router_tensor_name,
+                                         router_view, error),
+            "resolve converted BF16 layer-0 router weights: " + error);
+    const ReadOnlyBufferRef router_tensor = router_view.buffer;
+    require(router_tensor.length() ==
+                static_cast<std::size_t>(kExperts) * N_EMBD *
+                    sizeof(std::uint16_t),
+            "converted router has the production BF16 matrix extent");
+
+    const GRReadBuffers attention{
+        residual, next_attention_block_decoy, inject2, attention_norm,
+        gr_xn, gr_rs,
+        attention_down, attention_inject_weights, gr_lo, inject, attention_up,
+        mixed};
+    const WindowGDNBlockBuffers gdn{
+        mixed, gdn_state.conv_history, gdn_state.recurrent,
+        MatVecWeightFormat::q8_0, qkv_weights, conv_weights, alpha,
+        beta_weights, dt_bias, gdn_a, MatVecWeightFormat::q8_0,
+        gate_weights, gamma, MatVecWeightFormat::q8_0, output_weights, xq,
+        gdn_qkv, gdn_h, gdn_gate, gdn_beta, gdn_z, gdn_y, gdn_yq,
+        block_output, gdn_sink, gdn_active_rows};
+    const GRReadBuffers ffn{
+        residual, block_output, inject, ffn_norm,
+        gr_xn, gr_rs, ffn_down, ffn_inject_weights, gr_lo, inject2, ffn_up,
+        mixed};
+    const WindowT1AttentionGDNFFNBuffers layer0{
+        params, attention, gdn, ffn};
+    const WindowT1MoeRouterPrefixBuffers producer{
+        layer0, router_tensor, router_logits, router_ids, router_weights,
+        router_sink};
+    const MoeRoutedFFNBuffers routed{
+        full_mode->expert_address_table(),
+        context.buffers().read_only(xq),
+        context.buffers().read_only(moe_plans),
+        moe_gate, moe_up, moe_hidden, moe_hidden_q, moe_parts};
+    const MoeSharedFFNBuffers shared{
+        context.buffers().read_only(xq),
+        context.buffers().read_only(mixed),
+        context.buffers().read_only(shared_gate_weights),
+        context.buffers().read_only(shared_up_weights),
+        context.buffers().read_only(shared_down_weights),
+        context.buffers().read_only(shared_gate_input_weights),
+        active_rows,
+        context.buffers().read_only(moe_parts),
+        context.buffers().read_only(router_weights),
+        shared_gate, shared_up, shared_hidden, shared_hidden_q,
+        shared_output, shared_gate_logit, pending_output,
+        shared_gate_projection_sink, shared_up_sink, shared_down_sink,
+        shared_gate_sink};
+    const WindowT1MoeLayer0FullBuffers full_buffers{
+        {producer, full_mode->resident_table(), full_mode->usage_table(),
+         moe_plans},
+        {routed, shared}};
+
+    const GRReadBuffers next_attention{
+        residual, next_attention_block_decoy, next_attention_inject_decoy,
+        next_attention_norm, gr_xn, gr_rs, next_attention_down,
+        next_attention_inject_weights, gr_lo, inject, next_attention_up,
+        attention_entry_mixed};
+    const WindowMoeAttentionEntryBuffers attention_entry{
+        full_buffers.ffn, ffn, next_attention};
+    auto command = context.make_command_buffer(
+        "FullMode layer-0 MoE to no-PLE attention handoff", error);
+    require(command != nullptr,
+            "create same-segment FullMode handoff command: " + error);
+    require(session->track_use(*command, error),
+            "track GDN state through FullMode handoff: " + error);
+    const bool encoded = Encoder::encode(
+        context, *command, "FullMode producer and pending attention consumer",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_window_t1_moe_layer0_full_mode(
+                    context, *full_mode, encoder, kVocabulary, kExperts,
+                    MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
+                    full_buffers, encode_error)) {
+                return false;
+            }
+            return encode_window_moe_attention_entry(
+                context, encoder, kRows, attention_entry, encode_error);
+        },
+        error);
+    require(encoded,
+            "encode FullMode producer followed by no-PLE consumer in one segment: " +
+                error);
+    require(command->commit(error),
+            "commit FullMode producer and attention consumer: " + error);
+    id<MTLCommandBuffer> native =
+        (__bridge id<MTLCommandBuffer>)command->unsafe_native_handle();
+    [native waitUntilCompleted];
+    require(native.status == MTLCommandBufferStatusCompleted,
+            "same-segment FullMode producer and attention consumer completed: " +
+                (native.error ? std::string(native.error.localizedDescription.UTF8String)
+                              : std::string{}));
+
+    const auto* route_id_values =
+        static_cast<const std::int32_t*>(router_ids.contents);
+    std::array<bool, kExperts> selected{};
+    for (std::size_t route = 0; route < 10u; ++route) {
+        const std::int32_t expert = route_id_values[route];
+        require(expert >= 0 && static_cast<std::uint32_t>(expert) < kExperts &&
+                    !selected[static_cast<std::size_t>(expert)] &&
+                    static_cast<std::size_t>(expert) == route,
+                "FullMode top-10 route stably selects the populated expert slabs");
+        selected[static_cast<std::size_t>(expert)] = true;
+    }
+    const auto* route_weight_values =
+        static_cast<const float*>(router_weights.contents);
+    float route_weight_sum = 0.0f;
+    for (std::size_t route = 0; route < 10u; ++route) {
+        require(std::isfinite(route_weight_values[route]) &&
+                    route_weight_values[route] > 0.0f,
+                "FullMode top-10 route weights are positive and finite");
+        route_weight_sum += route_weight_values[route];
+    }
+    require(std::abs(route_weight_sum - 1.0f) < 1.0e-5f,
+            "FullMode decode route weights sum to one");
+    const auto* routed_part_values =
+        static_cast<const float*>(moe_parts.contents);
+    bool routed_parts_finite = true;
+    bool routed_parts_nonzero = false;
+    for (std::size_t index = 0; index < 10u * 2'560u; ++index) {
+        routed_parts_finite &= std::isfinite(routed_part_values[index]);
+        routed_parts_nonzero |=
+            std::abs(routed_part_values[index]) > 1.0e-9f;
+    }
+    require(routed_parts_finite && routed_parts_nonzero,
+            "FullMode Q2_0 routed experts produce finite nonzero down parts");
+    const auto* pending_values =
+        static_cast<const float*>(pending_output.contents);
+    bool pending_is_finite = true;
+    bool pending_is_nonzero = false;
+    for (std::size_t index = 0; index < N_EMBD; ++index) {
+        pending_is_finite &= std::isfinite(pending_values[index]);
+        pending_is_nonzero |= std::abs(pending_values[index]) > 1.0e-7f;
+    }
+    require(pending_is_finite && pending_is_nonzero,
+            "FullMode routed/shared combine leaves a finite nonzero pending output");
+    const auto* producer_injection =
+        static_cast<const float*>(inject2.contents);
+    const auto* injection_decoy =
+        static_cast<const float*>(next_attention_inject_decoy.contents);
+    require(std::all_of(producer_injection, producer_injection + 4u,
+                        [](float value) { return std::isfinite(value); }) &&
+                std::any_of(producer_injection, producer_injection + 4u,
+                            [](float value) {
+                                return std::abs(value) > 1.0e-7f;
+                            }),
+            "FullMode producer's FFN read emits a finite nonzero injection");
+    require(!std::equal(
+                reinterpret_cast<const std::uint8_t*>(producer_injection),
+                reinterpret_cast<const std::uint8_t*>(producer_injection) +
+                    4u * sizeof(float),
+                reinterpret_cast<const std::uint8_t*>(injection_decoy)),
+            "next attention injection decoy differs from the producer injection");
+
+    const auto output_snapshots = [&] {
+        const std::array<BufferRef, 5u> outputs{
+            gr_xn, gr_rs, gr_lo, inject, attention_entry_mixed};
+        const std::array<std::size_t, 5u> extents{
+            4u * N_EMBD * sizeof(float), 4u * sizeof(float),
+            kRows * HC_LOW_RANK * sizeof(float), 4u * sizeof(float),
+            N_EMBD * sizeof(float)};
+        std::array<std::vector<std::uint8_t>, 5u> snapshots;
+        for (std::size_t index = 0; index < outputs.size(); ++index) {
+            const auto* begin =
+                static_cast<const std::uint8_t*>(outputs[index].contents);
+            require(outputs[index].length >= extents[index],
+                    "GR handoff output view covers its T=1 write extent");
+            snapshots[index].assign(begin, begin + extents[index]);
+        }
+        return snapshots;
+    };
+    const auto actual_outputs = output_snapshots();
+    const std::vector<std::uint8_t> pending_snapshot(
+        static_cast<const std::uint8_t*>(pending_output.contents),
+        static_cast<const std::uint8_t*>(pending_output.contents) +
+            pending_output.length);
+    BufferRef reference_residual = allocate_zeroed_buffer(
+        context, "full-mode handoff reference residual", residual.length);
+    std::memcpy(reference_residual.contents, initial_residual.data(),
+                initial_residual.size());
+
+    const BufferRef reference_normalized =
+        require_scratch_view(context, *scratch, layout.gdn_qkv_replay,
+                             "reference normalized");
+    const BufferRef reference_lo =
+        require_scratch_view(context, *scratch, layout.gdn_h_replay,
+                             "reference low rank");
+    const BufferRef reference_inject_out =
+        require_scratch_view(context, *scratch, layout.gdn_gate_replay,
+                             "reference injection output");
+    const BufferRef reference_mixed =
+        require_scratch_view(context, *scratch, layout.gdn_beta_replay,
+                             "reference mixed");
+    const BufferRef reference_rs =
+        require_scratch_view(context, *scratch, layout.ple_gate,
+                             "reference rs");
+    const GRReadBuffers reference_attention{
+        reference_residual, pending_output, inject2,
+        next_attention_norm,
+        reference_normalized, reference_rs, next_attention_down,
+        next_attention_inject_weights, reference_lo, reference_inject_out,
+        next_attention_up, reference_mixed};
+    auto reference_command = context.make_command_buffer(
+        "Reference pending MoE attention read", error);
+    require(reference_command != nullptr,
+            "create reference pending attention command: " + error);
+    require(encode_gr_read(context, *reference_command, kRows, true,
+                           reference_attention, error),
+            "encode direct GR read using actual pending producer views: " +
+                error);
+    require(reference_command->commit(error),
+            "commit reference pending attention read: " + error);
+    id<MTLCommandBuffer> native_reference =
+        (__bridge id<MTLCommandBuffer>)reference_command->unsafe_native_handle();
+    [native_reference waitUntilCompleted];
+    require(native_reference.status == MTLCommandBufferStatusCompleted,
+            "reference pending attention read completed");
+
+    const auto exact_output_match = [&](std::size_t actual_index,
+                                        BufferRef expected,
+                                        const char* label) {
+        const auto* expected_bytes =
+            static_cast<const std::uint8_t*>(expected.contents);
+        const bool matches = actual_outputs[actual_index].size() <= expected.length &&
+            std::equal(actual_outputs[actual_index].begin(),
+                       actual_outputs[actual_index].end(), expected_bytes);
+        if (!matches) {
+            const float actual_first =
+                *reinterpret_cast<const float*>(
+                    actual_outputs[actual_index].data());
+            const float expected_first =
+                *static_cast<const float*>(expected.contents);
+            require(false, std::string("typed attention handoff matches direct ") +
+                               label + " read (first values " +
+                               std::to_string(actual_first) + " vs " +
+                               std::to_string(expected_first) + ")");
+        }
+    };
+    exact_output_match(0u, reference_normalized, "normalized");
+    exact_output_match(1u, reference_rs, "rs");
+    exact_output_match(2u, reference_lo, "low-rank");
+    exact_output_match(3u, reference_inject_out, "injection");
+    exact_output_match(4u, reference_mixed, "mixed");
+    require(std::equal(
+                static_cast<const std::uint8_t*>(residual.contents),
+                static_cast<const std::uint8_t*>(residual.contents) +
+                    residual.length,
+                static_cast<const std::uint8_t*>(reference_residual.contents)),
+            "typed no-PLE consumer applies the pending write once to GR residual");
+    require(std::equal(pending_snapshot.begin(), pending_snapshot.end(),
+                       static_cast<const std::uint8_t*>(pending_output.contents)),
+            "no-PLE attention consumer preserves its pending producer output");
+    const auto* consumed_mixed =
+        static_cast<const float*>(attention_entry_mixed.contents);
+    require(std::all_of(consumed_mixed,
+                        consumed_mixed + N_EMBD,
+                        [](float value) { return std::isfinite(value); }) &&
+                std::any_of(consumed_mixed, consumed_mixed + N_EMBD,
+                            [](float value) {
+                                return std::abs(value) > 1.0e-7f;
+                            }),
+            "no-PLE attention read consumes the pending output into finite mixed activations");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2601,9 +3342,12 @@ int main(int argc, char** argv) {
         const bool never_wrap_only = argc == 3 && std::string(argv[2]) == "--never-wrap";
         const bool tiered_copy_only = argc == 3 && std::string(argv[2]) == "--tiered-copy";
         const bool model_owner_only = argc == 3 && std::string(argv[2]) == "--model-owner";
-        require(argc == 2 || never_wrap_only || tiered_copy_only || model_owner_only,
+        const bool fullmode_handoff_only =
+            argc == 3 && std::string(argv[2]) == "--fullmode-handoff";
+        require(argc == 2 || never_wrap_only || tiered_copy_only ||
+                    model_owner_only || fullmode_handoff_only,
                 "usage: metal_window_storage_test strata.metallib "
-                "[--never-wrap|--tiered-copy|--model-owner]");
+                "[--never-wrap|--tiered-copy|--model-owner|--fullmode-handoff]");
         if (argc == 2) test_warmup_wave_barrier();
         char directory_template[] = "/tmp/strata-window-storage.XXXXXX";
         char* directory_name = mkdtemp(directory_template);
@@ -2623,6 +3367,14 @@ int main(int argc, char** argv) {
         require(plan_windows(sources, context->device_facts().max_buffer_length, plan, error),
                 "plan synthetic GGUF with the live Metal limit: " + error);
         Geometry geometry = owner_test_geometry(fixture, sources);
+        if (fullmode_handoff_only) {
+            run_fullmode_handoff_test(*context, directory);
+            context.reset();
+            std::error_code ignored;
+            fs::remove_all(directory, ignored);
+            std::cout << "metal_fullmode_handoff_test: OK\n";
+            return 0;
+        }
         if (model_owner_only) {
             run_model_storage_owner_test(*context, directory, fixture);
             context.reset();
