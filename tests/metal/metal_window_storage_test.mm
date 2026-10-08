@@ -2518,7 +2518,7 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
     require(tiered_storage->tiered_storage() != nullptr,
             "tiered ModelStorage must expose the borrowed ExpertStore construction source");
     WindowT1MoeLayer0FullBuffers wrong_mode_moe_buffers{};
-    wrong_mode_moe_buffers.ffn_write.routed.addresses =
+    wrong_mode_moe_buffers.ffn.routed.addresses =
         context.buffers().read_only(
             tiered_storage->tiered_storage()->expert_address_table());
     auto wrong_mode_moe_command = context.make_command_buffer(

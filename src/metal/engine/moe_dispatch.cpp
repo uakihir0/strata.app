@@ -1257,11 +1257,13 @@ bool encode_moe_shared_ffn_impl(Context& context, Encoder& encoder,
     return encode_gr_post(context, encoder, rows, post, error);
 }
 
-bool encode_moe_routed_shared_ffn_write_impl(
+bool encode_moe_routed_shared_ffn_impl(
     Context& context, Encoder& encoder, std::uint32_t rows,
     std::uint32_t experts, std::uint32_t layer,
     MoeExpertFormat gate_up_format, MoeDownFormat down_format,
-    const MoeRoutedSharedFFNWriteBuffers& buffers, std::string& error) {
+    const MoeRoutedFFNBuffers& routed,
+    const MoeSharedFFNBuffers& shared_ffn,
+    const MoeSharedFFNWriteBuffers* writeback, std::string& error) {
     error.clear();
     if (encoder.concurrent_group_open()) {
         error = "routed/shared MoE FFN requires ordered dispatch boundaries";
@@ -1270,26 +1272,24 @@ bool encode_moe_routed_shared_ffn_write_impl(
 
     if (!encode_moe_routed_ffn_impl(
             context, encoder, rows, experts, layer, gate_up_format,
-            down_format, buffers.routed, error, true)) {
+            down_format, routed, error, true)) {
         return false;
     }
 
-    if (!same_buffer_start(buffers.shared.ffn.input_activations,
-                           buffers.routed.input_activations)) {
+    if (!same_buffer_start(shared_ffn.input_activations,
+                           routed.input_activations)) {
         error = "routed/shared MoE FFN activation views must share the "
                 "routed Q8_1 producer";
         return false;
     }
-    if (!same_buffer_start(buffers.shared.ffn.routed_parts,
-                           buffers.routed.parts)) {
+    if (!same_buffer_start(shared_ffn.routed_parts, routed.parts)) {
         error = "routed/shared MoE FFN parts view must use the routed "
                 "producer output";
         return false;
     }
 
     if (!encode_moe_shared_ffn_impl(
-            context, encoder, rows, buffers.shared.ffn, error,
-            &buffers.shared, true)) {
+            context, encoder, rows, shared_ffn, error, writeback, true)) {
         return false;
     }
 
@@ -1375,8 +1375,9 @@ bool encode_moe_routed_shared_ffn_write_impl(
         !checked_bytes(static_cast<std::uint64_t>(rows) * 4u *
                            kMoeDownOutputWidth,
                        sizeof(float), residual_bytes) ||
-        !checked_bytes(static_cast<std::uint64_t>(rows) * 4u,
-                       sizeof(float), inject_bytes)) {
+        (writeback != nullptr &&
+         !checked_bytes(static_cast<std::uint64_t>(rows) * 4u,
+                        sizeof(float), inject_bytes))) {
         error = "routed/shared MoE FFN active range exceeds the host byte range";
         return false;
     }
@@ -1388,62 +1389,53 @@ bool encode_moe_routed_shared_ffn_write_impl(
         return view.slice(0u, bytes);
     };
     const std::array routed_inputs{
-        read_range(buffers.routed.addresses, routed_addresses_bytes),
-        read_range(buffers.routed.input_activations, routed_input_bytes),
-        read_range(buffers.routed.plans, routed_plan_bytes),
+        read_range(routed.addresses, routed_addresses_bytes),
+        read_range(routed.input_activations, routed_input_bytes),
+        read_range(routed.plans, routed_plan_bytes),
     };
     const std::array routed_outputs{
-        write_range(buffers.routed.gate, routed_gate_up_bytes),
-        write_range(buffers.routed.up, routed_gate_up_bytes),
-        write_range(buffers.routed.hidden, routed_gate_up_bytes),
-        write_range(buffers.routed.down_activations,
-                    routed_down_activations_bytes),
-        write_range(buffers.routed.parts, routed_parts_bytes),
+        write_range(routed.gate, routed_gate_up_bytes),
+        write_range(routed.up, routed_gate_up_bytes),
+        write_range(routed.hidden, routed_gate_up_bytes),
+        write_range(routed.down_activations, routed_down_activations_bytes),
+        write_range(routed.parts, routed_parts_bytes),
     };
     const std::array shared_inputs{
-        read_range(buffers.shared.ffn.input_activations, shared_input_bytes),
-        read_range(buffers.shared.ffn.mixed, shared_mixed_bytes),
-        read_range(buffers.shared.ffn.gate_weights,
-                   shared_gate_up_weights_bytes),
-        read_range(buffers.shared.ffn.up_weights,
-                   shared_gate_up_weights_bytes),
-        read_range(buffers.shared.ffn.down_weights,
-                   shared_down_weights_bytes),
-        read_range(buffers.shared.ffn.shared_gate_weights,
-                   shared_gate_weights_bytes),
-        read_range(buffers.shared.ffn.active_rows,
-                   shared_active_rows_bytes),
-        read_range(buffers.shared.ffn.routed_parts, routed_parts_bytes),
-        read_range(buffers.shared.ffn.route_weights,
-                   shared_route_weights_bytes),
+        read_range(shared_ffn.input_activations, shared_input_bytes),
+        read_range(shared_ffn.mixed, shared_mixed_bytes),
+        read_range(shared_ffn.gate_weights, shared_gate_up_weights_bytes),
+        read_range(shared_ffn.up_weights, shared_gate_up_weights_bytes),
+        read_range(shared_ffn.down_weights, shared_down_weights_bytes),
+        read_range(shared_ffn.shared_gate_weights, shared_gate_weights_bytes),
+        read_range(shared_ffn.active_rows, shared_active_rows_bytes),
+        read_range(shared_ffn.routed_parts, routed_parts_bytes),
+        read_range(shared_ffn.route_weights, shared_route_weights_bytes),
     };
     const std::array shared_outputs{
-        write_range(buffers.shared.ffn.gate, shared_projection_bytes),
-        write_range(buffers.shared.ffn.up, shared_projection_bytes),
-        write_range(buffers.shared.ffn.hidden, shared_projection_bytes),
-        write_range(buffers.shared.ffn.down_activations,
-                    shared_down_activations_bytes),
-        write_range(buffers.shared.ffn.shared_output, shared_output_bytes),
-        write_range(buffers.shared.ffn.shared_gate_logits,
-                    shared_gate_logits_bytes),
-        write_range(buffers.shared.ffn.output, shared_result_bytes),
-        write_range(buffers.shared.ffn.gate_sink, shared_gate_sink_bytes),
-        write_range(buffers.shared.ffn.up_sink, shared_up_sink_bytes),
-        write_range(buffers.shared.ffn.down_sink, shared_down_sink_bytes),
-        write_range(buffers.shared.ffn.shared_gate_sink,
-                    shared_gate_logits_sink_bytes),
+        write_range(shared_ffn.gate, shared_projection_bytes),
+        write_range(shared_ffn.up, shared_projection_bytes),
+        write_range(shared_ffn.hidden, shared_projection_bytes),
+        write_range(shared_ffn.down_activations, shared_down_activations_bytes),
+        write_range(shared_ffn.shared_output, shared_output_bytes),
+        write_range(shared_ffn.shared_gate_logits, shared_gate_logits_bytes),
+        write_range(shared_ffn.output, shared_result_bytes),
+        write_range(shared_ffn.gate_sink, shared_gate_sink_bytes),
+        write_range(shared_ffn.up_sink, shared_gate_sink_bytes),
+        write_range(shared_ffn.down_sink, shared_down_sink_bytes),
+        write_range(shared_ffn.shared_gate_sink, shared_gate_logits_sink_bytes),
     };
-    const std::array residual_writes{
-        write_range(buffers.shared.residual, residual_bytes),
-        write_range(buffers.shared.inject, inject_bytes),
-    };
+    std::array<BufferRef, 2u> residual_writes{};
+    if (writeback != nullptr) {
+        residual_writes = {write_range(writeback->residual, residual_bytes),
+                           write_range(writeback->inject, inject_bytes)};
+    }
     const auto valid_ranges = [](const auto& views) {
         return std::all_of(views.begin(), views.end(),
                            [](const auto& view) { return static_cast<bool>(view); });
     };
     if (!valid_ranges(routed_inputs) || !valid_ranges(routed_outputs) ||
         !valid_ranges(shared_inputs) || !valid_ranges(shared_outputs) ||
-        !valid_ranges(residual_writes)) {
+        (writeback != nullptr && !valid_ranges(residual_writes))) {
         error = "routed/shared MoE FFN active view is stale or undersized";
         return false;
     }
@@ -1494,14 +1486,13 @@ bool encode_moe_routed_shared_ffn_write_impl(
         }
     }
 
-    if (!encode_moe_routed_ffn_impl(
-            context, encoder, rows, experts, layer, gate_up_format,
-            down_format, buffers.routed, error)) {
+    if (!encode_moe_routed_ffn_impl(context, encoder, rows, experts, layer,
+                                    gate_up_format, down_format, routed,
+                                    error)) {
         return false;
     }
-    return encode_moe_shared_ffn_impl(
-        context, encoder, rows, buffers.shared.ffn, error,
-        &buffers.shared);
+    return encode_moe_shared_ffn_impl(context, encoder, rows, shared_ffn,
+                                      error, writeback);
 }
 
 }  // namespace
@@ -1712,9 +1703,9 @@ bool encode_moe_routed_shared_ffn_write(
     std::uint32_t experts, std::uint32_t layer,
     MoeExpertFormat gate_up_format, MoeDownFormat down_format,
     const MoeRoutedSharedFFNWriteBuffers& buffers, std::string& error) {
-    return encode_moe_routed_shared_ffn_write_impl(
+    return encode_moe_routed_shared_ffn_impl(
         context, encoder, rows, experts, layer, gate_up_format, down_format,
-        buffers, error);
+        buffers.routed, buffers.shared.ffn, &buffers.shared, error);
 }
 
 bool encode_moe_routed_shared_ffn_write(
@@ -1725,9 +1716,36 @@ bool encode_moe_routed_shared_ffn_write(
     return Encoder::encode(
         context, command_buffer, "routed/shared MoE FFN and GR residual write",
         [&](Encoder& encoder, std::string& encode_error) {
-            return encode_moe_routed_shared_ffn_write_impl(
+            return encode_moe_routed_shared_ffn_impl(
                 context, encoder, rows, experts, layer, gate_up_format,
-                down_format, buffers, encode_error);
+                down_format, buffers.routed, buffers.shared.ffn,
+                &buffers.shared, encode_error);
+        },
+        error);
+}
+
+bool encode_moe_routed_shared_ffn(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    std::uint32_t experts, std::uint32_t layer,
+    MoeExpertFormat gate_up_format, MoeDownFormat down_format,
+    const MoeRoutedSharedFFNBuffers& buffers, std::string& error) {
+    return encode_moe_routed_shared_ffn_impl(
+        context, encoder, rows, experts, layer, gate_up_format, down_format,
+        buffers.routed, buffers.shared, nullptr, error);
+}
+
+bool encode_moe_routed_shared_ffn(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    std::uint32_t experts, std::uint32_t layer,
+    MoeExpertFormat gate_up_format, MoeDownFormat down_format,
+    const MoeRoutedSharedFFNBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "routed/shared MoE FFN combine",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_moe_routed_shared_ffn_impl(
+                context, encoder, rows, experts, layer, gate_up_format,
+                down_format, buffers.routed, buffers.shared, nullptr,
+                encode_error);
         },
         error);
 }

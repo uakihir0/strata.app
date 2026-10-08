@@ -148,6 +148,14 @@ struct MoeRoutedSharedFFNWriteBuffers {
     MoeSharedFFNWriteBuffers shared;
 };
 
+struct MoeRoutedSharedFFNBuffers {
+    /// Routed experts, whose `parts` feed the shared combine below.
+    MoeRoutedFFNBuffers routed;
+    /// Shared expert and combine. `output` remains available for a later,
+    /// policy-specific GR residual write.
+    MoeSharedFFNBuffers shared;
+};
+
 /// Encode the stable top-10 route selection for 256 or 512 experts.
 /// `divide_weights` selects the prompt-path division mode; Window decode must
 /// pass false to match the model's multiply-by-reciprocal path. The views must
@@ -339,5 +347,26 @@ bool encode_moe_routed_shared_ffn_write(
     std::uint32_t experts, std::uint32_t layer,
     MoeExpertFormat gate_up_format, MoeDownFormat down_format,
     const MoeRoutedSharedFFNWriteBuffers& buffers, std::string& error);
+
+/// Encode routed experts, the shared expert and combine, leaving the result
+/// in `shared.output` without applying a GR residual write. Use this form when
+/// Window's pending-write policy defers the residual update to a later stage.
+/// Cross-stage alias checks cover all active input and output ranges. Tiered
+/// callers must first resolve the plan successfully through `ExpertStore` and
+/// retain all expert leases through command completion. Keep views alive and
+/// inputs unchanged until completion; do not read outputs early. Callers of
+/// the Encoder form must propagate false from their enclosing
+/// `Encoder::encode` body so earlier work is discarded.
+bool encode_moe_routed_shared_ffn(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    std::uint32_t experts, std::uint32_t layer,
+    MoeExpertFormat gate_up_format, MoeDownFormat down_format,
+    const MoeRoutedSharedFFNBuffers& buffers, std::string& error);
+/// Standalone transactional form. A failure discards every stage.
+bool encode_moe_routed_shared_ffn(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    std::uint32_t experts, std::uint32_t layer,
+    MoeExpertFormat gate_up_format, MoeDownFormat down_format,
+    const MoeRoutedSharedFFNBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal

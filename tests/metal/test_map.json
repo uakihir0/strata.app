@@ -132,7 +132,7 @@
     },
     "metal_window_storage_test": {
       "label": "metal",
-      "origin": "05 U3; 06 9.3; D-IMPL-290; REV-086"
+      "origin": "05 U3; 06 9.3; D-IMPL-290; REV-086; D-IMPL-291; REV-087"
     },
     "metal_model_storage_owner_test": {
       "label": "metal",
@@ -254,11 +254,11 @@
     },
     "metal_gdn_test": {
       "label": "metal",
-      "origin": "04 §5.1/§5.4/§5.9/§5.10, 04 §10.5, 09 9.1, L9 T=1 attention-GDN-FFN-router-route-Q8_1-plan-full-mode-MoE-handoffs, D-IMPL-272, D-IMPL-281, D-IMPL-290, REV-077, REV-086"
+      "origin": "04 §5.1/§5.4/§5.9/§5.10, 04 §10.5, 09 9.1, L9 T=1 attention-GDN-FFN-router-route-Q8_1-plan-full-mode-MoE-handoffs, D-IMPL-272, D-IMPL-281, D-IMPL-290, REV-077, REV-086, D-IMPL-291, REV-087"
     },
     "metal_gdn_test_concurrent": {
       "label": "metal",
-      "origin": "04 §5.1/§5.4/§5.9/§5.10, 04 §10.5, 09 9.1, L9 T=1 attention-GDN-FFN-router-route-Q8_1-plan-full-mode-MoE-handoffs, D-IMPL-272, D-IMPL-281, D-IMPL-290, REV-077, REV-086"
+      "origin": "04 §5.1/§5.4/§5.9/§5.10, 04 §10.5, 09 9.1, L9 T=1 attention-GDN-FFN-router-route-Q8_1-plan-full-mode-MoE-handoffs, D-IMPL-272, D-IMPL-281, D-IMPL-290, REV-077, REV-086, D-IMPL-291, REV-087"
     },
     "metal_gr_test": {
       "label": "metal",
@@ -278,11 +278,11 @@
     },
     "metal_moe_test": {
       "label": "metal",
-      "origin": "09 9.1, D-IMPL-273, REV-069, D-IMPL-280, REV-076, D-IMPL-282, REV-078, D-IMPL-283, REV-079, D-IMPL-284, REV-080, D-IMPL-285, REV-081, D-IMPL-287, REV-083, D-IMPL-288, REV-084, D-IMPL-289, REV-085"
+      "origin": "09 9.1, D-IMPL-273, REV-069, D-IMPL-280, REV-076, D-IMPL-282, REV-078, D-IMPL-283, REV-079, D-IMPL-284, REV-080, D-IMPL-285, REV-081, D-IMPL-287, REV-083, D-IMPL-288, REV-084, D-IMPL-289, REV-085, D-IMPL-291, REV-087"
     },
     "metal_moe_test_concurrent": {
       "label": "metal",
-      "origin": "09 9.1, 04 10.5, D-IMPL-273, REV-069, D-IMPL-280, REV-076, D-IMPL-282, REV-078, D-IMPL-283, REV-079, D-IMPL-284, REV-080, D-IMPL-285, REV-081, D-IMPL-287, REV-083, D-IMPL-288, REV-084, D-IMPL-289, REV-085"
+      "origin": "09 9.1, 04 10.5, D-IMPL-273, REV-069, D-IMPL-280, REV-076, D-IMPL-282, REV-078, D-IMPL-283, REV-079, D-IMPL-284, REV-080, D-IMPL-285, REV-081, D-IMPL-287, REV-083, D-IMPL-288, REV-084, D-IMPL-289, REV-085, D-IMPL-291, REV-087"
     },
     "metal_mtp_test": {
       "label": "metal",

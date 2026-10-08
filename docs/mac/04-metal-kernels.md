@@ -2194,21 +2194,25 @@ same read-only binding contract for Q8_1 activations, Q8_0 weights and live-row 
 F32 output and padded-column sink views. It supports the shared-expert projections without
 converting full-mode model views back to mutable `BufferRef`. The validated
 `encode_moe_shared_ffn` coordinator now composes the shared-expert chain and
-combine, but production Window dispatch still does not call it. The T=1 Window router prefix orders
+combine. The full-mode layer-0 coordinator reaches those stages through the
+routed/shared composition so it can bind the routed parts in the same transaction.
+The T=1 Window router prefix orders
 the layer-0 attention/GDN/FFN read, 256/512-expert BF16 router, multiply-by-reciprocal top-10 route
 and Q8_1 quantization of `mixed` in one segment. It slices the live-row count from `WindowParams.nc`
 and reuses GDN's `xq` only after the GDN reads finish. `encode_window_t1_moe_plan_prefix` extends
 that segment with the layer-0 GPU plan kernel, using the produced route IDs and disjoint resident,
 usage and plan views. `encode_window_t1_moe_layer0_full_mode` takes the `FullModeStorage` owner,
 uses its expert address/resident/usage tables, and composes the actual router/route/plan prefix
-with routed expert FFN, shared expert, combine and GR residual write in one ordered transaction.
-It validates the consumer's table identity, Q8_1 activations, plan, route weights and mixed input,
-and the same `WindowParams.nc`, residual and injection. Consumer reads may overlap producer storage
-only in the specific input roles declared for each handoff. Router weights and the resident table
-are checked as producer inputs, and consumer outputs and sinks cannot overlap them. In tiered mode
-the plan prefix ends at plan production; a caller must establish plan readiness, resolve misses
-through `ExpertStore`, retain expert leases through GPU completion, and then call the lower-level
-routed/shared consumer.
+with routed expert FFN, shared expert and combine in one ordered transaction. It leaves the
+combined output pending in `ffn.shared.output`; it does not write the GR residual. The PLE entry
+applies layer 0's pending result when PLE is enabled, and otherwise layer 1's attention GR read
+applies it according to `pending(1)`. The coordinator validates the consumer's table identity,
+Q8_1 activations, plan, route weights and mixed input, plus the same `WindowParams.nc`. Consumer
+reads may overlap producer storage only in the specific input roles declared for each handoff.
+Router weights and the resident table are checked as producer inputs, and consumer outputs and
+sinks cannot overlap them. In tiered mode the plan prefix ends at plan production; a caller must
+establish plan readiness, resolve misses through `ExpertStore`, retain expert leases through GPU
+completion, and then call the no-write routed/shared consumer for layer 0.
 There is no production scheduler that performs this sequence. Later Window layers, the indexed
 draft-head API, and Prefill dispatch remain pending.
 
@@ -2526,6 +2530,15 @@ composition in the same ordered segment. Tiered callers must wait for
 successful `ExpertStore` resolution before submitting it. The compositor does
 not build routes or plans, resolve misses, or integrate the production Window
 scheduler, and its synthetic tests do not establish end-to-end inference.
+
+`encode_moe_routed_shared_ffn` uses the same validated routed/shared stages
+and stops after combine, leaving the result in `shared.output`. Layer 0 uses
+this form because its FFN write remains pending: the PLE entry applies it
+when PLE is enabled, and otherwise the next layer's attention GR read applies
+it. `encode_moe_routed_shared_ffn_write` remains available for paths whose
+writeback is due at the current stage. The routed/shared GPU fixture checks
+that the pending form matches the combine oracle and leaves residual and
+injection bytes unchanged for T=1..8.
 
 **What the FFN reads per layer, T = 1:** the router (2.6 MB for 512 experts), 10 experts (13.8 MB for Q2_0, three
 slabs of 460,800 B each), and the shared expert. For T > 1, rows that share an expert share its read, which is why

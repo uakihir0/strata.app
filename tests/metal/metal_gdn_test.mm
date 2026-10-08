@@ -3539,24 +3539,20 @@ bool test_window_t1_attention_gdn(Context& context) {
         context.buffers().read_only(route_weights_storage.view());
     const ReadOnlyBufferRef producer_params =
         context.buffers().read_only(layer0_buffers.params);
-    consumer_handoff_buffers.ffn_write.routed.addresses =
+    consumer_handoff_buffers.ffn.routed.addresses =
         context.buffers().read_only(consumer_address_storage.view());
-    consumer_handoff_buffers.ffn_write.routed.input_activations =
+    consumer_handoff_buffers.ffn.routed.input_activations =
         producer_q8_1;
-    consumer_handoff_buffers.ffn_write.routed.plans = producer_plan;
-    consumer_handoff_buffers.ffn_write.shared.ffn.input_activations =
+    consumer_handoff_buffers.ffn.routed.plans = producer_plan;
+    consumer_handoff_buffers.ffn.shared.input_activations =
         producer_q8_1;
-    consumer_handoff_buffers.ffn_write.shared.ffn.mixed =
+    consumer_handoff_buffers.ffn.shared.mixed =
         context.buffers().read_only(layer0_buffers.ffn.mixed);
-    consumer_handoff_buffers.ffn_write.shared.ffn.active_rows =
+    consumer_handoff_buffers.ffn.shared.active_rows =
         producer_params.slice(offsetof(strata::metal::WindowParams, nc),
                               sizeof(std::uint32_t));
-    consumer_handoff_buffers.ffn_write.shared.ffn.route_weights =
+    consumer_handoff_buffers.ffn.shared.route_weights =
         producer_route_weights;
-    consumer_handoff_buffers.ffn_write.shared.residual =
-        layer0_buffers.ffn.residual;
-    consumer_handoff_buffers.ffn_write.shared.inject =
-        layer0_buffers.ffn.inject_out;
     const bool consumer_handoffs_valid =
         detail::validate_window_t1_moe_consumer_handoffs(
             context, vocabulary_size, kRouterExperts,
@@ -3567,7 +3563,7 @@ bool test_window_t1_attention_gdn(Context& context) {
 
     WindowT1MoeLayer0FullBuffers aliased_consumer_buffers =
         consumer_handoff_buffers;
-    aliased_consumer_buffers.ffn_write.routed.addresses =
+    aliased_consumer_buffers.ffn.routed.addresses =
         context.buffers().read_only(layer0_buffers.ffn.normalized);
     const bool producer_write_alias_rejected =
         !detail::validate_window_t1_moe_consumer_handoffs(
@@ -3580,7 +3576,7 @@ bool test_window_t1_attention_gdn(Context& context) {
 
     WindowT1MoeLayer0FullBuffers wrong_role_handoff_buffers =
         consumer_handoff_buffers;
-    wrong_role_handoff_buffers.ffn_write.shared.ffn.shared_gate_weights =
+    wrong_role_handoff_buffers.ffn.shared.shared_gate_weights =
         context.buffers().read_only(layer0_buffers.ffn.mixed);
     const bool wrong_role_handoff_rejected =
         !detail::validate_window_t1_moe_consumer_handoffs(
@@ -3593,7 +3589,7 @@ bool test_window_t1_attention_gdn(Context& context) {
 
     WindowT1MoeLayer0FullBuffers router_tensor_alias_buffers =
         consumer_handoff_buffers;
-    router_tensor_alias_buffers.ffn_write.shared.ffn.shared_gate_weights =
+    router_tensor_alias_buffers.ffn.shared.shared_gate_weights =
         plan_prefix_buffers.router.router_tensor;
     const bool router_tensor_alias_rejected =
         !detail::validate_window_t1_moe_consumer_handoffs(
@@ -3606,7 +3602,7 @@ bool test_window_t1_attention_gdn(Context& context) {
 
     WindowT1MoeLayer0FullBuffers resident_alias_buffers =
         consumer_handoff_buffers;
-    resident_alias_buffers.ffn_write.shared.ffn.shared_gate_weights =
+    resident_alias_buffers.ffn.shared.shared_gate_weights =
         plan_prefix_buffers.resident;
     const bool resident_alias_rejected =
         !detail::validate_window_t1_moe_consumer_handoffs(
@@ -3619,7 +3615,7 @@ bool test_window_t1_attention_gdn(Context& context) {
 
     WindowT1MoeLayer0FullBuffers router_write_alias_buffers =
         consumer_handoff_buffers;
-    router_write_alias_buffers.ffn_write.shared.ffn.shared_output =
+    router_write_alias_buffers.ffn.shared.shared_output =
         router_tensor_storage.view();
     const bool router_write_alias_rejected =
         !detail::validate_window_t1_moe_consumer_handoffs(
@@ -3632,7 +3628,7 @@ bool test_window_t1_attention_gdn(Context& context) {
 
     WindowT1MoeLayer0FullBuffers router_sink_alias_buffers =
         consumer_handoff_buffers;
-    router_sink_alias_buffers.ffn_write.shared.ffn.shared_gate_sink =
+    router_sink_alias_buffers.ffn.shared.shared_gate_sink =
         router_tensor_storage.view();
     const bool router_sink_alias_rejected =
         !detail::validate_window_t1_moe_consumer_handoffs(
@@ -3641,6 +3637,32 @@ bool test_window_t1_attention_gdn(Context& context) {
         error.find("overlap producer storage") != std::string::npos;
     check(router_sink_alias_rejected,
           label + " shared gate sink cannot overwrite producer router tensor",
+          error);
+
+    WindowT1MoeLayer0FullBuffers pending_residual_alias_buffers =
+        consumer_handoff_buffers;
+    pending_residual_alias_buffers.ffn.shared.output =
+        layer0_buffers.ffn.residual;
+    const bool pending_residual_alias_rejected =
+        !detail::validate_window_t1_moe_consumer_handoffs(
+            context, vocabulary_size, kRouterExperts,
+            pending_residual_alias_buffers, error) &&
+        error.find("overlap producer storage") != std::string::npos;
+    check(pending_residual_alias_rejected,
+          label + " pending layer-0 output cannot overwrite its GR residual",
+          error);
+
+    WindowT1MoeLayer0FullBuffers pending_injection_alias_buffers =
+        consumer_handoff_buffers;
+    pending_injection_alias_buffers.ffn.shared.output =
+        layer0_buffers.ffn.inject_out;
+    const bool pending_injection_alias_rejected =
+        !detail::validate_window_t1_moe_consumer_handoffs(
+            context, vocabulary_size, kRouterExperts,
+            pending_injection_alias_buffers, error) &&
+        error.find("overlap producer storage") != std::string::npos;
+    check(pending_injection_alias_rejected,
+          label + " pending layer-0 output cannot overwrite its GR injection",
           error);
 
     WindowT1MoePlanPrefixBuffers short_moe_plan = plan_prefix_buffers;

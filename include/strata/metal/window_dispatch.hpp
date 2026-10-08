@@ -77,11 +77,12 @@ struct WindowT1MoePlanPrefixBuffers {
 };
 
 /// Full-mode layer-0 T=1 Window buffers. The exact producer structure is
-/// passed with its consumer so the coordinator can bind the route, plan,
-/// activation and GR writeback handoffs before dispatch.
+/// passed with its consumer so the coordinator can bind the route, plan and
+/// activation handoffs before dispatch. The combined MoE output is left
+/// pending for the later PLE entry or next-layer attention read.
 struct WindowT1MoeLayer0FullBuffers {
     WindowT1MoePlanPrefixBuffers producer;
-    MoeRoutedSharedFFNWriteBuffers ffn_write;
+    MoeRoutedSharedFFNBuffers ffn;
 };
 
 /// Encode the T=1 input stem: gather the token from WindowParams, then
@@ -167,14 +168,16 @@ bool encode_window_t1_moe_plan_prefix(
     const WindowT1MoePlanPrefixBuffers& buffers, std::string& error);
 
 /// Encode the full-mode T=1 layer-0 Window router/route/plan prefix followed
-/// by routed expert FFN, shared expert/combine and GR residual write in one
-/// ordered transaction. The `FullModeStorage` owner supplies the expert
-/// address, resident and usage tables; caller-provided consumer views must
-/// match those exact tables. Producer and consumer views are checked against
-/// the same `producer` structure before dispatch. Tiered callers must resolve
-/// plans and retain leases through their command buffer before using the
-/// lower-level MoE consumer. Keep the FullModeStorage alive through GPU
-/// completion. Propagate false from a caller-owned Encoder body.
+/// by routed expert FFN and shared expert/combine in one ordered transaction.
+/// Leave the combined output in `ffn.shared.output`; the Window's pending
+/// write is applied by the later PLE entry or next-layer attention read. The
+/// `FullModeStorage` owner supplies the expert address, resident and usage
+/// tables; caller-provided consumer views must match those exact tables.
+/// Producer and consumer views are checked against the same `producer`
+/// structure before dispatch. Tiered callers must resolve plans and retain
+/// leases through their command buffer before using the lower-level MoE
+/// consumer. Keep the FullModeStorage alive through GPU completion. Propagate
+/// false from a caller-owned Encoder body.
 bool encode_window_t1_moe_layer0_full_mode(
     Context& context, const FullModeStorage& full_mode, Encoder& encoder,
     std::uint32_t vocabulary_size,

@@ -657,16 +657,15 @@ bool validate_window_t1_moe_layer0_consumer_handoffs(
         context.buffers().read_only(layer0.params);
     const ReadOnlyBufferRef active_rows = params_read_only.slice(
         offsetof(WindowParams, nc), sizeof(std::uint32_t));
-    const MoeRoutedFFNBuffers& routed = buffers.ffn_write.routed;
-    const MoeSharedFFNWriteBuffers& shared = buffers.ffn_write.shared;
+    const MoeRoutedFFNBuffers& routed = buffers.ffn.routed;
+    const MoeSharedFFNBuffers& shared = buffers.ffn.shared;
     if (!producer_input || !producer_plan || !producer_route_weights ||
         !active_rows) {
         error = "Window T=1 MoE FFN could not form producer views";
         return false;
     }
     if (!same_buffer_start(producer_input, routed.input_activations) ||
-        !same_buffer_start(producer_input,
-                           shared.ffn.input_activations)) {
+        !same_buffer_start(producer_input, shared.input_activations)) {
         error = "Window T=1 MoE FFN activations must use the producer Q8_1 input";
         return false;
     }
@@ -674,21 +673,15 @@ bool validate_window_t1_moe_layer0_consumer_handoffs(
         error = "Window T=1 MoE FFN plan must use the producer plan output";
         return false;
     }
-    if (!same_buffer_start(producer_route_weights,
-                           shared.ffn.route_weights)) {
+    if (!same_buffer_start(producer_route_weights, shared.route_weights)) {
         error = "Window T=1 MoE FFN route weights must use the producer output";
         return false;
     }
-    if (!same_buffer_start(layer0.ffn.mixed, shared.ffn.mixed)) {
+    if (!same_buffer_start(layer0.ffn.mixed, shared.mixed)) {
         error = "Window T=1 MoE FFN mixed input must use the producer output";
         return false;
     }
-    if (!same_buffer_start(layer0.ffn.residual, shared.residual) ||
-        !same_buffer_start(layer0.ffn.inject_out, shared.inject)) {
-        error = "Window T=1 MoE FFN writeback must use the producer GR views";
-        return false;
-    }
-    if (!same_buffer_start(active_rows, shared.ffn.active_rows)) {
+    if (!same_buffer_start(active_rows, shared.active_rows)) {
         error = "Window T=1 MoE FFN live rows must use WindowParams.nc";
         return false;
     }
@@ -697,41 +690,38 @@ bool validate_window_t1_moe_layer0_consumer_handoffs(
         ReadOnlyBufferRef view;
         BufferRef allowed_handoff;
     };
-    const std::array<ConsumerInputView, 12u> consumer_inputs{{
+    const std::array<ConsumerInputView, 11u> consumer_inputs{{
         {routed.addresses, {}},
         {routed.input_activations, layer0.gdn.xq},
         {routed.plans, buffers.producer.plans},
-        {shared.ffn.input_activations, layer0.gdn.xq},
-        {shared.ffn.mixed, layer0.ffn.mixed},
-        {shared.ffn.gate_weights, {}},
-        {shared.ffn.up_weights, {}},
-        {shared.ffn.down_weights, {}},
-        {shared.ffn.shared_gate_weights, {}},
-        {shared.ffn.routed_parts, {}},
-        {shared.ffn.route_weights, producer.route_weights},
-        {context.buffers().read_only(shared.inject),
-         layer0.ffn.inject_out},
+        {shared.input_activations, layer0.gdn.xq},
+        {shared.mixed, layer0.ffn.mixed},
+        {shared.gate_weights, {}},
+        {shared.up_weights, {}},
+        {shared.down_weights, {}},
+        {shared.shared_gate_weights, {}},
+        {shared.routed_parts, {}},
+        {shared.route_weights, producer.route_weights},
     }};
-    const std::array<BufferRef, 13u> consumer_outputs{
+    const std::array<BufferRef, 12u> consumer_outputs{
         routed.gate,
         routed.up,
         routed.hidden,
         routed.down_activations,
         routed.parts,
-        shared.ffn.gate,
-        shared.ffn.up,
-        shared.ffn.hidden,
-        shared.ffn.down_activations,
-        shared.ffn.shared_output,
-        shared.ffn.shared_gate_logits,
-        shared.ffn.output,
-        shared.residual,
+        shared.gate,
+        shared.up,
+        shared.hidden,
+        shared.down_activations,
+        shared.shared_output,
+        shared.shared_gate_logits,
+        shared.output,
     };
     const std::array<BufferRef, 4u> consumer_sinks{
-        shared.ffn.gate_sink,
-        shared.ffn.up_sink,
-        shared.ffn.down_sink,
-        shared.ffn.shared_gate_sink,
+        shared.gate_sink,
+        shared.up_sink,
+        shared.down_sink,
+        shared.shared_gate_sink,
     };
     const bool consumer_inputs_disjoint_from_params =
         std::all_of(consumer_inputs.begin(), consumer_inputs.end(),
@@ -788,11 +778,7 @@ bool validate_window_t1_moe_layer0_consumer_handoffs(
         }
         for (const BufferRef& output : consumer_outputs) {
             for (const BufferRef& input : producer_views) {
-                const bool residual_handoff =
-                    same_buffer_start(output, layer0.ffn.residual) &&
-                    same_buffer_start(input, layer0.ffn.residual);
-                if (!residual_handoff &&
-                    buffer_views_overlap(output, input)) {
+                if (buffer_views_overlap(output, input)) {
                     return false;
                 }
             }
@@ -835,8 +821,7 @@ bool validate_window_t1_moe_layer0_full_mode(
     if (!full_addresses || !context.buffers().owns(full_addresses) ||
         !full_resident || !context.buffers().owns(full_resident) ||
         !full_usage || !context.buffers().owns(full_usage) ||
-        !same_buffer_start(full_addresses,
-                           buffers.ffn_write.routed.addresses) ||
+        !same_buffer_start(full_addresses, buffers.ffn.routed.addresses) ||
         !same_buffer_start(full_resident, buffers.producer.resident) ||
         !same_buffer_start(full_usage, buffers.producer.usage)) {
         error = "Window T=1 full-mode MoE must use its FullModeStorage address, resident and usage tables";
@@ -1051,9 +1036,9 @@ bool encode_window_t1_moe_layer0_full_mode(
             buffers.producer, error)) {
         return false;
     }
-    return encode_moe_routed_shared_ffn_write(
+    return encode_moe_routed_shared_ffn(
         context, encoder, 1u, experts, 0u, gate_up_format, down_format,
-        buffers.ffn_write, error);
+        buffers.ffn, error);
 }
 
 bool encode_window_t1_moe_layer0_full_mode(

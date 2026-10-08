@@ -3465,6 +3465,71 @@ bool test_moe_routed_shared_ffn_write(
         outputs_match &= unchanged;
     }
 
+    std::memcpy(storage[residual].payload().data(), initial_residual.data(),
+                residual_bytes);
+    std::memcpy(storage[injection].payload().data(), inject.data(),
+                inject_bytes);
+    for (const BufferIndex index :
+         {gate_output, up_output, hidden_output, down_activations_output,
+          shared_output, shared_gate_logits_output, combined_output,
+          gate_sink, up_sink, down_sink, shared_gate_sink}) {
+        std::fill(storage[index].payload().begin(),
+                  storage[index].payload().end(), 0xa5u);
+    }
+    for (auto& buffer : storage) buffer.capture_before_dispatch();
+
+    const MoeRoutedSharedFFNBuffers pending_pipeline{routed, shared_buffers};
+    auto pending_command =
+        context.make_command_buffer(label + " pending GR write", error);
+    const bool pending_caller_owned = rows == 1u;
+    const bool pending_encoded =
+        pending_command &&
+        (pending_caller_owned
+             ? Encoder::encode(
+                   context, *pending_command, label + " pending GR write",
+                   [&](Encoder& encoder, std::string& encode_error) {
+                       return encode_moe_routed_shared_ffn(
+                           context, encoder, rows, experts, layer,
+                           MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
+                           pending_pipeline, encode_error);
+                   },
+                   error)
+             : encode_moe_routed_shared_ffn(
+                   context, *pending_command, rows, experts, layer,
+                   MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
+                   pending_pipeline, error));
+    const bool pending_dispatched =
+        pending_encoded && pending_command->commit(error) &&
+        pending_command->wait_until_completed(error);
+    check(pending_dispatched,
+          label + (pending_caller_owned
+                       ? " pending GR write caller-owned"
+                       : " pending GR write standalone"),
+          error);
+    if (!pending_dispatched) return false;
+
+    outputs_match &=
+        compare(combined_output, expected_combined,
+                "pending routed/shared combine");
+    const bool residual_pending =
+        std::memcmp(storage[residual].payload().data(),
+                    initial_residual.data(), residual_bytes) == 0;
+    const bool injection_pending =
+        std::memcmp(storage[injection].payload().data(), inject.data(),
+                    inject_bytes) == 0;
+    const bool pending_residual_guard =
+        !storage[residual].first_unwritten_change({});
+    const bool pending_injection_guard =
+        !storage[injection].first_unwritten_change({});
+    const bool pending_output_guard =
+        !storage[combined_output].first_unwritten_change(shared_written);
+    check(residual_pending && injection_pending && pending_residual_guard &&
+              pending_injection_guard && pending_output_guard,
+          label + " combined output stays pending without changing GR residual or injection");
+    outputs_match &= residual_pending && injection_pending &&
+                     pending_residual_guard && pending_injection_guard &&
+                     pending_output_guard;
+
     std::vector<std::vector<std::uint8_t>> route_before;
     route_before.reserve(routed_storage.size());
     for (const twin::GuardedBuffer* buffer : routed_storage) {
