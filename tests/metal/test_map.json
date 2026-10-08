@@ -80,7 +80,7 @@
     },
     "metal_session_state_test": {
       "label": "metal",
-      "origin": "06 1.5, D-IMPL-180, L9 prerequisite"
+      "origin": "06 1.5, D-IMPL-180, D-IMPL-302, REV-099, L9 prerequisite"
     },
     "metal_window_scratch_storage_test": {
       "label": "metal",

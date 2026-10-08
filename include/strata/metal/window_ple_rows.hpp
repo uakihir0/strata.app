@@ -56,7 +56,8 @@ public:
         std::span<const std::uint32_t> committed_prefix,
         const Geometry& geometry, std::string& error);
 
-    /// Clear the committed suffix, for example when resetting a session.
+    /// Clear this helper when used independently. An owning session-state
+    /// object must reset the GPU and host state through its own reset method.
     void reset() noexcept;
 
     /// Return up to two committed IDs in oldest-first order.

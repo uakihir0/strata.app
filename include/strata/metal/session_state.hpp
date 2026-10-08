@@ -3,11 +3,13 @@
 
 #include "strata/metal/context.hpp"
 #include "strata/metal/geometry.hpp"
+#include "strata/metal/window_ple_rows.hpp"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 
 namespace strata::metal {
@@ -75,7 +77,26 @@ public:
     bool gdn_layer(std::uint32_t ordinal, GdnSessionStateViews& views,
                    std::string& error) const;
     BufferRef ple_history() const noexcept;
+    /// Serialize token-history calls with this sequence's Window, commit and
+    /// reset lifecycle. The returned suffix view expires on its next mutation.
+    /// Initialize once per reset from IDs already applied to model state.
+    /// Row building and accepted-prefix updates fail until this succeeds.
+    bool initialize_ple_token_ids(
+        std::span<const std::uint32_t> applied_prefix,
+        const Geometry& geometry, std::string& error);
+    std::span<const std::uint32_t> ple_token_id_suffix() const noexcept;
+    /// Build without mutation; serialize with this sequence's Window lifecycle.
+    bool build_ple_rows(std::span<const std::uint32_t> tokens,
+                        const Geometry& geometry, WindowPleRows& output,
+                        std::string& error) const;
+    /// Call only after the corresponding GPU state commit succeeds.
+    bool commit_accepted_ple_tokens(
+        std::span<const std::uint32_t> window_tokens,
+        std::size_t accepted_count, const Geometry& geometry,
+        std::string& error);
     bool track_use(CommandBuffer& command_buffer, std::string& error);
+    /// Reset GPU and host state together; this is the only reset path for
+    /// token IDs owned by this session.
     bool reset(Context& context, std::string& error);
 
 private:
@@ -86,6 +107,8 @@ private:
     Context* context_ = nullptr;
     SessionStateLayout layout_;
     BufferRef allocation_;
+    WindowPleTokenHistory ple_token_ids_;
+    bool ple_token_ids_initialized_ = false;
     std::shared_ptr<UseTracker> use_tracker_;
 };
 

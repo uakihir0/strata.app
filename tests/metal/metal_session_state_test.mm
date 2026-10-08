@@ -2,6 +2,7 @@
 #include "strata/metal/session_state.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -21,6 +22,16 @@ void require_zero(BufferRef view, const std::string& label) {
     require(view && std::all_of(bytes, bytes + view.length,
                                 [](std::uint8_t byte) { return byte == 0; }),
             label + " must be zero initialized");
+}
+
+void require_byte_pattern(BufferRef view, std::uint8_t expected,
+                          const std::string& label) {
+    const auto* bytes = static_cast<const std::uint8_t*>(view.contents);
+    require(view && std::all_of(bytes, bytes + view.length,
+                                [expected](std::uint8_t byte) {
+                                    return byte == expected;
+                                }),
+            label + " must preserve its byte pattern");
 }
 
 void check_region(BufferRef view, BufferRef allocation,
@@ -112,6 +123,35 @@ int main() {
                 "unsupported geometry must be rejected before Metal allocation");
         auto state = SessionStateStorage::open(*context, geometry, error);
         require(state != nullptr, "open session-state storage: " + error);
+        require(state->ple_token_id_suffix().empty(),
+                "session token history must start empty");
+        const std::array<std::uint32_t, 1> baseline_token{88u};
+        const std::array<std::uint32_t, 1> uninitialized_token{77u};
+        WindowPleRows uninitialized_rows;
+        require(build_window_ple_rows(baseline_token, {}, geometry,
+                                      uninitialized_rows, error),
+                "prepare a nonempty output before uninitialized-row rejection: " +
+                    error);
+        const std::array<std::uint32_t, kWindowPleRowsPerToken>
+            baseline_rows = [&] {
+                std::array<std::uint32_t, kWindowPleRowsPerToken> copy{};
+                std::copy(uninitialized_rows.all_rows().begin(),
+                          uninitialized_rows.all_rows().end(), copy.begin());
+                return copy;
+            }();
+        require(!state->build_ple_rows(uninitialized_token, geometry,
+                                       uninitialized_rows, error) &&
+                    error.find("must be initialized") != std::string::npos &&
+                    uninitialized_rows.token_count() == 1u &&
+                    std::equal(uninitialized_rows.all_rows().begin(),
+                               uninitialized_rows.all_rows().end(),
+                               baseline_rows.begin(), baseline_rows.end()),
+                "Window rows must preserve existing output before history initialization");
+        require(!state->commit_accepted_ple_tokens(uninitialized_token, 1u,
+                                                   geometry, error) &&
+                    error.find("must be initialized") != std::string::npos &&
+                    state->ple_token_id_suffix().empty(),
+                "accepted-prefix updates must fail before history initialization");
         require(context->buffers().allocation_count() == allocations_before + 1,
                 "session state must use one Context-owned allocation");
         const BufferRef allocation = state->allocation();
@@ -153,12 +193,49 @@ int main() {
         std::memset(first_layer.conv_history.contents, 0xa5,
                     first_layer.conv_history.length);
         std::memset(ple.contents, 0xa5, ple.length);
+        const std::array<std::uint32_t, 2> first_tokens{101u, 102u};
+        require(state->initialize_ple_token_ids(first_tokens, geometry, error),
+                "seed session-owned PLE token history: " + error);
+        const std::array<std::uint32_t, 1> duplicate_seed{103u};
+        require(!state->initialize_ple_token_ids(duplicate_seed, geometry,
+                                                 error) &&
+                    error.find("already initialized") != std::string::npos,
+                "re-seeding must not clear or replace live sequence history");
+        const auto seeded_suffix = state->ple_token_id_suffix();
+        require(std::equal(seeded_suffix.begin(), seeded_suffix.end(),
+                           first_tokens.begin(), first_tokens.end()),
+                "rejected re-seeding must preserve the existing token suffix");
+        const std::array<std::uint32_t, 2> row_tokens{103u, 104u};
+        WindowPleRows session_rows;
+        WindowPleRows direct_rows;
+        require(state->build_ple_rows(row_tokens, geometry, session_rows,
+                                      error),
+                "build rows from session-owned PLE token IDs: " + error);
+        const auto applied_suffix = state->ple_token_id_suffix();
+        require(build_window_ple_rows(row_tokens, applied_suffix, geometry,
+                                      direct_rows, error),
+                "build direct rows from the same applied suffix: " + error);
+        require(session_rows.token_count() == direct_rows.token_count() &&
+                    std::equal(session_rows.all_rows().begin(),
+                               session_rows.all_rows().end(),
+                               direct_rows.all_rows().begin(),
+                               direct_rows.all_rows().end()),
+                "session-owned row builder must match direct PLE construction");
+        require(std::equal(applied_suffix.begin(), applied_suffix.end(),
+                           first_tokens.begin(), first_tokens.end()),
+                "building PLE rows must leave session token IDs unchanged");
         require(state->reset(*context, error), "reset session state: " + error);
         require_zero(allocation, "complete session state after reset");
         require_zero(first_layer.recurrent, "reset GDN recurrence");
         require_zero(first_layer.conv_history, "reset GDN conv history");
         require_zero(ple, "reset PLE history");
+        require(state->ple_token_id_suffix().empty(),
+                "successful session reset clears host PLE token history");
 
+        const std::array<std::uint32_t, 2> pending_tokens{201u, 202u};
+        require(state->initialize_ple_token_ids(pending_tokens, geometry, error),
+                "seed token history before a refused reset: " + error);
+        std::memset(allocation.contents, 0x5a, allocation.length);
         auto pending_use = context->make_command_buffer("pending session-state use", error);
         require(pending_use != nullptr,
                 "create pending-use command buffer: " + error);
@@ -167,9 +244,25 @@ int main() {
         require(!state->reset(*context, error) &&
                     error.find("command buffers are pending") != std::string::npos,
                 "reset must refuse while a tracked command buffer is pending");
+        const auto retained_pending_tokens = state->ple_token_id_suffix();
+        require(std::equal(retained_pending_tokens.begin(),
+                           retained_pending_tokens.end(),
+                           pending_tokens.begin(), pending_tokens.end()),
+                "refused reset must preserve host PLE token history");
+        require_byte_pattern(allocation, 0x5au,
+                             "GPU state after a pending-use reset refusal");
         pending_use->discard();
+        const std::array<std::uint32_t, 1> refused_reseed{203u};
+        require(!state->initialize_ple_token_ids(refused_reseed, geometry,
+                                                 error) &&
+                    error.find("already initialized") != std::string::npos,
+                "pending-use reset refusal must preserve the one-time seed gate");
         require(state->reset(*context, error),
                 "reset after tracked command buffer discard: " + error);
+        require_zero(allocation,
+                     "GPU state after successful reset following discard");
+        require(state->ple_token_id_suffix().empty(),
+                "successful reset after discard clears host token history");
 
         auto rejected_use = context->make_command_buffer("rejected session-state use", error);
         require(rejected_use != nullptr,
@@ -193,11 +286,28 @@ int main() {
         require(state->reset(*context, error),
                 "reset after tracked command buffer completion: " + error);
 
+        const std::array<std::uint32_t, 2> foreign_reset_tokens{301u, 302u};
+        require(state->initialize_ple_token_ids(foreign_reset_tokens, geometry,
+                                                error),
+                "seed token history before foreign-context reset: " + error);
+        std::memset(allocation.contents, 0xa6, allocation.length);
         auto other_context = Context::open(options, error);
         require(other_context != nullptr, "open second Metal context: " + error);
         require(!state->reset(*other_context, error) &&
                     error.find("different Metal Context") != std::string::npos,
                 "reset must reject a foreign Context");
+        const auto retained_tokens = state->ple_token_id_suffix();
+        require(std::equal(retained_tokens.begin(), retained_tokens.end(),
+                           foreign_reset_tokens.begin(),
+                           foreign_reset_tokens.end()),
+                "foreign-context reset must preserve host token history");
+        require_byte_pattern(allocation, 0xa6u,
+                             "GPU state after a foreign-context reset refusal");
+        const std::array<std::uint32_t, 1> foreign_refused_reseed{303u};
+        require(!state->initialize_ple_token_ids(foreign_refused_reseed,
+                                                 geometry, error) &&
+                    error.find("already initialized") != std::string::npos,
+                "foreign-context reset refusal must preserve the one-time seed gate");
 
         std::unique_ptr<SessionStateStorage> rolled_back_state;
         BufferRef rolled_back_allocation;

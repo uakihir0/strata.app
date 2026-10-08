@@ -757,10 +757,12 @@ window (section 8.5) and a prefill chunk (section 6.4) do.
 - The host's PLE row-index builder also needs the last two committed token IDs. `WindowPleTokenHistory`
   (D-IMPL-301) retains only that oldest-first suffix: constructing rows is read-only, and a speculative window
   advances it only after the caller confirms that the GPU state commit succeeded, using the accepted prefix.
+  `SessionStateStorage` owns this CPU-only suffix with the sequence lifecycle; a successful state reset clears it
+  after tracked GPU uses are complete without adding bytes to the Metal allocation.
   Seed it only from token IDs already applied to model state. In the prompt path, the last prompt token is the
   first T=1 decode window ([section 6.1](#61-the-chunk-loop-and-the-arena)); do not include it in the initial
-  suffix until that window commits. This token-ID suffix is separate from the floating-point `hist` above and is
-  not yet wired into `Window::run`.
+  suffix until that window commits. This token-ID suffix is separate from the floating-point `hist` above and
+  `Window::run` does not consume it yet.
 
 ### 4.9 RoPE table
 

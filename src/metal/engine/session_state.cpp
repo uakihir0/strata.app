@@ -111,6 +111,48 @@ BufferRef SessionStateStorage::ple_history() const noexcept {
     return view;
 }
 
+bool SessionStateStorage::initialize_ple_token_ids(
+    std::span<const std::uint32_t> applied_prefix, const Geometry& geometry,
+    std::string& error) {
+    if (ple_token_ids_initialized_) {
+        error = "PLE token history is already initialized; reset the session before reseeding";
+        return false;
+    }
+    if (!ple_token_ids_.replace_committed_history(applied_prefix, geometry,
+                                                 error)) {
+        return false;
+    }
+    ple_token_ids_initialized_ = true;
+    error.clear();
+    return true;
+}
+
+std::span<const std::uint32_t>
+SessionStateStorage::ple_token_id_suffix() const noexcept {
+    return ple_token_ids_.committed_suffix();
+}
+
+bool SessionStateStorage::build_ple_rows(
+    std::span<const std::uint32_t> tokens, const Geometry& geometry,
+    WindowPleRows& output, std::string& error) const {
+    if (!ple_token_ids_initialized_) {
+        error = "PLE token history must be initialized before building Window rows";
+        return false;
+    }
+    return ple_token_ids_.build_rows(tokens, geometry, output, error);
+}
+
+bool SessionStateStorage::commit_accepted_ple_tokens(
+    std::span<const std::uint32_t> window_tokens, std::size_t accepted_count,
+    const Geometry& geometry, std::string& error) {
+    if (!ple_token_ids_initialized_) {
+        error = "PLE token history must be initialized before committing Window tokens";
+        return false;
+    }
+    return ple_token_ids_.commit_accepted_prefix(window_tokens, accepted_count,
+                                                 geometry, error);
+}
+
 bool SessionStateStorage::track_use(CommandBuffer& command_buffer,
                                     std::string& error) {
     error.clear();
@@ -186,6 +228,8 @@ bool SessionStateStorage::reset(Context& context, std::string& error) {
     }
 
     std::memset(allocation_.contents, 0, layout_.allocation_bytes);
+    ple_token_ids_.reset();
+    ple_token_ids_initialized_ = false;
     error.clear();
     return true;
 }
