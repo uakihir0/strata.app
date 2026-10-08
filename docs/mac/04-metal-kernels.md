@@ -4885,8 +4885,14 @@ query/`ple_norm` overlap verify failure discard and alias rejection; outputs
 and guards are checked. The fixture also composes `encode_ple_block` for
 Q2_0, Q8_0 and BF16 key projections, including the F32-input BF16 value
 projection, padded columns, per-stage scalar oracles and a late-failure check
-after projection dispatches. Both serial and concurrent dispatch modes run
-the full-block fixture. The embedding fixture composes text gather, optional
+after projection dispatches. `encode_window_ple_entry` composes the layer-0
+GR post write in place with the PLE block at T=1 and T=2. Its query-norm
+oracle consumes the GPU output from a separate GR-post probe, so the PLE
+comparison follows the rounded value produced by the preceding stage. A short
+PLE history rejects the later stage and discards the preceding GR dispatch;
+the concurrent fixture also rejects a call made inside an open dispatch
+group. Both serial and concurrent dispatch modes run these fixtures. The
+embedding fixture composes text gather, optional
 image copy and GR broadcast through caller-owned Encoder overloads. GR cvec
 fixtures also run through a shared Encoder at T=1 and T=8 in project/add and
 write/no-write modes, checking residual oracles and guards. GR norm fixtures

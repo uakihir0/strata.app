@@ -7,6 +7,7 @@
 #include "strata/metal/gr_dispatch.hpp"
 #include "strata/metal/mv_dispatch.hpp"
 #include "strata/metal/ple_dispatch.hpp"
+#include "strata/metal/window_ple_dispatch.hpp"
 #include "twin.hpp"
 #include "oracles/bf16_mv.hpp"
 #include "oracles/q2_0_mv.hpp"
@@ -1525,12 +1526,42 @@ bool run_shared_ple_segment(Context& context,
     return passed;
 }
 
+void gr_post_reference(std::span<const float> residual,
+                       std::span<const float> block_out,
+                       std::span<const float> inject, std::uint32_t rows,
+                       std::vector<twin::tf>& output) {
+    output.resize(static_cast<std::size_t>(rows) * HC_DIM);
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        for (std::uint32_t index = 0u; index < HC_DIM; ++index) {
+            const std::uint32_t stream = index / N_EMBD;
+            const std::uint32_t column = index % N_EMBD;
+            const twin::tf scaled_inject = twin::fma(
+                twin::tf{0.25f},
+                twin::tf{inject[static_cast<std::size_t>(row) * HC + stream]},
+                twin::tf{});
+            const twin::tf sigmoid =
+                twin::tf{1.0f} /
+                (twin::tf{1.0f} + twin::accurate_exp(-scaled_inject));
+            const twin::tf weight =
+                twin::fma(twin::tf{2.0f}, sigmoid, twin::tf{});
+            const std::size_t output_index =
+                static_cast<std::size_t>(row) * HC_DIM + index;
+            const std::size_t block_index =
+                static_cast<std::size_t>(row) * N_EMBD + column;
+            output[output_index] = twin::fma(
+                twin::tf{block_out[block_index]}, weight,
+                twin::tf{residual[output_index]});
+        }
+    }
+}
+
 bool run_ple_block_projection_case(Context& context,
-                                  const twin::Options& options,
-                                  MatVecWeightFormat key_format,
-                                  std::uint32_t rows,
-                                  std::uint32_t compiled_columns,
-                                  bool check_late_failure) {
+                                   const twin::Options& options,
+                                   MatVecWeightFormat key_format,
+                                   std::uint32_t rows,
+                                   std::uint32_t compiled_columns,
+                                   bool check_late_failure,
+                                   bool prepend_gr_post = false) {
     constexpr std::uint32_t input_width = N_EMBD;
     constexpr std::uint32_t key_width = HC_DIM;
     constexpr float epsilon = 1.0e-6f;
@@ -1600,6 +1631,115 @@ bool run_ple_block_projection_case(Context& context,
                 value_input(twin::InputSet::fixture, row + 1u, column,
                             residual_rng);
         }
+    }
+
+    std::string error;
+    std::vector<float> residual_seed = residual;
+    std::vector<float> previous_block_out(
+        static_cast<std::size_t>(rows) * input_width);
+    std::vector<float> previous_inject(static_cast<std::size_t>(rows) * HC);
+    std::vector<twin::tf> residual_after_previous_write;
+    if (prepend_gr_post) {
+        std::mt19937_64 previous_write_rng(
+            options.seed ^ 0x57494e504c455752ull);
+        for (std::uint32_t row = 0u; row < rows; ++row) {
+            for (std::uint32_t column = 0u; column < input_width; ++column) {
+                previous_block_out[static_cast<std::size_t>(row) * input_width +
+                                   column] =
+                    value_input(twin::InputSet::fixture, row + 3u, column,
+                                previous_write_rng);
+            }
+            for (std::uint32_t stream = 0u; stream < HC; ++stream) {
+                previous_inject[static_cast<std::size_t>(row) * HC + stream] =
+                    gate_input(twin::InputSet::fixture, row + 5u, stream,
+                               previous_write_rng);
+            }
+        }
+        gr_post_reference(residual_seed, previous_block_out, previous_inject,
+                          rows, residual_after_previous_write);
+
+        twin::GuardedBuffer probe_residual;
+        twin::GuardedBuffer probe_block_out;
+        twin::GuardedBuffer probe_inject;
+        bool probe_allocated = true;
+        probe_allocated &= probe_residual.allocate(
+            context, label + " prior-write oracle residual",
+            post_count * sizeof(float), error);
+        probe_allocated &= probe_block_out.allocate(
+            context, label + " prior-write oracle block output",
+            previous_block_out.size() * sizeof(float), error);
+        probe_allocated &= probe_inject.allocate(
+            context, label + " prior-write oracle injection",
+            previous_inject.size() * sizeof(float), error);
+        check(probe_allocated,
+              label + " prior-write oracle buffer allocation", error);
+        if (!probe_allocated) return false;
+        std::memcpy(probe_residual.payload().data(), residual_seed.data(),
+                    residual_seed.size() * sizeof(float));
+        std::memcpy(probe_block_out.payload().data(),
+                    previous_block_out.data(),
+                    previous_block_out.size() * sizeof(float));
+        std::memcpy(probe_inject.payload().data(), previous_inject.data(),
+                    previous_inject.size() * sizeof(float));
+        probe_residual.capture_before_dispatch();
+        probe_block_out.capture_before_dispatch();
+        probe_inject.capture_before_dispatch();
+
+        auto probe_command = context.make_command_buffer(
+            label + " prior GR write oracle probe", error);
+        if (!probe_command) {
+            check(false, label + " prior-write oracle command buffer", error);
+            return false;
+        }
+        const GRPostBuffers probe_buffers{
+            probe_residual.view(), probe_block_out.view(), probe_inject.view(),
+            probe_residual.view(),
+        };
+        const bool probe_encoded = encode_gr_post(
+            context, *probe_command, rows, probe_buffers, error);
+        check(probe_encoded, label + " prior GR write oracle encode", error);
+        if (!probe_encoded) {
+            probe_command->discard();
+            return false;
+        }
+        const bool probe_dispatched = submit_and_wait(
+            probe_command, label + " prior GR write oracle probe", error);
+        check(probe_dispatched,
+              label + " prior GR write oracle dispatch", error);
+        if (!probe_dispatched) return false;
+
+        const auto actual_previous_write = std::span<const float>(
+            reinterpret_cast<const float*>(probe_residual.payload().data()),
+            post_count);
+        const auto prior_write_mismatch = twin::compare_floats(
+            actual_previous_write, residual_after_previous_write,
+            {twin::Comparison::units, 16.0, 0.0, 0u});
+        if (prior_write_mismatch) {
+            twin::report_failure(label.c_str(), options, rows,
+                                 *prior_write_mismatch);
+        }
+        check(!prior_write_mismatch,
+              label + " prior GR write matches its scalar oracle",
+              prior_write_mismatch ? prior_write_mismatch->reason : "");
+        const std::array<twin::ByteRange, 1> prior_write_range{{
+            {0u, post_count * sizeof(float)},
+        }};
+        const auto probe_residual_guard =
+            probe_residual.first_unwritten_change(prior_write_range);
+        check(!probe_residual_guard,
+              label + " prior-write residual guards remain unchanged",
+              probe_residual_guard ? probe_residual_guard->reason : "");
+        check(!probe_block_out.first_unwritten_change({}),
+              label + " prior-write block output remains read-only");
+        check(!probe_inject.first_unwritten_change({}),
+              label + " prior-write injection remains read-only");
+        if (prior_write_mismatch || probe_residual_guard ||
+            probe_block_out.first_unwritten_change({}) ||
+            probe_inject.first_unwritten_change({})) {
+            return false;
+        }
+        std::copy(actual_previous_write.begin(), actual_previous_write.end(),
+                  residual.begin());
     }
     for (std::uint32_t column = 0u; column < key_width; ++column) {
         const std::size_t history_offset =
@@ -1685,7 +1825,6 @@ bool run_ple_block_projection_case(Context& context,
     }
 
     std::vector<Q81> q8_reference;
-    std::string error;
     std::vector<float> key_projection;
     bool oracle_ready = true;
     if (quantized_key) {
@@ -1785,6 +1924,8 @@ bool run_ple_block_projection_case(Context& context,
         value_weights_buffer,
         sink_buffer,
         active_rows_buffer,
+        previous_block_buffer,
+        previous_inject_buffer,
         key_buffer,
         residual_buffer,
         query_buffer,
@@ -1829,6 +1970,10 @@ bool run_ple_block_projection_case(Context& context,
                           sink_count * sizeof(float));
     allocated &= allocate(active_rows_buffer, "active rows",
                           sizeof(std::uint32_t));
+    allocated &= allocate(previous_block_buffer, "previous block output",
+                          previous_block_out.size() * sizeof(float));
+    allocated &= allocate(previous_inject_buffer, "previous injection",
+                          previous_inject.size() * sizeof(float));
     allocated &= allocate(key_buffer, "key output",
                           key_count * sizeof(float));
     allocated &= allocate(value_buffer, "value output",
@@ -1877,8 +2022,12 @@ bool run_ple_block_projection_case(Context& context,
                 bf16_value_weights.size() * sizeof(std::uint16_t));
     std::memcpy(guarded[active_rows_buffer].payload().data(), &rows,
                 sizeof(rows));
-    std::memcpy(guarded[residual_buffer].payload().data(), residual.data(),
-                residual.size() * sizeof(float));
+    std::memcpy(guarded[previous_block_buffer].payload().data(),
+                previous_block_out.data(), previous_block_out.size() * sizeof(float));
+    std::memcpy(guarded[previous_inject_buffer].payload().data(),
+                previous_inject.data(), previous_inject.size() * sizeof(float));
+    std::memcpy(guarded[residual_buffer].payload().data(), residual_seed.data(),
+                residual_seed.size() * sizeof(float));
     std::memcpy(guarded[history_buffer].payload().data(),
                 initial_history.data(), initial_history.size() * sizeof(float));
     std::memcpy(guarded[conv_buffer].payload().data(), conv1d.data(),
@@ -1968,6 +2117,11 @@ bool run_ple_block_projection_case(Context& context,
         guarded[active_rows_buffer].view(),
         post,
     };
+    const WindowPLEEntryBuffers window_entry{
+        guarded[previous_block_buffer].view(),
+        guarded[previous_inject_buffer].view(),
+        block,
+    };
 
     if (check_late_failure) {
         std::array<std::vector<std::uint8_t>, buffer_count> before;
@@ -2031,9 +2185,19 @@ bool run_ple_block_projection_case(Context& context,
             check(false, label + " late-failure command buffer", error);
             return false;
         }
-        const bool accepted = encode_ple_block(
-            context, *rejected, rows, key_format, compiled_columns,
-            PLEHistoryUpdate::defer, invalid_block, error);
+        WindowPLEEntryBuffers invalid_entry = window_entry;
+        invalid_entry.ple = invalid_block;
+        const bool accepted = prepend_gr_post
+                                  ? encode_window_ple_entry(
+                                        context, *rejected, rows, key_format,
+                                        compiled_columns,
+                                        PLEHistoryUpdate::defer, invalid_entry,
+                                        error)
+                                  : encode_ple_block(
+                                        context, *rejected, rows, key_format,
+                                        compiled_columns,
+                                        PLEHistoryUpdate::defer, invalid_block,
+                                        error);
         const bool discarded =
             !accepted && rejected->unsafe_native_handle() == nullptr &&
             error.find("history") != std::string::npos;
@@ -2047,6 +2211,74 @@ bool run_ple_block_projection_case(Context& context,
             !alias_unchanged || !discarded || !unchanged) {
             return false;
         }
+
+        if (prepend_gr_post) {
+            auto caller_owned_rejection = context.make_command_buffer(
+                label + " caller-owned late history failure", error);
+            if (!caller_owned_rejection) {
+                check(false,
+                      label + " caller-owned late-failure command buffer",
+                      error);
+                return false;
+            }
+            const bool caller_owned_accepted = Encoder::encode(
+                context, *caller_owned_rejection,
+                "Window PLE caller-owned late failure",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encode_window_ple_entry(
+                        context, encoder, rows, key_format, compiled_columns,
+                        PLEHistoryUpdate::defer, invalid_entry, encode_error);
+                },
+                error);
+            const bool caller_owned_discarded =
+                !caller_owned_accepted &&
+                caller_owned_rejection->unsafe_native_handle() == nullptr &&
+                error.find("history") != std::string::npos;
+            check(caller_owned_discarded,
+                  label + " caller propagates late PLE failure to discard GR",
+                  error);
+            const bool caller_owned_unchanged = unchanged_after_rejection();
+            check(caller_owned_unchanged,
+                  label + " caller-owned failure preserves all buffers");
+            if (!caller_owned_discarded || !caller_owned_unchanged) {
+                return false;
+            }
+        }
+
+        const char* const dispatch_mode = std::getenv("STRATA_METAL_DISPATCH");
+        if (prepend_gr_post && dispatch_mode != nullptr &&
+            std::strcmp(dispatch_mode, "concurrent") == 0) {
+            auto grouped = context.make_command_buffer(
+                label + " open concurrent group rejection", error);
+            if (!grouped) {
+                check(false, label + " open-group command buffer", error);
+                return false;
+            }
+            std::string stage_error;
+            const bool outer_encoded = Encoder::encode(
+                context, *grouped, "Window PLE open-group rejection",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    if (!encoder.group_begin(encode_error)) return false;
+                    const bool stage_accepted = encode_window_ple_entry(
+                        context, encoder, rows, key_format, compiled_columns,
+                        PLEHistoryUpdate::defer, window_entry, stage_error);
+                    if (!encoder.group_end(encode_error)) return false;
+                    return !stage_accepted;
+                },
+                error);
+            const bool rejected_open_group =
+                outer_encoded &&
+                stage_error.find("ordered concurrent-group boundary") !=
+                    std::string::npos;
+            check(rejected_open_group,
+                  label + " rejects PLE entry inside concurrent dispatch group",
+                  stage_error);
+            const bool open_group_unchanged = unchanged_after_rejection();
+            check(open_group_unchanged,
+                  label + " open-group rejection preserves all buffers");
+            grouped->discard();
+            if (!rejected_open_group || !open_group_unchanged) return false;
+        }
     }
 
     auto command = context.make_command_buffer(label, error);
@@ -2054,14 +2286,33 @@ bool run_ple_block_projection_case(Context& context,
         check(false, label + " command buffer", error);
         return false;
     }
-    const bool encoded = Encoder::encode(
-        context, *command, "full PLE projection and post-op segment",
-        [&](Encoder& encoder, std::string& encode_error) {
-            return encode_ple_block(context, encoder, rows, key_format,
-                                    compiled_columns, PLEHistoryUpdate::defer,
-                                    block, encode_error);
-        },
-        error);
+    const bool encoded = prepend_gr_post && rows == 1u
+                             ? encode_window_ple_entry(
+                                   context, *command, rows, key_format,
+                                   compiled_columns,
+                                   PLEHistoryUpdate::defer, window_entry, error)
+                         : Encoder::encode(
+                               context, *command,
+                               prepend_gr_post
+                                   ? "Window prior write and PLE block segment"
+                                   : "full PLE projection and post-op segment",
+                               [&](Encoder& encoder,
+                                   std::string& encode_error) {
+                                   return prepend_gr_post
+                                              ? encode_window_ple_entry(
+                                                    context, encoder, rows,
+                                                    key_format,
+                                                    compiled_columns,
+                                                    PLEHistoryUpdate::defer,
+                                                    window_entry, encode_error)
+                                              : encode_ple_block(
+                                                    context, encoder, rows,
+                                                    key_format,
+                                                    compiled_columns,
+                                                    PLEHistoryUpdate::defer,
+                                                    block, encode_error);
+                               },
+                               error);
     check(encoded, label + " shared-Encoder encode", error);
     if (!encoded) {
         command->discard();
@@ -2179,6 +2430,10 @@ bool run_ple_block_projection_case(Context& context,
     }
     check(!guarded[input_buffer].first_unwritten_change({}),
           label + " input and guards remain unchanged");
+    check(!guarded[previous_block_buffer].first_unwritten_change({}),
+          label + " previous block output remains read-only");
+    check(!guarded[previous_inject_buffer].first_unwritten_change({}),
+          label + " previous injection remains read-only");
     check(!guarded[key_weights_buffer].first_unwritten_change({}),
           label + " key weights and guards remain unchanged");
     check(!guarded[value_weights_buffer].first_unwritten_change({}),
@@ -3790,11 +4045,11 @@ bool run_set(Context& context, twin::InputSet set,
             passed &= run_shared_ple_segment(context, options, rows);
         }
         passed &= run_ple_block_projection_case(
-            context, options, MatVecWeightFormat::q2_0, 2u, 4u, true);
+            context, options, MatVecWeightFormat::q2_0, 2u, 4u, true, true);
         passed &= run_ple_block_projection_case(
             context, options, MatVecWeightFormat::q8_0, 8u, 8u, false);
         passed &= run_ple_block_projection_case(
-            context, options, MatVecWeightFormat::bf16, 2u, 4u, false);
+            context, options, MatVecWeightFormat::bf16, 1u, 1u, false, true);
     }
     return passed;
 }

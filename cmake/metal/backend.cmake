@@ -121,6 +121,7 @@ set(STRATA_METAL_ENGINE_SOURCES
   src/metal/engine/prefill_gr_norm_dispatch.mm
   src/metal/engine/gr_dispatch.mm
   src/metal/engine/ple_dispatch.mm
+  src/metal/engine/window_ple_dispatch.mm
   src/metal/engine/window.cpp
   src/metal/engine/window_params.cpp
   src/metal/engine/window_params_ring.cpp

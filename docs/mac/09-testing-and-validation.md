@@ -1223,7 +1223,13 @@ unchanged outputs. Partial query/`ple_norm` overlap is rejected. The
 `encode_ple_block` fixtures cover Q2_0, Q8_0 and BF16 key formats, the
 F32-activation BF16 value projection, padded compiled columns and a discarded
 late failure after both projections were encoded. `metal_ple_test_concurrent`
-runs the same fixture with concurrent dispatch enabled.
+runs the same fixture with concurrent dispatch enabled. The PLE fixture also
+composes layer 0's GR post write in place before PLE at T=1 and T=2. Its
+query-norm oracle consumes the GPU result from a separate GR-post probe; a
+late short-history failure verifies that both the preceding write and PLE
+dispatches are discarded. Concurrent mode rejects this ordered composition
+when called inside an open dispatch group. The focused serial and concurrent
+CTest cases pass.
 
 | Tests | Defined in | What it serves |
 | --- | --- | --- |
