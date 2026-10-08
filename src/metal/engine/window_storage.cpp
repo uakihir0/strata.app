@@ -808,6 +808,7 @@ struct FullModeStorage::Impl {
     FullModeLayout layout;
     BufferRef expert_addresses;
     BufferRef resident;
+    BufferRef usage;
     std::unique_ptr<strata::kernels::PleTable> ple_table;
     strata::kernels::PleTableReader ple_reader;
 };
@@ -977,23 +978,30 @@ std::unique_ptr<FullModeStorage> FullModeStorage::open(Context& context,
         error = "full-mode converted dense-pack arena does not match validated geometry";
         return nullptr;
     }
+    const std::size_t usage_entries =
+        static_cast<std::size_t>(kFullModeMaxLayers) * geometry.n_expert;
     if (candidate->layout.expert_addresses.size() >
             std::numeric_limits<std::size_t>::max() / sizeof(std::uint64_t) ||
         candidate->layout.resident.size() >
-            std::numeric_limits<std::size_t>::max() / sizeof(std::int32_t)) {
-        error = "full-mode table size overflows";
+            std::numeric_limits<std::size_t>::max() / sizeof(std::int32_t) ||
+        usage_entries > std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+        error = "full-mode address, resident or usage table size overflows";
         return nullptr;
     }
     const std::size_t address_bytes = candidate->layout.expert_addresses.size() * sizeof(std::uint64_t);
     const std::size_t resident_bytes = candidate->layout.resident.size() * sizeof(std::int32_t);
+    const std::size_t usage_bytes = usage_entries * sizeof(float);
     candidate->expert_addresses =
         context.buffers().allocate("expert address table", address_bytes, error);
     if (!candidate->expert_addresses) return nullptr;
     candidate->resident = context.buffers().allocate("resident table", resident_bytes, error);
     if (!candidate->resident) return nullptr;
+    candidate->usage = context.buffers().allocate("MoE usage table", usage_bytes, error);
+    if (!candidate->usage) return nullptr;
     std::memcpy(candidate->expert_addresses.contents, candidate->layout.expert_addresses.data(),
                 address_bytes);
     std::memcpy(candidate->resident.contents, candidate->layout.resident.data(), resident_bytes);
+    std::memset(candidate->usage.contents, 0, usage_bytes);
     if (!context.buffers().commit_residency(error)) return nullptr;
 
     auto storage = std::unique_ptr<FullModeStorage>(new FullModeStorage(std::move(candidate)));
@@ -1018,6 +1026,8 @@ ReadOnlyBufferRef FullModeStorage::expert_address_table() const noexcept {
 ReadOnlyBufferRef FullModeStorage::resident_table() const noexcept {
     return ReadOnlyBufferRef(impl_->resident);
 }
+
+BufferRef FullModeStorage::usage_table() const noexcept { return impl_->usage; }
 
 strata::kernels::PleTableReader* FullModeStorage::ple_reader() noexcept {
     return impl_ != nullptr && impl_->ple_table != nullptr

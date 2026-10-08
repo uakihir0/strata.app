@@ -267,10 +267,14 @@ void full_plan() {
     check(plan.session_state_bytes == 118'038'528u &&
               plan.window_scratch_bytes == 47'911'680u,
           "planner reports exact Qwen4exp session and 65,536-cell Window scratch sizes");
+    const std::uint64_t qwen_usage_bytes =
+        48ull * geometry.n_expert * sizeof(float);
     check(plan.session_state_bytes <= plan.fixed_bytes &&
               plan.window_scratch_bytes <=
-                  plan.fixed_bytes - plan.session_state_bytes,
-          "Qwen4exp fixed-state subtotal fits the unchanged fixed allowance");
+                  plan.fixed_bytes - plan.session_state_bytes &&
+              qwen_usage_bytes <= plan.fixed_bytes - plan.session_state_bytes -
+                                      plan.window_scratch_bytes,
+          "Qwen4exp state, scratch and persistent usage fit the unchanged fixed allowance");
     auto coder_geometry = q2_geometry();
     coder_geometry.family = "coder";
     coder_geometry.n_expert = 256;
@@ -283,10 +287,14 @@ void full_plan() {
               coder_plan.window_scratch_bytes == 47'641'344u &&
               coder_plan.fixed_bytes == plan.fixed_bytes,
           "Coder planner uses the exact 256-expert scratch while retaining the fixed allowance");
+    const std::uint64_t coder_usage_bytes =
+        48ull * coder_geometry.n_expert * sizeof(float);
     check(coder_plan.session_state_bytes <= coder_plan.fixed_bytes &&
               coder_plan.window_scratch_bytes <=
-                  coder_plan.fixed_bytes - coder_plan.session_state_bytes,
-          "Coder fixed-state subtotal fits the unchanged fixed allowance");
+                  coder_plan.fixed_bytes - coder_plan.session_state_bytes &&
+              coder_usage_bytes <= coder_plan.fixed_bytes - coder_plan.session_state_bytes -
+                                       coder_plan.window_scratch_bytes,
+          "Coder state, scratch and persistent usage fit the unchanged fixed allowance");
     check(plan.fixed_bytes == kFixedAllowanceBytes &&
               coder_plan.fixed_bytes == kFixedAllowanceBytes,
           "Qwen and Coder plans retain the 256 MiB fixed admission charge");

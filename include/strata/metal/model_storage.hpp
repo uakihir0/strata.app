@@ -55,6 +55,8 @@ public:
     const KvStore* kv_store() const noexcept;
     const MtpRuntimeStorage* mtp_runtime() const noexcept;
     const WindowScratchStorage* window_scratch() const noexcept;
+    /// Mutable MoE usage counters; valid until this model storage is destroyed.
+    BufferRef moe_usage_table() const noexcept;
     /// Borrow the full-mode tensor/table resolver; null in tiered mode. The
     /// pointer does not outlive this ModelStorage, and its buffer views expose
     /// CPU mappings only through const pointers.

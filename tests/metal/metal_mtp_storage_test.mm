@@ -777,14 +777,16 @@ int main(int argc, char** argv) {
 
         PlanResult underreported_fixed_plan = owner_plan;
         const std::uint64_t exact_fixed_subtotal =
-            owner_plan.session_state_bytes + owner_plan.window_scratch_bytes;
+            owner_plan.session_state_bytes + owner_plan.window_scratch_bytes +
+            static_cast<std::uint64_t>(kTieredMaxLayers) * owner_geometry.n_expert *
+                sizeof(float);
         underreported_fixed_plan.fixed_bytes = exact_fixed_subtotal - 1;
         underreported_fixed_plan.total_bytes -=
             owner_plan.fixed_bytes - underreported_fixed_plan.fixed_bytes;
         require(ModelStorage::open(*owner_context, native.string(), owner_geometry,
                                    owner_window_sources, underreported_fixed_plan, error,
                                    &owner_mtp_sources) == nullptr &&
-                    error.find("exact session and Window scratch bytes exceed") !=
+                    error.find("exact session, Window scratch and MoE usage bytes exceed") !=
                         std::string::npos &&
                     owner_context->buffers().allocation_count() ==
                         allocations_before_owner,

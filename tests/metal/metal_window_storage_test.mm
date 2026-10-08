@@ -994,8 +994,11 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     const BufferRef address_table = storage->expert_address_table();
     const BufferRef resident_table = storage->resident_table();
     const BufferRef plan_buffer = storage->plan_buffer();
-    require(address_table && resident_table && plan_buffer,
-            "tiered addr, res and plan tables must be shared Metal buffers");
+    const BufferRef usage_table = storage->usage_table();
+    require(address_table && resident_table && plan_buffer && usage_table &&
+                usage_table.length == static_cast<std::size_t>(kTieredMaxLayers) *
+                                          geometry.n_expert * sizeof(float),
+            "tiered addr, res, plan and usage tables must be shared Metal buffers");
     const auto* addresses = static_cast<const std::uint64_t*>(address_table.contents);
     const auto* resident = static_cast<const std::int32_t*>(resident_table.contents);
     const auto* plans = static_cast<const TieredMoePlan*>(plan_buffer.contents);
@@ -1005,8 +1008,12 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
                 addresses[7 * 3 + 1] == layout.experts[7].resident_addresses[1] &&
                 addresses[7 * 3 + 2] == layout.experts[7].resident_addresses[2] &&
                 addresses[0] == 0 && addresses[1] == 0 && addresses[2] == 0 &&
-                plans[0].n_groups == 0 && plans[0].n_miss == 0,
-            "tiered shared tables must match the host layout and start with zeroed plans");
+                plans[0].n_groups == 0 && plans[0].n_miss == 0 &&
+                std::all_of(static_cast<const float*>(usage_table.contents),
+                            static_cast<const float*>(usage_table.contents) +
+                                usage_table.length / sizeof(float),
+                            [](float value) { return value == 0.0f; }),
+            "tiered shared tables must match the host layout and start with zeroed plans and usage");
 
     auto expert_store = ExpertStore::create(*storage, geometry, error);
     require(expert_store != nullptr, "create tiered ExpertStore: " + error);
@@ -1234,14 +1241,15 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     id<MTLCommandBuffer> native_cache =
         (__bridge id<MTLCommandBuffer>)cache_command->unsafe_native_handle();
     [native_cache waitUntilCompleted];
-    require(context.buffers().allocation_count() == 6,
-            "tiered mode must allocate its three arenas and three tables, without GGUF windows");
+    require(context.buffers().allocation_count() == 7,
+            "tiered mode must allocate its three arenas and four tables, without GGUF windows");
     require_not_overlapping_gguf_mapping(dense_arena, source_file, "tiered dense arena");
     require_not_overlapping_gguf_mapping(resident_arena, source_file, "tiered resident arena");
     require_not_overlapping_gguf_mapping(slot_arena, source_file, "tiered slot arena");
     require_not_overlapping_gguf_mapping(address_table, source_file, "tiered address table");
     require_not_overlapping_gguf_mapping(resident_table, source_file, "tiered resident table");
     require_not_overlapping_gguf_mapping(plan_buffer, source_file, "tiered plan table");
+    require_not_overlapping_gguf_mapping(usage_table, source_file, "tiered usage table");
 
     storage.reset();
     require(can_take_exclusive_lock(source_set_lock) &&
@@ -1620,6 +1628,9 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
                 full_ple->rows() == 728,
             "full-mode ModelStorage must publish its mapped PLE reader");
     const FullModeStorage* full_mode = full_storage->full_mode_storage();
+    const BufferRef full_mode_usage =
+        full_mode != nullptr ? full_mode->usage_table() : BufferRef{};
+    const BufferRef model_usage = full_storage->moe_usage_table();
     FullModeTensorView owner_token_view;
     require(full_mode != nullptr &&
                 full_mode->dense_tensor_view("token_embd.weight",
@@ -1629,8 +1640,17 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
                 full_mode->expert_address_table() &&
                 full_mode->resident_table() &&
                 context.buffers().owns(full_mode->expert_address_table()) &&
-                context.buffers().owns(full_mode->resident_table()),
-            "full-mode ModelStorage must expose borrowed dense weights and expert tables: " +
+                context.buffers().owns(full_mode->resident_table()) &&
+                full_mode_usage && model_usage &&
+                full_mode_usage.gpu_address == model_usage.gpu_address &&
+                full_mode_usage.length == static_cast<std::size_t>(kFullModeMaxLayers) *
+                                              plain_geometry.n_expert * sizeof(float) &&
+                context.buffers().owns(model_usage) &&
+                std::all_of(static_cast<const float*>(model_usage.contents),
+                            static_cast<const float*>(model_usage.contents) +
+                                model_usage.length / sizeof(float),
+                            [](float value) { return value == 0.0f; }),
+            "full-mode ModelStorage must expose borrowed dense weights, expert tables and zeroed usage: " +
                 error);
     const KvStore* full_kv = full_storage->kv_store();
     const BufferRef full_rope = full_kv != nullptr ? full_kv->rope() : BufferRef{};
@@ -1933,6 +1953,15 @@ void run_model_storage_owner_test(Context& context, const fs::path& directory,
             "tiered ModelStorage must not publish a reader for its closed startup mapping");
     require(tiered_storage->full_mode_storage() == nullptr,
             "tiered ModelStorage must not publish full-mode weight views or tables");
+    const BufferRef tiered_model_usage = tiered_storage->moe_usage_table();
+    require(tiered_model_usage && context.buffers().owns(tiered_model_usage) &&
+                tiered_model_usage.length == static_cast<std::size_t>(kTieredMaxLayers) *
+                                                packed_geometry.n_expert * sizeof(float) &&
+                std::all_of(static_cast<const float*>(tiered_model_usage.contents),
+                            static_cast<const float*>(tiered_model_usage.contents) +
+                                tiered_model_usage.length / sizeof(float),
+                            [](float value) { return value == 0.0f; }),
+            "tiered ModelStorage must expose its zeroed persistent MoE usage counters");
     require(tiered_storage->kv_store() != nullptr &&
                 tiered_storage->kv_store()->allocation().length ==
                     tiered_plan.kv_bytes &&

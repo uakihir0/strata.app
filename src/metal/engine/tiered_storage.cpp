@@ -648,6 +648,7 @@ struct TieredStorage::Impl {
     BufferRef expert_addresses;
     BufferRef resident;
     BufferRef plans;
+    BufferRef usage;
     std::vector<ShardDescriptors> shard_descriptors;
     std::vector<std::string> shard_paths;
     std::vector<std::uint64_t> shard_file_sizes;
@@ -796,13 +797,16 @@ std::unique_ptr<TieredStorage> TieredStorage::open(Context& context,
         return nullptr;
     }
 
+    const std::size_t usage_entries =
+        static_cast<std::size_t>(kTieredMaxLayers) * geometry.n_expert;
     if (candidate->layout.expert_addresses.size() >
             std::numeric_limits<std::size_t>::max() / sizeof(std::uint64_t) ||
         candidate->layout.resident.size() >
             std::numeric_limits<std::size_t>::max() / sizeof(std::int32_t) ||
         candidate->layout.plans.size() >
-            std::numeric_limits<std::size_t>::max() / sizeof(TieredMoePlan)) {
-        error = "tiered address, resident or plan table size overflows";
+            std::numeric_limits<std::size_t>::max() / sizeof(TieredMoePlan) ||
+        usage_entries > std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+        error = "tiered address, resident, plan or usage table size overflows";
         return nullptr;
     }
     candidate->expert_addresses = context.buffers().allocate(
@@ -817,6 +821,9 @@ std::unique_ptr<TieredStorage> TieredStorage::open(Context& context,
         "tiered MoE plan table",
         candidate->layout.plans.size() * sizeof(TieredMoePlan), error);
     if (!candidate->plans) return nullptr;
+    candidate->usage = context.buffers().allocate(
+        "tiered MoE usage table", usage_entries * sizeof(float), error);
+    if (!candidate->usage) return nullptr;
 
     std::vector<CopyTask> tasks;
     tasks.reserve(candidate->layout.dense_copies.size() +
@@ -875,6 +882,7 @@ std::unique_ptr<TieredStorage> TieredStorage::open(Context& context,
                 candidate->layout.resident.size() * sizeof(std::int32_t));
     std::memcpy(candidate->plans.contents, candidate->layout.plans.data(),
                 candidate->layout.plans.size() * sizeof(TieredMoePlan));
+    std::memset(candidate->usage.contents, 0, candidate->usage.length);
     if (!context.buffers().commit_residency(error)) return nullptr;
 
     auto storage = std::unique_ptr<TieredStorage>(new TieredStorage(std::move(candidate)));
@@ -1010,5 +1018,6 @@ bool TieredStorage::expert_pages_resident(std::uint32_t layer,
 BufferRef TieredStorage::expert_address_table() const noexcept { return impl_->expert_addresses; }
 BufferRef TieredStorage::resident_table() const noexcept { return impl_->resident; }
 BufferRef TieredStorage::plan_buffer() const noexcept { return impl_->plans; }
+BufferRef TieredStorage::usage_table() const noexcept { return impl_->usage; }
 
 }  // namespace strata::metal

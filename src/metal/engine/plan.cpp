@@ -379,6 +379,14 @@ bool make_plan(const Geometry& geometry, const PlanOptions& options, PlanResult&
     }
     result.fixed_bytes = kFixedBytes;
     result.experts_total = static_cast<std::uint64_t>(geometry.n_layers) * geometry.n_expert;
+    std::uint64_t moe_usage_entries = 0;
+    std::uint64_t moe_usage_bytes = 0;
+    if (!multiply(48, geometry.n_expert, moe_usage_entries) ||
+        !multiply(moe_usage_entries, sizeof(float), moe_usage_bytes) ||
+        moe_usage_bytes > result.fixed_bytes) {
+        error = "persistent MoE usage table exceeds the fixed-memory allowance";
+        return false;
+    }
     QsaKvLayout qsa_kv_layout;
     if (!make_qsa_kv_layout(options.max_context, options.kv, qsa_kv_layout, error)) return false;
     result.kv_bytes = qsa_kv_layout.allocation_bytes;
@@ -398,12 +406,13 @@ bool make_plan(const Geometry& geometry, const PlanOptions& options, PlanResult&
         result.window_scratch_bytes = scratch_layout.allocation_bytes;
         std::uint64_t exact_fixed_subtotal = 0;
         if (!add(result.session_state_bytes, result.window_scratch_bytes,
-                 exact_fixed_subtotal)) {
+                 exact_fixed_subtotal) ||
+            !add(exact_fixed_subtotal, moe_usage_bytes, exact_fixed_subtotal)) {
             error = "exact fixed-state byte count overflows";
             return false;
         }
         if (exact_fixed_subtotal > result.fixed_bytes) {
-            error = "exact session and Window scratch bytes exceed the fixed-memory allowance";
+            error = "exact session, Window scratch and MoE usage bytes exceed the fixed-memory allowance";
             return false;
         }
     }

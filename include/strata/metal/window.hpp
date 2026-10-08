@@ -94,6 +94,8 @@ public:
     ReadOnlyBufferRef dense_pack_arena() const noexcept;
     ReadOnlyBufferRef expert_address_table() const noexcept;
     ReadOnlyBufferRef resident_table() const noexcept;
+    /// Persistent per-layer expert-use counters, initialized to zero.
+    BufferRef usage_table() const noexcept;
     /// Row access to the storage-owned PLE reader; lifecycle and I/O mode stay
     /// controlled by this owner.
     strata::kernels::PleTableReader* ple_reader() noexcept;

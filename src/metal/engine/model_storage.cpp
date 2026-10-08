@@ -98,13 +98,16 @@ bool validate_plan_geometry(const Geometry& geometry, const PlanResult& memory_p
         return false;
     }
 
+    const std::uint64_t moe_usage_bytes =
+        static_cast<std::uint64_t>(kTieredMaxLayers) * geometry.n_expert * sizeof(float);
     std::uint64_t exact_fixed_subtotal = 0;
     if ((memory_plan.session_state_bytes == 0) !=
             (memory_plan.window_scratch_bytes == 0) ||
         !add_bytes(memory_plan.session_state_bytes,
                    memory_plan.window_scratch_bytes, exact_fixed_subtotal) ||
+        !add_bytes(exact_fixed_subtotal, moe_usage_bytes, exact_fixed_subtotal) ||
         exact_fixed_subtotal > memory_plan.fixed_bytes) {
-        error = "exact session and Window scratch bytes exceed the fixed-memory allowance";
+        error = "exact session, Window scratch and MoE usage bytes exceed the fixed-memory allowance";
         return false;
     }
 
@@ -183,6 +186,8 @@ std::unique_ptr<ModelStorage> ModelStorage::open(Context& context,
     QsaKvLayout kv_layout;
     if (!validate_main_qsa_kv_plan(memory_plan, facts.max_buffer_length,
                                    kv_layout, error)) return nullptr;
+    const std::uint64_t moe_usage_bytes =
+        static_cast<std::uint64_t>(kTieredMaxLayers) * geometry.n_expert * sizeof(float);
     WindowScratchLayout scratch_layout;
     bool open_window_scratch = false;
     if (is_qwen4exp_catalog_family(geometry.family)) {
@@ -204,8 +209,9 @@ std::unique_ptr<ModelStorage> ModelStorage::open(Context& context,
         std::uint64_t exact_fixed_subtotal = 0;
         if (!add_bytes(session_layout.allocation_bytes,
                        scratch_layout.allocation_bytes, exact_fixed_subtotal) ||
+            !add_bytes(exact_fixed_subtotal, moe_usage_bytes, exact_fixed_subtotal) ||
             exact_fixed_subtotal > memory_plan.fixed_bytes) {
-            error = "exact session and Window scratch bytes exceed the fixed-memory allowance";
+            error = "exact session, Window scratch and MoE usage bytes exceed the fixed-memory allowance";
             return nullptr;
         }
         if (facts.max_buffer_length == 0 ||
@@ -307,6 +313,12 @@ const MtpRuntimeStorage* ModelStorage::mtp_runtime() const noexcept {
 
 const WindowScratchStorage* ModelStorage::window_scratch() const noexcept {
     return window_scratch_.get();
+}
+
+BufferRef ModelStorage::moe_usage_table() const noexcept {
+    if (full_ != nullptr) return full_->usage_table();
+    if (tiered_ != nullptr) return tiered_->usage_table();
+    return {};
 }
 
 const FullModeStorage* ModelStorage::full_mode_storage() const noexcept {

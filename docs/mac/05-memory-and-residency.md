@@ -223,11 +223,12 @@ buffers stay fixed because the arena is allocated for T = 8 even when `--mtp-max
 The current exact GDN and PLE session-state allocation is 118,038,528 B (112.57 MiB). Together with the T=8
 Window scratch at 262,144 cells, the two layouts total 167,514,880 B (159.75 MiB) for 256 experts and
 167,523,072 B (159.76 MiB) for 512 experts, below the 256 MiB allowance. The planner reports
-`session_state_bytes` and `window_scratch_bytes` from these exact layouts and checks their subtotal against
-`F_fixed`; `ModelStorage` rebuilds and validates the same values and opens the Window scratch inside its outer
-allocation transaction. Session state remains owned by the session lifecycle. These two fields are a breakdown of
-`fixed_bytes`, not additional plan charges. Keep `F_fixed = 0.25 GiB` in admission until every fixed buffer has a
-verified exact size.
+`session_state_bytes` and `window_scratch_bytes` from these exact layouts and checks their subtotal together with
+`48 × n_expert × sizeof(float)` for the persistent MoE usage table against `F_fixed`; `ModelStorage` recomputes the
+same total and opens its buffers inside the outer allocation transaction. Session state remains owned by the session
+lifecycle. The two reported fields are a breakdown of `fixed_bytes`, not additional plan charges; the usage-table
+extent comes from the model geometry. Keep `F_fixed = 0.25 GiB` in admission until every fixed buffer has a verified
+exact size.
 
 ### 2.4 Prompt path (`--prefill`)
 
@@ -619,8 +620,11 @@ The policy and constants are in [06](06-engine-host-port.md), section 9.4. Memor
   2. The adapt thread `pread`s the incoming blob through the bulk (`F_NOCACHE`) descriptor, directly into the
      victim's place. No window reads that place any more, so no staging copy is needed.
   3. Between windows, after the read has landed, set `addr[in]` to the place and `res[in]` to its index.
-- Usage counters: `usage[48][512]` float, written by the plan kernel (+1 per (row, k) routing), read and decayed
-  (× 0.7) by the adapt thread between windows.
+- Usage counters: a zeroed Context-owned Shared table with 48 rows and `n_expert` floats per row (up to 512),
+  retained by the selected model storage for the full run. The plan kernel adds 1 per (row, k) routing in tiered mode.
+  Adaptive-swap integration is not implemented yet; when connected, the adapt thread must read and decay the table
+  (× 0.7) between windows after GPU plan writes complete. Full mode binds the same table shape but does not read or
+  update it.
 
 ### 5.7 Lookahead
 
@@ -666,8 +670,8 @@ If the query fails, the read still proceeds and the blob is conservatively count
    exclusion, and every converted exclusion must match exactly one validated `dense.bin` row and one arena binding.
    Unlisted pack bytes are never read. Windows split at `maxBufferLength` may overlap by up to 16 KiB at the split;
    the union counts those bytes once. The tiered loader validates the complete source inventory before allocating
-   and uses anonymous no-copy arenas; `metal_tiered_copy_test` checks that the CPU-visible address ranges of all six
-   tiered buffers do not overlap the live GGUF mapping.
+   and uses anonymous no-copy arenas; `metal_tiered_copy_test` checks that the CPU-visible address ranges of all seven
+   tiered arenas and tables do not overlap the live GGUF mapping.
 
 Violating rule 1 or 2 would, on the first command buffer, page the whole file into memory and push the machine into
 heavy memory pressure. `metal_never_wrap_test` checks the full-mode loader's PLE and union rules on a live synthetic
@@ -871,9 +875,9 @@ python tools/hit_curve.py TRACE ... [--profile data/expert-profile.bin] [--n-exp
 | --- | --- |
 | `metal_plan_test` | Section 3 on synthetic inputs: full/tiered choice, prefill chunk choice, slot pool iteration, error messages, the PLAN line keys. Includes every row of section 8 as a golden case with fixed W. |
 | `metal_window_test` | Window planning (section 4.2): 16 KiB rounding, merge rule, splits at expert-slab boundaries when `maxBufferLength` is forced small (test hook), and preservation of the merged-range union across an oversized unread gap. On the header fixtures of [03](03-model-reference.md) work item R1: one window for Q2_0 shard 1, none for the PLE shard, two for Swift shard 1 with no PLE tensor mapping (page-alignment padding may cover up to one page at an adjacent tensor boundary), and `wrapped_unread` of 252,149,760 B plus padding for Swift. |
-| `metal_window_storage_test` | Sections 4.1 and 4.3: a nine-expert synthetic GGUF spanning multiple VM pages is mmaped, wrapped in page-rounded no-copy MTLBuffer, and mapped to the exact expert address table; checks the full-mode shared-mapping IQ4 PLE reader through `ModelStorage`, tiered-mode reader absence, exact converted-router arena bytes, immutable inspection-time row mapping, 16 KiB padding, malformed/overlapping ranges, layer bounds, rollback and warm-up, plus the shared maximum-capacity address/resident buffers and mmap lifetime. `metal_window_test` checks profile order across wave boundaries, multiple converted-router row bindings, pack-range overlap and `maxBufferLength`, and compact row indexing with a two-layer, 256-expert Coder layout. |
+| `metal_window_storage_test` | Sections 4.1 and 4.3: a nine-expert synthetic GGUF spanning multiple VM pages is mmaped, wrapped in page-rounded no-copy MTLBuffer, and mapped to the exact expert address table; checks the full-mode shared-mapping IQ4 PLE reader through `ModelStorage`, tiered-mode reader absence, exact converted-router arena bytes, immutable inspection-time row mapping, 16 KiB padding, malformed/overlapping ranges, layer bounds, rollback and warm-up, plus the shared maximum-capacity address/resident buffers, zeroed persistent usage tables, and mmap lifetime. `metal_window_test` checks profile order across wave boundaries, multiple converted-router row bindings, pack-range overlap and `maxBufferLength`, and compact row indexing with a two-layer, 256-expert Coder layout. |
 | `metal_never_wrap_test` | Section 6: the live full-mode loader requires the shard inventory and `wrapped_unread` total to match the memory plan, accounts for every GGUF tensor exactly once as included or intentionally excluded, excludes the PLE tensor from sources, slices and addresses, resolves the converted F32 router only to its BF16 arena binding, and allows at most one 16 KiB page of overlap at the PLE boundary. |
-| `metal_tiered_copy_test` | On a small synthetic GGUF: the dense and resident arenas hold exact source bytes (byte compare), including converted `dense.bin` router rows; the tiered opener configures both descriptors and address/resident/plan tables match the layout; the test confirms the source GGUF mapping path and checks that no tiered buffer address range overlaps it. It rejects same-size source replacements, malformed dense-pack ranges/sizes and pending-generation markers before allocation. `metal_weight_store_test` checks rejection of held source-file/source-set/pack locks and pending generations, and that returned leases keep blocking writers through storage opening. |
+| `metal_tiered_copy_test` | On a small synthetic GGUF: the dense and resident arenas hold exact source bytes (byte compare), including converted `dense.bin` router rows; the tiered opener configures both descriptors, matches address/resident/plan tables to the layout, and publishes a zeroed persistent usage table; the test confirms the source GGUF mapping path and checks that no tiered buffer address range overlaps it. It rejects same-size source replacements, malformed dense-pack ranges/sizes and pending-generation markers before allocation. `metal_weight_store_test` checks rejection of held source-file/source-set/pack locks and pending generations, and that returned leases keep blocking writers through storage opening. |
 | `metal_slot_pool_test` | Ping-pong halves, Loading-to-Ready publication, duplicate-load refusal, abandoned-load retry, LRU tags, and no slot reuse until the layer-complete event; the command-buffer callback releases remaining leases, and the test gates the GPU with an arrival/release event pair. |
 | `metal_full_vs_tiered` (gate C4) | The same prompts, greedy and seeded, give byte-identical tokens and DONE counts (except the tier counters) in full mode and in tiered mode with `--gpu-budget-mib` forcing 50% and 90% residency ([09-testing-and-validation.md](09-testing-and-validation.md)) |
 | `metal_memory_pressure_smoke` | The M-4 procedure; records its numbers. Runs weekly, and on demand ([09-testing-and-validation.md](09-testing-and-validation.md), section 5.5). |
@@ -892,7 +896,7 @@ item H10, and the kernels that read these buffers are [04](04-metal-kernels.md) 
 | U2 | Window planning (section 4.2) | `metal_window_test` passes on the header fixtures of [03](03-model-reference.md) work item R1 |
 | U3 | Full mode (sections 4.1 and 4.3): the file windows, the address and resident tables, the residency set, the warm-up | Q2_0 at 65,536 fp16 cells starts on the reference Mac in full mode with the plan of section 8.1 and prints the warm-up line; M-5 is in appendix A |
 | U4 | The never-wrap rules and the loader's union check (section 6) | `metal_never_wrap_test` and the tiered no-GGUF assertion in `metal_tiered_copy_test` pass |
-| U5 | The tiered layout (sections 5.2 and 5.3): the dense and resident arenas filled through the bulk descriptor, the miss descriptor, `res`, `addr` and `plan` | `metal_tiered_copy_test` passes |
+| U5 | The tiered layout (sections 5.2 and 5.3): the dense and resident arenas filled through the bulk descriptor, the miss descriptor, `res`, `addr`, `plan` and persistent `usage` | `metal_tiered_copy_test` passes |
 | U6 | The slot pool, its halves and the slot cache; miss reads; prefill prefetch; lookahead; DONE accounting (sections 5.4, 5.5, 5.7 and 5.8), with [06](06-engine-host-port.md) H10 | `metal_slot_pool_test` and synthetic ExpertStore coverage in `metal_tiered_copy_test` pass; production layer-handshake parity and `metal_full_vs_tiered` remain open under REV-024 |
 | U7 | Adaptive swaps, memory side (section 5.6), with [06](06-engine-host-port.md) H10 | Gate C4 passes, including the arm of `accept.py c4` in which experts are swapped during the run ([09](09-testing-and-validation.md), section 4.4) |
 | U8 | macOS interplay (section 9): the memory-pressure source with [06](06-engine-host-port.md) H9, `STRATA_ARENA_LOCK`, the RAM warnings of section 3.2, step 6 | `metal_memory_pressure_smoke` passes ([09](09-testing-and-validation.md), section 5.5, with work item T13); with `STRATA_ARENA_LOCK=1` and a resident arena above the `mlock` limit, the engine warns and runs |

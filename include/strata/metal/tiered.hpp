@@ -114,6 +114,8 @@ public:
     BufferRef expert_address_table() const noexcept;
     BufferRef resident_table() const noexcept;
     BufferRef plan_buffer() const noexcept;
+    /// Persistent per-layer expert-use counters, initialized to zero.
+    BufferRef usage_table() const noexcept;
 
 private:
     struct Impl;
