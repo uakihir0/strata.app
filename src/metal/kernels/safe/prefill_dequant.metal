@@ -103,6 +103,49 @@ kernel void strata_pf_dequant_q5_k(
     }
 }
 
+static_assert(sizeof(block_q6_K) == 210,
+              "Q6_K Prefill dequantization requires 210-byte blocks");
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void strata_pf_dequant_q6_k(
+    device const block_q6_K* weights [[buffer(0)]],
+    device half* k_major_f16 [[buffer(1)]],
+    constant PrefillDequantParams& params [[buffer(2)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    const uint column = 256u * group.x + tid;
+    if (column >= params.n_out) return;
+
+    constexpr uint values_per_block = 256u;
+    const uint blocks_per_row = params.k / values_per_block;
+    const device block_q6_K* row =
+        weights + ulong(column) * blocks_per_row + group.y;
+    const float d = float(row->d);
+    for (uint value = 0u; value < values_per_block; ++value) {
+        const uint k = values_per_block * group.y + value;
+        const uint group32 = value / 32u;
+        const uint within_group = value % 32u;
+        const uint ql_half = group32 % 4u;
+        const uint ql_chunk = group32 / 4u;
+        const uint ql_byte = 64u * ql_chunk + 32u * (ql_half % 2u) +
+                             within_group;
+        const uint ql_shift = ql_half < 2u ? 0u : 4u;
+        const uint qh_byte = 32u * ql_chunk + within_group;
+        const uint qh_shift = 2u * ql_half;
+        const uint low =
+            (uint(row->ql[ql_byte]) >> ql_shift) & 0x0fu;
+        const uint high =
+            (uint(row->qh[qh_byte]) >> qh_shift) & 0x03u;
+        const int code = int(low | (high << 4u)) - 32;
+        const uint scale_index = 8u * ql_chunk + 2u * ql_half +
+                                 within_group / 16u;
+        const float scaled_d =
+            d * float(int(row->scales[scale_index]));
+        const float expanded = scaled_d * float(code);
+        k_major_f16[ulong(k) * params.n_out + column] = half(expanded);
+    }
+}
+
 [[max_total_threads_per_threadgroup(256)]]
 kernel void strata_pf_dequant_q2_0(
     device const block_q2_0* weights [[buffer(0)]],

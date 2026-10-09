@@ -19,6 +19,7 @@ constexpr std::uint32_t kValuesPerQ2Block = 64u;
 constexpr std::uint32_t kValuesPer32ValueBlock = 32u;
 constexpr std::uint32_t kValuesPerQ4KBlock = 256u;
 constexpr std::uint32_t kValuesPerQ5KBlock = 256u;
+constexpr std::uint32_t kValuesPerQ6KBlock = 256u;
 constexpr std::uint32_t kThreads = 256u;
 constexpr std::size_t kHalfBytes = sizeof(std::uint16_t);
 constexpr std::uint32_t kMaxSignedExtent =
@@ -30,6 +31,7 @@ static_assert(sizeof(block_q5_0) == 22u);
 static_assert(sizeof(block_q8_0) == 34u);
 static_assert(sizeof(block_q4_K) == 144u);
 static_assert(sizeof(block_q5_K) == 176u);
+static_assert(sizeof(block_q6_K) == 210u);
 static_assert(sizeof(PrefillDequantParams) == 2u * sizeof(std::uint32_t));
 
 bool checked_multiply(std::size_t left, std::size_t right,
@@ -311,6 +313,29 @@ bool encode_prefill_dequant_q5_k(Context& context,
         context, command_buffer, "Prefill Q5_K dequantization",
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_prefill_dequant_q5_k(
+                context, encoder, params, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_prefill_dequant_q6_k(Context& context, Encoder& encoder,
+                                 const PrefillDequantParams& params,
+                                 const PrefillDequantBuffers& buffers,
+                                 std::string& error) {
+    return encode_dequant_dispatch<block_q6_K>(
+        context, encoder, params, buffers, "Q6_K",
+        "strata_pf_dequant_q6_k", kValuesPerQ6KBlock, error);
+}
+
+bool encode_prefill_dequant_q6_k(Context& context,
+                                 CommandBuffer& command_buffer,
+                                 const PrefillDequantParams& params,
+                                 const PrefillDequantBuffers& buffers,
+                                 std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Prefill Q6_K dequantization",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_dequant_q6_k(
                 context, encoder, params, buffers, encode_error);
         },
         error);
