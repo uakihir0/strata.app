@@ -146,6 +146,66 @@ kernel void strata_pf_dequant_q6_k(
     }
 }
 
+static_assert(sizeof(block_q3_K) == 110,
+              "Q3_K Prefill dequantization requires 110-byte blocks");
+
+static inline uint pf_q3_k_scale(device const block_q3_K* weight,
+                                 uint scale_index) {
+    if (scale_index < 4u) {
+        return (uint(weight->scales[scale_index]) & 0x0fu) |
+               ((uint(weight->scales[scale_index + 8u]) & 0x03u) << 4u);
+    }
+    if (scale_index < 8u) {
+        return (uint(weight->scales[scale_index]) & 0x0fu) |
+               (((uint(weight->scales[scale_index + 4u]) >> 2u) & 0x03u)
+                << 4u);
+    }
+    if (scale_index < 12u) {
+        return (uint(weight->scales[scale_index - 8u]) >> 4u) |
+               (((uint(weight->scales[scale_index]) >> 4u) & 0x03u) << 4u);
+    }
+    return (uint(weight->scales[scale_index - 8u]) >> 4u) |
+           (((uint(weight->scales[scale_index - 4u]) >> 6u) & 0x03u)
+            << 4u);
+}
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void strata_pf_dequant_q3_k(
+    device const block_q3_K* weights [[buffer(0)]],
+    device half* k_major_f16 [[buffer(1)]],
+    constant PrefillDequantParams& params [[buffer(2)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    const uint column = 256u * group.x + tid;
+    if (column >= params.n_out) return;
+
+    constexpr uint values_per_block = 256u;
+    const uint blocks_per_row = params.k / values_per_block;
+    const device block_q3_K* row =
+        weights + ulong(column) * blocks_per_row + group.y;
+    const float d = float(row->d);
+    for (uint value = 0u; value < values_per_block; ++value) {
+        const uint k = values_per_block * group.y + value;
+        const uint group32 = value / 32u;
+        const uint half_index = group32 / 4u;
+        const uint quarter = group32 % 4u;
+        const uint within_group = value % 32u;
+        const uint scale_index =
+            8u * half_index + 2u * quarter + within_group / 16u;
+        const uint shift = 2u * quarter;
+        const uint mask = 1u << (4u * half_index + quarter);
+        const uint q2 =
+            (uint(row->qs[32u * half_index + within_group]) >> shift) & 0x03u;
+        const int code =
+            int(q2) -
+            ((uint(row->hmask[within_group]) & mask) != 0u ? 0 : 4);
+        const int scale = int(pf_q3_k_scale(row, scale_index)) - 32;
+        const float scaled_d = d * float(scale);
+        const float expanded = scaled_d * float(code);
+        k_major_f16[ulong(k) * params.n_out + column] = half(expanded);
+    }
+}
+
 [[max_total_threads_per_threadgroup(256)]]
 kernel void strata_pf_dequant_q2_0(
     device const block_q2_0* weights [[buffer(0)]],
