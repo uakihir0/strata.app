@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -31,13 +32,14 @@ namespace {
 constexpr std::size_t kGuardBytes = 4096u;
 constexpr std::uint8_t kPoison = 0xa5u;
 constexpr std::uint32_t kColumns = 257u;
-constexpr std::uint32_t kK = 128u;
+constexpr std::uint32_t kK = 512u;
 
 static_assert(sizeof(block_q4_0) == 18u);
 static_assert(sizeof(block_q5_0) == 22u);
 static_assert(sizeof(block_q8_0) == 34u);
 static_assert(sizeof(block_q2_0) == 18u);
 static_assert(sizeof(block_iq4_nl) == 18u);
+static_assert(sizeof(block_q4_K) == 144u);
 
 int g_failures = 0;
 
@@ -222,6 +224,75 @@ struct FormatTraits<block_iq4_nl> {
 };
 
 template <>
+struct FormatTraits<block_q4_K> {
+    static constexpr const char* name = "Q4_K";
+    static constexpr std::uint32_t values_per_block = 256u;
+    static constexpr std::uint32_t code_count = 16u;
+    static constexpr EncodeCommandBuffer encode =
+        &encode_prefill_dequant_q4_k;
+    static constexpr EncodeEncoder encode_encoder =
+        &encode_prefill_dequant_q4_k;
+
+    // The packed bytes are literal. Expected codes below are listed in output
+    // order and do not reuse the decoder's byte/nibble address calculation.
+    static constexpr std::array<std::uint8_t, 16> packed_pattern_a{
+        0x10u, 0x32u, 0x54u, 0x76u, 0x98u, 0xbau, 0xdcu, 0xfeu,
+        0xefu, 0xcdu, 0xabu, 0x89u, 0x67u, 0x45u, 0x23u, 0x01u};
+    static constexpr std::array<std::uint8_t, 32> logical_low_codes{{
+        0u, 2u, 4u, 6u, 8u, 10u, 12u, 14u, 15u, 13u, 11u, 9u, 7u, 5u, 3u,
+        1u, 0u, 2u, 4u, 6u, 8u, 10u, 12u, 14u, 15u, 13u, 11u, 9u, 7u, 5u,
+        3u, 1u}};
+    static constexpr std::array<std::uint8_t, 32> logical_high_codes{{
+        1u, 3u, 5u, 7u, 9u, 11u, 13u, 15u, 14u, 12u, 10u, 8u, 6u, 4u, 2u,
+        0u, 1u, 3u, 5u, 7u, 9u, 11u, 13u, 15u, 14u, 12u, 10u, 8u, 6u, 4u,
+        2u, 0u}};
+    static constexpr std::array<std::uint8_t, 12> packed_scales{
+        0x85u, 0x4au, 0xcbu, 0x3eu, 0x75u, 0xdau,
+        0x61u, 0xb6u, 0x9cu, 0xe2u, 0x5du, 0xa7u};
+    static constexpr std::array<std::uint8_t, 8> logical_scales{
+        5u, 10u, 11u, 62u, 44u, 18u, 61u, 7u};
+    static constexpr std::array<std::uint8_t, 8> logical_mins{
+        53u, 26u, 33u, 54u, 25u, 62u, 21u, 42u};
+
+    static void store_fixture(block_q4_K& block, std::uint32_t column,
+                              std::uint32_t block_index,
+                              std::uint16_t d_bits,
+                              std::uint16_t dmin_bits) {
+        block.dm = static_cast<std::uint32_t>(d_bits) |
+                   (static_cast<std::uint32_t>(dmin_bits) << 16u);
+        std::copy(packed_scales.begin(), packed_scales.end(), block.scales);
+        const bool complement = ((column + block_index) & 1u) != 0u;
+        for (std::uint32_t chunk = 0u; chunk < 4u; ++chunk) {
+            for (std::uint32_t byte = 0u; byte < 32u; ++byte) {
+                const std::uint8_t packed =
+                    packed_pattern_a[byte % packed_pattern_a.size()];
+                block.qs[chunk * 32u + byte] = static_cast<strata_u8>(
+                    complement ? packed ^ 0xffu : packed);
+            }
+        }
+    }
+
+    static std::uint32_t oracle_code(std::uint32_t column,
+                                    std::uint32_t block_index,
+                                    std::uint32_t value) {
+        const std::uint32_t within_half = value % 64u;
+        const std::uint32_t code =
+            within_half < 32u ? logical_low_codes[within_half]
+                              : logical_high_codes[within_half - 32u];
+        const bool complement = ((column + block_index) & 1u) != 0u;
+        return complement ? 15u - code : code;
+    }
+
+    static float expanded_value(std::uint32_t code, std::uint32_t value,
+                                float d, float dmin) {
+        const std::uint32_t group = value / 32u;
+        const float d1 = d * static_cast<float>(logical_scales[group]);
+        const float m1 = dmin * static_cast<float>(logical_mins[group]);
+        return std::fma(d1, static_cast<float>(code), -m1);
+    }
+};
+
+template <>
 struct FormatTraits<block_q4_0> {
     static constexpr const char* name = "Q4_0";
     static constexpr std::uint32_t values_per_block = 32u;
@@ -339,9 +410,21 @@ bool test_dequant_format(Context& context) {
             block = {};
             const std::uint16_t scale =
                 scales[(column + block_index) % scales.size()];
-            block.d = static_cast<strata_half>(scale);
             const float expanded_scale =
                 strata::kernels::f32_from_f16(scale);
+            constexpr std::array<std::uint16_t, 5> min_scales{
+                0x0001u, 0x0400u, 0x3000u, 0x3800u, 0x6bffu};
+            const std::uint16_t min_scale =
+                min_scales[(column * 3u + block_index) %
+                           min_scales.size()];
+            const float expanded_min_scale =
+                strata::kernels::f32_from_f16(min_scale);
+            if constexpr (std::is_same_v<Block, block_q4_K>) {
+                Format::store_fixture(block, column, block_index, scale,
+                                      min_scale);
+            } else {
+                block.d = static_cast<strata_half>(scale);
+            }
             for (std::uint32_t value = 0u;
                  value < Format::values_per_block; ++value) {
                 const std::uint32_t code =
@@ -356,15 +439,26 @@ bool test_dequant_format(Context& context) {
                     }
                     oracle_code =
                         Format::oracle_code(column, block_index, value);
+                } else if constexpr (std::is_same_v<Block, block_q4_K>) {
+                    oracle_code =
+                        Format::oracle_code(column, block_index, value);
                 } else {
                     Format::store(block, value, code);
                 }
                 const std::uint32_t k =
                     block_index * Format::values_per_block + value;
-                expected[static_cast<std::size_t>(k) * kColumns + column] =
-                    strata::kernels::f16_from_f32(
+                float expanded_value = 0.0f;
+                if constexpr (std::is_same_v<Block, block_q4_K>) {
+                    expanded_value = Format::expanded_value(
+                        oracle_code, value, expanded_scale,
+                        expanded_min_scale);
+                } else {
+                    expanded_value =
                         expanded_scale *
-                        Format::dequantized_value(oracle_code));
+                        Format::dequantized_value(oracle_code);
+                }
+                expected[static_cast<std::size_t>(k) * kColumns + column] =
+                    strata::kernels::f16_from_f32(expanded_value);
             }
         }
     }
@@ -583,6 +677,9 @@ int main(int argc, char** argv) {
     passed &= test_dequant_format<block_iq4_nl>(*context);
     passed &= test_validation_format<block_iq4_nl>(*context,
                                                     *foreign_context);
+    passed &= test_dequant_format<block_q4_K>(*context);
+    passed &= test_validation_format<block_q4_K>(*context,
+                                                  *foreign_context);
     passed &= test_dequant_format<block_q4_0>(*context);
     passed &= test_validation_format<block_q4_0>(*context,
                                                  *foreign_context);
