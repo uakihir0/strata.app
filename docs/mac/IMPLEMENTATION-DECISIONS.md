@@ -9857,3 +9857,60 @@ measuring L-15 remain open.
   `check_drift.py` and `git diff --check` passed. These synthetic component
   tests do not establish production Prefill integration or model-backed
   inference.
+
+### D-IMPL-355: Implement Prefill GDN output normalization
+
+- **Decision:** Add the isolated `strata_pf_gdn_out_norm` kernel and validated
+  standalone and caller-owned `encode_prefill_gdn_out_norm` APIs. Preserve the
+  four-simdgroup butterfly and ordered sum, epsilon, F32 multiplication order,
+  sigmoid gate and unsaturated F16 conversion. Keep recurrence output `oc`
+  read-only: upstream overwrites it with an F32 value that has no later
+  consumer, while the Mac path writes only the F16 `y_h` that `ssm_out` reads.
+  Reject unsafe row counts, short or misaligned views, foreign Context
+  buffers, output/input aliases and dispatch inside an open concurrent group.
+  Prefill GEMMs and chunk-loop integration remain pending.
+- **Reason:** The reduction and conversion choices are part of the numerical
+  contract. The isolated stage can be tested and composed after recurrence
+  without claiming that production Prefill is wired. Direct output sentinels
+  make the reduction association, ties-to-even conversion and unsaturated
+  overflow observable at the F16 boundary.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the `mac-dev` build succeeded. Focused serial/concurrent Prefill
+  tests passed 2/2; `mac-metal` passed 80/80; `mac-host` passed 43 tests and
+  skipped the one test requiring unavailable model inputs. `test_map.py`
+  reported all checks passed with planned/unimplemented notes,
+  `check_drift.py` found no upstream changes and valid golden files, and
+  `git diff --check` passed. These component tests do not establish
+  production Prefill integration or model-backed inference.
+
+### REV-152: Hostile review of Prefill GDN output normalization
+
+- **Scope:** `strata_pf_gdn_out_norm`, its standalone and caller-owned Encoder
+  APIs, ordered four-simdgroup reduction, epsilon, F32 operation order,
+  sigmoid, unsaturated F16 conversion, validation, rollback, concurrent-group
+  rejection, scalar oracle, composed pipeline and documentation.
+- **Findings:** The initial review identified a P3 coverage gap because the
+  ordinary oracle tolerance could admit a regrouped reduction. The first
+  follow-up also found that the initial sentinel could combine success across
+  different heads instead of requiring one complete witness. It identified
+  missing direct F16 boundary coverage and missing decision/review records.
+  No P1/P2 production-code defect was found. A final follow-up review is in
+  progress.
+- **Disposition:** Added a negative control whose regrouped sum changes the
+  F16 result and now require all 48 heads to match the specified output and
+  differ from the regrouped result at that same output. Added GPU fixtures
+  for an exact halfway ties-to-even result and the next F16 value, plus exact
+  positive/negative infinity bits from unsaturated conversion. Updated the
+  §6.4, §9.1, engine inventory and `test_map.json` descriptions. The final
+  final read-only hostile review confirmed that every head requires the
+  specified bit and differs from the regrouped control at that same output;
+  it found no actionable P1–P3 implementation defect. Its only follow-up was
+  to replace this record's pending status, which is now done. On Mac17,9
+  (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a), the `mac-dev` build
+  succeeded, focused serial/concurrent Prefill tests passed 2/2, `mac-metal`
+  passed 80/80, and `mac-host` passed 43 tests with one unavailable-model
+  input test skipped. `test_map.py` reported all checks passed with
+  planned/unimplemented notes, `check_drift.py` found no upstream changes and
+  valid golden files, and `git diff --check` passed. These synthetic
+  component tests do not establish production Prefill integration or
+  model-backed inference.

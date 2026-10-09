@@ -446,11 +446,11 @@
     },
     "metal_prefill_test": {
       "label": "metal",
-      "origin": "04 6.4 / 09 9.1 / D-IMPL-354 / REV-151"
+      "origin": "04 6.4 / 09 9.1 / D-IMPL-355 / REV-152"
     },
     "metal_prefill_test_concurrent": {
       "label": "metal",
-      "origin": "04 6.4 / 09 9.1 / D-IMPL-354 / REV-151"
+      "origin": "04 6.4 / 09 9.1 / D-IMPL-355 / REV-152"
     },
     "metal_qsa_test": {
       "label": "metal",

@@ -5,19 +5,24 @@ Upstream baseline: [Niko1221/Strata](https://github.com/Niko1221/Strata) v0.1.34
 
 The Prefill path now includes isolated GR read-normalization, fused
 GR write/next-read normalization, low-rank SiLU, four-stream mix and GDN
-gate, tiled-convolution, convolution-history, q/k L2 and recurrence encoders.
+gate, tiled-convolution, convolution-history, q/k L2, recurrence and
+output-normalization encoders.
 The focused serial and concurrent Prefill Metal tests pass (2/2) after the
-GDN gate, tiled-convolution, history-update, q/k L2 and recurrence changes.
+GDN gate, tiled-convolution, history-update, q/k L2, recurrence and output
+normalization changes. Output normalization includes a four-partial-order
+sentinel with a regrouping negative control, exact F16 halfway ties-to-even
+bits, and unsaturated positive/negative overflow checks.
 The full `mac-metal` suite passed 80/80, and `mac-host` passed 43 tests with
 one model-input-dependent test skipped because its fixtures were unavailable.
 These synthetic component tests use no model inputs.
-Prefill GEMMs, output normalization, layer scheduling, the production chunk
-loop and model-backed inference remain unimplemented. The tiled convolution
+Prefill GEMMs, layer scheduling, the production chunk loop and model-backed
+inference remain unimplemented. The tiled convolution
 reads the old history, and the separate history-update encoder runs after it
 in a caller-ordered segment; the separate L2 stage normalizes q/k and leaves
 v heads unchanged. The recurrence consumes normalized q/k plus v, updates the
-state and writes raw recurrent outputs; it is tested in isolation and in an
-L2→recurrence segment.
+state and writes raw recurrent outputs; output normalization applies RMS
+normalization, gamma and sigmoid before storing F16. These stages are tested
+in isolation and in L2→recurrence→output-normalization segments.
 
 Implementation choices, constraints, and required reviews are tracked in
 [IMPLEMENTATION-DECISIONS.md](IMPLEMENTATION-DECISIONS.md).
