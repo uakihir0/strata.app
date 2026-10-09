@@ -59,6 +59,7 @@ constexpr std::size_t kGuardBytes = 4096u;
 constexpr std::uint8_t kPoison = 0xa5u;
 constexpr double kGemmUnitRoundoff = 0x1.0p-24;
 constexpr double kGemmUnderflowAllowance = 0x1.0p-126;
+constexpr double kGemmRelativeTolerance = 0x1.0p-16;
 
 int g_failures = 0;
 
@@ -784,6 +785,7 @@ bool check_prefill_projection_oracle(
     const double error_scale =
         2.0 * static_cast<double>(k) * kGemmUnitRoundoff;
     bool within_bound = true;
+    bool within_relative_tolerance = true;
     double max_relative_l2 = 0.0;
     for (std::uint32_t row = 0u; row < rows; ++row) {
         double row_error_squared = 0.0;
@@ -820,16 +822,22 @@ bool check_prefill_projection_oracle(
             row_reference_squared += reference * reference;
         }
         if (row_reference_squared != 0.0) {
-            max_relative_l2 = std::max(
-                max_relative_l2,
-                std::sqrt(row_error_squared / row_reference_squared));
+            const double relative_l2 =
+                std::sqrt(row_error_squared / row_reference_squared);
+            max_relative_l2 = std::max(max_relative_l2, relative_l2);
+            within_relative_tolerance &=
+                relative_l2 <= kGemmRelativeTolerance;
         } else {
             within_bound &= row_error_squared == 0.0;
+            within_relative_tolerance &= row_error_squared == 0.0;
         }
     }
-    check(within_bound, std::string(label) + " FP64 GEMM error bound",
+    check(within_bound, std::string(label) + " FP64 GEMM U(2K) error bound",
           "max row-relative L2 error " + std::to_string(max_relative_l2));
-    return within_bound;
+    check(within_relative_tolerance,
+          std::string(label) + " FP64 GEMM R(2^-16) tolerance",
+          "max row-relative L2 error " + std::to_string(max_relative_l2));
+    return within_bound && within_relative_tolerance;
 }
 
 struct PrefillGRReadTestOutputs {
@@ -1148,15 +1156,28 @@ bool test_prefill_gr_read_chain(Context& context) {
             write_low ? &composed.xn16_lo : nullptr, active_residual,
             norm_values);
 
+        const std::size_t normalized_count =
+            static_cast<std::size_t>(rows) * normalized_values;
+        const auto* const normalized_high_values =
+            reinterpret_cast<const std::uint16_t*>(
+                composed.xn16.payload().data());
+        const auto* const normalized_low_values =
+            write_low
+                ? reinterpret_cast<const std::uint16_t*>(
+                      composed.xn16_lo.payload().data())
+                : nullptr;
+        const std::span<const std::uint16_t> normalized_high(
+            normalized_high_values, normalized_count);
         const std::span<const std::uint16_t> normalized_low =
-            write_low ? std::span<const std::uint16_t>(expected_norm.low)
-                      : std::span<const std::uint16_t>{};
+            write_low
+                ? std::span<const std::uint16_t>(normalized_low_values,
+                                                 normalized_count)
+                : std::span<const std::uint16_t>{};
         const auto* const low_rank_values =
             reinterpret_cast<const float*>(composed.low_rank.payload().data());
         passed &= check_prefill_projection_oracle(
-            label + " down projection",
-            std::span<const std::uint16_t>(expected_norm.high),
-            normalized_low, down_values, rows, 320u, 10240u,
+            label + " down projection", normalized_high, normalized_low,
+            down_values, rows, 320u, 10240u,
             std::span<const float>(low_rank_values, rows * 320u));
 
         const std::size_t low_rank_count =
@@ -1214,9 +1235,8 @@ bool test_prefill_gr_read_chain(Context& context) {
         const auto* const inject_result =
             reinterpret_cast<const float*>(composed.inject.payload().data());
         passed &= check_prefill_projection_oracle(
-            label + " injection projection",
-            std::span<const std::uint16_t>(expected_norm.high),
-            normalized_low, inject_values, rows, 4u, 10240u,
+            label + " injection projection", normalized_high, normalized_low,
+            inject_values, rows, 4u, 10240u,
             std::span<const float>(
                 inject_result, static_cast<std::size_t>(rows) * kStreams));
 

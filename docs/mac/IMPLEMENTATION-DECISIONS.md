@@ -10868,10 +10868,17 @@ measuring L-15 remain open.
   that verifies the downstream error, command-buffer discard and unchanged
   output allocations through both the transactional CommandBuffer wrapper and
   the caller-owned Encoder form.
-- **Disposition:** The initial P2 coverage findings are fixed. An adversarial
-  follow-up review of the added tests is pending.
+- **Follow-up findings and fixes:** A second review found that the new oracle
+  reported row-relative error without enforcing R(2^-16); the oracle now
+  enforces both U(2K) and R(2^-16). It also found that down and injection
+  references used the expected normalization values instead of the exact
+  BF16 values consumed by those GEMMs. The oracle now uses the produced
+  `xn16` and optional `xn16_lo` after normalization is checked separately.
+- **Disposition:** All four test-coverage findings are fixed. The hostile
+  reviewer verified both follow-up corrections and found no remaining issue;
+  an independent read-only review also found no remaining concrete finding.
 - **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
   27A266a), the rebuilt `mac-dev` target succeeded and the strengthened
   Prefill GR serial/concurrent tests passed 2/2. The full `mac-metal` suite
-  passed 90/90 before the final oracle and rollback assertions were added;
-  rerun it after the follow-up review.
+  passed 90/90 before the final oracle threshold/input corrections; the
+  focused Prefill GR serial/concurrent cases are rerun after those corrections.
