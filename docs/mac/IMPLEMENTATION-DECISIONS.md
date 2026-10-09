@@ -10773,3 +10773,55 @@ measuring L-15 remain open.
   before the oracle refinement. The rebuilt serial/concurrent IQ3_S tests
   passed 2/2 afterwards; the reversed-lane negative control failed as
   expected. `git diff --check` and `test_map` are recorded with this change.
+
+### D-IMPL-374: Compose native-weight dequantization with Prefill F16 GEMM
+
+- **Decision:** Add `encode_prefill_native_projection` for the eleven
+  supported native dense formats. It decodes weights into K-major F16 scratch
+  and then encodes the existing selected F16 GEMM in the same ordered
+  Encoder segment. Preserve the existing `STRATA_METAL_GEMM` policy. Reject
+  required-range overlap between either writable view and activations, native
+  weights or the other writable view. The caller-owned form reports failure
+  to the enclosing segment; the standalone form discards all encoded work on
+  failure.
+- **Reason:** The dequantizers and F16 GEMM were individually validated but
+  had no shared native-weight projection seam. Reusing their established
+  layouts and backend policy creates a testable next Prefill stage while
+  retaining the reference's explicit F16 rounding point. This coordinator
+  does not schedule layers, allocate or reuse production scratch, or execute
+  the Prefill chunk loop.
+- **Review required:** Audit every format-to-block mapping and K geometry;
+  verify serial and concurrent ordering, cross-stage writable aliases,
+  selection output behavior, late GEMM failure rollback in both APIs, and
+  tests against the direct two-component chain. Confirm all docs distinguish
+  this synthetic coordinator from production inference.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a), the mac-dev build succeeded; the focused Prefill dequant/GEMM suite passed 10/10, `mac-host` passed 45/45 with one unavailable-model-input test skipped, and the full `mac-metal` suite passed 90/90. The strengthened serial/concurrent dequant composition tests passed 2/2 after the review fixes. `test_map` and `git diff --check` passed.
+
+### REV-171: Hostile review of the native Prefill projection coordinator
+
+- **Scope:** Format dispatch and block geometry, ordered dequant→GEMM behavior,
+  required-range alias validation, selected-backend reporting, standalone and
+  caller-owned rollback, and whether the chain tests can false-pass.
+- **Findings and fixes:** The first review found that late-failure rollback
+  was tested only through the standalone CommandBuffer overload. Added a
+  caller-owned IQ3_S case that successfully encodes the dequant dispatch,
+  fails GEMM validation, propagates `false` from the enclosing
+  `Encoder::encode` body, and checks that the command buffer is discarded,
+  both writable buffers remain poisoned, and backend selection is unchanged.
+- **Follow-up finding and fix:** The second review pointed out that those
+  rollback assertions would also pass if stride validation moved before the
+  dequant dispatch. Added an isolated test probe that intentionally completes
+  the dequant prefix after the expected GEMM stride rejection and checks that
+  scratch now equals the scalar dequant oracle while Y remains untouched. A
+  separate call then propagates the same failure and verifies both buffers
+  remain poisoned and the command is discarded.
+- **Disposition:** Both P2 coverage findings are fixed. The final hostile
+  follow-up confirmed that the probe demonstrates a completed dequant prefix
+  and found no remaining concrete issue. No ordering, format layout, alias
+  validation or backend-selection defect was reported.
+- **Validation:** `cmake --build --preset mac-dev` succeeded.
+  `ctest --preset mac-metal -R 'metal_prefill_(dequant|gemm)'
+  --output-on-failure` passed 10/10, the full `mac-metal` suite passed 90/90,
+  and `mac-host` passed 45/45 with one unavailable-model-input test skipped.
+  After the follow-up oracle-strengthening probe, the rebuilt serial/concurrent
+  dequant tests passed 2/2. `test_map` and `git diff --check` passed.

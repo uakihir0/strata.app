@@ -20,6 +20,11 @@ host or kernel test does not establish that end-to-end model inference is availa
 [docs/mac](docs/mac/README.md), especially the [engine port](docs/mac/06-engine-host-port.md) and
 [setup and server port](docs/mac/07-server-setup-port.md).
 
+An isolated native-weight Prefill coordinator now composes each supported
+quantized-weight dequantizer with the F16 GEMM in one ordered encoder segment.
+Synthetic tests cover the component chain and rollback; production
+`Prefill::run` still does not call it.
+
 ## Build and test entry points
 
 The CMake presets target arm64 and macOS 27. The `mac-dev` preset enables the Metal backend and
