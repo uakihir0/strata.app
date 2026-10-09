@@ -5,6 +5,8 @@
 #include "strata/metal/context.hpp"
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/prefill_dequant_dispatch.hpp"
+#include "strata/metal/prefill_gemm_dispatch.hpp"
+#include "strata/metal/prefill_native_projection.hpp"
 
 #include "../../src/metal/kernels/common/types.h"
 #include "../../src/metal/kernels/common/codebooks.h"
@@ -21,6 +23,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -137,6 +140,8 @@ struct FormatTraits;
 template <>
 struct FormatTraits<block_q2_0> {
     static constexpr const char* name = "Q2_0";
+    static constexpr PrefillNativeWeightFormat native_format =
+        PrefillNativeWeightFormat::Q2_0;
     static constexpr std::uint32_t values_per_block = 64u;
     static constexpr std::uint32_t code_count = 4u;
     static constexpr EncodeCommandBuffer encode = &encode_prefill_dequant_q2_0;
@@ -187,6 +192,8 @@ struct FormatTraits<block_q2_0> {
 template <>
 struct FormatTraits<block_iq4_nl> {
     static constexpr const char* name = "IQ4_NL";
+    static constexpr PrefillNativeWeightFormat native_format =
+        PrefillNativeWeightFormat::IQ4_NL;
     static constexpr std::uint32_t values_per_block = 32u;
     static constexpr std::uint32_t code_count = 16u;
     static constexpr EncodeCommandBuffer encode =
@@ -232,6 +239,8 @@ struct FormatTraits<block_iq4_nl> {
 template <>
 struct FormatTraits<block_iq4_xs> {
     static constexpr const char* name = "IQ4_XS";
+    static constexpr PrefillNativeWeightFormat native_format =
+        PrefillNativeWeightFormat::IQ4_XS;
     static constexpr std::uint32_t values_per_block = 256u;
     static constexpr std::uint32_t code_count = 16u;
     static constexpr EncodeCommandBuffer encode =
@@ -348,6 +357,8 @@ struct FormatTraits<block_iq4_xs> {
 template <>
 struct FormatTraits<block_q4_K> {
     static constexpr const char* name = "Q4_K";
+    static constexpr PrefillNativeWeightFormat native_format =
+        PrefillNativeWeightFormat::Q4_K;
     static constexpr std::uint32_t values_per_block = 256u;
     static constexpr std::uint32_t code_count = 16u;
     static constexpr EncodeCommandBuffer encode =
@@ -468,6 +479,8 @@ struct FormatTraits<block_q4_K> {
 template <>
 struct FormatTraits<block_q5_K> {
     static constexpr const char* name = "Q5_K";
+    static constexpr PrefillNativeWeightFormat native_format =
+        PrefillNativeWeightFormat::Q5_K;
     static constexpr std::uint32_t values_per_block = 256u;
     static constexpr std::uint32_t code_count = 32u;
     static constexpr EncodeCommandBuffer encode =
@@ -551,6 +564,8 @@ struct FormatTraits<block_q5_K> {
 template <>
 struct FormatTraits<block_q6_K> {
     static constexpr const char* name = "Q6_K";
+    static constexpr PrefillNativeWeightFormat native_format =
+        PrefillNativeWeightFormat::Q6_K;
     static constexpr std::uint32_t values_per_block = 256u;
     static constexpr std::uint32_t code_count = 64u;
     static constexpr EncodeCommandBuffer encode =
@@ -641,6 +656,8 @@ struct FormatTraits<block_q6_K> {
 template <>
 struct FormatTraits<block_q3_K> {
     static constexpr const char* name = "Q3_K";
+    static constexpr PrefillNativeWeightFormat native_format =
+        PrefillNativeWeightFormat::Q3_K;
     static constexpr std::uint32_t values_per_block = 256u;
     static constexpr std::uint32_t code_count = 8u;
     static constexpr EncodeCommandBuffer encode =
@@ -783,6 +800,8 @@ struct FormatTraits<block_q3_K> {
 template <>
 struct FormatTraits<block_q4_0> {
     static constexpr const char* name = "Q4_0";
+    static constexpr PrefillNativeWeightFormat native_format =
+        PrefillNativeWeightFormat::Q4_0;
     static constexpr std::uint32_t values_per_block = 32u;
     static constexpr std::uint32_t code_count = 16u;
     static constexpr EncodeCommandBuffer encode = &encode_prefill_dequant_q4_0;
@@ -804,6 +823,8 @@ struct FormatTraits<block_q4_0> {
 template <>
 struct FormatTraits<block_q5_0> {
     static constexpr const char* name = "Q5_0";
+    static constexpr PrefillNativeWeightFormat native_format =
+        PrefillNativeWeightFormat::Q5_0;
     static constexpr std::uint32_t values_per_block = 32u;
     static constexpr std::uint32_t code_count = 32u;
     static constexpr EncodeCommandBuffer encode = &encode_prefill_dequant_q5_0;
@@ -827,6 +848,8 @@ struct FormatTraits<block_q5_0> {
 template <>
 struct FormatTraits<block_q8_0> {
     static constexpr const char* name = "Q8_0";
+    static constexpr PrefillNativeWeightFormat native_format =
+        PrefillNativeWeightFormat::Q8_0;
     static constexpr std::uint32_t values_per_block = 32u;
     static constexpr std::uint32_t code_count = 255u;
     static constexpr EncodeCommandBuffer encode = &encode_prefill_dequant_q8_0;
@@ -847,6 +870,8 @@ struct FormatTraits<block_q8_0> {
 template <>
 struct FormatTraits<block_iq3_s> {
     static constexpr const char* name = "IQ3_S";
+    static constexpr PrefillNativeWeightFormat native_format =
+        PrefillNativeWeightFormat::IQ3_S;
     static constexpr std::uint32_t values_per_block = 256u;
     static constexpr std::uint32_t code_count = 512u;
     static constexpr EncodeCommandBuffer encode =
@@ -1002,6 +1027,300 @@ bool expect_rejected(Context& context, EncodeCommandBuffer encode,
         error.find(expected_error) != std::string::npos;
     check(rejected, label, error);
     return rejected;
+}
+
+template <typename Block>
+bool test_native_projection_format(
+    Context& context, TestBuffer& weights, TestBuffer& direct_dequant,
+    std::size_t weight_bytes,
+    const std::vector<std::uint16_t>& expected_dequant) {
+    using Format = FormatTraits<Block>;
+    constexpr std::uint32_t rows = 3u;
+    constexpr std::uint32_t col0 = 3u;
+    constexpr std::uint32_t ldy = kColumns + col0 + 5u;
+    constexpr std::size_t scratch_bytes =
+        static_cast<std::size_t>(kColumns) * kK * sizeof(std::uint16_t);
+    constexpr std::size_t x_bytes =
+        static_cast<std::size_t>(rows) * kK * sizeof(std::uint16_t);
+    constexpr std::size_t y_elements =
+        static_cast<std::size_t>(rows - 1u) * ldy + col0 + kColumns;
+    constexpr std::size_t y_bytes = y_elements * sizeof(float);
+    const std::string prefix =
+        std::string("Prefill ") + Format::name + " native projection";
+    std::string error;
+    TestBuffer x, direct_y, projection_scratch, projection_y, failed_y;
+    const bool allocated =
+        x.allocate(context, prefix + " F16 activations", x_bytes, error) &&
+        direct_y.allocate(context, prefix + " direct F32 output",
+                          y_bytes + 8u, error) &&
+        projection_scratch.allocate(context, prefix + " F16 scratch",
+                                    scratch_bytes, error) &&
+        projection_y.allocate(context, prefix + " composed F32 output",
+                              y_bytes + 8u, error) &&
+        failed_y.allocate(context, prefix + " rollback F32 output",
+                          y_bytes + 8u, error);
+    check(allocated, prefix + " allocate buffers", error);
+    if (!allocated) return false;
+
+    std::vector<std::uint16_t> x_values(x_bytes / sizeof(std::uint16_t));
+    for (std::size_t index = 0u; index < x_bytes / sizeof(std::uint16_t);
+         ++index) {
+        const int centered = static_cast<int>(index % 17u) - 8;
+        x_values[index] = strata::kernels::f16_from_f32(
+            static_cast<float>(centered) * 0.015625f);
+    }
+    std::memcpy(x.payload().data(), x_values.data(), x_bytes);
+    const std::vector<std::uint8_t> x_before(
+        x.payload().begin(), x.payload().end());
+    const std::vector<std::uint8_t> weights_before(
+        weights.payload().begin(), weights.payload().begin() + weight_bytes);
+
+    const PrefillGemmMPPParams params{
+        rows, kColumns, kK, ldy, col0, false};
+    const auto x_read =
+        context.buffers().read_only(x.view().slice(0u, x_bytes));
+    const auto direct_weights = context.buffers().read_only(
+        direct_dequant.view().slice(0u, scratch_bytes));
+    const PrefillGemmMPPBuffers direct_buffers{
+        x_read, direct_weights, direct_y.view()};
+    auto direct_command =
+        context.make_command_buffer(prefix + " component chain", error);
+    check(direct_command != nullptr,
+          prefix + " reference command buffer", error);
+    if (!direct_command) return false;
+    PrefillGemmBackend direct_backend = PrefillGemmBackend::SIMD;
+    const bool direct_encoded = encode_prefill_gemm(
+        context, *direct_command, params, direct_buffers,
+        PrefillGemmFormat::F16, error, &direct_backend);
+    check(direct_encoded, prefix + " direct GEMM encode", error);
+    if (!direct_encoded) return false;
+    const bool direct_completed = submit_and_wait(direct_command, error);
+    check(direct_completed, prefix + " direct GEMM completion", error);
+    if (!direct_completed) return false;
+
+    std::memset(projection_scratch.payload().data(), kPoison, scratch_bytes);
+    std::memset(projection_y.payload().data(), kPoison,
+                projection_y.payload().size());
+    const PrefillNativeProjectionBuffers projection_buffers{
+        x_read,
+        context.buffers().read_only(
+            weights.view().slice(0u, weight_bytes)),
+        projection_scratch.view(),
+        projection_y.view()};
+    PrefillGemmBackend projection_backend = PrefillGemmBackend::SIMD;
+    bool projection_encoded = false;
+    if constexpr (std::is_same_v<Block, block_iq3_s>) {
+        auto projection_command =
+            context.make_command_buffer(prefix + " caller-owned", error);
+        check(projection_command != nullptr,
+              prefix + " caller-owned command buffer", error);
+        if (!projection_command) return false;
+        projection_encoded = Encoder::encode(
+            context, *projection_command, prefix + " caller-owned",
+            [&](Encoder& encoder, std::string& encode_error) {
+                return encode_prefill_native_projection(
+                    context, encoder, params, Format::native_format,
+                    projection_buffers, encode_error, &projection_backend);
+            },
+            error);
+        check(projection_encoded, prefix + " caller-owned encode", error);
+        if (!projection_encoded) return false;
+        const bool completed = submit_and_wait(projection_command, error);
+        check(completed, prefix + " caller-owned completion", error);
+        if (!completed) return false;
+    } else {
+        auto projection_command =
+            context.make_command_buffer(prefix + " standalone", error);
+        check(projection_command != nullptr,
+              prefix + " standalone command buffer", error);
+        if (!projection_command) return false;
+        projection_encoded = encode_prefill_native_projection(
+            context, *projection_command, params, Format::native_format,
+            projection_buffers, error, &projection_backend);
+        check(projection_encoded, prefix + " standalone encode", error);
+        if (!projection_encoded) return false;
+        const bool completed = submit_and_wait(projection_command, error);
+        check(completed, prefix + " standalone completion", error);
+        if (!completed) return false;
+    }
+
+    const bool backend_matches = projection_backend == direct_backend;
+    const bool scratch_matches =
+        std::memcmp(projection_scratch.payload().data(),
+                    expected_dequant.data(), scratch_bytes) == 0;
+    const bool output_matches =
+        std::memcmp(projection_y.payload().data(), direct_y.payload().data(),
+                    projection_y.payload().size()) == 0;
+    const bool x_unchanged =
+        std::equal(x_before.begin(), x_before.end(), x.payload().begin());
+    const bool weights_unchanged =
+        std::equal(weights_before.begin(), weights_before.end(),
+                   weights.payload().begin());
+    const auto output_is_poison = [](std::span<const std::uint8_t> bytes,
+                                     std::size_t begin, std::size_t end) {
+        return std::all_of(bytes.begin() + begin, bytes.begin() + end,
+                           [](std::uint8_t byte) { return byte == kPoison; });
+    };
+    bool output_padding_untouched = true;
+    const auto reference_bytes =
+        std::span<const std::uint8_t>(direct_y.payload().data(),
+                                      direct_y.payload().size());
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        const std::size_t row_begin =
+            static_cast<std::size_t>(row) * ldy * sizeof(float);
+        const std::size_t active_begin = row_begin + col0 * sizeof(float);
+        const std::size_t active_end =
+            active_begin + static_cast<std::size_t>(kColumns) * sizeof(float);
+        output_padding_untouched &=
+            output_is_poison(reference_bytes, row_begin, active_begin);
+        if (row + 1u < rows) {
+            const std::size_t row_end =
+                static_cast<std::size_t>(row + 1u) * ldy * sizeof(float);
+            output_padding_untouched &=
+                output_is_poison(reference_bytes, active_end, row_end);
+        } else {
+            output_padding_untouched &=
+                output_is_poison(reference_bytes, active_end,
+                                 reference_bytes.size());
+        }
+    }
+    check(backend_matches,
+          prefix + " uses the same selected GEMM backend as its components");
+    check(scratch_matches,
+          prefix + " dequantizes exact K-major F16 weights before GEMM");
+    check(output_matches,
+          prefix + " matches the direct dequant-to-GEMM component chain");
+    check(output_padding_untouched,
+          prefix + " leaves output column, row and tail padding untouched");
+    check(x_unchanged && weights_unchanged,
+          prefix + " preserves activations and native weights");
+
+    std::memset(projection_scratch.payload().data(), kPoison, scratch_bytes);
+    std::memset(failed_y.payload().data(), kPoison, failed_y.payload().size());
+    PrefillGemmMPPParams invalid_params = params;
+    invalid_params.ldy = col0 + kColumns - 1u;
+    const PrefillNativeProjectionBuffers rollback_buffers{
+        x_read,
+        context.buffers().read_only(
+            weights.view().slice(0u, weight_bytes)),
+        projection_scratch.view(),
+        failed_y.view()};
+    auto rollback_command =
+        context.make_command_buffer(prefix + " late failure rollback", error);
+    check(rollback_command != nullptr,
+          prefix + " late failure command buffer", error);
+    if (!rollback_command) return false;
+    PrefillGemmBackend unchanged_backend = PrefillGemmBackend::MPP;
+    const bool invalid_encoded = encode_prefill_native_projection(
+        context, *rollback_command, invalid_params, Format::native_format,
+        rollback_buffers, error, &unchanged_backend);
+    const bool rollback_discarded =
+        !invalid_encoded &&
+        error.find("output extent or stride is invalid") != std::string::npos &&
+        rollback_command->unsafe_native_handle() == nullptr &&
+        unchanged_backend == PrefillGemmBackend::MPP &&
+        std::all_of(projection_scratch.payload().begin(),
+                    projection_scratch.payload().end(),
+                    [](std::uint8_t byte) { return byte == kPoison; }) &&
+        std::all_of(failed_y.payload().begin(), failed_y.payload().end(),
+                    [](std::uint8_t byte) { return byte == kPoison; });
+    check(rollback_discarded,
+          prefix + " late GEMM rejection discards dequant and preserves buffers",
+          error);
+
+    bool caller_prefix_proven = true;
+    if constexpr (std::is_same_v<Block, block_iq3_s>) {
+        std::memset(projection_scratch.payload().data(), kPoison,
+                    scratch_bytes);
+        std::memset(failed_y.payload().data(), kPoison,
+                    failed_y.payload().size());
+        auto probe_command =
+            context.make_command_buffer(prefix + " late-failure probe", error);
+        check(probe_command != nullptr,
+              prefix + " late-failure probe command buffer", error);
+        if (!probe_command) return false;
+        PrefillGemmBackend probe_backend = PrefillGemmBackend::MPP;
+        bool coordinator_rejected_after_prefix = false;
+        const bool probe_encoded = Encoder::encode(
+            context, *probe_command, prefix + " late-failure probe",
+            [&](Encoder& encoder, std::string& encode_error) {
+                coordinator_rejected_after_prefix =
+                    !encode_prefill_native_projection(
+                        context, encoder, invalid_params, Format::native_format,
+                        rollback_buffers, encode_error, &probe_backend) &&
+                    encode_error.find("output extent or stride is invalid") !=
+                        std::string::npos;
+                // This probe deliberately submits the successfully encoded
+                // dequant prefix so the test can prove the stride error is
+                // reached after it. The rollback case below propagates false.
+                encode_error.clear();
+                return coordinator_rejected_after_prefix;
+            },
+            error);
+        if (probe_encoded) {
+            caller_prefix_proven =
+                submit_and_wait(probe_command, error) &&
+                probe_backend == PrefillGemmBackend::MPP &&
+                std::memcmp(projection_scratch.payload().data(),
+                            expected_dequant.data(), scratch_bytes) == 0 &&
+                std::all_of(failed_y.payload().begin(), failed_y.payload().end(),
+                            [](std::uint8_t byte) { return byte == kPoison; });
+        } else {
+            caller_prefix_proven = false;
+        }
+        check(caller_prefix_proven,
+              prefix + " late GEMM rejection follows a completed dequant prefix",
+              error);
+    }
+
+    bool caller_owned_rollback = true;
+    if constexpr (std::is_same_v<Block, block_iq3_s>) {
+        std::memset(projection_scratch.payload().data(), kPoison,
+                    scratch_bytes);
+        std::memset(failed_y.payload().data(), kPoison,
+                    failed_y.payload().size());
+        auto caller_command =
+            context.make_command_buffer(prefix + " caller-owned rollback",
+                                        error);
+        check(caller_command != nullptr,
+              prefix + " caller-owned rollback command buffer", error);
+        if (!caller_command) return false;
+        PrefillGemmBackend caller_backend = PrefillGemmBackend::MPP;
+        bool projection_rejected = false;
+        const bool caller_segment_succeeded = Encoder::encode(
+            context, *caller_command, prefix + " caller-owned rollback",
+            [&](Encoder& encoder, std::string& encode_error) {
+                projection_rejected = !encode_prefill_native_projection(
+                    context, encoder, invalid_params, Format::native_format,
+                    rollback_buffers, encode_error, &caller_backend);
+                return !projection_rejected;
+            },
+            error);
+        caller_owned_rollback =
+            !caller_segment_succeeded && projection_rejected &&
+            error.find("output extent or stride is invalid") !=
+                std::string::npos &&
+            caller_command->unsafe_native_handle() == nullptr &&
+            caller_backend == PrefillGemmBackend::MPP &&
+            std::all_of(projection_scratch.payload().begin(),
+                        projection_scratch.payload().end(),
+                        [](std::uint8_t byte) { return byte == kPoison; }) &&
+            std::all_of(failed_y.payload().begin(), failed_y.payload().end(),
+                        [](std::uint8_t byte) { return byte == kPoison; });
+        check(caller_owned_rollback,
+              prefix + " caller-owned late failure discards the segment",
+              error);
+    }
+
+    const bool guards_intact =
+        x.guards_intact() && direct_y.guards_intact() &&
+        projection_scratch.guards_intact() && projection_y.guards_intact() &&
+        failed_y.guards_intact();
+    check(guards_intact, prefix + " buffer guards");
+    return backend_matches && scratch_matches && output_matches &&
+           output_padding_untouched && x_unchanged && weights_unchanged &&
+           caller_prefix_proven &&
+           rollback_discarded && caller_owned_rollback && guards_intact;
 }
 
 template <typename Block>
@@ -1205,8 +1524,11 @@ bool test_dequant_format(Context& context) {
               " dequant leaves unused output bytes untouched");
     check(weights.guards_intact() && output.guards_intact(),
           std::string(Format::name) + " dequant input and output guards");
+    const bool projection =
+        test_native_projection_format<Block>(context, weights, output,
+                                             weight_bytes, expected);
     return exact && input_unchanged && trailing_bytes_untouched &&
-           weights.guards_intact() && output.guards_intact();
+           weights.guards_intact() && output.guards_intact() && projection;
 }
 
 template <typename Block>
@@ -1321,6 +1643,121 @@ bool test_validation_format(Context& context, Context& foreign_context) {
     return passed;
 }
 
+bool expect_native_projection_rejected(
+    Context& context, const PrefillGemmMPPParams& params,
+    PrefillNativeWeightFormat format,
+    const PrefillNativeProjectionBuffers& buffers,
+    std::string_view expected_error, const std::string& label) {
+    std::string error;
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    PrefillGemmBackend selected = PrefillGemmBackend::MPP;
+    const bool encoded = encode_prefill_native_projection(
+        context, *command, params, format, buffers, error, &selected);
+    const bool rejected =
+        !encoded && command->unsafe_native_handle() == nullptr &&
+        selected == PrefillGemmBackend::MPP &&
+        error.find(expected_error) != std::string::npos;
+    check(rejected, label, error);
+    return rejected;
+}
+
+bool test_native_projection_validation(Context& context,
+                                       Context& foreign_context) {
+    constexpr std::uint32_t rows = 2u;
+    constexpr std::uint32_t n = 64u;
+    constexpr std::uint32_t k = 64u;
+    constexpr std::size_t weight_bytes =
+        static_cast<std::size_t>(n) * (k / 64u) * sizeof(block_q2_0);
+    constexpr std::size_t x_bytes =
+        static_cast<std::size_t>(rows) * k * sizeof(std::uint16_t);
+    constexpr std::size_t scratch_bytes =
+        static_cast<std::size_t>(n) * k * sizeof(std::uint16_t);
+    constexpr std::size_t y_bytes =
+        static_cast<std::size_t>(rows) * n * sizeof(float);
+    const PrefillGemmMPPParams params{rows, n, k, n, 0u, false};
+    std::string error;
+    TestBuffer x, weights, scratch, y, shared, foreign_weights;
+    const std::size_t shared_bytes =
+        std::max({weight_bytes, x_bytes, scratch_bytes, y_bytes});
+    const bool allocated =
+        x.allocate(context, "native projection validation X", x_bytes, error) &&
+        weights.allocate(context, "native projection validation W",
+                         weight_bytes, error) &&
+        scratch.allocate(context, "native projection validation scratch",
+                         scratch_bytes, error) &&
+        y.allocate(context, "native projection validation Y", y_bytes, error) &&
+        shared.allocate(context, "native projection validation aliases",
+                        shared_bytes, error) &&
+        foreign_weights.allocate(foreign_context,
+                                 "native projection foreign W",
+                                 weight_bytes, error);
+    check(allocated, "native projection validation allocate buffers", error);
+    if (!allocated) return false;
+
+    const auto x_read = context.buffers().read_only(x.view());
+    const auto weights_read = context.buffers().read_only(weights.view());
+    const PrefillNativeProjectionBuffers valid{
+        x_read, weights_read, scratch.view(), y.view()};
+    bool passed = true;
+    passed &= expect_native_projection_rejected(
+        context, params, static_cast<PrefillNativeWeightFormat>(0xffu), valid,
+        "format is invalid", "native projection rejects an invalid format");
+
+    const PrefillNativeProjectionBuffers scratch_aliases_x{
+        context.buffers().read_only(
+            shared.view().slice(0u, x_bytes)),
+        weights_read, shared.view().slice(0u, scratch_bytes), y.view()};
+    passed &= expect_native_projection_rejected(
+        context, params, PrefillNativeWeightFormat::Q2_0, scratch_aliases_x,
+        "scratch overlaps an input",
+        "native projection rejects scratch/X overlap before dispatch");
+
+    const PrefillNativeProjectionBuffers y_aliases_weights{
+        x_read,
+        context.buffers().read_only(shared.view().slice(0u, weight_bytes)),
+        scratch.view(), shared.view().slice(0u, y_bytes)};
+    passed &= expect_native_projection_rejected(
+        context, params, PrefillNativeWeightFormat::Q2_0, y_aliases_weights,
+        "output overlaps another buffer",
+        "native projection rejects Y/native-weight overlap before dispatch");
+
+    const PrefillNativeProjectionBuffers y_aliases_x{
+        context.buffers().read_only(shared.view().slice(0u, x_bytes)),
+        weights_read, scratch.view(), shared.view().slice(0u, y_bytes)};
+    passed &= expect_native_projection_rejected(
+        context, params, PrefillNativeWeightFormat::Q2_0, y_aliases_x,
+        "output overlaps another buffer",
+        "native projection rejects Y/X overlap before dispatch");
+
+    const PrefillNativeProjectionBuffers y_aliases_scratch{
+        x_read, weights_read, shared.view().slice(0u, scratch_bytes),
+        shared.view().slice(0u, y_bytes)};
+    passed &= expect_native_projection_rejected(
+        context, params, PrefillNativeWeightFormat::Q2_0, y_aliases_scratch,
+        "output overlaps another buffer",
+        "native projection rejects Y/scratch overlap before dispatch");
+
+    const PrefillNativeProjectionBuffers foreign_input{
+        x_read, foreign_context.buffers().read_only(foreign_weights.view()),
+        scratch.view(), y.view()};
+    passed &= expect_native_projection_rejected(
+        context, params, PrefillNativeWeightFormat::Q2_0, foreign_input,
+        "not owned by this Context",
+        "native projection rejects foreign weights");
+
+    auto invalid_geometry = params;
+    invalid_geometry.k = 96u;
+    passed &= expect_native_projection_rejected(
+        context, invalid_geometry, PrefillNativeWeightFormat::Q2_0, valid,
+        "divisible by the native block size",
+        "native projection rejects native-block K remainder");
+    return passed;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1378,5 +1815,6 @@ int main(int argc, char** argv) {
     passed &= test_dequant_format<block_q8_0>(*context);
     passed &= test_validation_format<block_q8_0>(*context,
                                                  *foreign_context);
+    passed &= test_native_projection_validation(*context, *foreign_context);
     return passed && g_failures == 0 ? 0 : 1;
 }
