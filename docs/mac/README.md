@@ -5,13 +5,14 @@ Upstream baseline: [Niko1221/Strata](https://github.com/Niko1221/Strata) v0.1.34
 
 The Prefill path now includes isolated GR read-normalization, fused
 GR write/next-read normalization, low-rank SiLU, four-stream mix and GDN
-gate and tiled-convolution encoders.
+gate, tiled-convolution and convolution-history encoders.
 The focused serial and concurrent Prefill Metal tests pass (2/2) after the
-GDN gate and tiled-convolution changes. These synthetic component tests use
-no model inputs.
+GDN gate, tiled-convolution and history-update changes. These synthetic
+component tests use no model inputs.
 Prefill GEMMs, layer scheduling, the production chunk loop and model-backed
-inference remain unimplemented. The tiled convolution reads old history but
-does not advance it; the ordered history-update encoder remains pending.
+inference remain unimplemented. The tiled convolution reads the old history,
+and the separate history-update encoder runs after it in a caller-ordered
+segment.
 
 Implementation choices, constraints, and required reviews are tracked in
 [IMPLEMENTATION-DECISIONS.md](IMPLEMENTATION-DECISIONS.md).

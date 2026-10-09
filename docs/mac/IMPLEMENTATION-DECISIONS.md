@@ -9707,3 +9707,49 @@ measuring L-15 remain open.
   passed 43 tests with one unavailable-model-input case skipped. The pinned
   Python runner passed all 35/35 modules. The fixtures are synthetic and do
   not establish integrated Prefill or model-backed behavior.
+
+### D-IMPL-352: Implement Prefill GDN convolution-history update
+
+- **Decision:** Add the isolated `strata_pf_gdn_conv_hist` kernel and
+  validated `encode_prefill_gdn_conv_history` API. Load all three next-history
+  values per channel before writing any history slot. For T=1/2, retain the
+  newest old-history values; for T≥3, copy the last three QKV rows. Provide
+  standalone transactional and caller-owned Encoder forms, validate
+  shader-safe rows, extents, alignment and Context ownership, reject
+  history/QKV overlap, and require an ordered concurrent-group boundary.
+- **Reason:** Section 6.4 requires convolution to consume the old history
+  before state advances, including chunks shorter than the three-row history.
+  Separate read-then-write stages make this dependency explicit and testable
+  in one ordered Encoder segment. Prefill GEMM and chunk-loop integration
+  remain outside this isolated stage.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the mac-dev build succeeded; focused Prefill serial/concurrent
+  CTests passed 2/2 after the final rollback fixture; the full `mac-metal`
+  suite passed 80/80; and `mac-host` passed 43 tests with one unavailable
+  model-input case skipped. Standalone and caller-owned history fixtures at
+  T=1/2/3/8/65 match an exact scalar oracle. Same-segment convolution→history
+  fixtures at T=1/2/65 verify the convolution output uses the old history.
+  Validation covers row limits, short/misaligned/foreign views, overlap,
+  guards, QKV/weight immutability, open-group refusal and rollback through
+  both overloads. Inputs are synthetic; this does not establish production
+  Prefill or model-backed inference. The hostile-review record is REV-149.
+
+### REV-149: Hostile review of Prefill GDN convolution-history update
+
+- **Scope:** `strata_pf_gdn_conv_hist`, the standalone and caller-owned
+  Encoder APIs, T=1/2 retention, all-loads-before-stores behavior,
+  convolution/history ordering, validation, rollback and test inventories.
+- **Findings:** The first read-only review found no implementation defect and
+  identified a missing direct rollback test for the standalone overload. The
+  follow-up review confirmed the added test exercises a prior standalone
+  convolution dispatch, a failing standalone history call, whole-command
+  buffer discard and byte preservation. It then found that the §6.4 pending
+  status and test inventories still described history update as unimplemented.
+- **Disposition:** Added standalone-overload rollback coverage and synchronized
+  the kernel inventory, host API table, Prefill test inventories, README and
+  requirement map. The follow-up review found no remaining correctness issue.
+  On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a), the focused
+  Prefill serial/concurrent tests passed 2/2 with the new rollback regression;
+  the full Metal suite passed 80/80 and the host suite passed with only the
+  unavailable-model-input case skipped. Synthetic fixtures do not demonstrate
+  production Prefill integration or model-backed inference.
