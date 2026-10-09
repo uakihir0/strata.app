@@ -2,6 +2,7 @@
 #pragma once
 
 #include "strata/metal/context.hpp"
+#include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/mtp_kv.hpp"
 
 #include <string>
@@ -210,6 +211,43 @@ struct MtpRoutedExpertsBuffers {
     BufferRef parts;
 };
 
+/// MTP stages 18–19: shared-expert inputs/scratch plus the residual write.
+/// The encoder quantizes `mixed` into `mixed_q8_1`, evaluates the shared
+/// expert, combines its gated output with stage-17 `routed_parts`, then
+/// applies the result to `residual` using the supplied GR `inject`. The
+/// shared-expert fields omit the Q8_1 input, mixed row and active-row
+/// metadata because this wrapper produces those from `params` and `mixed`.
+struct MtpSharedExpertWriteBuffers {
+    ReadOnlyBufferRef gate_weights;
+    ReadOnlyBufferRef up_weights;
+    ReadOnlyBufferRef down_weights;
+    ReadOnlyBufferRef shared_gate_weights;
+    ReadOnlyBufferRef routed_parts;
+    ReadOnlyBufferRef route_weights;
+
+    BufferRef gate;
+    BufferRef up;
+    BufferRef hidden;
+    BufferRef down_activations;
+    BufferRef shared_output;
+    BufferRef shared_gate_logits;
+    BufferRef output;
+    BufferRef gate_sink;
+    BufferRef up_sink;
+    BufferRef down_sink;
+    BufferRef shared_gate_sink;
+
+    BufferRef residual;
+    BufferRef inject;
+};
+
+struct MtpSharedFFNWriteBuffers {
+    ReadOnlyBufferRef params;
+    BufferRef mixed;
+    BufferRef mixed_q8_1;
+    MtpSharedExpertWriteBuffers shared;
+};
+
 /// Add MTP hidden and embedding streams to the caller-owned Encoder segment.
 /// On failure, the enclosing Encoder::encode body must return false so prior
 /// work in that segment is discarded.
@@ -354,5 +392,21 @@ bool encode_mtp_routed_experts(Context& context,
                                CommandBuffer& command_buffer,
                                const MtpRoutedExpertsBuffers& buffers,
                                std::string& error);
+
+/// Encode MTP stages 18–19 for T=1: quantize the mixed row to Q8_1, run the
+/// shared expert, combine its output with routed parts and weights, and write
+/// the combined result to the GR residual. The standalone form is
+/// transactional; the caller-owned form requires an ordered group boundary
+/// and must propagate failure from its enclosing Encoder::encode body.
+/// The caller must not modify `params`, `mixed`, shared weights, routed parts,
+/// route weights, `residual`, or `inject` until GPU completion. This stage
+/// reads and then writes `residual` in place. Every view must remain alive
+/// through completion.
+bool encode_mtp_shared_ffn_write(
+    Context& context, Encoder& encoder,
+    const MtpSharedFFNWriteBuffers& buffers, std::string& error);
+bool encode_mtp_shared_ffn_write(
+    Context& context, CommandBuffer& command_buffer,
+    const MtpSharedFFNWriteBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal

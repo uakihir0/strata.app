@@ -412,6 +412,14 @@
       "label": "metal",
       "origin": "09 9.1, 04 §5.11, D-IMPL-333, REV-130"
     },
+    "metal_mtp_shared_ffn_write_test": {
+      "label": "metal",
+      "origin": "09 9.1, 04 §5.11, D-IMPL-334, REV-131"
+    },
+    "metal_mtp_shared_ffn_write_test_concurrent": {
+      "label": "metal",
+      "origin": "09 9.1, 04 §5.11, D-IMPL-334, REV-131"
+    },
     "metal_mv_test": {
       "label": "metal",
       "origin": "09 9.1, D-IMPL-271, D-IMPL-299, REV-096, D-IMPL-305, REV-102, D-IMPL-306"

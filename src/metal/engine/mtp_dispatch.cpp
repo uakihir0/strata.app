@@ -2212,4 +2212,211 @@ bool encode_mtp_routed_experts(
         error);
 }
 
+namespace {
+
+bool validate_mtp_shared_ffn_write(
+    Context& context, const MtpSharedFFNWriteBuffers& buffers,
+    std::uint32_t& rows, MoeSharedFFNBuffers& shared_ffn,
+    std::string& error) {
+    constexpr char operation[] = "MTP shared FFN write";
+    if (!read_mtp_rows(context, buffers.params, operation, rows, error)) {
+        return false;
+    }
+    if (rows != 1u) {
+        error = std::string(operation) +
+                " requires T=1 for the full-layer pass";
+        return false;
+    }
+
+    const ReadOnlyBufferRef active_rows =
+        buffers.params.slice(offsetof(MtpParams, T), sizeof(std::uint32_t));
+    if (!active_rows) {
+        error = std::string(operation) +
+                " could not form the active-row count view";
+        return false;
+    }
+
+    const auto& shared = buffers.shared;
+    shared_ffn = {
+        context.buffers().read_only(buffers.mixed_q8_1),
+        context.buffers().read_only(buffers.mixed),
+        shared.gate_weights,
+        shared.up_weights,
+        shared.down_weights,
+        shared.shared_gate_weights,
+        active_rows,
+        shared.routed_parts,
+        shared.route_weights,
+        shared.gate,
+        shared.up,
+        shared.hidden,
+        shared.down_activations,
+        shared.shared_output,
+        shared.shared_gate_logits,
+        shared.output,
+        shared.gate_sink,
+        shared.up_sink,
+        shared.down_sink,
+        shared.shared_gate_sink,
+    };
+
+    constexpr std::size_t mixed_bytes =
+        static_cast<std::size_t>(N_EMBD) * sizeof(float);
+    constexpr std::size_t q8_1_bytes =
+        static_cast<std::size_t>(N_EMBD / kMtpQ8BlockValues) *
+        sizeof(Q81);
+    constexpr std::size_t gate_up_weight_bytes =
+        static_cast<std::size_t>(N_FF) *
+        (N_EMBD / kMtpQ8BlockValues) * sizeof(block_q8_0);
+    constexpr std::size_t down_weight_bytes =
+        static_cast<std::size_t>(N_EMBD) *
+        (N_FF / kMtpQ8BlockValues) * sizeof(block_q8_0);
+    constexpr std::size_t shared_gate_weight_bytes =
+        static_cast<std::size_t>(N_EMBD) * sizeof(std::uint16_t);
+    constexpr std::size_t routed_parts_bytes =
+        static_cast<std::size_t>(kMtpRouterTopK) * N_EMBD * sizeof(float);
+    constexpr std::size_t route_weights_bytes =
+        static_cast<std::size_t>(kMtpRouterTopK) * sizeof(float);
+    constexpr std::size_t expert_row_bytes =
+        static_cast<std::size_t>(N_FF) * sizeof(float);
+    constexpr std::size_t down_activation_bytes =
+        static_cast<std::size_t>(N_FF / kMtpQ8BlockValues) * sizeof(Q81);
+    constexpr std::size_t embedding_row_bytes =
+        static_cast<std::size_t>(N_EMBD) * sizeof(float);
+    constexpr std::size_t sink_bytes = sizeof(float);
+    constexpr std::size_t residual_bytes =
+        static_cast<std::size_t>(HC_DIM) * sizeof(float);
+    constexpr std::size_t injection_bytes =
+        static_cast<std::size_t>(HC) * sizeof(float);
+
+    const std::array<std::pair<const char*, ReadOnlyBufferRef>, 7> inputs{{
+        {"mixed", context.buffers().read_only(buffers.mixed)},
+        {"gate_weights", shared.gate_weights},
+        {"up_weights", shared.up_weights},
+        {"down_weights", shared.down_weights},
+        {"shared_gate_weights", shared.shared_gate_weights},
+        {"routed_parts", shared.routed_parts},
+        {"route_weights", shared.route_weights},
+    }};
+    const std::array<std::size_t, inputs.size()> input_bytes{{
+        mixed_bytes,
+        gate_up_weight_bytes,
+        gate_up_weight_bytes,
+        down_weight_bytes,
+        shared_gate_weight_bytes,
+        routed_parts_bytes,
+        route_weights_bytes,
+    }};
+    for (std::size_t index = 0u; index < inputs.size(); ++index) {
+        if (overlaps(buffers.params, sizeof(MtpParams), inputs[index].second,
+                     input_bytes[index])) {
+            error = std::string(operation) +
+                    " parameter block overlaps active view " +
+                    inputs[index].first;
+            return false;
+        }
+    }
+
+    for (std::size_t index = 0u; index < inputs.size(); ++index) {
+        if (overlaps(inputs[index].second, input_bytes[index],
+                     buffers.mixed_q8_1, q8_1_bytes)) {
+            error = std::string(operation) +
+                    " Q8_1 output overlaps active input " +
+                    inputs[index].first;
+            return false;
+        }
+    }
+
+    const std::array<std::pair<const char*, BufferRef>, 14> outputs{{
+        {"mixed_q8_1", buffers.mixed_q8_1},
+        {"gate", shared.gate},
+        {"up", shared.up},
+        {"hidden", shared.hidden},
+        {"down_activations", shared.down_activations},
+        {"shared_output", shared.shared_output},
+        {"shared_gate_logits", shared.shared_gate_logits},
+        {"output", shared.output},
+        {"gate_sink", shared.gate_sink},
+        {"up_sink", shared.up_sink},
+        {"down_sink", shared.down_sink},
+        {"shared_gate_sink", shared.shared_gate_sink},
+        {"residual", shared.residual},
+        {"inject", shared.inject},
+    }};
+    constexpr std::array<std::size_t, outputs.size()> output_bytes{{
+        q8_1_bytes,
+        expert_row_bytes,
+        expert_row_bytes,
+        expert_row_bytes,
+        down_activation_bytes,
+        embedding_row_bytes,
+        sizeof(float),
+        embedding_row_bytes,
+        sink_bytes,
+        sink_bytes,
+        sink_bytes,
+        sink_bytes,
+        residual_bytes,
+        injection_bytes,
+    }};
+    for (std::size_t index = 0u; index < outputs.size(); ++index) {
+        if (overlaps(buffers.params, sizeof(MtpParams),
+                     outputs[index].second, output_bytes[index])) {
+            error = std::string(operation) +
+                    " parameter block overlaps active view " +
+                    outputs[index].first;
+            return false;
+        }
+    }
+    for (std::size_t index = 1u; index < outputs.size(); ++index) {
+        if (overlaps(buffers.mixed_q8_1, q8_1_bytes,
+                     outputs[index].second, output_bytes[index])) {
+            error = std::string(operation) +
+                    " Q8_1 output overlaps active output " +
+                    outputs[index].first;
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+bool encode_mtp_shared_ffn_write(
+    Context& context, Encoder& encoder,
+    const MtpSharedFFNWriteBuffers& buffers, std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "MTP shared FFN write requires an ordered concurrent-group boundary";
+        return false;
+    }
+
+    std::uint32_t rows = 0u;
+    MoeSharedFFNBuffers shared_ffn{};
+    if (!validate_mtp_shared_ffn_write(context, buffers, rows, shared_ffn,
+                                       error)) {
+        return false;
+    }
+    if (!encode_q8_1(context, encoder, rows, N_EMBD,
+                     {buffers.mixed, buffers.mixed_q8_1}, error)) {
+        return false;
+    }
+    const MoeSharedFFNWriteBuffers writeback{
+        shared_ffn, buffers.shared.residual, buffers.shared.inject};
+    return encode_moe_shared_ffn_write(context, encoder, rows, writeback,
+                                       error);
+}
+
+bool encode_mtp_shared_ffn_write(
+    Context& context, CommandBuffer& command_buffer,
+    const MtpSharedFFNWriteBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "MTP shared FFN write",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_mtp_shared_ffn_write(context, encoder, buffers,
+                                               encode_error);
+        },
+        error);
+}
+
 }  // namespace strata::metal

@@ -199,6 +199,18 @@ strata_metal_test(metal_moe_test_concurrent metal
 set_tests_properties(metal_moe_test_concurrent PROPERTIES
   TIMEOUT 180
   ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
+strata_metal_test(metal_mtp_shared_ffn_write_test metal
+                  metal_moe_test ${STRATA_METALLIB}
+                  --mtp-shared-write-only --input-set fixture)
+set_tests_properties(metal_mtp_shared_ffn_write_test PROPERTIES
+  TIMEOUT 180
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial")
+strata_metal_test(metal_mtp_shared_ffn_write_test_concurrent metal
+                  metal_moe_test ${STRATA_METALLIB}
+                  --mtp-shared-write-only --input-set fixture)
+set_tests_properties(metal_mtp_shared_ffn_write_test_concurrent PROPERTIES
+  TIMEOUT 180
+  ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
 
 add_executable(metal_sampler_parity_test tests/metal/metal_sampler_parity_test.mm)
 target_include_directories(metal_sampler_parity_test PRIVATE ${STRATA_METAL_GENERATED_DIR})

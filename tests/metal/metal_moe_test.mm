@@ -34,6 +34,8 @@
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/gr_dispatch.hpp"
 #include "strata/metal/moe_dispatch.hpp"
+#include "strata/metal/mtp_dispatch.hpp"
+#include "../../src/metal/kernels/common/types.h"
 
 #include <algorithm>
 #include <array>
@@ -3873,7 +3875,7 @@ bool test_composed_shared_ffn(
         up_weights_bytes,
         down_weights_bytes,
         shared_gate_weights_bytes,
-        sizeof(rows),
+        sizeof(MtpParams),
         routed_parts_bytes,
         route_weights_bytes,
         gate_bytes,
@@ -3918,6 +3920,8 @@ bool test_composed_shared_ffn(
         return true;
     };
     const std::uint32_t live_rows = rows;
+    MtpParams mtp_params{};
+    mtp_params.T = live_rows;
     const bool inputs_copied =
         copy_bytes(input_q8_1, mixed_q8_1.data(), active_input_q8_bytes) &&
         copy_bytes(mixed_f32, mixed.data(), mixed_bytes) &&
@@ -3926,7 +3930,7 @@ bool test_composed_shared_ffn(
         copy_bytes(down_weight_data, down_weights.data(), down_weights_bytes) &&
         copy_bytes(shared_gate_weight_data, gate_input_weights.data(),
                    shared_gate_weights_bytes) &&
-        copy_bytes(active_row_data, &live_rows, sizeof(live_rows)) &&
+        copy_bytes(active_row_data, &mtp_params, sizeof(mtp_params)) &&
         copy_bytes(routed_part_data, routed_parts.data(), routed_parts_bytes) &&
         copy_bytes(route_weight_data, route_weights.data(),
                    route_weights_bytes);
@@ -4030,6 +4034,31 @@ bool test_composed_shared_ffn(
     const MoeSharedFFNWriteBuffers write_buffers{
         buffers, storage[residual_input].view(),
         storage[injection_input].view()};
+    const MtpSharedFFNWriteBuffers mtp_write_buffers{
+        context.buffers().read_only(storage[active_row_data].view()),
+        storage[mixed_f32].view(),
+        storage[input_q8_1].view(),
+        {
+            buffers.gate_weights,
+            buffers.up_weights,
+            buffers.down_weights,
+            buffers.shared_gate_weights,
+            buffers.routed_parts,
+            buffers.route_weights,
+            buffers.gate,
+            buffers.up,
+            buffers.hidden,
+            buffers.down_activations,
+            buffers.shared_output,
+            buffers.shared_gate_logits,
+            buffers.output,
+            buffers.gate_sink,
+            buffers.up_sink,
+            buffers.down_sink,
+            buffers.shared_gate_sink,
+            storage[residual_input].view(),
+            storage[injection_input].view(),
+        }};
 
     bool validation_ok = true;
     if (rows == 1u && set == twin::InputSet::fixture) {
@@ -4540,7 +4569,320 @@ bool test_composed_shared_ffn(
             write_match &= residual_guards && injection_unchanged;
         }
     }
-    return outputs_match && guards_ok && write_match;
+    bool mtp_write_match = true;
+    if (rows == 1u && set == twin::InputSet::fixture) {
+        constexpr std::array<BufferIndex, 11u> compared_outputs{
+            gate_output, up_output, hidden_output, down_q8_1_output,
+            shared_output, shared_gate_logits, combined_output, gate_sink,
+            up_sink, down_sink, shared_gate_sink};
+        std::array<std::vector<std::uint8_t>, compared_outputs.size()>
+            expected_outputs{};
+        for (std::size_t i = 0u; i < compared_outputs.size(); ++i) {
+            const auto payload =
+                storage[compared_outputs[i]].payload();
+            expected_outputs[i].assign(payload.begin(), payload.end());
+        }
+        std::memcpy(storage[residual_input].payload().data(),
+                    initial_residual.data(), residual_bytes);
+
+        const char* const dispatch_mode =
+            std::getenv("STRATA_METAL_DISPATCH");
+        const bool standalone =
+            dispatch_mode != nullptr &&
+            std::string_view(dispatch_mode) == "concurrent";
+        constexpr std::array<BufferIndex, 9u> mtp_read_only_inputs{
+            mixed_f32, gate_weight_data, up_weight_data, down_weight_data,
+            shared_gate_weight_data, active_row_data, routed_part_data,
+            route_weight_data, injection_input};
+        for (const BufferIndex input : mtp_read_only_inputs) {
+            storage[input].capture_before_dispatch();
+        }
+        auto mtp_command =
+            context.make_command_buffer(label + " MTP stages 18-19", error);
+        const bool mtp_encoded = mtp_command && (standalone
+            ? encode_mtp_shared_ffn_write(context, *mtp_command,
+                                          mtp_write_buffers, error)
+            : Encoder::encode(
+                  context, *mtp_command, label + " MTP stages 18-19",
+                  [&](Encoder& encoder, std::string& encode_error) {
+                      return encode_mtp_shared_ffn_write(
+                          context, encoder, mtp_write_buffers, encode_error);
+                  },
+                  error));
+        const bool mtp_dispatched =
+            mtp_encoded && mtp_command->commit(error) &&
+            mtp_command->wait_until_completed(error);
+        check(mtp_dispatched,
+              label + (standalone
+                           ? " MTP standalone shared FFN and GR write"
+                           : " MTP caller-owned shared FFN and GR write"),
+              error);
+        mtp_write_match &= mtp_dispatched;
+        if (mtp_dispatched) {
+            bool inputs_unchanged = true;
+            for (const BufferIndex input : mtp_read_only_inputs) {
+                const bool unchanged =
+                    !storage[input].first_unwritten_change({});
+                check(unchanged,
+                      label + " MTP " + names[input] +
+                          " remains read-only with guards");
+                inputs_unchanged &= unchanged;
+            }
+            mtp_write_match &= inputs_unchanged;
+
+            for (std::size_t i = 0u; i < compared_outputs.size(); ++i) {
+                const auto actual = storage[compared_outputs[i]].payload();
+                const bool matches =
+                    actual.size() == expected_outputs[i].size() &&
+                    std::equal(actual.begin(), actual.end(),
+                               expected_outputs[i].begin());
+                check(matches,
+                      label + " MTP shared output matches direct MoE path " +
+                          std::to_string(i));
+                mtp_write_match &= matches;
+            }
+
+            const auto actual_input_q8 =
+                storage[input_q8_1].payload().first(active_input_q8_bytes);
+            const auto expected_input_q8 =
+                std::span<const std::uint8_t>(
+                    reinterpret_cast<const std::uint8_t*>(
+                        mixed_q8_1.data()),
+                    active_input_q8_bytes);
+            const bool q8_matches =
+                !twin::compare_bytes(actual_input_q8, expected_input_q8);
+            check(q8_matches,
+                  label + " MTP mixed Q8_1 matches the scalar oracle");
+            mtp_write_match &= q8_matches;
+
+            const auto* combined_data =
+                reinterpret_cast<const float*>(
+                    storage[combined_output].payload().data());
+            std::vector<twin::tf> expected_post;
+            moe_gr_post_reference(
+                initial_residual,
+                std::span<const float>(combined_data,
+                                       combined_bytes / sizeof(float)),
+                inject, rows, expected_post);
+            const auto* actual_residual =
+                reinterpret_cast<const float*>(
+                    storage[residual_input].payload().data());
+            const auto post_failure = twin::compare_floats(
+                std::span<const float>(actual_residual,
+                                       expected_post.size()),
+                expected_post,
+                {twin::Comparison::units, 16.0, 0.0, 0u});
+            if (post_failure) {
+                twin::report_failure(label.c_str(), options, rows,
+                                     *post_failure);
+            }
+            check(!post_failure,
+                  label + " MTP shared combine and GR post oracle");
+            mtp_write_match &= !post_failure;
+        }
+
+        const auto capture_state = [&] {
+            std::array<std::vector<std::uint8_t>, buffer_count> state{};
+            for (std::size_t i = 0u; i < storage.size(); ++i) {
+                const auto payload = storage[i].payload();
+                state[i].assign(payload.begin(), payload.end());
+            }
+            return state;
+        };
+        const auto state_unchanged = [&](const auto& state) {
+            bool unchanged = true;
+            for (std::size_t i = 0u; i < storage.size(); ++i) {
+                const auto payload = storage[i].payload();
+                unchanged &= payload.size() == state[i].size() &&
+                    std::equal(payload.begin(), payload.end(),
+                               state[i].begin());
+            }
+            return unchanged;
+        };
+        const auto reject_mtp = [&](const std::string& case_label,
+                                    const MtpSharedFFNWriteBuffers& candidate,
+                                    std::string_view expected_error) {
+            const auto before = capture_state();
+            auto command = context.make_command_buffer(case_label, error);
+            const bool rejected = command &&
+                !encode_mtp_shared_ffn_write(context, *command, candidate,
+                                             error);
+            const bool discarded =
+                command && command->unsafe_native_handle() == nullptr;
+            const bool unchanged = state_unchanged(before);
+            const bool error_matches =
+                error.find(expected_error) != std::string::npos;
+            check(rejected && discarded && unchanged && error_matches,
+                  case_label + " rejects transactionally", error);
+            mtp_write_match &= rejected && discarded && unchanged &&
+                               error_matches;
+        };
+
+        twin::GuardedBuffer invalid_params;
+        MtpParams invalid_mtp_params{};
+        invalid_mtp_params.T = 2u;
+        const bool invalid_params_ready =
+            invalid_params.allocate(context, label + " invalid MTP params",
+                                    sizeof(MtpParams), error);
+        check(invalid_params_ready, label + " invalid MTP params allocation",
+              error);
+        if (invalid_params_ready) {
+            std::memcpy(invalid_params.payload().data(), &invalid_mtp_params,
+                        sizeof(invalid_mtp_params));
+            invalid_params.capture_before_dispatch();
+            MtpSharedFFNWriteBuffers invalid_rows = mtp_write_buffers;
+            invalid_rows.params =
+                context.buffers().read_only(invalid_params.view());
+            reject_mtp(label + " MTP rejects T=2", invalid_rows,
+                       "requires T=1");
+
+            const auto rollback_before = capture_state();
+            auto rollback_command = context.make_command_buffer(
+                label + " MTP caller-owned rollback", error);
+            const bool rollback_rejected = rollback_command &&
+                !Encoder::encode(
+                    context, *rollback_command,
+                    label + " MTP caller-owned rollback",
+                    [&](Encoder& encoder, std::string& encode_error) {
+                        return encode_mtp_shared_ffn_write(
+                                   context, encoder, mtp_write_buffers,
+                                   encode_error) &&
+                               encode_mtp_shared_ffn_write(
+                                   context, encoder, invalid_rows,
+                                   encode_error);
+                    },
+                    error);
+            const bool rollback_discarded =
+                rollback_command &&
+                rollback_command->unsafe_native_handle() == nullptr;
+            const bool rollback_unchanged =
+                state_unchanged(rollback_before);
+            const bool rollback_error =
+                error.find("requires T=1") != std::string::npos;
+            check(rollback_rejected && rollback_discarded &&
+                      rollback_unchanged && rollback_error,
+                  label + " MTP later failure rolls back earlier dispatches",
+                  error);
+            mtp_write_match &= rollback_rejected && rollback_discarded &&
+                               rollback_unchanged && rollback_error;
+        } else {
+            mtp_write_match = false;
+        }
+
+        MtpSharedFFNWriteBuffers short_q8 = mtp_write_buffers;
+        short_q8.mixed_q8_1 =
+            storage[input_q8_1].view().slice(0u, sizeof(Q81));
+        reject_mtp(label + " MTP rejects short Q8_1 output", short_q8,
+                   "undersized");
+        MtpSharedFFNWriteBuffers q8_alias = mtp_write_buffers;
+        q8_alias.mixed_q8_1 = storage[mixed_f32].view();
+        reject_mtp(label + " MTP rejects Q8_1 input/output alias", q8_alias,
+                   "overlap");
+        MtpSharedFFNWriteBuffers gate_weight_alias = mtp_write_buffers;
+        gate_weight_alias.mixed_q8_1 =
+            storage[gate_weight_data].view();
+        reject_mtp(label + " MTP rejects Q8_1/shared gate-weight alias",
+                   gate_weight_alias,
+                   "Q8_1 output overlaps active input gate_weights");
+        MtpSharedFFNWriteBuffers up_weight_alias = mtp_write_buffers;
+        up_weight_alias.mixed_q8_1 = storage[up_weight_data].view();
+        reject_mtp(label + " MTP rejects Q8_1/shared up-weight alias",
+                   up_weight_alias,
+                   "Q8_1 output overlaps active input up_weights");
+        MtpSharedFFNWriteBuffers down_weight_alias = mtp_write_buffers;
+        down_weight_alias.mixed_q8_1 = storage[down_weight_data].view();
+        reject_mtp(label + " MTP rejects Q8_1/shared down-weight alias",
+                   down_weight_alias,
+                   "Q8_1 output overlaps active input down_weights");
+        MtpSharedFFNWriteBuffers shared_gate_weight_alias =
+            mtp_write_buffers;
+        shared_gate_weight_alias.mixed_q8_1 =
+            storage[combined_output].view();
+        shared_gate_weight_alias.shared.shared_gate_weights =
+            context.buffers().read_only(storage[combined_output].view().slice(
+                0u, shared_gate_weights_bytes));
+        reject_mtp(
+            label + " MTP rejects Q8_1/shared gate-input-weight alias",
+            shared_gate_weight_alias,
+            "Q8_1 output overlaps active input shared_gate_weights");
+        MtpSharedFFNWriteBuffers routed_parts_alias = mtp_write_buffers;
+        routed_parts_alias.mixed_q8_1 =
+            storage[routed_part_data].view();
+        reject_mtp(label + " MTP rejects Q8_1/routed-parts alias",
+                   routed_parts_alias,
+                   "Q8_1 output overlaps active input routed_parts");
+        MtpSharedFFNWriteBuffers route_weights_alias = mtp_write_buffers;
+        route_weights_alias.mixed_q8_1 = storage[input_q8_1].view();
+        route_weights_alias.shared.route_weights =
+            context.buffers().read_only(storage[input_q8_1].view().slice(
+                0u, route_weights_bytes));
+        reject_mtp(label + " MTP rejects Q8_1/route-weights alias",
+                   route_weights_alias,
+                   "Q8_1 output overlaps active input route_weights");
+        MtpSharedFFNWriteBuffers scratch_alias = mtp_write_buffers;
+        scratch_alias.mixed_q8_1 = storage[gate_output].view();
+        reject_mtp(label + " MTP rejects Q8_1/shared scratch alias",
+                   scratch_alias,
+                   "Q8_1 output overlaps active output gate");
+        MtpSharedFFNWriteBuffers residual_alias = mtp_write_buffers;
+        residual_alias.mixed_q8_1 = storage[residual_input].view();
+        reject_mtp(label + " MTP rejects Q8_1/residual alias",
+                   residual_alias,
+                   "Q8_1 output overlaps active output residual");
+        MtpSharedFFNWriteBuffers injection_alias = mtp_write_buffers;
+        injection_alias.mixed_q8_1 = storage[input_q8_1].view();
+        injection_alias.shared.inject =
+            storage[input_q8_1].view().slice(0u, injection_bytes);
+        reject_mtp(label + " MTP rejects Q8_1/injection alias",
+                   injection_alias,
+                   "Q8_1 output overlaps active output inject");
+
+        std::array<std::uint8_t, sizeof(std::uint32_t)> mixed_prefix{};
+        std::memcpy(mixed_prefix.data(),
+                    storage[mixed_f32].payload().data(),
+                    mixed_prefix.size());
+        const std::uint32_t alias_rows = 1u;
+        std::memcpy(storage[mixed_f32].payload().data(), &alias_rows,
+                    sizeof(alias_rows));
+        MtpSharedFFNWriteBuffers params_alias = mtp_write_buffers;
+        params_alias.params =
+            context.buffers().read_only(storage[mixed_f32].view());
+        reject_mtp(label + " MTP rejects params/mixed alias", params_alias,
+                   "parameter block overlaps active view mixed");
+        std::memcpy(storage[mixed_f32].payload().data(), mixed_prefix.data(),
+                    mixed_prefix.size());
+
+        if (standalone) {
+            const auto group_before = capture_state();
+            auto group_command =
+                context.make_command_buffer(label + " MTP open group", error);
+            const bool group_rejected = group_command && !Encoder::encode(
+                context, *group_command, label + " MTP open group",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    if (!encoder.group_begin(encode_error)) return false;
+                    if (!encode_mtp_shared_ffn_write(
+                            context, encoder, mtp_write_buffers,
+                            encode_error)) {
+                        return false;
+                    }
+                    encode_error = "MTP accepted an open group";
+                    return false;
+                },
+                error);
+            const bool group_discarded = group_command &&
+                group_command->unsafe_native_handle() == nullptr;
+            const bool group_unchanged = state_unchanged(group_before);
+            const bool group_error_matches =
+                error.find("ordered concurrent-group boundary") !=
+                std::string::npos;
+            check(group_rejected && group_discarded && group_unchanged &&
+                      group_error_matches,
+                  label + " MTP rejects open concurrent groups", error);
+            mtp_write_match &= group_rejected && group_discarded &&
+                               group_unchanged && group_error_matches;
+        }
+    }
+    return outputs_match && guards_ok && write_match && mtp_write_match;
 }
 
 bool test_shared_expert_chain_case(
@@ -10776,9 +11118,13 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    const bool mtp_shared_write_only =
+        argc > 2 && std::string_view(argv[2]) == "--mtp-shared-write-only";
     twin::Options options;
     std::string err;
-    if (!twin::parse_options(argc, argv, 2, options, err)) {
+    if (!twin::parse_options(argc, argv,
+                             mtp_shared_write_only ? 3 : 2,
+                             options, err)) {
         std::fprintf(stderr, "%s\n", err.c_str());
         return 2;
     }
@@ -10794,6 +11140,24 @@ int main(int argc, char** argv) {
     auto context = Context::open(context_options, err);
     check(context != nullptr, "open Metal context", err);
     if (!context) return 1;
+
+    if (mtp_shared_write_only) {
+        std::vector<block_q8_0> gate_weights;
+        std::vector<block_q8_0> up_weights;
+        std::vector<block_q8_0> down_weights;
+        std::vector<std::uint16_t> gate_input_weights;
+        make_shared_expert_weights(
+            twin::InputSet::fixture,
+            options.seed ^
+                (static_cast<std::uint64_t>(twin::InputSet::fixture) << 52u),
+            gate_weights, up_weights, down_weights, gate_input_weights);
+        const bool completed = test_shared_expert_chain_case(
+            *context, 1u, twin::InputSet::fixture, options, gate_weights,
+            up_weights, down_weights, gate_input_weights);
+        std::printf("metal_mtp_shared_ffn_write_test: %s\n",
+                    completed && g_failures == 0 ? "OK" : "FAILED");
+        return completed && g_failures == 0 ? 0 : 1;
+    }
 
     if (!test_route_dispatch_validation(*context)) ++g_failures;
     if (!test_plan_dispatch_validation(*context)) ++g_failures;
