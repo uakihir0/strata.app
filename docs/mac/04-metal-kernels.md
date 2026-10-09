@@ -2912,6 +2912,15 @@ writes, with `row(c) = {c, c + 1, (c + 1) / 4, window > 0 ? min(c + 1, window) :
   open concurrent group so chunk→merge→FWHT dependencies retain their
   barriers. This is an isolated host encoder; it does not bind
   `MtpRuntimeStorage` or establish model-backed attention parity.
+- Stage 14's `encode_mtp_attention_output_projection` composes the QSA gate,
+  Q8_1 quantization of the 6144-wide gated attention row, and the Q8_0
+  6144→2560 O projection in one ordered Encoder segment. It requires T=1 and
+  uses `MtpParams.T` as the projection's active-row metadata. The caller
+  supplies stage 13's attention output, stage 10's `q_full`, the named Q8_1
+  scratch, O-projection weights, `bo`, and the required sink. The wrapper
+  validates extents, Context ownership and aliases before dispatch, and
+  refuses an open concurrent group. This isolated encoder does not bind
+  `MtpRuntimeStorage` or establish model-backed attention parity.
 - Stages 2 and 4 are upstream's `native_qsa_rms_norm_weighted`, whose `norm<1024>` (for rows of 1024 or more) is
   the same arithmetic as `native_gr_rms_norm_weighted`. `strata_rms_norm_w` serves both with `n_cols` and the gamma
   period `gp` as `setBytes` constants (section 5.4).

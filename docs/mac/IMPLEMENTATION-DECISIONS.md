@@ -8523,3 +8523,55 @@ measuring L-15 remain open.
   upstream changes with goldens still valid. `git diff --check` was clean.
 - **Review required:** Production runtime-view binding and inspected-model
   stage 13/full-drafter parity remain open under D-IMPL-329.
+
+### D-IMPL-330: Compose MTP drafter stage 14 output projection
+
+- **Decision:** Add caller-owned Encoder and standalone transactional forms
+  for the T=1 stage-14 pipeline: QSA attention gate, Q8_1 quantization of the
+  6144-value gated row, then the read-only Q8_0 `self_attn.o_proj` projection
+  from 6144 to 2560 values. Pass `MtpParams.T` to the mat-vec as its active-row
+  metadata. Validate Context ownership, active extents, alignment, and
+  input/output aliases before dispatch; reject parameter-block overlap with
+  attention, `q_full`, or O-projection weights.
+- **Reason:** The documented stage is a strict dependency chain over kernels
+  already used elsewhere. Reusing their validated Encoder forms preserves the
+  established gate, quantization and projection arithmetic while ordering
+  each consumer after its producer. The CPU-visible parameter block supplies
+  the mat-vec's active-row count, so it must stay immutable and distinct from
+  data inputs. This remains an isolated stage and does not bind
+  `MtpRuntimeStorage` or claim model-backed parity.
+- **Validation:** `metal_mtp_output_projection_test` checks the gate against
+  the accurate sigmoid oracle, Q8_1 bytes against the scalar quantizer, and
+  `bo` against the scalar Q8_0 mat-vec oracle. It covers standalone and
+  caller-owned forms, T errors, short views, parameter/data and
+  input/output aliases, foreign weights, guards, immutable inputs, Q8_1
+  padding, concurrent-group rejection and rollback. Full build and suite
+  results are recorded in REV-127.
+- **Review required:** Bind stage-14 inputs and scratch to production MTP
+  runtime views, compose stages 6–15 through `MtpRuntimeStorage`, and compare
+  the handoff and full drafter round against an inspected model. Production
+  MTP scheduling and the upstream-compatible MTP API remain open.
+
+### REV-127: Hostile review of MTP drafter stage 14
+
+- **Scope:** The MTP attention gate/Q8_1/O-projection coordinator, its Metal
+  twin, CMake registration, test-map entry and stage-status documentation.
+- **Adversarial finding (P3):** The CPU-visible `MtpParams.T` view could
+  overlap a read-only attention, `q_full` or O-projection-weight input while
+  avoiding every output alias check. Such a view makes active-row metadata
+  ambiguous. **Resolution:** Reject parameter-block overlap with each data
+  input and add regression cases for `params`/attention, `params`/`q_full` and
+  `params`/weights.
+- **Re-review:** The subagent confirmed both regression cases construct valid
+  views and are rejected, and found no additional issue in stage ordering,
+  T=1 handling, active-row metadata, extents, alignment, aliases, rollback or
+  documentation.
+- **Disposition:** Serial and concurrent stage-14 CTests passed 2/2 as part of
+  `ctest --preset mac-metal --output-on-failure`, which passed 71/71. After
+  adding the `params`/`q_full` alias case, the focused pair passed again 2/2.
+  `ctest --preset mac-host --output-on-failure` passed all 44 registered
+  tests with the documented real-input test skipped. The Python suite passed
+  35/35 modules; `test_map` passed and `check_drift.py` reported no upstream
+  changes with goldens still valid. The full `mac-dev` build passed.
+- **Review required:** Production runtime-view wiring and inspected-model
+  stage-14/full-drafter parity remain open under D-IMPL-330.
