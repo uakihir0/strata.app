@@ -8831,3 +8831,116 @@ measuring L-15 remain open.
   it does not establish MTP runtime wiring or model-backed parity.
 - **Review required:** Continue with stages 21–22 and production
   `MtpRuntimeStorage` wiring and parity under D-IMPL-335.
+
+### D-IMPL-336: Compose MTP drafter stage 21 output-head projection
+
+- **Decision:** Add a T=1 `encode_mtp_draft_head` coordinator that quantizes
+  `sample` to Q8_1 and projects either the full output vocabulary or a
+  once-validated unique draft-vocabulary row map represented by an immutable
+  typed token. Validate map ranges and duplicates at token construction, then
+  reuse the token in stages 21 and 22 rather than scanning/sorting the
+  vocabulary map for every draft token. Support Q5_K, Q6_K and IQ4_XS through
+  a read-only indexed-head mat-vec Encoder overload; preserve the existing
+  full-vocabulary head and dot-kernel arithmetic. Validate active extents,
+  formats, Context ownership and aliases before dispatch.
+- **Reason:** Draft tokens use the same output weights and quantized head
+  path as target tokens, with an optional subset table. Reusing Q8_1 and
+  format-specific indexed mat-vec kernels avoids a second arithmetic
+  implementation and keeps the projection on the GPU. Mapping remains an
+  explicit input so this isolated stage does not imply `MtpRuntimeStorage`
+  integration or copy mapped rows to the host.
+- **Validation:** Serial and concurrent fixtures check full and indexed
+  Q5_K/Q6_K/IQ4_XS output against independent Q8_1 and scalar mat-vec oracles,
+  including unsorted row mapping, output tails, guards, input immutability,
+  invalid maps/formats/T, aliases and caller-owned rollback after an earlier
+  valid dispatch.
+- **Build and tests:** `cmake --build --preset mac-dev` succeeded. Focused
+  `metal_mv_test`, `metal_mv_test_concurrent`, `metal_mtp_test` and
+  `metal_mtp_test_concurrent` passed 4/4 on Mac17,9 (64 GB, macOS 27.0.1,
+  Xcode 27.0 build 27A266a).
+- **Review required:** Review the once-validated map-token lifetime and
+  confirm that its backing view remains immutable through asynchronous
+  dispatch. Bind the isolated encoders to production `MtpRuntimeStorage` and
+  establish parity against an inspected model. Stages 1–5 and the production
+  MTP scheduler remain open.
+
+### REV-133: Hostile review of MTP drafter stage 21
+
+- **Scope:** Indexed read-only output-head mat-vec, draft-vocabulary map
+  validation and reuse, serial/concurrent fixtures, test-map metadata and
+  documentation claims.
+- **Adversarial findings:** The first review found that the row map was
+  copied and sorted on every projection, adding allocation and O(n log n)
+  work to each draft token. It also found that the test documentation claimed
+  full-head coverage for Q6_K and IQ4_XS while those formats were only tested
+  through indexed rows. Map range/uniqueness validation now happens once in
+  `make_mtp_draft_vocabulary_map`, whose immutable token is reused by stages
+  21 and 22; full-head fixtures now cover Q5_K, Q6_K and IQ4_XS. Review found
+  no bounds, indexing, alias, ownership, read-only, output-order or rollback
+  correctness defect.
+- **Disposition:** After these fixes, the build and focused `metal_mv_test`,
+  `metal_mv_test_concurrent`, `metal_mtp_test` and
+  `metal_mtp_test_concurrent` passed 4/4 on Mac17,9 (64 GB, macOS 27.0.1,
+  Xcode 27.0 build 27A266a). The fixtures cover isolated projections only;
+  production `MtpRuntimeStorage` binding and model-backed parity remain open.
+- **Review required:** Recheck the Stage 22 composition's use of the map token,
+  and continue with production MTP runtime binding and drafter parity.
+
+### D-IMPL-337: Compose MTP drafter stage 22 greedy sampling
+
+- **Decision:** Add transactional standalone and caller-owned Encoder forms of
+  `encode_mtp_draft_sampling`. Require T=1, greedy mode, and empty
+  zero-offset history; compose the existing greedy sampler with a GPU
+  argmax-probability kernel, then optionally map the selected subset index to
+  its full token ID. Reuse the once-validated immutable vocabulary-map token
+  from stage 21.
+- **Reason:** The MTP path needs both a greedy token and its probability for
+  draft acceptance. Computing probability while the selected ID is still a
+  subset row preserves the drafter's logit-space semantics; mapping afterward
+  keeps the selected token in full-vocabulary space without reading the map
+  back to the CPU. Reusing the token avoids repeating range and uniqueness
+  checks for every generated draft token.
+- **Validation:** Serial and concurrent fixtures compare full and strict
+  subset token IDs and argmax probabilities against independent expectations.
+  The subset oracle excludes extra logits in the head buffer, detecting a
+  probability reduction that accidentally uses the full-head row count. They
+  also check mapping after probability calculation, immutable inputs,
+  T/mode/history rejection, short views, aliases, caller-owned rollback and
+  open-group refusal.
+- **Build and tests:** The `mac-dev` build succeeded and the focused
+  `metal_mv_test`, `metal_mv_test_concurrent`, `metal_mtp_test` and
+  `metal_mtp_test_concurrent` tests passed 4/4 on Mac17,9 (64 GB, macOS 27.0.1,
+  Xcode 27.0 build 27A266a).
+- **Review required:** The hostile review of stages 21–22 and full
+  `mac-metal` validation are complete. Stages 1–5, production
+  `MtpRuntimeStorage` binding, scheduler integration and inspected-model
+  drafter parity remain open.
+
+### REV-134: Hostile review of MTP drafter stages 21–22
+
+- **Scope:** Stage-21 full and indexed head projection, immutable vocabulary
+  map-token validation/reuse, Stage-22 greedy sampling and row mapping,
+  probability semantics, aliases, transaction rollback, concurrent dispatch,
+  tests and documentation.
+- **Adversarial findings:** The first review found a per-token map copy/sort
+  and missing full-head fixtures for Q6_K/IQ4_XS; these were fixed and
+  recorded under REV-133. The Stage-22 review then found that its seven-entry
+  map only permuted a seven-row head, so a probability reduction using the
+  wrong vocabulary size could pass. The fixture now uses a strict four-of-
+  seven subset and separate full/subset softmax oracles that exclude inactive
+  logits. The final review found no further correctness, memory-safety, ABI,
+  alias, transaction or concurrency defects. It also caught a stale test-map
+  review citation and wording that attributed sampling to stage 21; both
+  documentation issues are corrected.
+- **Disposition:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a),
+  the `mac-dev` build succeeded; focused `metal_mv_test`,
+  `metal_mv_test_concurrent`, `metal_mtp_test` and
+  `metal_mtp_test_concurrent` passed 4/4; the full `mac-metal` suite passed
+  80/80; `mac-host` passed 43 tests with one unavailable real-input test
+  skipped; and the Python runner passed 35/35 modules in `.venv`. `test_map`,
+  `check_drift.py` and `git diff --check` also passed. These fixtures validate
+  isolated encoder behavior and do not establish production runtime binding,
+  scheduler integration or model-backed parity.
+- **Review required:** Implement or explicitly disposition the remaining
+  L11 work: MTP stages 1–5, `MtpRuntimeStorage` view binding, scheduler
+  integration and inspected-model parity.

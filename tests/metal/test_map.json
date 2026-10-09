@@ -322,11 +322,11 @@
     },
     "metal_mtp_test": {
       "label": "metal",
-      "origin": "09 9.1, 04 §5.11, D-IMPL-322, REV-119, D-IMPL-336, REV-133"
+      "origin": "09 9.1, 04 §5.11, D-IMPL-322, REV-119, D-IMPL-336, REV-133, D-IMPL-337, REV-134"
     },
     "metal_mtp_test_concurrent": {
       "label": "metal",
-      "origin": "09 9.1, 04 §5.11, D-IMPL-322, REV-119, D-IMPL-336, REV-133"
+      "origin": "09 9.1, 04 §5.11, D-IMPL-322, REV-119, D-IMPL-336, REV-133, D-IMPL-337, REV-134"
     },
     "metal_mtp_gr_test": {
       "label": "metal",
