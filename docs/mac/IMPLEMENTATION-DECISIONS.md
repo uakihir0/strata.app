@@ -10932,3 +10932,46 @@ measuring L-15 remain open.
   27A266a), the final rebuilt `mac-dev` target and focused serial/concurrent
   Prefill tests passed 2/2; `test_map` passed 1/1 and the full `mac-metal`
   suite passed 90/90 after the final test expansion.
+
+### D-IMPL-377: Compose the Prefill GDN post-projection stages
+
+- **Decision:** Add `encode_prefill_gdn_transforms` for the ordered six-stage
+  sequence from GDN gate generation through output normalization. The caller
+  supplies `alpha_beta`, `qkv` and `z` projections, model vectors, scratch,
+  history and recurrent state. Validate active buffer extents, alignment,
+  Context ownership and cross-stage writable/read-only aliases before
+  dispatching. Keep both caller-owned Encoder and transactional CommandBuffer
+  forms.
+- **Reason:** The gates, convolution, history, L2, recurrence and output
+  normalization already have validated encoders and independent numerical
+  tests. Their ordering and persistent mutations form one useful Prefill
+  boundary that can be compared directly with those components. The native
+  input projections and final `ssm_out` projection are a separate next
+  integration step because their format/dequantization and GEMM scratch
+  contracts are not part of the existing post-projection GDN APIs.
+- **Review required:** Check every active tensor shape and cross-stage alias,
+  the old-history-read-before-update order, state/history mutation, failure
+  propagation and the distinction between synthetic post-projection parity
+  and model-backed Prefill inference.
+
+### REV-174: Hostile review of Prefill GDN transform composition
+
+- **Scope:** Review the six-stage ordering, shape/alias validation before the
+  first dispatch, caller-owned and standalone failure behavior, persistent
+  history/state updates, and direct-chain tests including tile and late-stage
+  failure cases.
+- **Findings and fixes:** The first review found that the coordinator
+  preflighted active byte ranges but passed oversized original views to
+  component encoders. The convolution-history encoder checks full view lengths,
+  so two disjoint active ranges in one arena could be rejected after the gate
+  and convolution dispatches had already been encoded. The coordinator now
+  passes active-length slices to all six component APIs, and a regression
+  fixture proves that oversized history/QKV views sharing one arena are
+  accepted by both API forms.
+- **Disposition:** The hostile reviewer verified the active-length slicing
+  fix and shared-arena regression and found no further concrete issues.
+- **Validation:** The focused serial and concurrent Prefill tests pass after
+  adding direct-chain parity at T=1/3/65 and invalid cross-stage alias,
+  final-output and shared-arena cases. On Mac17,9 (64 GB, macOS 27.0.1,
+  Xcode 27.0 build 27A266a), the rebuilt `mac-dev` target succeeded,
+  `test_map` passed 1/1 and the final full `mac-metal` suite passed 90/90.

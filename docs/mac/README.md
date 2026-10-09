@@ -87,6 +87,12 @@ v heads unchanged. The recurrence consumes normalized q/k plus v, updates the
 state and writes raw recurrent outputs; output normalization applies RMS
 normalization, gamma and sigmoid before storing F16. These stages are tested
 in isolation and in L2→recurrence→output-normalization segments.
+The `encode_prefill_gdn_transforms` coordinator now orders the complete
+post-projection chain from gate generation through F16 `y_h`, including the
+convolution-history and recurrent-state updates. Synthetic serial/concurrent
+tests compare it against the direct component chain at T=1/3/65. Its projected
+inputs are still supplied by the caller; the GDN GEMMs, final `ssm_out`
+projection, chunk scheduler and production Prefill path remain unimplemented.
 
 Implementation choices, constraints, and required reviews are tracked in
 [IMPLEMENTATION-DECISIONS.md](IMPLEMENTATION-DECISIONS.md).

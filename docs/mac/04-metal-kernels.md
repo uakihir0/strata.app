@@ -4508,6 +4508,27 @@ GPU fixtures lock F16 halfway RNE bits and unsaturated positive/negative
 overflow to infinity; tests also cover input immutability, guards, validation
 and rollback. Prefill GEMMs and chunk-loop integration remain pending.
 
+`encode_prefill_gdn_transforms` now composes the six post-projection stages in
+one ordered segment: gates, tiled convolution, convolution-history advance,
+q/k L2, recurrence and output normalization. Its inputs are the already
+projected `alpha_beta`, `qkv` and `z` tensors plus the layer vectors and
+persistent `history`/`state`; it returns F16 `y_h`. It does not encode the
+four input projections or the final `ssm_out` projection, and is not called by
+the Prefill chunk loop. Before the first dispatch it validates every active
+extent, alignment, Context owner and cross-stage writable/read-only alias.
+Convolution consumes the old history before the next-history write; `h` and
+`oc` are then reused by their documented in-place/following stages. The
+standalone form wraps all six operations in one transactional command buffer.
+Serial and concurrent tests compare every output and both persistent state
+updates with the direct component sequence at T=1/3/65, including the
+convolution tile boundary. They also reject an alias that would otherwise fail
+at the recurrence stage, a short final output before any stage is encoded, and
+an open concurrent group. Oversized history/QKV views whose active ranges are
+disjoint in one arena are accepted through both API forms. The component
+encoders receive active-length slices so their local alias checks match the
+coordinator's preflight. These synthetic post-projection tests do not establish
+model-backed inference.
+
 **Bits.**
 - Given the same `qkv`, `gate`, `beta` and `z`, steps 4-8 give the bits of decode's GDN kernels over the same rows:
   the state and the history that write-through windows (section 8.5) would leave, and `y_h = half(y)` for decode's
