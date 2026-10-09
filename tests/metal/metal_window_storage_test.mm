@@ -3598,7 +3598,8 @@ void run_fullmode_handoff_test(Context& context,
     if (!use_ple_entry) {
         const auto exercise_generic_fullmode_producer =
             [&](std::uint32_t rows, bool caller_owned,
-                bool induce_late_failure, bool consume_pending) {
+                bool induce_late_failure, bool consume_pending,
+                bool induce_consumer_failure = false) {
                 std::vector<std::uint32_t> generic_tokens(rows, 0u);
                 std::vector<WindowSamplerSettings> generic_samplers(
                     rows, sampler_settings);
@@ -3728,6 +3729,9 @@ void run_fullmode_handoff_test(Context& context,
                      generic_buffers.ffn.shared.up_sink,
                      generic_buffers.ffn.shared.down_sink,
                      generic_buffers.ffn.shared.shared_gate_sink});
+                if (consume_pending) {
+                    append_gr_mutations(generic_attention_entry.attention);
+                }
 
                 struct BufferSnapshot {
                     BufferRef view;
@@ -3735,7 +3739,7 @@ void run_fullmode_handoff_test(Context& context,
                 };
                 std::vector<BufferSnapshot> before;
                 before.reserve(mutation_views.size());
-                if (induce_late_failure) {
+                if (induce_late_failure || induce_consumer_failure) {
                     for (BufferRef view : mutation_views) {
                         require(view && view.contents != nullptr,
                                 "snapshot generic producer mutation view");
@@ -3786,6 +3790,63 @@ void run_fullmode_handoff_test(Context& context,
                                 dispatched_buffers.ffn.shared.down_sink),
                             "form an owned empty late-failure sink view");
                 }
+                WindowMoePendingConsumer dispatched_consumer =
+                    generic_pending_consumer;
+                if (induce_consumer_failure) {
+                    auto& invalid_attention =
+                        std::get<WindowMoeAttentionEntryBuffers>(
+                            dispatched_consumer);
+                    invalid_attention.attention.mixed =
+                        invalid_attention.attention.mixed.slice(0u, 0u);
+                    require(static_cast<bool>(
+                                invalid_attention.attention.mixed),
+                            "form an owned empty late-consumer output view");
+                }
+                if (rows == 2u && !caller_owned && consume_pending &&
+                    !induce_consumer_failure) {
+                    WindowMoePendingConsumer aliased_consumer =
+                        generic_pending_consumer;
+                    auto& aliased_attention =
+                        std::get<WindowMoeAttentionEntryBuffers>(
+                            aliased_consumer);
+                    aliased_attention.attention.inject_out =
+                        full_mode->usage_table();
+                    const std::vector<std::uint8_t> usage_before_alias(
+                        static_cast<const std::uint8_t*>(usage_view.contents),
+                        static_cast<const std::uint8_t*>(usage_view.contents) +
+                            usage_view.length);
+                    const WindowMoeLayer0FullModeStepBuffers aliased_step{
+                        dispatched_buffers, aliased_consumer};
+                    auto alias_command = context.make_command_buffer(
+                        "Reject generic consumer output alias to MoE usage",
+                        error);
+                    require(alias_command != nullptr,
+                            "create consumer/producers alias check: " +
+                                error);
+                    const bool alias_encoded = Encoder::encode(
+                        context, *alias_command,
+                        "generic consumer/producers alias check",
+                        [&](Encoder& encoder,
+                            std::string& encode_error) {
+                            return encode_window_moe_layer0_full_mode_step(
+                                context, *full_mode, encoder, kVocabulary,
+                                kExperts, MoeExpertFormat::q2_0,
+                                MoeDownFormat::q2_0, false, aliased_step,
+                                encode_error);
+                        },
+                        error);
+                    require(
+                        !alias_encoded &&
+                            alias_command->unsafe_native_handle() == nullptr &&
+                            error.find("overlaps producer storage") !=
+                                std::string::npos &&
+                            std::equal(
+                                usage_before_alias.begin(),
+                                usage_before_alias.end(),
+                                static_cast<const std::uint8_t*>(
+                                    usage_view.contents)),
+                        "generic step rejects consumer writes into producer usage before any dispatch");
+                }
                 auto command = context.make_command_buffer(
                     "generic FullMode layer-0 producer T=" +
                         std::to_string(rows),
@@ -3795,30 +3856,48 @@ void run_fullmode_handoff_test(Context& context,
                 require(session->track_use(*command, error),
                         "track GDN state through generic FullMode producer: " +
                             error);
-                const bool encoded = caller_owned
-                    ? Encoder::encode(
-                          context, *command,
-                          "caller-owned generic FullMode producer",
-                          [&](Encoder& encoder, std::string& encode_error) {
-                              if (!encode_window_moe_layer0_full_mode(
-                                  context, *full_mode, encoder, kVocabulary,
-                                  kExperts, MoeExpertFormat::q2_0,
-                                  MoeDownFormat::q2_0, dispatched_buffers,
-                                  encode_error)) {
-                                  return false;
-                              }
-                              return !consume_pending ||
-                                     encode_window_moe_pending_consumer(
-                                         context, encoder, rows, false,
-                                         generic_pending_consumer,
-                                         encode_error);
-                          },
-                          error)
-                    : encode_window_moe_layer0_full_mode(
-                          context, *full_mode, *command, kVocabulary,
-                          kExperts, MoeExpertFormat::q2_0,
-                          MoeDownFormat::q2_0, dispatched_buffers, error);
-                if (induce_late_failure) {
+                const WindowMoeLayer0FullModeStepBuffers step_buffers{
+                    dispatched_buffers, dispatched_consumer};
+                const bool encoded = consume_pending
+                    ? (caller_owned
+                           ? Encoder::encode(
+                                 context, *command,
+                                 "caller-owned generic FullMode producer/consumer",
+                                 [&](Encoder& encoder,
+                                     std::string& encode_error) {
+                                     return encode_window_moe_layer0_full_mode_step(
+                                         context, *full_mode, encoder,
+                                         kVocabulary, kExperts,
+                                         MoeExpertFormat::q2_0,
+                                         MoeDownFormat::q2_0, false,
+                                         step_buffers, encode_error);
+                                 },
+                                 error)
+                           : encode_window_moe_layer0_full_mode_step(
+                                 context, *full_mode, *command, kVocabulary,
+                                 kExperts, MoeExpertFormat::q2_0,
+                                 MoeDownFormat::q2_0, false, step_buffers,
+                                 error))
+                    : (caller_owned
+                           ? Encoder::encode(
+                                 context, *command,
+                                 "caller-owned generic FullMode producer",
+                                 [&](Encoder& encoder,
+                                     std::string& encode_error) {
+                                     return encode_window_moe_layer0_full_mode(
+                                         context, *full_mode, encoder,
+                                         kVocabulary, kExperts,
+                                         MoeExpertFormat::q2_0,
+                                         MoeDownFormat::q2_0,
+                                         dispatched_buffers, encode_error);
+                                 },
+                                 error)
+                           : encode_window_moe_layer0_full_mode(
+                                 context, *full_mode, *command, kVocabulary,
+                                 kExperts, MoeExpertFormat::q2_0,
+                                 MoeDownFormat::q2_0, dispatched_buffers,
+                                 error));
+                if (induce_late_failure || induce_consumer_failure) {
                     bool unchanged = before.size() == mutation_views.size();
                     for (const BufferSnapshot& snapshot : before) {
                         const auto* const current =
@@ -3832,7 +3911,11 @@ void run_fullmode_handoff_test(Context& context,
                                 command->unsafe_native_handle() == nullptr &&
                                 error.find("undersized") != std::string::npos &&
                                 unchanged,
-                            "late shared-MoE validation failure discards the generic producer transaction and preserves all views");
+                            (induce_consumer_failure
+                                 ? "late generic consumer validation failure"
+                                 : "late shared-MoE validation failure") +
+                                std::string(
+                                    " discards the FullMode transaction and preserves all views"));
                     std::memcpy(gdn_active_rows.contents, &kRows,
                                 sizeof(kRows));
                     return;
@@ -4327,11 +4410,11 @@ void run_fullmode_handoff_test(Context& context,
                                 oracle_mixed_out.contents,
                                 static_cast<std::size_t>(rows) * N_EMBD *
                                     sizeof(float)) == 0,
-                            "T=8 pending consumer matches direct apply=true GR output for the independently computed MoE result");
+                            "generic pending consumer matches direct apply=true GR output for the independently computed MoE result");
                     require(std::memcmp(
                                 residual.contents, oracle_residual.contents,
                                 generic_residual_bytes) == 0,
-                            "T=8 pending consumer residual matches the direct GR reference");
+                            "generic pending consumer residual matches the direct GR reference");
                     const auto* const consumed_values =
                         static_cast<const float*>(
                             attention_entry_mixed.contents);
@@ -4348,7 +4431,7 @@ void run_fullmode_handoff_test(Context& context,
                                                     return std::abs(value) >
                                                            1.0e-7f;
                                                 }),
-                                "generic T=8 pending selector computes nonzero next-attention rows");
+                                "generic pending selector computes nonzero next-attention rows");
                     }
                     check_active_output(
                         attention_entry_mixed,
@@ -4365,11 +4448,13 @@ void run_fullmode_handoff_test(Context& context,
                             sizeof(kRows));
             };
         exercise_generic_fullmode_producer(1u, false, false, false);
-        exercise_generic_fullmode_producer(2u, false, false, false);
-        exercise_generic_fullmode_producer(3u, false, false, false);
+        exercise_generic_fullmode_producer(2u, false, false, true);
+        exercise_generic_fullmode_producer(3u, false, false, true);
         exercise_generic_fullmode_producer(8u, true, false, true);
         exercise_generic_fullmode_producer(2u, true, true, false);
         exercise_generic_fullmode_producer(3u, false, true, false);
+        exercise_generic_fullmode_producer(2u, false, false, true, true);
+        exercise_generic_fullmode_producer(3u, true, false, true, true);
     }
 
     PLEBlockBuffers ple_block{};
@@ -4917,6 +5002,339 @@ void run_fullmode_handoff_test(Context& context,
                     static_cast<const std::uint8_t*>(
                         ple_block.post.history.contents)),
                 "deferred Window PLE entry preserves committed history");
+
+        WindowMoeLayer0FullBuffers generic_ple_producer = full_buffers;
+        generic_ple_producer.producer.router.layer0.params = params;
+        const ReadOnlyBufferRef generic_ple_params =
+            context.buffers().read_only(params);
+        generic_ple_producer.ffn.shared.active_rows =
+            generic_ple_params.slice(
+                offsetof(strata::metal::WindowParams, T),
+                sizeof(std::uint32_t));
+        require(static_cast<bool>(
+                    generic_ple_producer.ffn.shared.active_rows),
+                "bind generic PLE producer active rows to WindowParams.T");
+        const WindowMoeLayer0FullModeStepBuffers generic_ple_step{
+            generic_ple_producer, pending_consumer};
+        WindowMoeLayer0FullModeStepBuffers aliased_ple_input_step =
+            generic_ple_step;
+        std::get<WindowMoePendingPLEConsumer>(
+            aliased_ple_input_step.consumer)
+            .buffers.ple.input_f32 = pending_output;
+        auto aliased_ple_input_command = context.make_command_buffer(
+            "Reject PLE table input alias to pending MoE output", error);
+        require(aliased_ple_input_command != nullptr,
+                "create PLE-input alias rejection command: " + error);
+        const bool aliased_ple_input_encoded =
+            encode_window_moe_layer0_full_mode_step(
+                context, *full_mode, *aliased_ple_input_command, kVocabulary,
+                kExperts, MoeExpertFormat::q2_0, MoeDownFormat::q2_0, true,
+                aliased_ple_input_step, error);
+        require(!aliased_ple_input_encoded &&
+                    aliased_ple_input_command->unsafe_native_handle() ==
+                        nullptr &&
+                    error.find("outside declared handoffs") !=
+                        std::string::npos &&
+                    std::equal(
+                        pending_snapshot.begin(), pending_snapshot.end(),
+                        static_cast<const std::uint8_t*>(
+                            pending_output.contents)),
+                "generic step rejects PLE table input alias to pending output before any dispatch");
+        std::memcpy(residual.contents, initial_residual.data(),
+                    initial_residual.size());
+        auto generic_ple_command = context.make_command_buffer(
+            "Generic FullMode producer and PLE consumer", error);
+        require(generic_ple_command != nullptr,
+                "create generic FullMode-to-PLE command: " + error);
+        require(session->track_use(*generic_ple_command, error),
+                "track GDN state through generic FullMode-to-PLE step: " +
+                    error);
+        require(encode_window_moe_layer0_full_mode_step(
+                    context, *full_mode, *generic_ple_command, kVocabulary,
+                    kExperts, MoeExpertFormat::q2_0, MoeDownFormat::q2_0,
+                    true, generic_ple_step, error),
+                "encode generic FullMode producer and resolved PLE consumer: " +
+                    error);
+        require(generic_ple_command->commit(error),
+                "commit generic FullMode-to-PLE step: " + error);
+        require(generic_ple_command->wait_until_completed(error),
+                "wait for generic FullMode-to-PLE step: " + error);
+        for (std::size_t index = 0; index < outputs.size(); ++index) {
+            const auto* actual =
+                static_cast<const std::uint8_t*>(outputs[index].contents);
+            require(std::equal(actual_ple_outputs[index].begin(),
+                               actual_ple_outputs[index].end(), actual),
+                    "generic FullMode-to-PLE step matches T=1 token-step output " +
+                        std::to_string(index));
+        }
+        require(std::equal(
+                    actual_residual.begin(), actual_residual.end(),
+                    static_cast<const std::uint8_t*>(residual.contents)),
+                "generic FullMode-to-PLE step matches T=1 residual");
+        require(std::equal(
+                    pending_snapshot.begin(), pending_snapshot.end(),
+                    static_cast<const std::uint8_t*>(pending_output.contents)),
+                "generic PLE composition preserves the producer pending output");
+        require(std::equal(
+                    ple_history_initial.begin(), ple_history_initial.end(),
+                    static_cast<const std::uint8_t*>(
+                        ple_block.post.history.contents)),
+                "generic deferred PLE composition preserves committed history");
+        WindowMoeLayer0FullModeStepBuffers advancing_ple_step =
+            generic_ple_step;
+        std::get<WindowMoePendingPLEConsumer>(
+            advancing_ple_step.consumer)
+            .history_update = PLEHistoryUpdate::advance_rows;
+        auto advancing_ple_command = context.make_command_buffer(
+            "Reject speculative PLE history advancement", error);
+        require(advancing_ple_command != nullptr,
+                "create speculative PLE-history rejection command: " + error);
+        const bool advancing_ple_encoded =
+            encode_window_moe_layer0_full_mode_step(
+                context, *full_mode, *advancing_ple_command, kVocabulary,
+                kExperts, MoeExpertFormat::q2_0, MoeDownFormat::q2_0, true,
+                advancing_ple_step, error);
+        require(!advancing_ple_encoded &&
+                    advancing_ple_command->unsafe_native_handle() == nullptr &&
+                    error.find("must defer committed history advancement") !=
+                        std::string::npos &&
+                    std::equal(
+                        ple_history_initial.begin(),
+                        ple_history_initial.end(),
+                        static_cast<const std::uint8_t*>(
+                            ple_block.post.history.contents)),
+                "speculative FullMode PLE step rejects history advancement before encoding");
+
+        const std::vector<std::uint32_t> generic_ple_tokens(3u, tokens[0]);
+        std::vector<WindowSamplerSettings> generic_ple_samplers(
+            generic_ple_tokens.size(), sampler_settings);
+        const BufferRef generic_ple_t3_params = params_ring->build_slot(
+            1u, 1u, generic_ple_tokens, generic_ple_samplers, 0u,
+            0x11223344u, 0x55667788u, error);
+        require(static_cast<bool>(generic_ple_t3_params),
+                "build T=3 generic PLE parameters: " + error);
+        strata::metal::WindowParams generic_ple_parameter_values{};
+        std::memcpy(&generic_ple_parameter_values,
+                    generic_ple_t3_params.contents,
+                    sizeof(generic_ple_parameter_values));
+        require(generic_ple_parameter_values.T == 3u &&
+                    generic_ple_parameter_values.nc == 4u,
+                "generic PLE producer separates active rows from compiled columns");
+        WindowPleRows generic_ple_rows;
+        require(session->build_ple_rows(generic_ple_tokens,
+                                         runtime_geometry, generic_ple_rows,
+                                         error),
+                "build T=3 generic PLE row IDs: " + error);
+        strata::kernels::PleTableReader* const generic_ple_reader =
+            full_mode->ple_reader();
+        require(generic_ple_reader != nullptr &&
+                    generic_ple_reader->is_open(),
+                "resolve open FullMode PLE reader for T=3 rows");
+        BufferRef generic_ple_input;
+        require(stage_window_ple_input(*generic_ple_reader,
+                                       generic_ple_rows, *scratch,
+                                       generic_ple_input, error),
+                "stage T=3 generic PLE table rows: " + error);
+        // This compact fixture has a one-token vocabulary. Keep its valid
+        // staged allocation, then use distinct synthetic row values to expose
+        // row broadcast and row ordering mistakes in the T=3 composition.
+        auto* const generic_ple_input_values =
+            static_cast<float*>(generic_ple_input.contents);
+        for (std::uint32_t row = 0u; row < 3u; ++row) {
+            for (std::size_t index = 0u; index < N_EMBD; ++index) {
+                generic_ple_input_values[
+                    static_cast<std::size_t>(row) * N_EMBD + index] =
+                    static_cast<float>((row + 1u) * (index % 29u + 1u)) *
+                    0.0002f;
+            }
+        }
+        for (std::uint32_t row = 1u; row < 3u; ++row) {
+            require(std::memcmp(
+                        generic_ple_input_values,
+                        generic_ple_input_values +
+                            static_cast<std::size_t>(row) * N_EMBD,
+                        N_EMBD * sizeof(float)) != 0,
+                    "T=3 PLE table inputs are distinct for every token row");
+        }
+
+        WindowMoeLayer0FullBuffers generic_ple_multi_producer = full_buffers;
+        generic_ple_multi_producer.producer.router.layer0.params =
+            generic_ple_t3_params;
+        const ReadOnlyBufferRef generic_ple_t3_params_read_only =
+            context.buffers().read_only(generic_ple_t3_params);
+        generic_ple_multi_producer.ffn.shared.active_rows =
+            generic_ple_t3_params_read_only.slice(
+                offsetof(strata::metal::WindowParams, T),
+                sizeof(std::uint32_t));
+        require(static_cast<bool>(
+                    generic_ple_multi_producer.ffn.shared.active_rows),
+                "bind T=3 generic FullMode active rows");
+        constexpr std::uint32_t generic_ple_rows_count = 3u;
+        std::memcpy(gdn_active_rows.contents, &generic_ple_rows_count,
+                    sizeof(generic_ple_rows_count));
+        auto* const generic_ple_residual =
+            static_cast<float*>(residual.contents);
+        for (std::uint32_t row = 0u; row < 3u; ++row) {
+            for (std::size_t index = 0u; index < 4u * N_EMBD; ++index) {
+                generic_ple_residual[
+                    static_cast<std::size_t>(row) * 4u * N_EMBD + index] =
+                    static_cast<float>((row + 2u) * (index % 17u + 1u)) *
+                    0.0007f;
+            }
+        }
+        const std::vector<std::uint8_t> generic_ple_reference_residual_input(
+            static_cast<const std::uint8_t*>(residual.contents),
+            static_cast<const std::uint8_t*>(residual.contents) +
+                residual.length);
+        WindowMoePendingConsumer generic_ple_multi_consumer =
+            pending_consumer;
+        auto& generic_ple_payload =
+            std::get<WindowMoePendingPLEConsumer>(
+                generic_ple_multi_consumer);
+        generic_ple_payload.buffers.ple.input_f32 = generic_ple_input;
+        generic_ple_payload.buffers.ple.key_q8_1 = allocate(
+            "T=3 generic PLE Q8_1 key activations",
+            3u * static_cast<std::size_t>(N_EMBD / 32u) * sizeof(Q81));
+        generic_ple_payload.buffers.ple.active_rows =
+            generic_ple_t3_params_read_only.slice(
+                offsetof(strata::metal::WindowParams, T),
+                sizeof(std::uint32_t));
+        const WindowMoeLayer0FullModeStepBuffers generic_ple_multi_step{
+            generic_ple_multi_producer, generic_ple_multi_consumer};
+
+        const std::array<std::size_t, 6u> generic_ple_active_bytes{
+            3u * HC_DIM * sizeof(float), 3u * N_EMBD * sizeof(float),
+            3u * HC_DIM * sizeof(float), 3u * HC * sizeof(float),
+            3u * HC_DIM * sizeof(float), 3u * HC_DIM * sizeof(float)};
+        for (BufferRef output : outputs) {
+            std::memset(output.contents, 0xa5u, output.length);
+        }
+        std::memcpy(ple_block.post.history.contents,
+                    ple_history_initial.data(), ple_history_initial.size());
+        auto generic_ple_multi_command = context.make_command_buffer(
+            "T=3 generic FullMode producer and PLE consumer", error);
+        require(generic_ple_multi_command != nullptr,
+                "create T=3 generic FullMode-to-PLE command: " + error);
+        require(session->track_use(*generic_ple_multi_command, error),
+                "track GDN state through T=3 generic FullMode-to-PLE step: " +
+                    error);
+        require(encode_window_moe_layer0_full_mode_step(
+                    context, *full_mode, *generic_ple_multi_command,
+                    kVocabulary, kExperts, MoeExpertFormat::q2_0,
+                    MoeDownFormat::q2_0, true, generic_ple_multi_step,
+                    error),
+                "encode T=3 generic FullMode-to-PLE step: " + error);
+        require(generic_ple_multi_command->commit(error),
+                "commit T=3 generic FullMode-to-PLE step: " + error);
+        require(generic_ple_multi_command->wait_until_completed(error),
+                "wait for T=3 generic FullMode-to-PLE step: " + error);
+        for (std::size_t index = 0u; index < outputs.size(); ++index) {
+            BufferRef output = outputs[index];
+            const std::size_t active_bytes =
+                generic_ple_active_bytes[index];
+            require(output.length >= active_bytes,
+                    "T=3 generic PLE output covers its active extent");
+            const auto* const bytes =
+                static_cast<const std::uint8_t*>(output.contents);
+            require(std::all_of(bytes + active_bytes,
+                                bytes + output.length,
+                                [](std::uint8_t value) {
+                                    return value == 0xa5u;
+                                }),
+                    "T=3 generic PLE consumer preserves padded output tails");
+        }
+        for (const auto& [view, row_width] :
+             {std::pair{ple_block.post.value, N_EMBD},
+              std::pair{ple_block.post.gated, HC_DIM}}) {
+            const auto* const values =
+                static_cast<const float*>(view.contents);
+            for (std::uint32_t row = 0u; row < 3u; ++row) {
+                const float* const begin =
+                    values + static_cast<std::size_t>(row) * row_width;
+                require(std::all_of(begin, begin + row_width,
+                                    [](float value) {
+                                        return std::isfinite(value);
+                                    }) &&
+                            std::any_of(begin, begin + row_width,
+                                        [](float value) {
+                                            return std::abs(value) > 1.0e-7f;
+                                        }),
+                        "T=3 generic PLE step computes finite nonzero values for every row");
+            }
+        }
+        BufferRef reference_ple_residual = allocate_zeroed_buffer(
+            context, "T=3 direct PLE reference residual", residual.length);
+        std::memcpy(reference_ple_residual.contents,
+                    generic_ple_reference_residual_input.data(),
+                    generic_ple_reference_residual_input.size());
+        PLEBlockBuffers reference_ple_t3 =
+            generic_ple_payload.buffers.ple;
+        const std::array<BufferRef, 6u> reference_outputs{
+            allocate("T=3 direct PLE reference key", outputs[0].length),
+            allocate("T=3 direct PLE reference value", outputs[1].length),
+            allocate("T=3 direct PLE reference query", outputs[2].length),
+            allocate("T=3 direct PLE reference gate", outputs[3].length),
+            allocate("T=3 direct PLE reference gated", outputs[4].length),
+            allocate("T=3 direct PLE reference norm", outputs[5].length)};
+        for (std::size_t index = 0u; index < reference_outputs.size(); ++index) {
+            std::memset(reference_outputs[index].contents, 0xa5u,
+                        reference_outputs[index].length);
+        }
+        reference_ple_t3.key_q8_1 = allocate(
+            "T=3 direct PLE reference Q8_1 key activations",
+            generic_ple_payload.buffers.ple.key_q8_1.length);
+        reference_ple_t3.matvec_sink = allocate(
+            "T=3 direct PLE reference mat-vec sink",
+            generic_ple_payload.buffers.ple.matvec_sink.length);
+        reference_ple_t3.key_weights = ple_block.key_weights;
+        reference_ple_t3.value_weights = ple_block.value_weights;
+        reference_ple_t3.post.conv1d = ple_block.post.conv1d;
+        reference_ple_t3.post.key_gamma = ple_block.post.key_gamma;
+        reference_ple_t3.post.query_gamma =
+            ple_block.post.query_gamma;
+        reference_ple_t3.post.conv_gamma = ple_block.post.conv_gamma;
+        reference_ple_t3.post.key = reference_outputs[0];
+        reference_ple_t3.post.value = reference_outputs[1];
+        reference_ple_t3.post.query = reference_outputs[2];
+        reference_ple_t3.post.gate = reference_outputs[3];
+        reference_ple_t3.post.gated = reference_outputs[4];
+        reference_ple_t3.post.ple_norm = reference_outputs[5];
+        reference_ple_t3.post.residual = reference_ple_residual;
+        const WindowPLEEntryBuffers reference_ple_entry_t3{
+            pending_output, inject2, reference_ple_t3};
+        auto reference_ple_command = context.make_command_buffer(
+            "T=3 direct PLE entry reference", error);
+        require(reference_ple_command != nullptr,
+                "create T=3 direct PLE reference command: " + error);
+        require(session->track_use(*reference_ple_command, error),
+                "track PLE history through T=3 direct reference: " + error);
+        require(encode_window_ple_entry(
+                    context, *reference_ple_command,
+                    generic_ple_rows_count,
+                    fullmode_ple_key_format(ple_key_type),
+                    generic_ple_parameter_values.nc,
+                    PLEHistoryUpdate::defer, reference_ple_entry_t3, error),
+                "encode direct T=3 PLE-entry reference: " + error);
+        require(reference_ple_command->commit(error),
+                "commit direct T=3 PLE-entry reference: " + error);
+        require(reference_ple_command->wait_until_completed(error),
+                "wait for direct T=3 PLE-entry reference: " + error);
+        for (std::size_t index = 0u; index < outputs.size(); ++index) {
+            require(std::memcmp(outputs[index].contents,
+                                reference_outputs[index].contents,
+                                outputs[index].length) == 0,
+                    "T=3 composed PLE output matches direct entry for output " +
+                        std::to_string(index));
+        }
+        require(std::memcmp(residual.contents,
+                            reference_ple_residual.contents,
+                            residual.length) == 0,
+                "T=3 composed PLE residual matches the direct entry");
+        require(std::equal(
+                    ple_history_initial.begin(), ple_history_initial.end(),
+                    static_cast<const std::uint8_t*>(
+                        ple_block.post.history.contents)),
+                "T=3 generic speculative PLE step defers committed history");
         return;
     }
 

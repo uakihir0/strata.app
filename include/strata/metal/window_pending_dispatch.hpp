@@ -22,6 +22,14 @@ using WindowMoePendingConsumer =
     std::variant<WindowMoePendingPLEConsumer,
                  WindowMoeAttentionEntryBuffers>;
 
+/// A speculative FullMode layer-0 producer followed by exactly one pending
+/// consumer. The input residual is already prepared in `layer0`; this step
+/// does not gather token embeddings or initialize GR streams.
+struct WindowMoeLayer0FullModeStepBuffers {
+    WindowMoeLayer0FullBuffers layer0;
+    WindowMoePendingConsumer consumer;
+};
+
 /// The buffers for one T=1 FullMode step from token embedding through the
 /// selected pending-MoE consumer. `streams` must be the exact layer-0
 /// attention residual view. `embedding` is dead after the stream broadcast
@@ -48,6 +56,30 @@ bool encode_window_moe_pending_consumer(
     Context& context, Encoder& encoder, std::uint32_t rows,
     bool ple_enabled, const WindowMoePendingConsumer& consumer,
     std::string& error);
+
+/// Encode the speculative FullMode layer-0 producer and its selected PLE or
+/// no-PLE consumer for T=1..8 in one ordered segment. Infer the active row
+/// count and compiled columns from the validated `WindowParams`; resolve PLE
+/// projection weights from `full_mode` when PLE is selected. The consumer's
+/// pending output, prior GR residual and injection must match this producer.
+/// Reject cross-stage aliases outside the pending-output, injection and
+/// residual handoffs. Speculative PLE must defer committed history advancement.
+/// Caller-owned Encoder bodies must propagate false so a late consumer
+/// failure discards the producer dispatches too.
+bool encode_window_moe_layer0_full_mode_step(
+    Context& context, const FullModeStorage& full_mode, Encoder& encoder,
+    std::uint32_t vocabulary_size, std::uint32_t experts,
+    MoeExpertFormat gate_up_format, MoeDownFormat down_format,
+    bool ple_enabled, const WindowMoeLayer0FullModeStepBuffers& buffers,
+    std::string& error);
+/// Standalone transactional form; any producer or consumer failure discards
+/// the entire layer-0 segment.
+bool encode_window_moe_layer0_full_mode_step(
+    Context& context, const FullModeStorage& full_mode,
+    CommandBuffer& command_buffer, std::uint32_t vocabulary_size,
+    std::uint32_t experts, MoeExpertFormat gate_up_format,
+    MoeDownFormat down_format, bool ple_enabled,
+    const WindowMoeLayer0FullModeStepBuffers& buffers, std::string& error);
 
 /// Resolve `token_embd.weight` from FullModeStorage, then encode the T=1
 /// token gather, GR stream broadcast, full-mode layer-0 MoE producer and

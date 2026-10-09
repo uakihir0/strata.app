@@ -2355,15 +2355,26 @@ draft-head API, and Prefill dispatch remain pending.
 in one ordered segment using a sparse 256-expert GGUF fixture. It checks the produced route,
 nonzero routed/shared output, consumer outputs against a direct GR-read reference, and exactly-once
 residual application. Its generic FullMode layer-0 producer cases cover T=1, T=2, T=3 with
-`nc=4`, and T=8, including a same-segment T=8 no-PLE consumer. Independent router, route, Q2_0 routed-expert,
-Q8_0 shared-expert, combine, pending-output and GR-consumer oracles check the active outputs.
-T=3 cases verify active rows are distinct from compiled columns and reject undersized padded sinks.
-Late shared-FFN validation failures in caller-owned T=2 and standalone T=3 forms discard earlier
-producer work and preserve every writable view. The fixture checks active-row output guards and
+`nc=4`, and T=8. The generic producer-to-consumer step runs as a standalone T=2 transaction and
+T=3 transaction, and as a caller-owned T=8 transaction. Independent router, route, Q2_0 routed-expert, Q8_0
+shared-expert, combine, pending-output and GR-consumer oracles check the active outputs. T=3 cases
+verify active rows are distinct from compiled columns and reject undersized padded sinks. Late
+shared-FFN validation failures in caller-owned T=2 and standalone T=3 forms discard earlier
+producer work; late consumer failures in standalone T=2 and caller-owned T=3 steps discard the
+producer and consumer dispatches and preserve every writable view. A consumer output alias to the
+FullMode usage table is rejected before dispatch. The fixture checks active-row output guards and
 unchanged FullMode usage. These synthetic multirow fixtures validate composition and transaction
-behavior; they do not establish real-model parity or production scheduling. `metal_fullmode_ple_handoff_test` exercises the T=1 producer with the typed PLE
-entry in one ordered segment, then compares its PLE outputs and residual against a direct GR-post
-plus PLE-entry reference. `prepare_window_t1_input` builds the T=1 `WindowParams` ring slot and, for
+behavior; they do not establish real-model parity or production scheduling.
+`metal_fullmode_ple_handoff_test` exercises the T=1 producer with the typed PLE entry in one ordered
+segment, then compares its PLE outputs and residual against a direct GR-post plus PLE-entry
+reference. It also runs generic producer-to-PLE steps at T=1 and T=3 (`nc=4`); T=1 matches the
+token-to-consumer step, and T=3 uses distinct synthetic PLE input rows to match every output and
+the residual against a direct T=3 PLE-entry reference, while checking padded output guards and
+deferred PLE history. The compact fixture has a one-token vocabulary, so the T=3 row-sensitive
+oracle supplies synthetic input values after staging its table allocation. Speculative PLE
+composition rejects `advance_rows` and a PLE table-input alias to the pending MoE output before
+encoding. `prepare_window_t1_input`
+builds the T=1 `WindowParams` ring slot and, for
 PLE, builds row IDs from the test token and committed history, then stages the sixteen IQ4_NL rows
 from the synthetic FullMode GGUF's mapped table. An uninitialized session is rejected without
 changing the ring slot or PLE scratch. The test compares staged values against a direct table gather

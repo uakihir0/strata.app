@@ -4,6 +4,7 @@
 #include "strata/metal/window.hpp"
 
 #include <array>
+#include <cstring>
 #include <initializer_list>
 #include <vector>
 
@@ -319,6 +320,182 @@ bool resolve_ple_model_weights(const FullModeStorage& full_mode,
     return true;
 }
 
+bool validate_fullmode_step_consumer_aliases(
+    const WindowMoeLayer0FullModeStepBuffers& buffers,
+    const WindowMoePendingConsumer& consumer, std::string& error) {
+    std::vector<BufferRef> producer_views;
+    std::vector<ReadOnlyBufferRef> producer_readonly;
+    append_fullmode_layer0_views(buffers.layer0, producer_views,
+                                 producer_readonly);
+
+    std::vector<BufferRef> producer_writes;
+    std::vector<BufferRef> producer_reusable_scratch;
+    const WindowT1MoeRouterPrefixBuffers& router =
+        buffers.layer0.producer.router;
+    const GRReadBuffers& attention = router.layer0.attention;
+    const WindowGDNBlockBuffers& gdn = router.layer0.gdn;
+    const GRReadBuffers& ffn = router.layer0.ffn;
+    producer_reusable_scratch.insert(
+        producer_reusable_scratch.end(),
+        {attention.block_out, attention.normalized, attention.rs,
+         attention.lo, attention.inject_out, attention.mixed, gdn.xq,
+         gdn.qkv, gdn.h,
+         gdn.gate, gdn.beta, gdn.z, gdn.y, gdn.yq, gdn.block_out,
+         gdn.sink, ffn.normalized, ffn.rs, ffn.lo, ffn.inject_prev,
+         ffn.mixed,
+         router.router_logits, router.route_ids, router.route_weights,
+         router.router_matvec_sink, buffers.layer0.producer.plans});
+    producer_writes.insert(producer_writes.end(),
+                           {attention.normalized, attention.rs,
+                            attention.lo, attention.inject_out,
+                            attention.mixed, gdn.history, gdn.state,
+                            gdn.xq, gdn.qkv, gdn.h, gdn.gate, gdn.beta,
+                            gdn.z, gdn.y, gdn.yq, gdn.block_out,
+                            gdn.sink, ffn.normalized, ffn.rs, ffn.lo,
+                            ffn.inject_out, ffn.mixed,
+                            router.router_logits, router.route_ids,
+                            router.route_weights,
+                            router.router_matvec_sink,
+                            buffers.layer0.producer.usage,
+                            buffers.layer0.producer.plans});
+    const MoeRoutedSharedFFNBuffers& moe = buffers.layer0.ffn;
+    producer_writes.insert(
+        producer_writes.end(),
+        {moe.routed.gate, moe.routed.up, moe.routed.hidden,
+         moe.routed.down_activations, moe.routed.parts,
+         moe.shared.gate, moe.shared.up, moe.shared.hidden,
+         moe.shared.down_activations, moe.shared.shared_output,
+         moe.shared.shared_gate_logits, moe.shared.output,
+         moe.shared.gate_sink, moe.shared.up_sink,
+         moe.shared.down_sink, moe.shared.shared_gate_sink});
+
+    struct ConsumerReadHandoff {
+        BufferRef view;
+        BufferRef allowed_producer_output;
+    };
+    std::vector<ConsumerReadHandoff> consumer_reads;
+    std::vector<ReadOnlyBufferRef> consumer_readonly;
+    std::vector<BufferRef> consumer_writes;
+    BufferRef consumer_residual;
+    if (const auto* ple =
+            std::get_if<WindowMoePendingPLEConsumer>(&consumer)) {
+        const WindowMoePLEEntryBuffers& entry = ple->buffers;
+        const PLEBlockBuffers& block = entry.ple;
+        consumer_reads.insert(
+            consumer_reads.end(),
+            {{entry.previous_ffn.shared.output,
+              buffers.layer0.ffn.shared.output},
+             {entry.previous_gr_read.residual, {}},
+             {entry.previous_gr_read.inject_out,
+              buffers.layer0.producer.router.layer0.ffn.inject_out},
+             {block.input_f32, {}},
+             {block.post.history, {}}});
+        consumer_readonly.insert(
+            consumer_readonly.end(),
+            {block.key_weights, block.value_weights, block.active_rows,
+             block.post.conv1d, block.post.key_gamma,
+             block.post.query_gamma, block.post.conv_gamma});
+        consumer_residual = block.post.residual;
+        consumer_writes.insert(
+            consumer_writes.end(),
+            {block.key_q8_1, block.matvec_sink, block.post.key,
+             block.post.residual, block.post.query, block.post.ple_norm,
+             block.post.value, block.post.gate, block.post.gated});
+    } else if (const auto* attention_entry =
+                   std::get_if<WindowMoeAttentionEntryBuffers>(&consumer)) {
+        consumer_reads.insert(
+            consumer_reads.end(),
+            {{attention_entry->previous_ffn.shared.output,
+              buffers.layer0.ffn.shared.output},
+             {attention_entry->previous_gr_read.residual, {}},
+             {attention_entry->previous_gr_read.inject_out,
+              buffers.layer0.producer.router.layer0.ffn.inject_out},
+             {attention_entry->attention.norm, {}},
+             {attention_entry->attention.hc_down, {}},
+             {attention_entry->attention.hc_inject, {}},
+             {attention_entry->attention.hc_up, {}}});
+        consumer_residual = attention_entry->attention.residual;
+        consumer_writes.insert(
+            consumer_writes.end(),
+            {attention_entry->attention.residual,
+             attention_entry->attention.normalized,
+             attention_entry->attention.rs,
+             attention_entry->attention.lo,
+             attention_entry->attention.inject_out,
+             attention_entry->attention.mixed});
+    } else {
+        error = "Window FullMode pending consumer payload is invalid";
+        return false;
+    }
+
+    const BufferRef expected_residual = ffn.residual;
+    const auto is_reusable_producer_scratch = [&](BufferRef view) {
+        return std::any_of(
+            producer_reusable_scratch.begin(),
+            producer_reusable_scratch.end(),
+            [&](BufferRef scratch) { return same_view(view, scratch); });
+    };
+    for (std::size_t output_index = 0u;
+         output_index < consumer_writes.size(); ++output_index) {
+        const BufferRef output = consumer_writes[output_index];
+        for (std::size_t producer_index = 0u;
+             producer_index < producer_views.size(); ++producer_index) {
+            const BufferRef producer_view = producer_views[producer_index];
+            const bool allowed_residual_handoff =
+                same_view(output, consumer_residual) &&
+                same_view(output, expected_residual) &&
+                same_view(producer_view, expected_residual);
+            const bool allowed_reuse =
+                same_view(output, producer_view) &&
+                is_reusable_producer_scratch(producer_view);
+            if (views_overlap(output, producer_view) &&
+                !allowed_residual_handoff && !allowed_reuse) {
+                error = "Window FullMode consumer writable view overlaps producer storage outside declared handoffs or dead scratch";
+                return false;
+            }
+        }
+        for (ReadOnlyBufferRef producer_view : producer_readonly) {
+            const bool allowed_reuse =
+                views_overlap(output, producer_view) &&
+                is_reusable_producer_scratch(output);
+            if (views_overlap(output, producer_view) && !allowed_reuse) {
+                error = "Window FullMode consumer writable views overlap producer read-only storage";
+                return false;
+            }
+        }
+    }
+
+    const auto validate_consumer_buffer_read =
+        [&](const ConsumerReadHandoff& read) {
+            for (BufferRef producer_output : producer_writes) {
+                const bool allowed_handoff =
+                    read.allowed_producer_output &&
+                    same_view(read.view, read.allowed_producer_output) &&
+                    same_view(producer_output,
+                              read.allowed_producer_output);
+                if (views_overlap(read.view, producer_output) &&
+                    !allowed_handoff) {
+                    error = "Window FullMode consumer read-only inputs overlap producer outputs outside declared handoffs";
+                    return false;
+                }
+            }
+            return true;
+        };
+    for (const ConsumerReadHandoff& read : consumer_reads) {
+        if (!validate_consumer_buffer_read(read)) return false;
+    }
+    for (ReadOnlyBufferRef input : consumer_readonly) {
+        for (BufferRef producer_output : producer_writes) {
+            if (views_overlap(producer_output, input)) {
+                error = "Window FullMode consumer read-only inputs overlap producer outputs outside declared handoffs";
+                return false;
+            }
+        }
+    }
+    error.clear();
+    return true;
+}
+
 }  // namespace
 
 bool encode_window_moe_pending_consumer(
@@ -347,6 +524,100 @@ bool encode_window_moe_pending_consumer(
     }
     return encode_window_moe_attention_entry(
         context, encoder, rows, *attention, error);
+}
+
+bool encode_window_moe_layer0_full_mode_step(
+    Context& context, const FullModeStorage& full_mode, Encoder& encoder,
+    std::uint32_t vocabulary_size, std::uint32_t experts,
+    MoeExpertFormat gate_up_format, MoeDownFormat down_format,
+    bool ple_enabled, const WindowMoeLayer0FullModeStepBuffers& buffers,
+    std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "Window FullMode producer/consumer step requires ordered dispatch boundaries";
+        return false;
+    }
+
+    const auto* const ple =
+        std::get_if<WindowMoePendingPLEConsumer>(&buffers.consumer);
+    const auto* const attention =
+        std::get_if<WindowMoeAttentionEntryBuffers>(&buffers.consumer);
+    if (ple_enabled != (ple != nullptr) ||
+        ple_enabled == (attention != nullptr)) {
+        error = "Window pending-MoE consumer does not match the selected PLE branch";
+        return false;
+    }
+
+    const GRReadBuffers& producer_ffn =
+        buffers.layer0.producer.router.layer0.ffn;
+    const BufferRef pending_output = buffers.layer0.ffn.shared.output;
+    const MoeRoutedSharedFFNBuffers* consumer_ffn = nullptr;
+    const GRReadBuffers* consumer_previous_gr = nullptr;
+    if (ple != nullptr) {
+        consumer_ffn = &ple->buffers.previous_ffn;
+        consumer_previous_gr = &ple->buffers.previous_gr_read;
+    } else {
+        consumer_ffn = &attention->previous_ffn;
+        consumer_previous_gr = &attention->previous_gr_read;
+    }
+    if (!same_view(consumer_ffn->shared.output, pending_output)) {
+        error = "Window FullMode consumer must use this producer's pending MoE output";
+        return false;
+    }
+    if (!same_view(consumer_previous_gr->residual,
+                   producer_ffn.residual) ||
+        !same_view(consumer_previous_gr->inject_out,
+                   producer_ffn.inject_out)) {
+        error = "Window FullMode consumer must use this producer's FFN residual and injection";
+        return false;
+    }
+    if (ple_enabled && ple->history_update != PLEHistoryUpdate::defer) {
+        error = "speculative FullMode PLE consumer must defer committed history advancement";
+        return false;
+    }
+    if (!validate_fullmode_step_consumer_aliases(buffers, buffers.consumer,
+                                                 error)) {
+        return false;
+    }
+
+    WindowMoePendingConsumer consumer = buffers.consumer;
+    if (ple_enabled && !resolve_ple_model_weights(full_mode, consumer, error)) {
+        return false;
+    }
+    if (!encode_window_moe_layer0_full_mode(
+            context, full_mode, encoder, vocabulary_size, experts,
+            gate_up_format, down_format, buffers.layer0, error)) {
+        return false;
+    }
+
+    WindowParams params{};
+    std::memcpy(&params,
+                buffers.layer0.producer.router.layer0.params.contents,
+                sizeof(params));
+    if (auto* const selected_ple =
+            std::get_if<WindowMoePendingPLEConsumer>(&consumer)) {
+        selected_ple->compiled_columns = params.nc;
+    }
+    return encode_window_moe_pending_consumer(
+        context, encoder, params.T, ple_enabled, consumer, error);
+}
+
+bool encode_window_moe_layer0_full_mode_step(
+    Context& context, const FullModeStorage& full_mode,
+    CommandBuffer& command_buffer, std::uint32_t vocabulary_size,
+    std::uint32_t experts, MoeExpertFormat gate_up_format,
+    MoeDownFormat down_format, bool ple_enabled,
+    const WindowMoeLayer0FullModeStepBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer,
+        "Window speculative FullMode producer and pending consumer",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_moe_layer0_full_mode_step(
+                context, full_mode, encoder, vocabulary_size, experts,
+                gate_up_format, down_format, ple_enabled, buffers,
+                encode_error);
+        },
+        error);
 }
 
 bool encode_window_t1_full_mode_step(
