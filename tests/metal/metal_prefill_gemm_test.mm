@@ -785,6 +785,86 @@ bool test_validation(Context& context, Context& foreign_context, bool f16,
         passed &= check_bf16x2_rollback(
             aliased_low_buffers, "overlaps a read-only input",
             prefix + " BF16X2 low/output alias rollback");
+
+        std::array<std::uint16_t, 32u> high_values{};
+        std::array<std::uint16_t, 64u * 32u> weight_values{};
+        high_values.fill(strata::kernels::bf16_from_f32(1.0f));
+        weight_values.fill(strata::kernels::bf16_from_f32(0.5f));
+        std::memcpy(x.payload().data(), high_values.data(),
+                    high_values.size() * sizeof(std::uint16_t));
+        std::memcpy(bf16x2_w.payload().data(), weight_values.data(),
+                    weight_values.size() * sizeof(std::uint16_t));
+        const auto caller_owned_buffers = PrefillGemmBF16X2Buffers{
+            context.buffers().read_only(x.view()),
+            context.buffers().read_only(x.view().slice(0u, 2u)),
+            context.buffers().read_only(bf16x2_w.view()), bf16x2_y.view()};
+        const std::vector<std::uint8_t> caller_y_before(
+            bf16x2_y.allocation().begin(), bf16x2_y.allocation().end());
+        std::fill(bf16x2_y.payload().begin(), bf16x2_y.payload().end(), 0u);
+        auto prefix_probe =
+            context.make_command_buffer(prefix + " BF16X2 prefix probe", error);
+        if (!prefix_probe) {
+            check(false, prefix + " BF16X2 prefix-probe command buffer", error);
+            return false;
+        }
+        std::string prefix_error;
+        const bool prefix_encoded = Encoder::encode(
+            context, *prefix_probe, "caller-owned BF16X2 prefix probe",
+            [&](Encoder& encoder, std::string&) {
+                const bool complete = encode_prefill_gemm_bf16x2(
+                    context, encoder, bf16x2_params, caller_owned_buffers,
+                    prefix_error);
+                return !complete &&
+                       prefix_error.find("X buffer") != std::string::npos;
+            },
+            error);
+        const bool prefix_completed =
+            prefix_encoded &&
+            submit_and_wait(prefix_probe, error);
+        bool high_product_matches = prefix_completed &&
+                                    prefix_error.find("X buffer") !=
+                                        std::string::npos;
+        const auto* const prefix_output =
+            reinterpret_cast<const float*>(bf16x2_y.payload().data());
+        for (std::size_t column = 0u; column < 64u; ++column) {
+            high_product_matches &=
+                prefix_output[column] == 16.0f;
+        }
+        check(high_product_matches,
+              prefix + " caller-owned BF16X2 probe encoded its high prefix",
+              prefix_error);
+        passed &= high_product_matches;
+
+        std::fill(bf16x2_y.payload().begin(), bf16x2_y.payload().end(),
+                  kPoison);
+        auto caller_rollback =
+            context.make_command_buffer(prefix + " BF16X2 caller rollback",
+                                        error);
+        if (!caller_rollback) {
+            check(false,
+                  prefix + " BF16X2 caller-rollback command buffer", error);
+            return false;
+        }
+        PrefillGemmBackend caller_selected = PrefillGemmBackend::MPP;
+        const bool caller_encoded = Encoder::encode(
+            context, *caller_rollback, "caller-owned BF16X2 late failure",
+            [&](Encoder& encoder, std::string& encode_error) {
+                return encode_prefill_gemm_bf16x2(
+                    context, encoder, bf16x2_params, caller_owned_buffers,
+                    encode_error, &caller_selected);
+            },
+            error);
+        const bool caller_rolled_back =
+            !caller_encoded &&
+            caller_rollback->unsafe_native_handle() == nullptr &&
+            caller_selected == PrefillGemmBackend::MPP &&
+            error.find("X buffer") != std::string::npos &&
+            std::equal(caller_y_before.begin(), caller_y_before.end(),
+                       bf16x2_y.allocation().begin());
+        check(caller_rolled_back,
+              prefix + " caller-owned BF16X2 late failure rolls back high prefix",
+              error);
+        passed &= caller_rolled_back;
     }
     return passed;
 }

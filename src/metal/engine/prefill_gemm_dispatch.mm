@@ -261,7 +261,59 @@ bool encode_selected_prefill_gemm(
     return false;
 }
 
+bool encode_prefill_gemm_bf16x2_ordered(
+    Context& context, Encoder& encoder,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmBF16X2Buffers& buffers, std::string& error,
+    PrefillGemmBackend* selected_backend) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "Prefill BF16X2 GEMM requires an ordered "
+                "concurrent-group boundary";
+        return false;
+    }
+
+    const char* const configured = std::getenv("STRATA_METAL_GEMM");
+    const std::string_view setting =
+        configured == nullptr ? std::string_view{}
+                              : std::string_view(configured);
+    PrefillGemmBackend backend = PrefillGemmBackend::SIMD;
+    if (!resolve_prefill_gemm_backend(
+            supports_apple10(context), params.n, setting, backend, error)) {
+        return false;
+    }
+
+    const PrefillGemmMPPBuffers high_buffers{
+        buffers.x_hi, buffers.w, buffers.y};
+    if (!encode_selected_prefill_gemm(
+            context, encoder, params, high_buffers, PrefillGemmFormat::BF16,
+            backend, error)) {
+        return false;
+    }
+
+    PrefillGemmMPPParams low_params = params;
+    low_params.accumulate = true;
+    const PrefillGemmMPPBuffers low_buffers{
+        buffers.x_lo, buffers.w, buffers.y};
+    if (!encode_selected_prefill_gemm(
+            context, encoder, low_params, low_buffers,
+            PrefillGemmFormat::BF16, backend, error)) {
+        return false;
+    }
+    if (selected_backend != nullptr) *selected_backend = backend;
+    return true;
+}
+
 }  // namespace
+
+bool encode_prefill_gemm_bf16x2(
+    Context& context, Encoder& encoder,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmBF16X2Buffers& buffers, std::string& error,
+    PrefillGemmBackend* selected_backend) {
+    return encode_prefill_gemm_bf16x2_ordered(
+        context, encoder, params, buffers, error, selected_backend);
+}
 
 bool encode_prefill_gemm(
     Context& context, Encoder& encoder,
@@ -313,31 +365,8 @@ bool encode_prefill_gemm_bf16x2(
     const bool encoded = Encoder::encode(
         context, command_buffer, "Prefill BF16X2 GEMM",
         [&](Encoder& encoder, std::string& encode_error) {
-            const char* const configured = std::getenv("STRATA_METAL_GEMM");
-            const std::string_view setting =
-                configured == nullptr ? std::string_view{}
-                                      : std::string_view(configured);
-            if (!resolve_prefill_gemm_backend(
-                    supports_apple10(context), params.n, setting, selected,
-                    encode_error)) {
-                return false;
-            }
-
-            const PrefillGemmMPPBuffers high_buffers{
-                buffers.x_hi, buffers.w, buffers.y};
-            if (!encode_selected_prefill_gemm(
-                    context, encoder, params, high_buffers,
-                    PrefillGemmFormat::BF16, selected, encode_error)) {
-                return false;
-            }
-
-            PrefillGemmMPPParams low_params = params;
-            low_params.accumulate = true;
-            const PrefillGemmMPPBuffers low_buffers{
-                buffers.x_lo, buffers.w, buffers.y};
-            return encode_selected_prefill_gemm(
-                context, encoder, low_params, low_buffers,
-                PrefillGemmFormat::BF16, selected, encode_error);
+            return encode_prefill_gemm_bf16x2_ordered(
+                context, encoder, params, buffers, encode_error, &selected);
         },
         error);
     if (encoded && selected_backend != nullptr) {

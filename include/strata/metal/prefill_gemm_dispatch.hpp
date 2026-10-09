@@ -66,6 +66,13 @@ bool encode_prefill_gemm(
 /// Transactionally encode both BF16X2 activation products into one command
 /// buffer. The high product uses params.accumulate; the low product always
 /// accumulates into its result. Both products use the same selected backend.
+/// Propagate a false result from the caller-owned Encoder body so a successful
+/// high product cannot be submitted if validation of the low product fails.
+bool encode_prefill_gemm_bf16x2(
+    Context& context, Encoder& encoder,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmBF16X2Buffers& buffers, std::string& error,
+    PrefillGemmBackend* selected_backend = nullptr);
 bool encode_prefill_gemm_bf16x2(
     Context& context, CommandBuffer& command_buffer,
     const PrefillGemmMPPParams& params,
