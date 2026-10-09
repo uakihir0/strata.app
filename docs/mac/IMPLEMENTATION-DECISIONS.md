@@ -8619,3 +8619,47 @@ measuring L-15 remain open.
   tests, with 116 passed and one expected skip.
 - **Review required:** Production MTP runtime wiring and inspected-model
   stage-15/full-drafter parity remain open under D-IMPL-331.
+
+### D-IMPL-332: Compose MTP drafter stage 16 router and route
+
+- **Decision:** Add caller-owned Encoder and standalone transactional forms
+  for the T=1 router pass. Feed the stage-15 `mixed` row through the existing
+  BF16 2560→512 mat-vec, then pass its `logits_r` through the stable 512-expert
+  top-10 route with `divide_weights=false`. Validate all extents, Context
+  ownership and active cross-stage aliases before dispatch.
+- **Reason:** The documented full-layer pass uses the same BF16 router and
+  full 512-expert route as the main MoE path. Reusing the validated encoders
+  preserves their numeric and tie-breaking behaviour, while one ordered
+  Encoder segment guarantees that routing consumes the produced logits. The
+  stage remains isolated from `MtpRuntimeStorage` and model parity.
+- **Validation:** The serial/concurrent twin checks router logits against the
+  BF16 scalar oracle, IDs and weights against the route oracle, and byte
+  parity between standalone, caller-owned and direct-component forms. It
+  also covers T errors, short and foreign views, parameter/input and
+  output/output aliases, read-only inputs, output guards, open-group
+  rejection and caller-owned rollback. Complete build, focused CTest, host
+  suite and drift results are recorded in REV-129.
+- **Review required:** Bind the router and route views to production MTP
+  runtime storage, compose subsequent drafter stages, and establish
+  inspected-model parity. Production scheduling and the upstream-compatible
+  MTP API remain open.
+
+### REV-129: Hostile review of MTP drafter stage 16
+
+- **Scope:** The MTP BF16 router/top-10 route coordinator, its Metal twin,
+  CMake registration, test-map entry and stage-status documentation.
+- **Adversarial review:** The subagent reviewed stage ordering, alias and
+  extent validation, T=1 handling, the 512-expert non-division route mode,
+  standalone transactionality, caller-owned rollback and serial/concurrent
+  tests. No actionable findings.
+- **Disposition:** `cmake --preset mac-dev` and `cmake --build --preset
+  mac-dev` succeeded. The focused serial/concurrent CTests passed 2/2;
+  `ctest --preset mac-host --output-on-failure` passed all 44 registered
+  tests with one documented unavailable-real-input test skipped. The host
+  preset's `test_map` passed, `check_drift.py` found no upstream changes and
+  confirmed the golden files remain valid. The complete mac-metal suite had
+  passed 73/73 after stage 15; stage 16's two additional tests were run
+  directly and passed. The README records the 117-test complete run plus
+  stage-16 focused coverage.
+- **Review required:** Production runtime binding and inspected-model
+  stage-16/full-drafter parity remain open under D-IMPL-332.

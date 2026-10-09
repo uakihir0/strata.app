@@ -2929,6 +2929,14 @@ writes, with `row(c) = {c, c + 1, (c + 1) / 4, window > 0 ? min(c + 1, window) :
   normalize→down→up ordering at a closed concurrent-group boundary. This
   isolated encoder does not bind `MtpRuntimeStorage` or establish
   model-backed parity.
+- Stage 16's `encode_mtp_router` composes the BF16 2560→512 router projection
+  with the stable top-10 route selection. It reads the stage-15 `mixed` row,
+  the BF16 `mlp.gate` matrix and T=1 parameters, then writes `logits_r`, `ids`
+  and normalized route weights. The MTP wrapper checks all active extents and
+  cross-stage aliases before dispatch, uses the full 512-expert route with
+  `divide_weights=false`, and requires an ordered concurrent-group boundary.
+  This isolated encoder does not bind `MtpRuntimeStorage` or establish
+  model-backed parity.
 - Stages 2 and 4 are upstream's `native_qsa_rms_norm_weighted`, whose `norm<1024>` (for rows of 1024 or more) is
   the same arithmetic as `native_gr_rms_norm_weighted`. `strata_rms_norm_w` serves both with `n_cols` and the gamma
   period `gp` as `setBytes` constants (section 5.4).
