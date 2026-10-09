@@ -1,6 +1,6 @@
 # Implementation decisions and review items
 
-Status: working log, 2026-10-08.
+Status: working log, 2026-10-10.
 
 This file records choices made while implementing the plan. A recorded choice does not
 make a hardware gate, a human review, or an external resource available. Update the
@@ -10085,3 +10085,196 @@ measuring L-15 remain open.
   existing planned-work and missing-check diagnostics. The tests use
   synthetic inputs; they do not establish production Prefill integration or
   model-backed inference.
+
+### D-IMPL-359: Add an isolated Prefill GEMM selector
+
+- **Decision:** Add a device-independent policy resolver and selected
+  F16/BF16 Encoder APIs for the implemented MPP and SIMD components. Empty
+  `STRATA_METAL_GEMM` selects MPP on Apple10 when n >= 64 and SIMD otherwise;
+  n < 64 always selects SIMD. `simd` forces SIMD, `mpp` forces MPP only on
+  Apple10, and unknown settings fail. Until L-6 validates another family,
+  explicitly forcing MPP there fails closed. The `CommandBuffer` overload
+  routes through `Encoder::encode` so every selection or validation failure
+  discards unsubmitted work. A successful call can report the backend it
+  dispatched for test and diagnostic use.
+- **Reason:** The implementation plan calls for an automatic MPP/SIMD choice,
+  but the production Prefill chunk/layer scheduler and BF16X2 remainder GEMM
+  are still incomplete. A standalone selector advances and tests the policy
+  without implying those components are already connected to inference.
+  Rejecting unvalidated older-family MPP overrides avoids advertising support
+  based only on a simulated family flag.
+- **Review items:** Test default SIMD selection and explicit MPP handling on
+  earlier supported Apple GPU families, then reconsider the conservative
+  `mpp` override gate using L-6 evidence. Integrate this API only with the
+  planned production Prefill scheduler and its model-backed parity tests.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the `mac-dev` build succeeded; selector policy and selected GEMM
+  CTests passed 9/9, including serial/concurrent selection, backend reporting,
+  forced SIMD and invalid-setting rollback. `mac-host` passed 44 tests with
+  one real-input test skipped. The full 88-test `mac-metal` run is recorded
+  below under REV-156. `test_map.py`, `check_drift.py` and
+  `git diff --check` passed. GPU tests use synthetic inputs; no model inputs
+  were available.
+
+### REV-156: Hostile review of the Prefill GEMM selector
+
+- **Scope:** GEMM selection policy, environment parsing, family gating,
+  MPP/SIMD dispatch, command-buffer rollback, host and GPU tests, CMake
+  registration and synchronized documentation.
+- **Findings and fixes:** The first review found that numerical-oracle tests
+  alone could not prove which backend the selected encoder used. The API now
+  reports the backend only after its matching encoder succeeds, and GPU tests
+  compare that report against a separate expectation derived from the active
+  family, width and setting. The review also caught auto-mode summaries
+  incorrectly naming MPP; they now report `AUTO`. Documentation now
+  distinguishes this isolated selector from production Prefill wiring, and
+  the decision/review records are linked from the test map. A follow-up found
+  that initializing the selected-backend output to SIMD could hide a missing
+  report on SIMD runs; tests now seed it with the opposite expected backend.
+  Invalid-setting GPU coverage also verifies transactional discard.
+- **Disposition:** No selector/dispatch mismatch remains in the reviewed
+  implementation. Running on non-Apple10 hardware was unavailable, so the
+  earlier-family MPP rejection is verified by the pure policy tests only;
+  cross-family runtime validation remains an explicit review item.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `cmake --build --preset mac-dev` succeeded, the final focused
+  selector/GEMM CTests passed 9/9, `mac-host` passed 44 tests with one
+  unavailable-model-input test skipped, and the final complete `mac-metal`
+  preset passed 88/88. `test_map.py` passed with the repository's existing
+  planned-work and missing-requirement diagnostics; `check_drift.py` reported
+  no upstream changes and valid goldens; `git diff --check` passed. These
+  synthetic tests do not establish production Prefill integration or
+  model-backed inference.
+
+### D-IMPL-360: Remove successful generated MTP storage fixtures
+
+- **Decision:** After both child-process storage checks and all CLI storage checks
+  finish, remove the generated MTP fixture on success or failure only if its
+  directory is still the same pinned device/inode and carries the private
+  ownership marker created by the helper. Recursively inspect and remove entries
+  relative to pinned directory descriptors; unlink symlinks themselves without
+  following their targets. Leave explicitly prepared fixtures in place.
+- **Reason:** Repeated `metal_mtp_storage_test` runs had accumulated 93
+  generated directories of about 758 MiB each, consuming roughly 69 GiB in
+  `build-dev`. The test's fixture has no consumer after its child processes and
+  CLI checks finish, including on failure because the generated inputs are
+  reproducible. The explicit `--prepare` command still preserves its output
+  for callers. Restricting cleanup to the private marked fixture avoids broad
+  deletion below the build tree.
+- **Review items:** Keep the replacement-path and external-symlink cleanup
+  self-tests. Treat any identity, marker, parent, or ACL mismatch as a refusal;
+  leave the directory for inspection if cleanup cannot prove ownership.
+
+### REV-157: Hostile review of generated MTP fixture cleanup
+
+- **Scope:** Ownership-marker validation, descriptor-pinned recursive cleanup,
+  replacement and symlink handling, success/failure lifecycle, CTest coverage,
+  and documentation.
+- **Findings and fixes:** The first review found that the deletion helper did
+  not constrain `fixture_name`; it now accepts only the exact unique generated
+  name form and tests refusal of `../sentinel`. The review also found missing
+  coverage of the `_with_prepared_fixture` lifecycle; self-tests now verify
+  removal after both successful and failing actions. Cleanup now runs for
+  either action outcome, retains the ownership marker until all other entries
+  are removed, and reports cleanup failure alongside the original test failure.
+  A follow-up review found that an unexpected cleanup exception could mask the
+  test failure; the code now catches ordinary exceptions and the self-test
+  injects a cleanup exception to verify both failures remain visible. Final
+  review found that fixture creation could leave a partial marker after a
+  write/verification failure. Creation now rolls back only after the opened
+  inode was confirmed as the named entry, and only for an empty directory or
+  the helper's private marker prefix; replacement paths and unexpected data
+  remain untouched.
+- **Disposition:** The actionable findings are fixed. A same-UID process could
+  still race the final inode check and `rmdir`; the build directory is private
+  from other users and same-UID processes are within the existing fixture
+  trust boundary. Cleanup refuses mismatched names, parent state, marker,
+  permissions, ACLs and pinned inode identity.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `metal_mtp_storage_fixture` passed 1/1 and
+  `metal_mtp_storage_test` passed 1/1 after the final helper changes.
+  `test_map.py`, `check_drift.py` and `git diff --check` passed. The storage
+  test left no generated fixture directories. Removing 93 old marked
+  directories reduced `build-dev` from 103 GiB to 34 GiB; reported free space
+  rose from 56 GiB to 134 GiB.
+
+### D-IMPL-361: Reclaim WeightStore CLI test outputs
+
+- **Decision:** Run the WeightStore CLI CMake test body in a child process so
+  cleanup runs after either success or `FATAL_ERROR`. A Python helper walks
+  the build output path without following symlinks, creates a random child
+  directory with its private ownership marker, and returns its device/inode.
+  After the child exits, the helper removes the tree relative to pinned file
+  descriptors only if the directory still has that identity and marker. The
+  test also launches an injected-failure child with a symlink to an external
+  sentinel and verifies that cleanup preserves the sentinel.
+- **Reason:** Successful `metal_weight_store_cli_test` runs had accumulated
+  45 per-run fixture directories of about 758 MiB each, consuming roughly
+  33 GiB. These unique directories are generated solely by the CTest script
+  and can be recreated for every run; no model input or user artifact is kept
+  there.
+- **Review items:** Retain the successful-run, injected-failure and external
+  symlink checks. Cleanup must remain confined to the validated build output
+  root, pinned device/inode, and exact per-run marker.
+
+### REV-158: Hostile review of WeightStore CLI fixture cleanup
+
+- **Scope:** CMake child-process lifecycle, per-run marker, build-root
+  validation, descriptor-relative cleanup after success and fatal failure,
+  and symlink handling.
+- **Findings and fixes:** The first review found that the earlier CMake-only
+  cleanup could race replacement of its marker and that its injected failure
+  happened before fixture generation. Cleanup moved into the Python helper,
+  which pins the parent chain, captures the created directory's device/inode,
+  and requires the same identity during no-follow cleanup. The failure is now
+  injected after generating the large synthetic fixture and adding an external
+  sentinel symlink.
+- **Disposition:** Final review found no actionable issues. If CTest hard-kills
+  the parent before it can call cleanup, a per-run directory can remain; a
+  changed identity or ownership marker also causes cleanup to fail closed and
+  leave the directory for inspection. Same-effective-UID processes remain
+  trusted by the private build directory.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `metal_weight_store_cli_test` passed 1/1, including the injected
+  failure and external-sentinel check. The helper removed both per-run trees.
+  Removing 45 prior generated fixture directories reduced `build-dev` from
+  34 GiB to 1.1 GiB; reported free space rose from 134 GiB to 169 GiB.
+
+### D-IMPL-362: Coordinate BF16X2 Prefill GEMM remainders transactionally
+
+- **Decision:** Add `encode_prefill_gemm_bf16x2` as a command-buffer-only
+  coordinator. Resolve `STRATA_METAL_GEMM` once, encode the high activation
+  using the caller's accumulate setting, then encode the low remainder with
+  accumulation enabled into the same output. Run both through one
+  `Encoder::encode` transaction so a validation or dispatch failure in the
+  second product discards the first product's unsubmitted work.
+- **Reason:** BF16X2 must preserve upstream's ordered `X_hi · W` then
+  `X_lo · W` accumulation, and both products must use the same selected
+  backend. A command-buffer transaction gives the low-product late-failure
+  path a concrete rollback guarantee while keeping the isolated GEMM
+  components available for independent use.
+- **Review items:** Check high/low accumulate semantics, one-time backend
+  resolution, forced MPP handling for n<64 and non-Apple10 devices, all
+  buffer/alias validation, ordering in serial and concurrent dispatch modes,
+  low-input late-failure rollback, and numerical oracle coverage.
+
+### REV-159: Hostile review of BF16X2 Prefill GEMM coordination
+
+- **Scope:** `encode_prefill_gemm_bf16x2`, backend choice across both products,
+  beta/accumulate behavior, transactional rollback, GPU numerical tests, and
+  documentation.
+- **Findings and fixes:** The first adversarial review found missing MPP
+  late-failure and BF16X2 low/output-alias rollback coverage, plus a stale
+  “BF16X2 remainder unimplemented” sentence. Those test cases and the
+  production-wiring status wording are now corrected.
+- **Disposition:** The first review's findings are fixed. Final re-review found
+  no actionable issues. A late-failure case now uses n=64 so the MPP selector
+  path is exercised, and a second late-failure case aliases X_lo with Y. Both
+  require full command-buffer rollback and preserve the selected-backend
+  output. The earlier “BF16X2 remainder unimplemented” wording now identifies
+  only the remaining production Prefill wiring/scheduling gap.
+- **Validation:** `mac-host` passed 45/45 with the real-input test skipped;
+  `mac-metal` passed 88/88 after the coordinator implementation. After adding
+  the n=64 MPP rollback and X_lo/Y alias rollback cases, all eight focused
+  serial/concurrent MPP, SIMD and automatic selector CTests passed again.
+  `test_map.py`, `check_drift.py` and `git diff --check` passed.
