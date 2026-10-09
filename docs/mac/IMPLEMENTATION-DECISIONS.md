@@ -8978,7 +8978,7 @@ measuring L-15 remain open.
   passed 80/80. These checks do not establish scheduler integration or
   end-to-end inference.
 - **Review:** REV-136 records the hostile-review findings, test improvements
-  and final disposition. Runtime bindings for later MTP stages, scheduler
+  and final disposition. Runtime bindings for stages 7–22, scheduler
   integration and inspected-model drafter parity remain open.
 
 ### REV-136: Hostile review of MTP input projection runtime binding
@@ -9010,6 +9010,46 @@ measuring L-15 remain open.
   storage fixture confirms binding and dispatch only; it does not provide
   numerical oracle coverage, scheduler integration or inspected-model
   drafter parity.
+
+### D-IMPL-340: Bind MTP add-streams from runtime storage
+
+- **Decision:** Add `MtpRuntimeStorage::bind_add_streams` to resolve the
+  selected MTP parameter slot, read-only `h2` and `e2` views, and writable
+  `mtp_rin` output for stage 6. The caller must append stage 6 after stages
+  1–5 in the same ordered Encoder segment. The stage-6 encoder retains
+  responsibility for T, active extents, alignment and alias validation.
+- **Reason:** Stage 6 consumes the two outputs of the input projection and
+  initializes the MTP residual stream consumed by later drafter stages. Binding
+  the named regions through the same owner keeps their lifetime and allocation
+  identity consistent; ordered encoding preserves the producer/consumer
+  dependency without adding a buffer or submission.
+- **Validation:** `metal_mtp_storage_test` resolves the stage-6 views and
+  dispatches the full chain from GPU-produced T=1 token through stages 1–5
+  into stage 6 in one ordered Encoder segment. The existing `metal_mtp_test`
+  also checks stage-6 scalar parity for T=1..8. The runtime storage fixture is
+  a binding/dispatch smoke test and does not establish model-weight numerical
+  parity or scheduler integration.
+- **Build and tests:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `cmake --build --preset mac-dev` succeeded, and the focused
+  `metal_mtp_storage_test`, `metal_mtp_test` and `metal_mtp_test_concurrent`
+  passed 3/3. These tests do not establish inspected-model drafter parity.
+- **Review:** REV-137 records the hostile review and final disposition.
+  Runtime bindings for stages 7–22, scheduler integration and inspected-model
+  drafter parity remain open.
+
+### REV-137: Hostile review of MTP stage-6 runtime binding
+
+- **Scope:** `MtpRuntimeStorage::bind_add_streams`, its named region choices,
+  and the GPU-producer → stages 1–5 → stage 6 ordered integration fixture.
+- **Findings and disposition:** The hostile review found no actionable issue.
+  It confirmed that `h2` and `e2` active ranges match the stage-6 reads, that
+  `mtp_rin` is disjoint from both, and that the producer, projection and
+  add-streams dispatches share one Encoder callback whose failure discards the
+  unsubmitted segment.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a),
+  the `mac-dev` build succeeded; focused `metal_mtp_storage_test`,
+  `metal_mtp_test` and `metal_mtp_test_concurrent` passed 3/3. The storage
+  fixture verifies binding and ordered dispatch, not inspected-model parity.
 
 ### D-IMPL-338: Compose MTP drafter stages 1–5
 
