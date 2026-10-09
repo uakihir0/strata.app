@@ -7,6 +7,8 @@
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/gr_dispatch.hpp"
 #include "strata/metal/prefill_dispatch.hpp"
+#include "strata/metal/prefill_gemm_dispatch.hpp"
+#include "strata/metal/prefill_gr_read_dispatch.hpp"
 #include "strata/metal/prefill_gr_mix_dispatch.hpp"
 #include "strata/metal/prefill_gr_norm_dispatch.hpp"
 #include "strata/metal/prefill_gr_silu_dispatch.hpp"
@@ -36,6 +38,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace strata::metal;
@@ -54,6 +57,8 @@ constexpr std::uint32_t kThreads = 256u;
 constexpr float kEpsilon = 1.0e-6f;
 constexpr std::size_t kGuardBytes = 4096u;
 constexpr std::uint8_t kPoison = 0xa5u;
+constexpr double kGemmUnitRoundoff = 0x1.0p-24;
+constexpr double kGemmUnderflowAllowance = 0x1.0p-126;
 
 int g_failures = 0;
 
@@ -64,6 +69,38 @@ void check(bool condition, const std::string& label,
     std::fflush(stdout);
     if (!condition) ++g_failures;
 }
+
+class ScopedEnvironment {
+public:
+    ~ScopedEnvironment() { (void)restore(); }
+
+    bool set(std::string name, const char* value) {
+        if (active_) return false;
+        name_ = std::move(name);
+        const char* const current = std::getenv(name_.c_str());
+        had_value_ = current != nullptr;
+        if (had_value_) old_value_ = current;
+        if (::setenv(name_.c_str(), value, 1) != 0) return false;
+        active_ = true;
+        return true;
+    }
+
+    bool restore() {
+        if (!active_) return true;
+        const int result = had_value_
+                               ? ::setenv(name_.c_str(), old_value_.c_str(), 1)
+                               : ::unsetenv(name_.c_str());
+        if (result != 0) return false;
+        active_ = false;
+        return true;
+    }
+
+private:
+    std::string name_;
+    std::string old_value_;
+    bool had_value_ = false;
+    bool active_ = false;
+};
 
 class TestBuffer {
 public:
@@ -729,6 +766,628 @@ SiluOracle prefill_gr_silu_oracle(std::span<const float> low_rank,
         }
     }
     return result;
+}
+
+bool check_prefill_projection_oracle(
+    std::string_view label, std::span<const std::uint16_t> input_high,
+    std::span<const std::uint16_t> input_low,
+    std::span<const std::uint16_t> weights, std::uint32_t rows,
+    std::uint32_t n, std::uint32_t k, std::span<const float> actual) {
+    if (input_high.size() != static_cast<std::size_t>(rows) * k ||
+        (!input_low.empty() && input_low.size() != input_high.size()) ||
+        weights.size() != static_cast<std::size_t>(n) * k ||
+        actual.size() != static_cast<std::size_t>(rows) * n) {
+        check(false, std::string(label) + " FP64 oracle dimensions");
+        return false;
+    }
+
+    const double error_scale =
+        2.0 * static_cast<double>(k) * kGemmUnitRoundoff;
+    bool within_bound = true;
+    double max_relative_l2 = 0.0;
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        double row_error_squared = 0.0;
+        double row_reference_squared = 0.0;
+        for (std::uint32_t column = 0u; column < n; ++column) {
+            double reference = 0.0;
+            double magnitude = 0.0;
+            for (std::uint32_t inner = 0u; inner < k; ++inner) {
+                const std::size_t input_index =
+                    static_cast<std::size_t>(row) * k + inner;
+                const double weight = strata::kernels::f32_from_bf16(
+                    weights[static_cast<std::size_t>(column) * k + inner]);
+                const double high = strata::kernels::f32_from_bf16(
+                    input_high[input_index]);
+                const double high_product = high * weight;
+                reference += high_product;
+                magnitude += std::abs(high_product);
+                if (!input_low.empty()) {
+                    const double low = strata::kernels::f32_from_bf16(
+                        input_low[input_index]);
+                    const double low_product = low * weight;
+                    reference += low_product;
+                    magnitude += std::abs(low_product);
+                }
+            }
+            const float output =
+                actual[static_cast<std::size_t>(row) * n + column];
+            const double error = static_cast<double>(output) - reference;
+            const double bound =
+                error_scale * magnitude + kGemmUnderflowAllowance;
+            within_bound &= std::isfinite(output) &&
+                            std::abs(error) <= bound;
+            row_error_squared += error * error;
+            row_reference_squared += reference * reference;
+        }
+        if (row_reference_squared != 0.0) {
+            max_relative_l2 = std::max(
+                max_relative_l2,
+                std::sqrt(row_error_squared / row_reference_squared));
+        } else {
+            within_bound &= row_error_squared == 0.0;
+        }
+    }
+    check(within_bound, std::string(label) + " FP64 GEMM error bound",
+          "max row-relative L2 error " + std::to_string(max_relative_l2));
+    return within_bound;
+}
+
+struct PrefillGRReadTestOutputs {
+    TestBuffer rs;
+    TestBuffer xn16;
+    TestBuffer xn16_lo;
+    TestBuffer low_rank;
+    TestBuffer low_rank_bf16;
+    TestBuffer low_rank_bf16_lo;
+    TestBuffer gated;
+    TestBuffer inject;
+
+    bool allocate(Context& context, std::uint32_t rows, bool write_low,
+                  std::string_view label, std::string& error) {
+        const std::size_t stream_rows =
+            static_cast<std::size_t>(rows) * kStreams;
+        const std::size_t normalized_values =
+            stream_rows * kWidth;
+        const std::size_t low_rank_values =
+            static_cast<std::size_t>(rows) * 320u;
+        const std::size_t gated_values =
+            stream_rows * kWidth;
+        const std::string prefix(label);
+        return rs.allocate(context, prefix + " rs",
+                           stream_rows * sizeof(float), error) &&
+               xn16.allocate(context, prefix + " xn16",
+                             normalized_values * sizeof(std::uint16_t),
+                             error) &&
+               (!write_low ||
+                xn16_lo.allocate(context, prefix + " xn16 low",
+                                 normalized_values * sizeof(std::uint16_t),
+                                 error)) &&
+               low_rank.allocate(context, prefix + " low rank",
+                                 low_rank_values * sizeof(float), error) &&
+               low_rank_bf16.allocate(
+                   context, prefix + " low rank BF16",
+                   low_rank_values * sizeof(std::uint16_t), error) &&
+               (!write_low ||
+                low_rank_bf16_lo.allocate(
+                    context, prefix + " low rank BF16 low",
+                    low_rank_values * sizeof(std::uint16_t), error)) &&
+               gated.allocate(context, prefix + " gated",
+                              gated_values * sizeof(float), error) &&
+               inject.allocate(context, prefix + " inject",
+                               stream_rows * sizeof(float), error);
+    }
+
+    PrefillGRReadBuffers bind(
+        BufferRef residual, BufferRef norm, ReadOnlyBufferRef down_weights,
+        ReadOnlyBufferRef up_weights,
+        ReadOnlyBufferRef inject_weights, bool write_low) const {
+        return {residual,
+                norm,
+                rs.view(),
+                xn16.view(),
+                write_low ? xn16_lo.view() : BufferRef{},
+                down_weights,
+                low_rank.view(),
+                low_rank_bf16.view(),
+                write_low ? low_rank_bf16_lo.view() : BufferRef{},
+                up_weights,
+                gated.view(),
+                inject_weights,
+                inject.view()};
+    }
+};
+
+bool encode_prefill_gr_read_reference(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    PrefillBF16X2Mode mode, const PrefillGRReadBuffers& buffers,
+    std::string& error) {
+    const bool write_low = mode == PrefillBF16X2Mode::all_projections;
+    const PrefillGRNormBuffers norm_buffers{
+        buffers.residual, buffers.norm, buffers.rs, buffers.xn16,
+        write_low ? buffers.xn16_lo : BufferRef{}};
+    if (!encode_prefill_gr_norm(context, encoder, rows, mode, norm_buffers,
+                                error)) {
+        return false;
+    }
+
+    const auto xn16 = context.buffers().read_only(buffers.xn16);
+    const auto xn16_lo =
+        write_low ? context.buffers().read_only(buffers.xn16_lo)
+                  : ReadOnlyBufferRef{};
+    const PrefillGemmMPPParams down_params{
+        rows, 320u, 10240u, 320u, 0u, false};
+    const PrefillGemmMPPParams up_params{
+        rows, 10240u, 320u, 10240u, 0u, false};
+    const PrefillGemmMPPParams inject_params{
+        rows, 4u, 10240u, 4u, 0u, false};
+    const auto project = [&](const PrefillGemmMPPParams& params,
+                             ReadOnlyBufferRef high,
+                             ReadOnlyBufferRef low,
+                             ReadOnlyBufferRef weights, BufferRef output) {
+        if (write_low) {
+            return encode_prefill_gemm_bf16x2(
+                context, encoder, params,
+                {high, low, weights, output}, error);
+        }
+        return encode_prefill_gemm(
+            context, encoder, params, {high, weights, output},
+            PrefillGemmFormat::BF16, error);
+    };
+    if (!project(down_params, xn16, xn16_lo, buffers.down_weights,
+                 buffers.low_rank)) {
+        return false;
+    }
+
+    const PrefillGRSiluBuffers silu_buffers{
+        context.buffers().read_only(buffers.low_rank),
+        buffers.low_rank_bf16,
+        write_low ? buffers.low_rank_bf16_lo : BufferRef{}};
+    if (!encode_prefill_gr_silu(context, encoder, rows, mode, silu_buffers,
+                                error)) {
+        return false;
+    }
+
+    const auto low_rank_bf16 =
+        context.buffers().read_only(buffers.low_rank_bf16);
+    const auto low_rank_bf16_lo =
+        write_low
+            ? context.buffers().read_only(buffers.low_rank_bf16_lo)
+            : ReadOnlyBufferRef{};
+    if (!project(up_params, low_rank_bf16, low_rank_bf16_lo,
+                 buffers.up_weights, buffers.gated)) {
+        return false;
+    }
+    return project(inject_params, xn16, xn16_lo, buffers.inject_weights,
+                   buffers.inject);
+}
+
+bool test_prefill_gr_read_chain(Context& context) {
+    constexpr std::array<std::uint32_t, 3> rows_by_mode{1u, 2u, 3u};
+    constexpr std::array<PrefillBF16X2Mode, 3> modes{
+        PrefillBF16X2Mode::off,
+        PrefillBF16X2Mode::all_projections,
+        PrefillBF16X2Mode::except_gr};
+    constexpr std::size_t normalized_values = kStreams * kWidth;
+    constexpr std::size_t down_weight_values = 320u * 10240u;
+    constexpr std::size_t up_weight_values = 10240u * 320u;
+    constexpr std::size_t inject_weight_values = 4u * 10240u;
+    const std::string label = "Prefill GR normalization and read projections";
+    std::string error;
+    TestBuffer residual, norm, down_weights, up_weights, inject_weights;
+    const bool inputs_allocated =
+        residual.allocate(context, label + " residual",
+                          rows_by_mode[2] * normalized_values *
+                              sizeof(float),
+                          error) &&
+        norm.allocate(context, label + " norm weights",
+                      normalized_values * sizeof(float), error) &&
+        down_weights.allocate(context, label + " down weights",
+                              down_weight_values * sizeof(std::uint16_t),
+                              error) &&
+        up_weights.allocate(context, label + " up weights",
+                            up_weight_values * sizeof(std::uint16_t), error) &&
+        inject_weights.allocate(context, label + " inject weights",
+                                inject_weight_values *
+                                    sizeof(std::uint16_t),
+                                error);
+    check(inputs_allocated, label + " allocate model inputs", error);
+    if (!inputs_allocated) return false;
+
+    std::vector<float> residual_values(rows_by_mode[2] * normalized_values);
+    std::vector<float> norm_values(normalized_values);
+    std::vector<std::uint16_t> down_values(down_weight_values);
+    std::vector<std::uint16_t> up_values(up_weight_values);
+    std::vector<std::uint16_t> inject_values(inject_weight_values);
+    for (std::size_t index = 0u; index < residual_values.size(); ++index) {
+        const int centered = static_cast<int>((index * 29u + 17u) % 257u) -
+                             128;
+        residual_values[index] = static_cast<float>(centered) / 128.0f;
+    }
+    for (std::size_t index = 0u; index < norm_values.size(); ++index) {
+        norm_values[index] =
+            0.75f + static_cast<float>((index * 17u + 11u) % 37u) *
+                        0.015625f;
+    }
+    const auto fill_bf16 = [](std::vector<std::uint16_t>& values,
+                              std::uint32_t multiplier,
+                              std::uint32_t modulus, float scale) {
+        for (std::size_t index = 0u; index < values.size(); ++index) {
+            const int centered =
+                static_cast<int>((index * multiplier + index / 7u) %
+                                 modulus) -
+                static_cast<int>(modulus / 2u);
+            values[index] = strata::kernels::bf16_from_f32(
+                static_cast<float>(centered) * scale);
+        }
+    };
+    fill_bf16(down_values, 13u, 31u, 0.00390625f);
+    fill_bf16(up_values, 19u, 29u, 0.00390625f);
+    fill_bf16(inject_values, 7u, 23u, 0.00390625f);
+    std::memcpy(residual.payload().data(), residual_values.data(),
+                residual_values.size() * sizeof(float));
+    std::memcpy(norm.payload().data(), norm_values.data(),
+                norm_values.size() * sizeof(float));
+    std::memcpy(down_weights.payload().data(), down_values.data(),
+                down_values.size() * sizeof(std::uint16_t));
+    std::memcpy(up_weights.payload().data(), up_values.data(),
+                up_values.size() * sizeof(std::uint16_t));
+    std::memcpy(inject_weights.payload().data(), inject_values.data(),
+                inject_values.size() * sizeof(std::uint16_t));
+    const std::vector<std::uint8_t> residual_before(
+        residual.payload().begin(), residual.payload().end());
+    const std::vector<std::uint8_t> norm_before(
+        norm.payload().begin(), norm.payload().end());
+    const std::vector<std::uint8_t> down_weights_before(
+        down_weights.payload().begin(), down_weights.payload().end());
+    const std::vector<std::uint8_t> up_weights_before(
+        up_weights.payload().begin(), up_weights.payload().end());
+    const std::vector<std::uint8_t> inject_weights_before(
+        inject_weights.payload().begin(), inject_weights.payload().end());
+    const auto down_read = context.buffers().read_only(down_weights.view());
+    const auto up_read = context.buffers().read_only(up_weights.view());
+    const auto inject_read = context.buffers().read_only(inject_weights.view());
+
+    bool passed = true;
+    for (std::size_t mode_index = 0u; mode_index < modes.size();
+         ++mode_index) {
+        const std::uint32_t rows = rows_by_mode[mode_index];
+        const bool write_low =
+            modes[mode_index] == PrefillBF16X2Mode::all_projections;
+        PrefillGRReadTestOutputs composed, reference;
+        const bool outputs_allocated =
+            composed.allocate(context, rows, write_low,
+                              label + " composed " +
+                                  std::to_string(mode_index),
+                              error) &&
+            reference.allocate(context, rows, write_low,
+                               label + " reference " +
+                                   std::to_string(mode_index),
+                               error);
+        check(outputs_allocated, label + " allocate chain outputs", error);
+        if (!outputs_allocated) return false;
+
+        const PrefillGRReadBuffers composed_buffers = composed.bind(
+            residual.view(), norm.view(), down_read, up_read, inject_read,
+            write_low);
+        const PrefillGRReadBuffers reference_buffers = reference.bind(
+            residual.view(), norm.view(), down_read, up_read, inject_read,
+            write_low);
+
+        auto composed_command =
+            context.make_command_buffer(label + " composed", error);
+        if (!composed_command) {
+            check(false, label + " composed command buffer", error);
+            return false;
+        }
+        const bool composed_encoded = encode_prefill_gr_read(
+            context, *composed_command, rows, modes[mode_index],
+            composed_buffers, error);
+        check(composed_encoded, label + " coordinator encoding", error);
+        if (!composed_encoded) return false;
+        const bool composed_completed =
+            submit_and_wait(composed_command, label + " composed", error);
+        check(composed_completed, label + " coordinator dispatch", error);
+        if (!composed_completed) return false;
+
+        auto reference_command =
+            context.make_command_buffer(label + " reference", error);
+        if (!reference_command) {
+            check(false, label + " reference command buffer", error);
+            return false;
+        }
+        const bool reference_encoded = Encoder::encode(
+            context, *reference_command, "direct Prefill GR read chain",
+            [&](Encoder& encoder, std::string& encode_error) {
+                return encode_prefill_gr_read_reference(
+                    context, encoder, rows, modes[mode_index],
+                    reference_buffers, encode_error);
+            },
+            error);
+        check(reference_encoded, label + " direct component chain", error);
+        if (!reference_encoded) return false;
+        const bool reference_completed =
+            submit_and_wait(reference_command, label + " reference", error);
+        check(reference_completed, label + " direct chain dispatch", error);
+        if (!reference_completed) return false;
+
+        const auto compare = [&](const TestBuffer& actual,
+                                 const TestBuffer& expected,
+                                 std::string_view stage) {
+            const bool equal =
+                std::equal(actual.payload().begin(), actual.payload().end(),
+                           expected.payload().begin());
+            check(equal, label + " " + std::string(stage) +
+                             " matches direct composition");
+            return equal;
+        };
+        passed &= compare(composed.rs, reference.rs, "scale");
+        passed &= compare(composed.xn16, reference.xn16, "normalized input");
+        passed &= compare(composed.low_rank, reference.low_rank,
+                          "down projection");
+        passed &= compare(composed.low_rank_bf16, reference.low_rank_bf16,
+                          "SiLU conversion");
+        passed &= compare(composed.gated, reference.gated, "up projection");
+        passed &= compare(composed.inject, reference.inject,
+                          "injection projection");
+        if (write_low) {
+            passed &= compare(composed.xn16_lo, reference.xn16_lo,
+                              "normalized remainder");
+            passed &= compare(composed.low_rank_bf16_lo,
+                              reference.low_rank_bf16_lo,
+                              "SiLU remainder");
+        }
+
+        const std::span<const float> active_residual(
+            residual_values.data(),
+            static_cast<std::size_t>(rows) * normalized_values);
+        const Oracle expected_norm = prefill_gr_norm_oracle(
+            active_residual, norm_values, rows, write_low);
+        passed &= check_outputs(
+            label + " mode " + std::to_string(mode_index), expected_norm,
+            composed.rs, composed.xn16,
+            write_low ? &composed.xn16_lo : nullptr, active_residual,
+            norm_values);
+
+        const std::span<const std::uint16_t> normalized_low =
+            write_low ? std::span<const std::uint16_t>(expected_norm.low)
+                      : std::span<const std::uint16_t>{};
+        const auto* const low_rank_values =
+            reinterpret_cast<const float*>(composed.low_rank.payload().data());
+        passed &= check_prefill_projection_oracle(
+            label + " down projection",
+            std::span<const std::uint16_t>(expected_norm.high),
+            normalized_low, down_values, rows, 320u, 10240u,
+            std::span<const float>(low_rank_values, rows * 320u));
+
+        const std::size_t low_rank_count =
+            static_cast<std::size_t>(rows) * 320u;
+        const SiluOracle expected_silu = prefill_gr_silu_oracle(
+            std::span<const float>(low_rank_values, low_rank_count),
+            write_low);
+        const bool silu_high_matches = std::equal(
+            expected_silu.high.begin(), expected_silu.high.end(),
+            reinterpret_cast<const std::uint16_t*>(
+                composed.low_rank_bf16.payload().data()));
+        check(silu_high_matches, label + " SiLU BF16 matches scalar oracle");
+        passed &= silu_high_matches;
+        if (write_low) {
+            const auto* const actual_low =
+                reinterpret_cast<const std::uint16_t*>(
+                    composed.low_rank_bf16_lo.payload().data());
+            std::uint16_t max_low_ulp = 0u;
+            for (std::size_t index = 0u;
+                 index < expected_silu.low.size(); ++index) {
+                max_low_ulp = std::max(
+                    max_low_ulp,
+                    bf16_ulp_distance(actual_low[index],
+                                      expected_silu.low[index]));
+            }
+            const bool silu_low_matches = max_low_ulp <= 2u;
+            check(silu_low_matches,
+                  label + " SiLU remainder matches scalar oracle",
+                  "max ULP=" + std::to_string(max_low_ulp) + ", limit=2");
+            passed &= silu_low_matches;
+        }
+
+        const auto* const low_rank_high =
+            reinterpret_cast<const std::uint16_t*>(
+                composed.low_rank_bf16.payload().data());
+        const auto* const low_rank_low =
+            write_low
+                ? reinterpret_cast<const std::uint16_t*>(
+                      composed.low_rank_bf16_lo.payload().data())
+                : nullptr;
+        const auto* const gated_values =
+            reinterpret_cast<const float*>(composed.gated.payload().data());
+        passed &= check_prefill_projection_oracle(
+            label + " up projection",
+            std::span<const std::uint16_t>(low_rank_high, low_rank_count),
+            write_low
+                ? std::span<const std::uint16_t>(low_rank_low,
+                                                 low_rank_count)
+                : std::span<const std::uint16_t>{},
+            up_values, rows, 10240u, 320u,
+            std::span<const float>(gated_values,
+                                   static_cast<std::size_t>(rows) *
+                                       normalized_values));
+
+        const auto* const inject_result =
+            reinterpret_cast<const float*>(composed.inject.payload().data());
+        passed &= check_prefill_projection_oracle(
+            label + " injection projection",
+            std::span<const std::uint16_t>(expected_norm.high),
+            normalized_low, inject_values, rows, 4u, 10240u,
+            std::span<const float>(
+                inject_result, static_cast<std::size_t>(rows) * kStreams));
+
+        const bool guards_intact =
+            composed.rs.guards_intact() && composed.xn16.guards_intact() &&
+            composed.low_rank.guards_intact() &&
+            composed.low_rank_bf16.guards_intact() &&
+            composed.gated.guards_intact() &&
+            composed.inject.guards_intact() &&
+            (!write_low || (composed.xn16_lo.guards_intact() &&
+                            composed.low_rank_bf16_lo.guards_intact())) &&
+            residual.guards_intact() && norm.guards_intact() &&
+            down_weights.guards_intact() && up_weights.guards_intact() &&
+            inject_weights.guards_intact();
+        check(guards_intact, label + " output and input guards");
+        passed &= guards_intact;
+
+        if (mode_index == 0u) {
+            PrefillGRReadBuffers aliased = composed_buffers;
+            aliased.rs = composed.low_rank.view();
+            const std::vector<std::uint8_t> low_rank_before(
+                composed.low_rank.allocation().begin(),
+                composed.low_rank.allocation().end());
+            auto alias_command =
+                context.make_command_buffer(label + " alias rejection", error);
+            if (!alias_command) {
+                check(false, label + " alias command buffer", error);
+                return false;
+            }
+            const bool alias_encoded = encode_prefill_gr_read(
+                context, *alias_command, rows, modes[mode_index], aliased,
+                error);
+            const bool alias_rejected =
+                !alias_encoded &&
+                alias_command->unsafe_native_handle() == nullptr &&
+                error.find("writable output views overlap") !=
+                    std::string::npos &&
+                std::equal(low_rank_before.begin(), low_rank_before.end(),
+                           composed.low_rank.allocation().begin());
+            check(alias_rejected,
+                  label + " rejects cross-stage output alias before dispatch",
+                  error);
+            passed &= alias_rejected;
+
+            const char* const dispatch = std::getenv("STRATA_METAL_DISPATCH");
+            if (dispatch != nullptr &&
+                std::string_view(dispatch) == "concurrent") {
+                auto group_command = context.make_command_buffer(
+                    label + " open concurrent group", error);
+                if (!group_command) {
+                    check(false, label + " open-group command buffer", error);
+                    return false;
+                }
+                const bool group_encoded = Encoder::encode(
+                    context, *group_command, "open Prefill GR read group",
+                    [&](Encoder& encoder, std::string& encode_error) {
+                        if (!encoder.group_begin(encode_error)) return false;
+                        return encode_prefill_gr_read(
+                            context, encoder, rows, modes[mode_index],
+                            composed_buffers, encode_error);
+                    },
+                    error);
+                const bool group_rejected =
+                    !group_encoded &&
+                    error.find("ordered concurrent-group boundary") !=
+                        std::string::npos;
+                check(group_rejected,
+                      label + " rejects an open concurrent group", error);
+                passed &= group_rejected;
+            }
+        }
+    }
+
+    PrefillGRReadTestOutputs late_failure;
+    const bool late_failure_allocated =
+        late_failure.allocate(context, 1u, false, label + " late failure",
+                              error);
+    check(late_failure_allocated, label + " allocate late-failure outputs",
+          error);
+    if (!late_failure_allocated) return false;
+    const PrefillGRReadBuffers late_failure_buffers = late_failure.bind(
+        residual.view(), norm.view(), down_read, up_read, inject_read, false);
+    const std::array<TestBuffer*, 6> late_failure_outputs{
+        &late_failure.rs, &late_failure.xn16, &late_failure.low_rank,
+        &late_failure.low_rank_bf16, &late_failure.gated,
+        &late_failure.inject};
+    const auto snapshot_late_failure_outputs = [&] {
+        std::array<std::vector<std::uint8_t>, 6> snapshots;
+        for (std::size_t index = 0u; index < snapshots.size(); ++index) {
+            const auto bytes = late_failure_outputs[index]->allocation();
+            snapshots[index].assign(bytes.begin(), bytes.end());
+        }
+        return snapshots;
+    };
+    const auto late_failure_outputs_unchanged = [&](const auto& snapshots) {
+        for (std::size_t index = 0u; index < snapshots.size(); ++index) {
+            const auto bytes = late_failure_outputs[index]->allocation();
+            if (!std::equal(snapshots[index].begin(), snapshots[index].end(),
+                            bytes.begin())) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto run_late_failure = [&](std::string_view form,
+                                      bool caller_owned) {
+        const auto before = snapshot_late_failure_outputs();
+        auto command = context.make_command_buffer(
+            label + " late failure " + std::string(form), error);
+        if (!command) {
+            check(false, label + " late-failure command buffer", error);
+            return false;
+        }
+        bool encoded = false;
+        if (caller_owned) {
+            encoded = Encoder::encode(
+                context, *command, "caller-owned Prefill GR read failure",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encode_prefill_gr_read(
+                        context, encoder, 1u, PrefillBF16X2Mode::off,
+                        late_failure_buffers, encode_error);
+                },
+                error);
+        } else {
+            encoded = encode_prefill_gr_read(
+                context, *command, 1u, PrefillBF16X2Mode::off,
+                late_failure_buffers, error);
+        }
+        const bool discarded =
+            command->unsafe_native_handle() == nullptr;
+        const bool unchanged =
+            late_failure_outputs_unchanged(before);
+        const bool rejected =
+            !encoded && discarded && unchanged &&
+            error.find("STRATA_METAL_GEMM must be") != std::string::npos;
+        check(rejected,
+              label + " " + std::string(form) +
+                  " discards normalization prefix after GEMM selector failure",
+              error + (discarded ? " (command buffer discarded)"
+                                 : " (command buffer remained submit-capable)"));
+        return rejected;
+    };
+
+    ScopedEnvironment invalid_gemm_setting;
+    const bool invalid_setting_applied =
+        invalid_gemm_setting.set("STRATA_METAL_GEMM", "invalid");
+    check(invalid_setting_applied,
+          label + " installs deterministic late GEMM failure");
+    if (invalid_setting_applied) {
+        passed &= run_late_failure("transactional", false);
+        passed &= run_late_failure("caller-owned", true);
+        const bool environment_restored = invalid_gemm_setting.restore();
+        check(environment_restored,
+              label + " restores STRATA_METAL_GEMM after late-failure checks");
+        passed &= environment_restored;
+    }
+
+    const bool immutable_inputs =
+        std::equal(residual_before.begin(), residual_before.end(),
+                   residual.payload().begin()) &&
+        std::equal(norm_before.begin(), norm_before.end(),
+                   norm.payload().begin()) &&
+        std::equal(down_weights_before.begin(), down_weights_before.end(),
+                   down_weights.payload().begin()) &&
+        std::equal(up_weights_before.begin(), up_weights_before.end(),
+                   up_weights.payload().begin()) &&
+        std::equal(inject_weights_before.begin(), inject_weights_before.end(),
+                   inject_weights.payload().begin());
+    check(immutable_inputs, label + " keeps all model inputs immutable");
+    passed &= immutable_inputs;
+    return passed;
 }
 
 bool run_silu_case(Context& context, std::uint32_t rows,
@@ -5484,6 +6143,7 @@ int main(int argc, char** argv) {
     passed &= run_silu_case(*context, 3u,
                             PrefillBF16X2Mode::all_projections, true);
     passed &= test_prefill_embedding_chain(*context);
+    passed &= test_prefill_gr_read_chain(*context);
     passed &= test_failure_discards_prior_prefill_dispatch(*context);
     passed &= test_silu_failure_discards_prior_dispatch(*context);
     passed &= test_gr_mix_failure_discards_prior_dispatch(*context);

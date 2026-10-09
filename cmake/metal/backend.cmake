@@ -120,6 +120,7 @@ set(STRATA_METAL_ENGINE_SOURCES
   src/metal/engine/embed_dispatch.mm
   src/metal/engine/prefill_dispatch.mm
   src/metal/engine/prefill_gr_norm_dispatch.mm
+  src/metal/engine/prefill_gr_read_dispatch.mm
   src/metal/engine/prefill_gr_write_norm_dispatch.mm
   src/metal/engine/prefill_gdn_gates_dispatch.mm
   src/metal/engine/prefill_gdn_conv_dispatch.mm
