@@ -1,6 +1,7 @@
 #include "oracles/gdn.hpp"
 
 #include "../../../src/metal/kernels/common/params.h"
+#include "strata/kernels/f16_bits.hpp"
 
 #include <array>
 #include <bit>
@@ -407,6 +408,46 @@ void gdn_rec(std::vector<float>& state, std::span<const float> h,
                     state[index] = s[column][row_group][r].value;
                     final_state[index] = s[column][row_group][r];
                 }
+            }
+        }
+    }
+}
+
+void gdn_out_norm(std::span<const tf> oc, std::span<const float> z,
+                  std::span<const float> gamma, std::uint32_t rows,
+                  std::vector<std::uint16_t>& y_h) {
+    y_h.resize(static_cast<std::size_t>(rows) * kValueDim);
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        for (std::uint32_t head = 0u; head < kVHeads; ++head) {
+            std::array<tf, 4> partials{};
+            for (std::uint32_t warp = 0u; warp < partials.size(); ++warp) {
+                std::array<tf, 32> squares{};
+                for (std::uint32_t lane = 0u; lane < squares.size(); ++lane) {
+                    const tf value{
+                        oc[static_cast<std::size_t>(row) * kValueDim +
+                           static_cast<std::size_t>(head) * kHeadDim +
+                           warp * 32u + lane]
+                            .value};
+                    squares[lane] = value * value;
+                }
+                partials[warp] = butterfly(squares)[0];
+            }
+            const tf sum =
+                ((partials[0] + partials[1]) + partials[2]) + partials[3];
+            const tf scale =
+                rsqrt_accurate(sum / tf{static_cast<float>(kHeadDim)} +
+                               tf{kEpsilon});
+            for (std::uint32_t column = 0u; column < kHeadDim; ++column) {
+                const std::size_t index =
+                    static_cast<std::size_t>(row) * kValueDim +
+                    static_cast<std::size_t>(head) * kHeadDim + column;
+                const tf value{oc[index].value};
+                const tf normalized =
+                    (value * scale) * tf{gamma[column]};
+                const tf gated =
+                    normalized * sigmoid(tf{z[index]});
+                y_h[index] =
+                    strata::kernels::f16_from_f32(gated.value);
             }
         }
     }

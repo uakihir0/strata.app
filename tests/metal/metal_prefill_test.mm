@@ -13,6 +13,7 @@
 #include "strata/metal/prefill_gdn_gates_dispatch.hpp"
 #include "strata/metal/prefill_gdn_conv_dispatch.hpp"
 #include "strata/metal/prefill_gdn_l2_dispatch.hpp"
+#include "strata/metal/prefill_gdn_out_norm_dispatch.hpp"
 #include "strata/metal/prefill_gdn_rec_dispatch.hpp"
 #include "strata/metal/prefill_gr_write_norm_dispatch.hpp"
 #include "twin.hpp"
@@ -46,6 +47,7 @@ constexpr std::uint32_t kStreams = 4u;
 constexpr std::uint32_t kGdnHeads = 48u;
 constexpr std::uint32_t kGdnConvChannels = 10240u;
 constexpr std::uint32_t kGdnConvKernel = 4u;
+constexpr std::uint32_t kGdnHeadDim = GDN_HEAD_DIM;
 constexpr std::uint32_t kGdnValueDim = GDN_VALUE_DIM;
 constexpr std::uint32_t kGdnStateElements = GDN_STATE_ELEMENTS;
 constexpr std::uint32_t kThreads = 256u;
@@ -125,6 +127,18 @@ std::uint64_t float_ulp_distance(float left, float right) {
     const std::uint32_t a = float_ordered(left);
     const std::uint32_t b = float_ordered(right);
     return a < b ? std::uint64_t{b} - a : std::uint64_t{a} - b;
+}
+
+std::uint16_t half_ordered(std::uint16_t bits) {
+    return (bits & 0x8000u) != 0u
+               ? static_cast<std::uint16_t>(~bits)
+               : static_cast<std::uint16_t>(bits | 0x8000u);
+}
+
+std::uint32_t half_ulp_distance(std::uint16_t left, std::uint16_t right) {
+    const std::uint32_t a = half_ordered(left);
+    const std::uint32_t b = half_ordered(right);
+    return a < b ? b - a : a - b;
 }
 
 std::uint16_t bf16_ordered(std::uint16_t value) {
@@ -3664,6 +3678,851 @@ bool test_prefill_gdn_rec_failure_discards_prior_dispatch(Context& context) {
     return caller_rolled_back && standalone_rolled_back;
 }
 
+bool run_prefill_gdn_out_norm_case(Context& context, std::uint32_t rows,
+                                   bool shared_encoder,
+                                   bool compose_with_rec) {
+    const std::string label =
+        "Prefill GDN output normalization T=" + std::to_string(rows) +
+        (compose_with_rec
+             ? " L2→recurrence→out_norm"
+             : (shared_encoder ? " caller-owned" : " standalone"));
+    const std::size_t value_count =
+        static_cast<std::size_t>(rows) * kGdnValueDim;
+    const std::size_t value_bytes = value_count * sizeof(float);
+    const std::size_t gamma_bytes =
+        static_cast<std::size_t>(kGdnHeadDim) * sizeof(float);
+    const std::size_t output_bytes = value_count * sizeof(std::uint16_t);
+    constexpr std::size_t state_bytes =
+        static_cast<std::size_t>(kGdnStateElements) * sizeof(float);
+    const std::size_t h_bytes =
+        static_cast<std::size_t>(rows) * kGdnConvChannels * sizeof(float);
+    const std::size_t head_bytes =
+        static_cast<std::size_t>(rows) * kGdnHeads * sizeof(float);
+
+    std::vector<float> oc(value_count);
+    std::vector<float> z(value_count);
+    std::vector<float> gamma(kGdnHeadDim);
+    for (std::size_t i = 0u; i < value_count; ++i) {
+        const int centered = static_cast<int>((i * 41u + 29u) % 503u) - 251;
+        oc[i] = static_cast<float>(centered) * 0.003f;
+        const int gate_centered =
+            static_cast<int>((i * 13u + 7u) % 101u) - 50;
+        z[i] = static_cast<float>(gate_centered) * 0.05f;
+    }
+    for (std::size_t i = 0u; i < gamma.size(); ++i) {
+        const int centered =
+            static_cast<int>((i * 17u + 3u) % 101u) - 50;
+        gamma[i] = static_cast<float>(centered) * 0.01f;
+    }
+
+    std::vector<float> initial_state;
+    std::vector<float> h;
+    std::vector<float> gate;
+    std::vector<float> beta;
+    std::vector<float> expected_h;
+    std::vector<twin::tf> expected_oc(value_count);
+    std::vector<twin::tf> expected_state;
+    if (compose_with_rec) {
+        initial_state.resize(kGdnStateElements);
+        h.resize(static_cast<std::size_t>(rows) * kGdnConvChannels);
+        gate.resize(static_cast<std::size_t>(rows) * kGdnHeads);
+        beta.resize(static_cast<std::size_t>(rows) * kGdnHeads);
+        for (std::size_t i = 0u; i < initial_state.size(); ++i) {
+            const int centered =
+                static_cast<int>((i * 29u + 17u) % 101u) - 50;
+            initial_state[i] = static_cast<float>(centered) * 0.0002f;
+        }
+        for (std::size_t i = 0u; i < h.size(); ++i) {
+            const int centered =
+                static_cast<int>((i * 37u + 43u) % 509u) - 254;
+            h[i] = static_cast<float>(centered) * 0.0003f;
+        }
+        for (std::size_t i = 0u; i < gate.size(); ++i) {
+            const int centered =
+                static_cast<int>((i * 13u + 5u) % 101u) - 50;
+            gate[i] = -2.0f + static_cast<float>(centered) * 0.001f;
+            beta[i] = 0.4f +
+                      static_cast<float>((i * 7u + 3u) % 101u) * 0.0005f;
+        }
+        expected_h = prefill_gdn_l2_oracle(h, rows);
+        std::vector<float> expected_state_values = initial_state;
+        oracle::gdn_rec(expected_state_values, expected_h, gate, beta, rows,
+                       expected_oc, expected_state);
+    } else {
+        for (std::size_t i = 0u; i < value_count; ++i) {
+            expected_oc[i] = twin::tf{oc[i]};
+        }
+    }
+    std::vector<std::uint16_t> expected_y_h;
+    oracle::gdn_out_norm(expected_oc, z, gamma, rows, expected_y_h);
+
+    TestBuffer oc_buffer, z_buffer, gamma_buffer, y_h_buffer;
+    TestBuffer state_buffer, h_buffer, gate_buffer, beta_buffer;
+    std::string error;
+    bool allocated =
+        oc_buffer.allocate(context, label + " oc", value_bytes, error) &&
+        z_buffer.allocate(context, label + " z", value_bytes, error) &&
+        gamma_buffer.allocate(context, label + " gamma", gamma_bytes, error) &&
+        y_h_buffer.allocate(context, label + " y_h", output_bytes, error);
+    if (compose_with_rec) {
+        allocated =
+            allocated &&
+            state_buffer.allocate(context, label + " state", state_bytes,
+                                  error) &&
+            h_buffer.allocate(context, label + " h", h_bytes, error) &&
+            gate_buffer.allocate(context, label + " gate", head_bytes, error) &&
+            beta_buffer.allocate(context, label + " beta", head_bytes, error);
+    }
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    if (compose_with_rec) {
+        std::memcpy(state_buffer.payload().data(), initial_state.data(),
+                    state_bytes);
+        std::memcpy(h_buffer.payload().data(), h.data(), h_bytes);
+        std::memcpy(gate_buffer.payload().data(), gate.data(), head_bytes);
+        std::memcpy(beta_buffer.payload().data(), beta.data(), head_bytes);
+    } else {
+        std::memcpy(oc_buffer.payload().data(), oc.data(), value_bytes);
+    }
+    std::memcpy(z_buffer.payload().data(), z.data(), value_bytes);
+    std::memcpy(gamma_buffer.payload().data(), gamma.data(), gamma_bytes);
+    const auto z_before = std::vector<std::uint8_t>(
+        z_buffer.payload().begin(), z_buffer.payload().end());
+    const auto gamma_before = std::vector<std::uint8_t>(
+        gamma_buffer.payload().begin(), gamma_buffer.payload().end());
+    const auto oc_before = std::vector<std::uint8_t>(
+        oc_buffer.payload().begin(), oc_buffer.payload().end());
+
+    const PrefillGDNOutNormBuffers buffers{
+        context.buffers().read_only(oc_buffer.view()),
+        context.buffers().read_only(z_buffer.view()),
+        context.buffers().read_only(gamma_buffer.view()), y_h_buffer.view()};
+    auto command = context.make_command_buffer(label, error);
+    check(command != nullptr, label + " command buffer", error);
+    if (!command) return false;
+    bool encoded = false;
+    if (shared_encoder) {
+        encoded = Encoder::encode(
+            context, *command, label,
+            [&](Encoder& encoder, std::string& encode_error) {
+                if (compose_with_rec) {
+                    if (!encode_prefill_gdn_l2(context, encoder, rows,
+                                               h_buffer.view(), encode_error)) {
+                        return false;
+                    }
+                    const PrefillGDNRecBuffers rec_buffers{
+                        state_buffer.view(),
+                        context.buffers().read_only(h_buffer.view()),
+                        context.buffers().read_only(gate_buffer.view()),
+                        context.buffers().read_only(beta_buffer.view()),
+                        oc_buffer.view()};
+                    if (!encode_prefill_gdn_rec(context, encoder, rows,
+                                                rec_buffers, encode_error)) {
+                        return false;
+                    }
+                }
+                return encode_prefill_gdn_out_norm(
+                    context, encoder, rows, buffers, encode_error);
+            },
+            error);
+    } else {
+        encoded = encode_prefill_gdn_out_norm(context, *command, rows, buffers,
+                                              error);
+    }
+    check(encoded, label + " production encode", error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    if (!submit_and_wait(command, label, error)) {
+        check(false, label + " Metal dispatch", error);
+        return false;
+    }
+
+    const auto actual_y_h = std::span<const std::uint16_t>(
+        reinterpret_cast<const std::uint16_t*>(y_h_buffer.payload().data()),
+        expected_y_h.size());
+    std::uint32_t max_half_ulp = 0u;
+    for (std::size_t i = 0u; i < actual_y_h.size(); ++i) {
+        max_half_ulp =
+            std::max(max_half_ulp,
+                     half_ulp_distance(actual_y_h[i], expected_y_h[i]));
+    }
+    const bool output_matches = max_half_ulp <= 1u;
+    check(output_matches, label + " F16 output oracle",
+          "maximum half ULP=" + std::to_string(max_half_ulp) + ", limit=1");
+
+    bool rec_matches = true;
+    bool h_matches = true;
+    if (compose_with_rec) {
+        const auto actual_oc = std::span<const float>(
+            reinterpret_cast<const float*>(oc_buffer.payload().data()),
+            expected_oc.size());
+        const auto oc_mismatch = twin::compare_floats(
+            actual_oc, expected_oc,
+            {twin::Comparison::units, 512.0, 0.0, 0u});
+        const auto actual_state = std::span<const float>(
+            reinterpret_cast<const float*>(state_buffer.payload().data()),
+            expected_state.size());
+        const auto state_mismatch = twin::compare_floats(
+            actual_state, expected_state,
+            {twin::Comparison::units, 512.0, 0.0, 0u});
+        rec_matches = !oc_mismatch && !state_mismatch;
+        check(rec_matches, label + " recurrence output/state oracles",
+              oc_mismatch ? oc_mismatch->reason
+                          : (state_mismatch ? state_mismatch->reason : ""));
+
+        const auto actual_h = std::span<const float>(
+            reinterpret_cast<const float*>(h_buffer.payload().data()),
+            expected_h.size());
+        for (std::size_t i = 0u; i < actual_h.size(); ++i) {
+            if (i % kGdnConvChannels <
+                2u * GDN_QK_HEADS * GDN_HEAD_DIM) {
+                h_matches &=
+                    float_ulp_distance(actual_h[i], expected_h[i]) <= 32u;
+            } else {
+                h_matches &= std::memcmp(
+                                 h_buffer.payload().data() + i * sizeof(float),
+                                 h.data() + i, sizeof(float)) == 0;
+            }
+        }
+        check(h_matches, label + " q/k normalization and unchanged v");
+    } else {
+        const bool immutable =
+            std::equal(oc_before.begin(), oc_before.end(),
+                       oc_buffer.payload().begin());
+        check(immutable, label + " oc remains unchanged");
+        rec_matches &= immutable;
+    }
+    const bool readonly_inputs_unchanged =
+        std::equal(z_before.begin(), z_before.end(),
+                   z_buffer.payload().begin()) &&
+        std::equal(gamma_before.begin(), gamma_before.end(),
+                   gamma_buffer.payload().begin());
+    check(readonly_inputs_unchanged, label + " z/gamma remain unchanged");
+    const bool guards =
+        oc_buffer.guards_intact() && z_buffer.guards_intact() &&
+        gamma_buffer.guards_intact() && y_h_buffer.guards_intact() &&
+        (!compose_with_rec ||
+         (state_buffer.guards_intact() && h_buffer.guards_intact() &&
+          gate_buffer.guards_intact() && beta_buffer.guards_intact()));
+    check(guards, label + " guard regions");
+    return output_matches && rec_matches && h_matches &&
+           readonly_inputs_unchanged && guards;
+}
+
+bool test_prefill_gdn_out_norm_epsilon_sentinel(Context& context) {
+    const std::string label =
+        "Prefill GDN output normalization epsilon sentinel";
+    constexpr std::size_t value_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(float);
+    constexpr std::size_t gamma_bytes =
+        static_cast<std::size_t>(kGdnHeadDim) * sizeof(float);
+    constexpr std::size_t output_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(std::uint16_t);
+    std::vector<float> oc(kGdnValueDim, 0.0f);
+    std::vector<float> z(kGdnValueDim, 0.0f);
+    std::vector<float> gamma(kGdnHeadDim, 1.0f);
+    oc[0u] = 0.001f;
+    std::vector<twin::tf> expected_oc(kGdnValueDim);
+    for (std::size_t i = 0u; i < oc.size(); ++i) {
+        expected_oc[i] = twin::tf{oc[i]};
+    }
+    std::vector<std::uint16_t> expected_y_h;
+    oracle::gdn_out_norm(expected_oc, z, gamma, 1u, expected_y_h);
+    const float without_epsilon =
+        (oc[0u] * (1.0f / std::sqrt((oc[0u] * oc[0u]) /
+                                    static_cast<float>(kGdnHeadDim)))) *
+        0.5f;
+    const std::uint16_t no_epsilon_bits =
+        strata::kernels::f16_from_f32(without_epsilon);
+    const bool epsilon_control =
+        half_ulp_distance(expected_y_h[0u], no_epsilon_bits) > 100u;
+    check(epsilon_control, label + " distinguishes omitted epsilon",
+          "with epsilon bits=" + std::to_string(expected_y_h[0u]) +
+              ", without=" + std::to_string(no_epsilon_bits));
+
+    TestBuffer oc_buffer, z_buffer, gamma_buffer, y_h_buffer;
+    std::string error;
+    const bool allocated =
+        oc_buffer.allocate(context, label + " oc", value_bytes, error) &&
+        z_buffer.allocate(context, label + " z", value_bytes, error) &&
+        gamma_buffer.allocate(context, label + " gamma", gamma_bytes, error) &&
+        y_h_buffer.allocate(context, label + " y_h", output_bytes, error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    std::memcpy(oc_buffer.payload().data(), oc.data(), value_bytes);
+    std::memcpy(z_buffer.payload().data(), z.data(), value_bytes);
+    std::memcpy(gamma_buffer.payload().data(), gamma.data(), gamma_bytes);
+    const PrefillGDNOutNormBuffers buffers{
+        context.buffers().read_only(oc_buffer.view()),
+        context.buffers().read_only(z_buffer.view()),
+        context.buffers().read_only(gamma_buffer.view()), y_h_buffer.view()};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded =
+        encode_prefill_gdn_out_norm(context, *command, 1u, buffers, error);
+    check(encoded, label + " production encode", error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    if (!submit_and_wait(command, label, error)) {
+        check(false, label + " Metal dispatch", error);
+        return false;
+    }
+    const auto actual = std::span<const std::uint16_t>(
+        reinterpret_cast<const std::uint16_t*>(y_h_buffer.payload().data()),
+        expected_y_h.size());
+    const bool matches =
+        half_ulp_distance(actual[0u], expected_y_h[0u]) <= 1u;
+    check(matches, label + " retains RMS_EPSILON",
+          "half ULP=" +
+              std::to_string(half_ulp_distance(actual[0u], expected_y_h[0u])));
+    const bool guards = oc_buffer.guards_intact() && z_buffer.guards_intact() &&
+                        gamma_buffer.guards_intact() &&
+                        y_h_buffer.guards_intact();
+    check(guards, label + " guard regions");
+    return epsilon_control && matches && guards;
+}
+
+bool test_prefill_gdn_out_norm_reduction_order_sentinel(Context& context) {
+    const std::string label =
+        "Prefill GDN output normalization reduction-order sentinel";
+    constexpr std::size_t value_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(float);
+    constexpr std::size_t gamma_bytes =
+        static_cast<std::size_t>(kGdnHeadDim) * sizeof(float);
+    constexpr std::size_t output_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(std::uint16_t);
+    std::vector<float> oc(kGdnValueDim, 0.0f);
+    std::vector<float> z(kGdnValueDim, 20.0f);
+    std::vector<float> gamma(kGdnHeadDim, 1.0f);
+    gamma[1u] = 180.9751434326171875f;
+    for (std::size_t head = 0u; head < kGdnHeads; ++head) {
+        const std::size_t base = head * kGdnHeadDim;
+        oc[base] = 4096.0f;
+        oc[base + 1u] = 1.0f;
+        oc[base + 32u] = 1.0f;
+        oc[base + 64u] = 1.0f;
+        oc[base + 96u] = 1.0f;
+    }
+
+    std::vector<twin::tf> expected_oc(kGdnValueDim);
+    for (std::size_t i = 0u; i < oc.size(); ++i) {
+        expected_oc[i] = twin::tf{oc[i]};
+    }
+    std::vector<std::uint16_t> expected_y_h;
+    oracle::gdn_out_norm(expected_oc, z, gamma, 1u, expected_y_h);
+
+    // A right-associated sum gives 2^24 + 3, which rounds to 2^24 + 4.
+    // The specified left-associated reduction rounds each +1 away at 2^24.
+    const float regrouped_sum =
+        16777216.0f + ((1.0f + 1.0f) + 1.0f);
+    const float regrouped_mean =
+        regrouped_sum / static_cast<float>(kGdnHeadDim) + 1.0e-6f;
+    const float regrouped_scale = static_cast<float>(
+        1.0 / std::sqrt(static_cast<double>(regrouped_mean)));
+    const float regrouped_value =
+        (1.0f * regrouped_scale) * gamma[1u];
+    const std::uint16_t regrouped_bits =
+        strata::kernels::f16_from_f32(regrouped_value);
+    const bool order_control = expected_y_h[1u] != regrouped_bits;
+    check(order_control, label + " distinguishes regrouped partials",
+          "specified bits=" + std::to_string(expected_y_h[1u]) +
+              ", regrouped bits=" + std::to_string(regrouped_bits));
+
+    TestBuffer oc_buffer, z_buffer, gamma_buffer, y_h_buffer;
+    std::string error;
+    const bool allocated =
+        oc_buffer.allocate(context, label + " oc", value_bytes, error) &&
+        z_buffer.allocate(context, label + " z", value_bytes, error) &&
+        gamma_buffer.allocate(context, label + " gamma", gamma_bytes, error) &&
+        y_h_buffer.allocate(context, label + " y_h", output_bytes, error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    std::memcpy(oc_buffer.payload().data(), oc.data(), value_bytes);
+    std::memcpy(z_buffer.payload().data(), z.data(), value_bytes);
+    std::memcpy(gamma_buffer.payload().data(), gamma.data(), gamma_bytes);
+    const PrefillGDNOutNormBuffers buffers{
+        context.buffers().read_only(oc_buffer.view()),
+        context.buffers().read_only(z_buffer.view()),
+        context.buffers().read_only(gamma_buffer.view()), y_h_buffer.view()};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded =
+        encode_prefill_gdn_out_norm(context, *command, 1u, buffers, error);
+    check(encoded, label + " production encode", error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    if (!submit_and_wait(command, label, error)) {
+        check(false, label + " Metal dispatch", error);
+        return false;
+    }
+    const auto actual = std::span<const std::uint16_t>(
+        reinterpret_cast<const std::uint16_t*>(y_h_buffer.payload().data()),
+        expected_y_h.size());
+    bool all_heads_follow_order = true;
+    for (std::size_t head = 0u; head < kGdnHeads; ++head) {
+        const std::size_t index = head * kGdnHeadDim + 1u;
+        all_heads_follow_order &=
+            actual[index] == expected_y_h[index] &&
+            actual[index] != regrouped_bits;
+    }
+    check(all_heads_follow_order,
+          label + " output follows the specified four-partial order",
+          "specified bits=" + std::to_string(expected_y_h[1u]) +
+              ", regrouped bits=" + std::to_string(regrouped_bits) +
+              ", actual head 0 bits=" + std::to_string(actual[1u]));
+    const bool guards = oc_buffer.guards_intact() && z_buffer.guards_intact() &&
+                        gamma_buffer.guards_intact() &&
+                        y_h_buffer.guards_intact();
+    check(guards, label + " guard regions");
+    return order_control && all_heads_follow_order && guards;
+}
+
+bool test_prefill_gdn_out_norm_unsaturated_half_overflow(Context& context) {
+    const std::string label =
+        "Prefill GDN output normalization unsaturated F16 overflow";
+    constexpr std::size_t value_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(float);
+    constexpr std::size_t gamma_bytes =
+        static_cast<std::size_t>(kGdnHeadDim) * sizeof(float);
+    constexpr std::size_t output_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(std::uint16_t);
+    std::vector<float> oc(kGdnValueDim, 0.0f);
+    std::vector<float> z(kGdnValueDim, 0.0f);
+    std::vector<float> gamma(kGdnHeadDim, 1.0f);
+    oc[0u] = 1.0f;
+    oc[1u] = -1.0f;
+    z[0u] = 20.0f;
+    z[1u] = 20.0f;
+    gamma[0u] = 10000.0f;
+    gamma[1u] = 10000.0f;
+    std::vector<twin::tf> expected_oc(kGdnValueDim);
+    for (std::size_t i = 0u; i < oc.size(); ++i) {
+        expected_oc[i] = twin::tf{oc[i]};
+    }
+    std::vector<std::uint16_t> expected_y_h;
+    oracle::gdn_out_norm(expected_oc, z, gamma, 1u, expected_y_h);
+    const bool oracle_unsaturated =
+        expected_y_h[0u] == 0x7c00u && expected_y_h[1u] == 0xfc00u;
+    check(oracle_unsaturated, label + " oracle preserves signed infinity",
+          "positive=" + std::to_string(expected_y_h[0u]) +
+              ", negative=" + std::to_string(expected_y_h[1u]));
+
+    TestBuffer oc_buffer, z_buffer, gamma_buffer, y_h_buffer;
+    std::string error;
+    const bool allocated =
+        oc_buffer.allocate(context, label + " oc", value_bytes, error) &&
+        z_buffer.allocate(context, label + " z", value_bytes, error) &&
+        gamma_buffer.allocate(context, label + " gamma", gamma_bytes, error) &&
+        y_h_buffer.allocate(context, label + " y_h", output_bytes, error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    std::memcpy(oc_buffer.payload().data(), oc.data(), value_bytes);
+    std::memcpy(z_buffer.payload().data(), z.data(), value_bytes);
+    std::memcpy(gamma_buffer.payload().data(), gamma.data(), gamma_bytes);
+    const PrefillGDNOutNormBuffers buffers{
+        context.buffers().read_only(oc_buffer.view()),
+        context.buffers().read_only(z_buffer.view()),
+        context.buffers().read_only(gamma_buffer.view()), y_h_buffer.view()};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded =
+        encode_prefill_gdn_out_norm(context, *command, 1u, buffers, error);
+    check(encoded, label + " production encode", error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    if (!submit_and_wait(command, label, error)) {
+        check(false, label + " Metal dispatch", error);
+        return false;
+    }
+    const auto actual = std::span<const std::uint16_t>(
+        reinterpret_cast<const std::uint16_t*>(y_h_buffer.payload().data()),
+        expected_y_h.size());
+    const bool unsaturated =
+        actual[0u] == 0x7c00u && actual[1u] == 0xfc00u;
+    check(unsaturated, label + " does not clamp to finite F16",
+          "positive=" + std::to_string(actual[0u]) +
+              ", negative=" + std::to_string(actual[1u]));
+    const bool guards = oc_buffer.guards_intact() && z_buffer.guards_intact() &&
+                        gamma_buffer.guards_intact() &&
+                        y_h_buffer.guards_intact();
+    check(guards, label + " guard regions");
+    return oracle_unsaturated && unsaturated && guards;
+}
+
+bool test_prefill_gdn_out_norm_halfway_rne(Context& context) {
+    const std::string label =
+        "Prefill GDN output normalization F16 halfway RNE";
+    constexpr std::size_t value_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(float);
+    constexpr std::size_t gamma_bytes =
+        static_cast<std::size_t>(kGdnHeadDim) * sizeof(float);
+    constexpr std::size_t output_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(std::uint16_t);
+    std::vector<float> oc(kGdnValueDim, 1.0f);
+    std::vector<float> z(kGdnValueDim, 20.0f);
+    std::vector<float> gamma(kGdnHeadDim, 1.0f);
+    // With 128 unit inputs, rsqrt(1 + epsilon) is 0x3f7ffff8 on the
+    // reference compiler. This gamma makes the pre-conversion F32 value the
+    // exact midpoint between F16 1.0 and its successor; ties round to even.
+    gamma[0u] = 1.000488758087158203125f;
+    gamma[1u] = std::nextafter(gamma[0u],
+                               std::numeric_limits<float>::infinity());
+    std::vector<twin::tf> expected_oc(kGdnValueDim);
+    for (std::size_t i = 0u; i < oc.size(); ++i) {
+        expected_oc[i] = twin::tf{oc[i]};
+    }
+    std::vector<std::uint16_t> expected_y_h;
+    oracle::gdn_out_norm(expected_oc, z, gamma, 1u, expected_y_h);
+    const bool oracle_tie =
+        expected_y_h[0u] == 0x3c00u && expected_y_h[1u] == 0x3c01u;
+    check(oracle_tie, label + " scalar oracle locks both RNE sides",
+          "tie=" + std::to_string(expected_y_h[0u]) +
+              ", above=" + std::to_string(expected_y_h[1u]));
+
+    TestBuffer oc_buffer, z_buffer, gamma_buffer, y_h_buffer;
+    std::string error;
+    const bool allocated =
+        oc_buffer.allocate(context, label + " oc", value_bytes, error) &&
+        z_buffer.allocate(context, label + " z", value_bytes, error) &&
+        gamma_buffer.allocate(context, label + " gamma", gamma_bytes, error) &&
+        y_h_buffer.allocate(context, label + " y_h", output_bytes, error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    std::memcpy(oc_buffer.payload().data(), oc.data(), value_bytes);
+    std::memcpy(z_buffer.payload().data(), z.data(), value_bytes);
+    std::memcpy(gamma_buffer.payload().data(), gamma.data(), gamma_bytes);
+    const PrefillGDNOutNormBuffers buffers{
+        context.buffers().read_only(oc_buffer.view()),
+        context.buffers().read_only(z_buffer.view()),
+        context.buffers().read_only(gamma_buffer.view()), y_h_buffer.view()};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded =
+        encode_prefill_gdn_out_norm(context, *command, 1u, buffers, error);
+    check(encoded, label + " production encode", error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    if (!submit_and_wait(command, label, error)) {
+        check(false, label + " Metal dispatch", error);
+        return false;
+    }
+    const auto actual = std::span<const std::uint16_t>(
+        reinterpret_cast<const std::uint16_t*>(y_h_buffer.payload().data()),
+        expected_y_h.size());
+    const bool rne_bits =
+        actual[0u] == 0x3c00u && actual[1u] == 0x3c01u;
+    check(rne_bits, label + " GPU output rounds midpoint to even",
+          "tie=" + std::to_string(actual[0u]) +
+              ", above=" + std::to_string(actual[1u]));
+    const bool guards = oc_buffer.guards_intact() && z_buffer.guards_intact() &&
+                        gamma_buffer.guards_intact() &&
+                        y_h_buffer.guards_intact();
+    check(guards, label + " guard regions");
+    return oracle_tie && rne_bits && guards;
+}
+
+bool reject_prefill_gdn_out_norm_call(
+    Context& context, std::uint32_t rows,
+    const PrefillGDNOutNormBuffers& buffers,
+    std::string_view expected_error, const std::string& label) {
+    std::string error;
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, "rejected Prefill GDN output normalization",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_gdn_out_norm(context, encoder, rows, buffers,
+                                               encode_error);
+        },
+        error);
+    const bool right_error =
+        !encoded && error.find(expected_error) != std::string::npos;
+    check(right_error, label, error);
+    return right_error;
+}
+
+bool test_prefill_gdn_out_norm_validation(Context& context,
+                                          Context& foreign_context) {
+    const std::string label = "Prefill GDN output normalization validation";
+    constexpr std::size_t value_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(float);
+    constexpr std::size_t gamma_bytes =
+        static_cast<std::size_t>(kGdnHeadDim) * sizeof(float);
+    constexpr std::size_t output_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(std::uint16_t);
+    TestBuffer oc, z, gamma, y_h, foreign_oc, foreign_y_h, output_alias,
+        overlapping_inputs;
+    std::string error;
+    const bool allocated =
+        oc.allocate(context, label + " oc", value_bytes, error) &&
+        z.allocate(context, label + " z", value_bytes, error) &&
+        gamma.allocate(context, label + " gamma", gamma_bytes, error) &&
+        y_h.allocate(context, label + " y_h", output_bytes, error) &&
+        foreign_oc.allocate(foreign_context, label + " foreign oc",
+                            value_bytes, error) &&
+        foreign_y_h.allocate(foreign_context, label + " foreign y_h",
+                             output_bytes, error) &&
+        output_alias.allocate(context, label + " output alias backing",
+                              value_bytes, error) &&
+        overlapping_inputs.allocate(context, label + " shared read inputs",
+                                   value_bytes, error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    const ReadOnlyBufferRef oc_ro = context.buffers().read_only(oc.view());
+    const ReadOnlyBufferRef z_ro = context.buffers().read_only(z.view());
+    const ReadOnlyBufferRef gamma_ro =
+        context.buffers().read_only(gamma.view());
+    const PrefillGDNOutNormBuffers valid{oc_ro, z_ro, gamma_ro, y_h.view()};
+    bool passed = true;
+    passed &= reject_prefill_gdn_out_norm_call(
+        context, 0u, valid, "row count", label + " rejects zero rows");
+    passed &= reject_prefill_gdn_out_norm_call(
+        context, kPrefillMaxShaderRows + 1u, {},
+        "row count", label + " rejects shader-unsafe rows");
+    passed &= reject_prefill_gdn_out_norm_call(
+        context, 1u,
+        {oc_ro.slice(0u, value_bytes - sizeof(float)), z_ro, gamma_ro,
+         y_h.view()},
+        "undersized or misaligned", label + " rejects short oc");
+    passed &= reject_prefill_gdn_out_norm_call(
+        context, 1u,
+        {oc_ro, z_ro.slice(0u, value_bytes - sizeof(float)), gamma_ro,
+         y_h.view()},
+        "undersized or misaligned", label + " rejects short z");
+    passed &= reject_prefill_gdn_out_norm_call(
+        context, 1u,
+        {oc_ro, z_ro, gamma_ro.slice(0u, gamma_bytes - sizeof(float)),
+         y_h.view()},
+        "undersized or misaligned", label + " rejects short gamma");
+    passed &= reject_prefill_gdn_out_norm_call(
+        context, 1u,
+        {oc_ro, z_ro, gamma_ro,
+         y_h.view().slice(0u, output_bytes - sizeof(std::uint16_t))},
+        "undersized or misaligned", label + " rejects short y_h");
+
+    BufferRef raw_float = context.buffers().allocate(
+        label + " misaligned F32 backing", value_bytes + 1u, error);
+    BufferRef raw_half = context.buffers().allocate(
+        label + " misaligned F16 backing", output_bytes + 1u, error);
+    if (!raw_float || !raw_half) {
+        check(false, label + " allocate misaligned backings", error);
+        return false;
+    }
+    passed &= reject_prefill_gdn_out_norm_call(
+        context, 1u,
+        {context.buffers().read_only(raw_float.slice(1u, value_bytes)), z_ro,
+         gamma_ro, y_h.view()},
+        "undersized or misaligned", label + " rejects misaligned oc");
+    passed &= reject_prefill_gdn_out_norm_call(
+        context, 1u,
+        {oc_ro, z_ro, gamma_ro,
+         raw_half.slice(1u, output_bytes)},
+        "undersized or misaligned", label + " rejects misaligned y_h");
+    passed &= reject_prefill_gdn_out_norm_call(
+        context, 1u,
+        {foreign_context.buffers().read_only(foreign_oc.view()), z_ro,
+         gamma_ro, y_h.view()},
+        "not owned by this Context",
+        label + " rejects foreign Context input");
+    passed &= reject_prefill_gdn_out_norm_call(
+        context, 1u,
+        {oc_ro, z_ro, gamma_ro, foreign_y_h.view()},
+        "not owned by this Context",
+        label + " rejects foreign Context output");
+
+    const ReadOnlyBufferRef alias_as_oc = context.buffers().read_only(
+        output_alias.view().slice(0u, value_bytes));
+    passed &= reject_prefill_gdn_out_norm_call(
+        context, 1u,
+        {alias_as_oc, z_ro, gamma_ro,
+         output_alias.view().slice(0u, output_bytes)},
+        "overlaps a read-only input", label + " rejects y_h/oc overlap");
+
+    const ReadOnlyBufferRef shared =
+        context.buffers().read_only(overlapping_inputs.view());
+    auto overlap_command =
+        context.make_command_buffer(label + " read-only overlap", error);
+    if (!overlap_command) {
+        check(false, label + " overlap command buffer", error);
+        return false;
+    }
+    const bool readonly_overlap_accepted = Encoder::encode(
+        context, *overlap_command, "Prefill GDN overlapping read-only inputs",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_gdn_out_norm(
+                context, encoder, 1u,
+                {shared.slice(0u, value_bytes),
+                 shared.slice(0u, value_bytes),
+                 shared.slice(0u, gamma_bytes), y_h.view()},
+                encode_error);
+        },
+        error);
+    overlap_command->discard();
+    check(readonly_overlap_accepted,
+          label + " accepts overlapping read-only inputs", error);
+    passed &= readonly_overlap_accepted;
+    return passed;
+}
+
+bool test_prefill_gdn_out_norm_open_concurrent_group_rejected(
+    Context& context) {
+    const char* const dispatch = std::getenv("STRATA_METAL_DISPATCH");
+    if (dispatch == nullptr || std::string_view(dispatch) != "concurrent") {
+        return true;
+    }
+    const std::string label =
+        "Prefill GDN output normalization rejects open concurrent group";
+    constexpr std::size_t value_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(float);
+    constexpr std::size_t gamma_bytes =
+        static_cast<std::size_t>(kGdnHeadDim) * sizeof(float);
+    constexpr std::size_t output_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(std::uint16_t);
+    TestBuffer oc, z, gamma, y_h;
+    std::string error;
+    const bool allocated =
+        oc.allocate(context, label + " oc", value_bytes, error) &&
+        z.allocate(context, label + " z", value_bytes, error) &&
+        gamma.allocate(context, label + " gamma", gamma_bytes, error) &&
+        y_h.allocate(context, label + " y_h", output_bytes, error);
+    if (!allocated) {
+        check(false, label + " allocate buffers", error);
+        return false;
+    }
+    const PrefillGDNOutNormBuffers buffers{
+        context.buffers().read_only(oc.view()),
+        context.buffers().read_only(z.view()),
+        context.buffers().read_only(gamma.view()), y_h.view()};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, "open concurrent GDN output normalization",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encoder.group_begin(encode_error)) return false;
+            return encode_prefill_gdn_out_norm(
+                context, encoder, 1u, buffers, encode_error);
+        },
+        error);
+    const bool rejected =
+        !encoded && error.find("ordered concurrent-group boundary") !=
+                        std::string::npos;
+    check(rejected, label, error);
+    return rejected;
+}
+
+bool test_prefill_gdn_out_norm_failure_discards_prior_dispatch(
+    Context& context) {
+    const std::string label =
+        "Prefill GDN output normalization late failure rollback";
+    constexpr std::size_t value_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(float);
+    constexpr std::size_t gamma_bytes =
+        static_cast<std::size_t>(kGdnHeadDim) * sizeof(float);
+    constexpr std::size_t output_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(std::uint16_t);
+    TestBuffer oc, z, gamma, y_h;
+    std::string error;
+    const bool allocated =
+        oc.allocate(context, label + " oc", value_bytes, error) &&
+        z.allocate(context, label + " z", value_bytes, error) &&
+        gamma.allocate(context, label + " gamma", gamma_bytes, error) &&
+        y_h.allocate(context, label + " y_h", output_bytes, error);
+    if (!allocated) {
+        check(false, label + " allocate buffers", error);
+        return false;
+    }
+    const std::array<std::span<const std::uint8_t>, 4u> before{
+        std::span<const std::uint8_t>(oc.allocation()),
+        std::span<const std::uint8_t>(z.allocation()),
+        std::span<const std::uint8_t>(gamma.allocation()),
+        std::span<const std::uint8_t>(y_h.allocation())};
+    const auto unchanged = [&] {
+        const std::array<std::span<const std::uint8_t>, 4u> after{
+            std::span<const std::uint8_t>(oc.allocation()),
+            std::span<const std::uint8_t>(z.allocation()),
+            std::span<const std::uint8_t>(gamma.allocation()),
+            std::span<const std::uint8_t>(y_h.allocation())};
+        for (std::size_t i = 0u; i < before.size(); ++i) {
+            if (!std::equal(before[i].begin(), before[i].end(),
+                            after[i].begin())) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const PrefillGDNOutNormBuffers buffers{
+        context.buffers().read_only(oc.view()),
+        context.buffers().read_only(z.view()),
+        context.buffers().read_only(gamma.view()), y_h.view()};
+
+    auto caller_command = context.make_command_buffer(label + " shared", error);
+    if (!caller_command) {
+        check(false, label + " shared command buffer", error);
+        return false;
+    }
+    const bool caller_encoded = Encoder::encode(
+        context, *caller_command, "Prefill GDN out-norm shared rollback",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_prefill_gdn_out_norm(context, encoder, 1u, buffers,
+                                             encode_error)) {
+                return false;
+            }
+            return encode_prefill_gdn_out_norm(context, encoder, 0u, buffers,
+                                               encode_error);
+        },
+        error);
+    const bool caller_rolled_back =
+        !caller_encoded && caller_command->unsafe_native_handle() == nullptr &&
+        error.find("row count") != std::string::npos && unchanged();
+    check(caller_rolled_back, label + " caller-owned rollback", error);
+
+    auto standalone_command =
+        context.make_command_buffer(label + " standalone", error);
+    if (!standalone_command) {
+        check(false, label + " standalone command buffer", error);
+        return false;
+    }
+    const bool first = encode_prefill_gdn_out_norm(
+        context, *standalone_command, 1u, buffers, error);
+    const bool second =
+        first && encode_prefill_gdn_out_norm(
+                     context, *standalone_command, 0u, buffers, error);
+    const bool standalone_rolled_back =
+        first && !second &&
+        standalone_command->unsafe_native_handle() == nullptr &&
+        error.find("row count") != std::string::npos && unchanged();
+    check(standalone_rolled_back, label + " standalone rollback", error);
+    return caller_rolled_back && standalone_rolled_back;
+}
+
 bool reject_prefill_gdn_conv_tiled_call(
     Context& context, std::uint32_t rows,
     const PrefillGDNConvTiledBuffers& buffers,
@@ -4585,6 +5444,13 @@ int main(int argc, char** argv) {
     passed &= test_prefill_gdn_l2_epsilon_sentinel(*context);
     passed &= test_prefill_gdn_rec_validation(*context, *foreign_context);
     passed &= test_prefill_gdn_rec_reduction_sentinel(*context);
+    passed &= test_prefill_gdn_out_norm_validation(*context, *foreign_context);
+    passed &= test_prefill_gdn_out_norm_epsilon_sentinel(*context);
+    passed &=
+        test_prefill_gdn_out_norm_reduction_order_sentinel(*context);
+    passed &=
+        test_prefill_gdn_out_norm_unsaturated_half_overflow(*context);
+    passed &= test_prefill_gdn_out_norm_halfway_rne(*context);
     const std::array<std::uint32_t, 3> rows{1u, 3u, 8u};
     const std::array<PrefillBF16X2Mode, 3> modes{
         PrefillBF16X2Mode::off,
@@ -4630,6 +5496,8 @@ int main(int argc, char** argv) {
     passed &= test_prefill_gdn_l2_failure_discards_prior_dispatch(*context);
     passed &=
         test_prefill_gdn_rec_failure_discards_prior_dispatch(*context);
+    passed &=
+        test_prefill_gdn_out_norm_failure_discards_prior_dispatch(*context);
     passed &= test_open_concurrent_group_rejected(*context);
     passed &= test_silu_open_concurrent_group_rejected(*context);
     passed &= test_gr_mix_open_concurrent_group_rejected(*context);
@@ -4651,6 +5519,8 @@ int main(int argc, char** argv) {
     passed &= test_prefill_gdn_l2_open_concurrent_group_rejected(*context);
     passed &=
         test_prefill_gdn_rec_open_concurrent_group_rejected(*context);
+    passed &=
+        test_prefill_gdn_out_norm_open_concurrent_group_rejected(*context);
     for (const std::uint32_t gate_rows : {1u, 3u, 8u}) {
         passed &= run_prefill_gdn_gates_case(*context, gate_rows, false);
         passed &= run_prefill_gdn_gates_case(*context, gate_rows, true);
@@ -4689,6 +5559,21 @@ int main(int argc, char** argv) {
     for (const std::uint32_t composed_rows : {1u, 3u, 8u}) {
         passed &=
             run_prefill_gdn_rec_case(*context, composed_rows, true, true);
+    }
+    for (const std::uint32_t out_norm_rows : {1u, 2u, 3u, 8u, 65u}) {
+        passed &=
+            run_prefill_gdn_out_norm_case(*context, out_norm_rows, false,
+                                          false);
+    }
+    for (const std::uint32_t out_norm_rows : {1u, 8u}) {
+        passed &=
+            run_prefill_gdn_out_norm_case(*context, out_norm_rows, true,
+                                          false);
+    }
+    for (const std::uint32_t composed_rows : {1u, 3u, 8u}) {
+        passed &=
+            run_prefill_gdn_out_norm_case(*context, composed_rows, true,
+                                          true);
     }
     if (g_failures != 0) {
         std::fprintf(stderr, "%d Prefill Metal test(s) failed\n", g_failures);

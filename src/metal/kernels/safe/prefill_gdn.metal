@@ -198,6 +198,36 @@ kernel void strata_pf_gdn_rec(
     }
 }
 
+[[max_total_threads_per_threadgroup(128)]]
+kernel void strata_pf_gdn_out_norm(
+    device const float* oc [[buffer(0)]],
+    device const float* z [[buffer(1)]],
+    device const float* gamma [[buffer(2)]],
+    device half* y_h [[buffer(3)]],
+    threadgroup float* warp_sums [[threadgroup(0)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint warp [[simdgroup_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]]) {
+    const uint row = group.x;
+    const uint head = group.y;
+    const uint column = tid;
+    const ulong index =
+        ulong(row) * GDN_VALUE_DIM + ulong(head) * GDN_HEAD_DIM + column;
+    const float value = oc[index];
+    const float partial = bfly_sum(value * value);
+    if (lane == 0u) warp_sums[warp] = partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float sum =
+        ((warp_sums[0] + warp_sums[1]) + warp_sums[2]) + warp_sums[3];
+    const float scale =
+        rsqrt(sum / float(GDN_HEAD_DIM) + RMS_EPSILON);
+    const float normalized = (value * scale) * gamma[column];
+    const float gated = normalized * sigmoid_k(z[index]);
+    y_h[index] = half(gated);
+}
+
 [[max_total_threads_per_threadgroup(256)]]
 kernel void strata_pf_gdn_gates(
     device const float* alpha_beta [[buffer(0)]],

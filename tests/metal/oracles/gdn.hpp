@@ -41,6 +41,12 @@ void gdn_rec(std::vector<float>& state,
              std::vector<twin::tf>& output,
              std::vector<twin::tf>& final_state);
 
+void gdn_out_norm(std::span<const twin::tf> oc,
+                  std::span<const float> z,
+                  std::span<const float> gamma,
+                  std::uint32_t rows,
+                  std::vector<std::uint16_t>& y_h);
+
 void gdn_conv_commit(std::vector<float>& history,
                      std::span<const float> qkv,
                      std::uint32_t rows);
