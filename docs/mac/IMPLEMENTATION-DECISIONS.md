@@ -10678,12 +10678,18 @@ measuring L-15 remain open.
   fixture now toggles each low q bit in the second half and the separate
   logical oracle models that pattern. A negative-control build with the
   kernel's 32-byte half offset removed fails the Q3_K expansion assertion;
-  restoring the offset makes serial and concurrent tests pass.
-- **Disposition:** The reviewer found no decoder, host validation, arithmetic
-  or manifest defect. The fixture blind spot is corrected; follow-up hostile
-  review of that correction is pending.
+  restoring the offset makes serial and concurrent tests pass. Follow-up
+  review found that packed scales also repeated across columns and blocks,
+  which could hide a cross-row scale address error. The fixture now rotates
+  and offsets the 16 logical scales per row; all 514 scale vectors in the
+  `[N=257, two-block]` test geometry are distinct, and the independent oracle
+  applies the matching logical mapping.
+- **Disposition:** Follow-up hostile review found no remaining actionable
+  issue. The Q3_K decoder, checked host dispatch and manifest matched their
+  reference contracts.
 - **Validation:** The mac-dev build succeeded and the focused serial and
-  concurrent dequant tests passed 2/2 after the fix. Before the fixture repair,
-  the complete mac-metal suite passed 90/90, mac-host passed 44 tests with one
-  unavailable-input test skipped, and the Python runner passed 35/35 modules
-  with declared skips. `git diff --check` passes.
+  concurrent dequant tests passed 2/2 after both fixture fixes. The missing
+  `qs` half-offset negative control failed as intended. Before the fixture
+  repairs, the complete mac-metal suite passed 90/90, mac-host passed 44 tests
+  with one unavailable-input test skipped, and the Python runner passed 35/35
+  modules with declared skips. `git diff --check` passes.

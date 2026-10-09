@@ -36,8 +36,10 @@ could hide a within-group byte offset error; the fixture now gives every
 actionable issue. REV-167 adversarially checked Q6_K nibble chunks, qh bit
 fields, signed scales and all six-bit codes. REV-168 checked the Q3_K
 scale/bitplane decoder against the embedding and CUDA paths and caught a
-repeated `qs` half that could hide its byte offset; distinct half patterns now
-make the negative-control mutation fail, and serial/concurrent tests pass.
+repeated `qs` half that could hide its byte offset plus repeated scales across
+rows; distinct q and per-row scale patterns now expose both address errors.
+The offset negative control fails as intended, serial/concurrent tests pass,
+and hostile follow-up review found no remaining issue.
 The isolated F16/BF16 MPP and SIMD GEMM serial and concurrent tests pass 4/4
 on Apple10. The full `mac-metal` suite passed 90/90. `mac-host` ran 45 tests: 44
 passed and one real-input test was skipped because model inputs are
