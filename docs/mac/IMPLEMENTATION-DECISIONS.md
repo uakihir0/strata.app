@@ -9914,3 +9914,61 @@ measuring L-15 remain open.
   valid golden files, and `git diff --check` passed. These synthetic
   component tests do not establish production Prefill integration or
   model-backed inference.
+
+### D-IMPL-356: Implement an isolated Apple10 BF16 MPP GEMM
+
+- **Decision:** Add `strata_pf_gemm_bf16_mpp` as a standalone MSL 4.0
+  component with validated standalone and caller-owned Encoder APIs. It
+  multiplies row-major BF16 X `[rows][k]` by row-major BF16 W `[n][k]`,
+  writes F32 Y with caller-selected `col0` and `ldy`, and supports overwrite
+  and accumulate. Validate rows against the shader index range, K as a
+  positive multiple of 32, MPP's signed extents, all byte ranges and
+  alignments, Context ownership and output/input disjointness. Restrict the
+  path to Apple10 and skip `_mpp` pipeline creation on other GPU families.
+  Keep the F16 path, both SIMD fallbacks, activation remainder, selector and
+  production Prefill scheduling/chunk integration open.
+- **Reason:** Section 6.2 names Apple10 MPP as the default candidate and
+  requires L-6 to validate its numerical and chunk properties before
+  selection. Implementing and testing the BF16 primitive is a bounded step
+  toward that path without making a production-readiness claim. The macOS 27
+  SDK's BF16 tensor specializations are gated by `__HAVE_BFLOAT__`, so the
+  shader defines that SDK feature macro before including MPP. Its current
+  cooperative tensor traits reject const-qualified BF16 element metadata;
+  the external Metal ABI and host binding remain read-only, while the
+  internal MPP tensor wrapper removes const qualification and is only passed
+  to the read-only matrix operation. Revisit this cast if a future SDK adds
+  const BF16 tensor traits.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `cmake --build --preset mac-dev` succeeded. The dedicated serial
+  and concurrent CTests passed 2/2 after the review strengthened the
+  misalignment, exact/partial overlap and adjacent-view fixtures. They compare
+  T,n=1/63/65 at K=32 and 65×65×2560 in both modes against the FP64 product
+  oracle under U(2K) and R(2^-16), and check padding, input immutability,
+  guards, validation and rollback. The full `mac-metal` suite passed 82/82;
+  `mac-host` passed 43 tests with one test skipped because its model inputs
+  were unavailable. `test_map.py` passed with notes for planned requirements,
+  `check_drift.py` found no upstream changes and valid golden files, and
+  `git diff --check` passed. These tests do not establish all-family MPP
+  support, the SIMD fallback, production Prefill integration or model-backed
+  inference.
+
+### REV-153: Hostile review of the isolated Prefill BF16 MPP GEMM
+
+- **Scope:** `strata_pf_gemm_bf16_mpp`, the MPP tensor ABI and BF16 SDK
+  feature gate, pipeline-family filtering, both encoder overloads,
+  dimensions/strides and checked buffer ranges, overlap and rollback
+  validation, edge tiles and overwrite/accumulate tests, and documentation
+  status.
+- **Disposition:** The read-only review found no actionable P1–P3
+  implementation defect. It identified test-coverage gaps: the misaligned X
+  fixture was also undersized, and alias coverage did not distinguish exact
+  from partial overlap or prove that adjacent views are accepted. Expanded
+  the X fixture so its misaligned view still has the required byte count;
+  added exact and partial output/input overlap checks plus an adjacent-view
+  acceptance check. The review also noted that non-Apple10 Context startup
+  and pipeline-cache behavior were not exercised on older hardware; this
+  remains an explicit cross-family validation item. The final focused
+  regression passed serial and concurrent CTests 2/2 after the fixture
+  changes; the full `mac-metal` suite passed 82/82 and `mac-host` passed 43
+  tests with one unavailable-model-input test skipped. No implementation
+  correction was required by review.
