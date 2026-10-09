@@ -47,6 +47,30 @@ struct PrefillChunkRange {
     std::uint32_t rows = 0;
 };
 
+class PrefillChunkSchedule {
+public:
+    std::size_t token_count() const noexcept { return token_count_; }
+    std::uint32_t chunk_rows() const noexcept { return chunk_rows_; }
+    std::size_t chunk_count() const noexcept {
+        return token_count_ == 0u || chunk_rows_ == 0u
+                   ? 0u
+                   : 1u + (token_count_ - 1u) / chunk_rows_;
+    }
+
+    /// Return a scheduled range; an invalid index leaves `output` unchanged.
+    bool range_at(std::size_t index, PrefillChunkRange& output) const noexcept;
+
+private:
+    friend bool build_prefill_chunk_schedule(
+        std::uint32_t pos0, std::size_t token_count,
+        std::uint32_t chunk_rows, PrefillChunkSchedule& output,
+        std::string& error);
+
+    std::uint32_t pos0_ = 0;
+    std::size_t token_count_ = 0;
+    std::uint32_t chunk_rows_ = 0;
+};
+
 /// Split a prompt into non-empty ranges no larger than `chunk_rows`.
 ///
 /// An empty prompt produces an empty schedule. Non-empty prompt positions must
@@ -55,7 +79,7 @@ struct PrefillChunkRange {
 bool build_prefill_chunk_schedule(std::uint32_t pos0,
                                   std::size_t token_count,
                                   std::uint32_t chunk_rows,
-                                  std::vector<PrefillChunkRange>& output,
+                                  PrefillChunkSchedule& output,
                                   std::string& error);
 
 /// Build the host inputs for one non-empty chunk.

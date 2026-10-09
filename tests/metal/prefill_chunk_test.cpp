@@ -135,14 +135,15 @@ void builds_chunk_schedule_without_padding() {
         3u, 5u, kPrefillImageTokenFlag | 7u, 11u, 13u,
         17u, 19u, 23u, 29u, 31u,
     };
-    std::vector<PrefillChunkRange> schedule;
+    PrefillChunkSchedule schedule;
     std::string error;
     check(build_prefill_chunk_schedule(7u, tokens.size(), 4u, schedule,
                                        error),
           "plans a prompt as fixed-size chunks with a short tail");
-    check(schedule.size() == 3u,
+    check(schedule.token_count() == tokens.size() &&
+              schedule.chunk_rows() == 4u && schedule.chunk_count() == 3u,
           "the schedule contains one range for each non-empty chunk");
-    if (schedule.size() != 3u) return;
+    if (schedule.chunk_count() != 3u) return;
 
     const std::array<PrefillChunkRange, 3> expected{{
         {0u, 7u, 4u},
@@ -150,8 +151,10 @@ void builds_chunk_schedule_without_padding() {
         {8u, 15u, 2u},
     }};
     std::size_t covered_rows = 0u;
-    for (std::size_t index = 0u; index < schedule.size(); ++index) {
-        const auto& range = schedule[index];
+    for (std::size_t index = 0u; index < schedule.chunk_count(); ++index) {
+        PrefillChunkRange range;
+        check(schedule.range_at(index, range),
+              "returns an in-range chunk descriptor");
         check(range.token_offset == expected[index].token_offset &&
                   range.pos0 == expected[index].pos0 &&
                   range.rows == expected[index].rows,
@@ -177,21 +180,34 @@ void builds_chunk_schedule_without_padding() {
     check(covered_rows == tokens.size(),
           "scheduled chunks cover every prompt token exactly once");
 
-    std::vector<PrefillChunkRange> empty_schedule{{0u, 9u, 1u}};
+    PrefillChunkRange untouched_range{91u, 92u, 93u};
+    check(!schedule.range_at(schedule.chunk_count(), untouched_range) &&
+              untouched_range.token_offset == 91u &&
+              untouched_range.pos0 == 92u && untouched_range.rows == 93u,
+          "an out-of-range lookup preserves its output descriptor");
+
+    PrefillChunkSchedule empty_schedule;
     check(build_prefill_chunk_schedule(
               std::numeric_limits<std::uint32_t>::max(), 0u, 4u,
               empty_schedule, error) &&
-              empty_schedule.empty(),
-          "an empty prompt produces an empty schedule and clears old ranges");
+              empty_schedule.token_count() == 0u &&
+              empty_schedule.chunk_count() == 0u &&
+              empty_schedule.chunk_rows() == 4u,
+          "an empty prompt produces a zero-range schedule");
 }
 
 void rejects_invalid_chunk_schedules_transactionally() {
     using namespace strata::metal;
-    std::vector<PrefillChunkRange> schedule{{5u, 17u, 3u}};
+    PrefillChunkSchedule schedule;
     std::string error;
+    check(build_prefill_chunk_schedule(17u, 3u, 3u, schedule, error),
+          "builds the initial schedule for transaction checks");
     const auto remains_unchanged = [&] {
-        return schedule.size() == 1u && schedule[0].token_offset == 5u &&
-               schedule[0].pos0 == 17u && schedule[0].rows == 3u;
+        PrefillChunkRange range;
+        return schedule.token_count() == 3u &&
+               schedule.chunk_rows() == 3u && schedule.chunk_count() == 1u &&
+               schedule.range_at(0u, range) && range.token_offset == 0u &&
+               range.pos0 == 17u && range.rows == 3u;
     };
 
     check(!build_prefill_chunk_schedule(0u, 3u, 0u, schedule, error) &&
@@ -209,19 +225,27 @@ void rejects_invalid_chunk_schedules_transactionally() {
 
     const auto last_valid_pos = static_cast<std::uint32_t>(
         std::numeric_limits<std::int32_t>::max() - 1);
+    PrefillChunkRange last_range;
     check(build_prefill_chunk_schedule(last_valid_pos, 1u, 1u, schedule,
                                        error) &&
-              schedule.size() == 1u &&
-              schedule[0].pos0 == last_valid_pos &&
-              schedule[0].rows == 1u,
+              schedule.chunk_count() == 1u &&
+              schedule.range_at(0u, last_range) &&
+              last_range.pos0 == last_valid_pos &&
+              last_range.rows == 1u,
           "accepts the final position whose n_kv fits signed StepRow");
 
+    const auto preserves_last_range = [&] {
+        PrefillChunkRange range;
+        return schedule.token_count() == 1u &&
+               schedule.chunk_rows() == 1u && schedule.chunk_count() == 1u &&
+               schedule.range_at(0u, range) &&
+               range.pos0 == last_valid_pos && range.rows == 1u;
+    };
     check(!build_prefill_chunk_schedule(last_valid_pos, 2u, 1u, schedule,
                                         error) &&
               error.find("signed StepRow") != std::string::npos,
           "rejects a prompt whose final chunk would overflow signed StepRow");
-    check(schedule.size() == 1u && schedule[0].pos0 == last_valid_pos &&
-              schedule[0].rows == 1u,
+    check(preserves_last_range(),
           "position-overflow failure preserves the previous schedule");
 
     check(!build_prefill_chunk_schedule(
@@ -229,8 +253,7 @@ void rejects_invalid_chunk_schedules_transactionally() {
               error) &&
               error.find("signed StepRow") != std::string::npos,
           "rejects an unrepresentable prompt count before chunk arithmetic");
-    check(schedule.size() == 1u && schedule[0].pos0 == last_valid_pos &&
-              schedule[0].rows == 1u,
+    check(preserves_last_range(),
           "unrepresentable-count failure preserves the previous schedule");
 }
 

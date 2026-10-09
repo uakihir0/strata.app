@@ -36,15 +36,36 @@ static_assert(strata::metal::kPrefillMaxShaderRows ==
 
 namespace strata::metal {
 
+bool PrefillChunkSchedule::range_at(
+    std::size_t index, PrefillChunkRange& output) const noexcept {
+    if (index >= chunk_count()) return false;
+
+    const std::size_t offset =
+        index * static_cast<std::size_t>(chunk_rows_);
+    const auto rows = static_cast<std::uint32_t>(
+        std::min(token_count_ - offset,
+                 static_cast<std::size_t>(chunk_rows_)));
+    PrefillChunkRange next{
+        offset,
+        static_cast<std::uint32_t>(static_cast<std::uint64_t>(pos0_) + offset),
+        rows,
+    };
+    output = next;
+    return true;
+}
+
 bool build_prefill_chunk_schedule(
     std::uint32_t pos0, std::size_t token_count, std::uint32_t chunk_rows,
-    std::vector<PrefillChunkRange>& output, std::string& error) {
+    PrefillChunkSchedule& output, std::string& error) {
     if (chunk_rows == 0u || chunk_rows > kPrefillMaxShaderRows) {
         error = "Prefill chunk size must fit the shader row limit";
         return false;
     }
 
-    std::vector<PrefillChunkRange> next;
+    PrefillChunkSchedule next;
+    next.pos0_ = pos0;
+    next.token_count_ = token_count;
+    next.chunk_rows_ = chunk_rows;
     if (token_count != 0u) {
         const auto max_step_value = static_cast<std::uint64_t>(
             std::numeric_limits<std::int32_t>::max());
@@ -53,30 +74,9 @@ bool build_prefill_chunk_schedule(
             error = "Prefill prompt positions exceed the signed StepRow range";
             return false;
         }
-
-        const std::size_t chunk_count =
-            1u + (token_count - 1u) / chunk_rows;
-        if (chunk_count > next.max_size()) {
-            error = "Prefill chunk schedule is too large";
-            return false;
-        }
-        next.reserve(chunk_count);
-
-        for (std::size_t offset = 0u; offset < token_count;) {
-            const auto rows = static_cast<std::uint32_t>(
-                std::min(token_count - offset,
-                         static_cast<std::size_t>(chunk_rows)));
-            next.push_back({
-                offset,
-                static_cast<std::uint32_t>(
-                    static_cast<std::uint64_t>(pos0) + offset),
-                rows,
-            });
-            offset += rows;
-        }
     }
 
-    output.swap(next);
+    output = next;
     error.clear();
     return true;
 }
