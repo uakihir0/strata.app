@@ -10469,3 +10469,45 @@ measuring L-15 remain open.
   strengthening. After rebuilding the strengthened fixture, the serial and
   concurrent dequant tests passed 2/2. `mac-host` passed 44/45 with one
   unavailable-real-input test skipped, and `test_map` passed.
+
+### D-IMPL-367: Add the IQ4_NL Prefill dequantizer
+
+- **Decision:** Add `strata_pf_dequant_iq4_nl` and caller-owned/standalone
+  `encode_prefill_dequant_iq4_nl` APIs. Decode each 32-value, 18-byte block
+  from the low nibble sequence followed by the high nibble sequence, map each
+  nibble through the canonical `kvalues_iq4nl` codebook, multiply by the F16
+  scale in F32 and round once to F16 while writing K-major `[k][n_out]`
+  scratch. Reuse the existing 32-value checked host dispatch contract.
+- **Reason:** IQ4_NL is a catalogue format with an existing canonical codebook
+  and scalar mat-vec oracle. It adds a distinct nonlinear decode while
+  preserving the explicit boundary between isolated Prefill building blocks
+  and production scheduling.
+- **Review items:** Verify the 32-value/18-byte block and low/high nibble
+  order against the native mat-vec and scalar oracle; all 16 codebook values,
+  F32 multiplication and one-round F16 RNE; multiple blocks and output-column
+  tails; checked extents, signed geometry, alignment, ownership, overlap,
+  input immutability, guards and rollback after a successful prefix
+  dispatch; manifest and documentation accuracy.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the build passed, the focused serial/concurrent dequant tests
+  passed 2/2, and the full `mac-metal` preset passed 90/90. `mac-host` passed
+  44/45 with one unavailable-real-input test skipped. `test_map`,
+  `check_drift.py` and `git diff --check` passed. Hostile-review results are
+  recorded in REV-164.
+
+### REV-164: Hostile review of IQ4_NL Prefill dequantization
+
+- **Scope:** IQ4_NL's 32-value/18-byte block, low/high nibble ordering,
+  canonical nonlinear codebook mapping, F32 scale product and F16 rounding;
+  host size validation, independent logical-code fixture, boundary/rejection
+  and rollback tests, manifest registration and documentation.
+- **Findings:** The independent adversarial review found no actionable issue.
+  It cross-checked the block order and codebook against the native mat-vec and
+  scalar reference, and verified the host validation and build/test wiring.
+- **Disposition:** No actionable implementation, test or documentation
+  findings remain. The feature remains an isolated Prefill dequantizer;
+  production Prefill scheduling and model-backed inference remain open.
+- **Validation:** The full `mac-metal` suite passed 90/90, including serial
+  and concurrent dequant coverage. `mac-host` passed 44/45 with one
+  unavailable-real-input test skipped; `test_map`, `check_drift.py` and
+  `git diff --check` passed.

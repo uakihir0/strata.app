@@ -37,6 +37,7 @@ static_assert(sizeof(block_q4_0) == 18u);
 static_assert(sizeof(block_q5_0) == 22u);
 static_assert(sizeof(block_q8_0) == 34u);
 static_assert(sizeof(block_q2_0) == 18u);
+static_assert(sizeof(block_iq4_nl) == 18u);
 
 int g_failures = 0;
 
@@ -130,7 +131,6 @@ struct FormatTraits<block_q2_0> {
     static constexpr const char* name = "Q2_0";
     static constexpr std::uint32_t values_per_block = 64u;
     static constexpr std::uint32_t code_count = 4u;
-    static constexpr int zero_point = 1;
     static constexpr EncodeCommandBuffer encode = &encode_prefill_dequant_q2_0;
     static constexpr EncodeEncoder encode_encoder =
         &encode_prefill_dequant_q2_0;
@@ -170,6 +170,55 @@ struct FormatTraits<block_q2_0> {
         const bool complement = ((column + block_index) & 1u) != 0u;
         return complement ? 3u - code : code;
     }
+
+    static float dequantized_value(std::uint32_t code) {
+        return static_cast<float>(static_cast<int>(code) - 1);
+    }
+};
+
+template <>
+struct FormatTraits<block_iq4_nl> {
+    static constexpr const char* name = "IQ4_NL";
+    static constexpr std::uint32_t values_per_block = 32u;
+    static constexpr std::uint32_t code_count = 16u;
+    static constexpr EncodeCommandBuffer encode =
+        &encode_prefill_dequant_iq4_nl;
+    static constexpr EncodeEncoder encode_encoder =
+        &encode_prefill_dequant_iq4_nl;
+
+    static constexpr std::array<std::uint8_t, 16> packed_pattern_a{
+        0x10u, 0x32u, 0x54u, 0x76u, 0x98u, 0xbau, 0xdcu, 0xfeu,
+        0xefu, 0xcdu, 0xabu, 0x89u, 0x67u, 0x45u, 0x23u, 0x01u};
+    // Expected nibble indices are listed in K order, independently of the
+    // packed-byte decoder and the GPU's codebook lookup.
+    static constexpr std::array<std::uint8_t, 32> logical_codes_a{
+        0u, 2u, 4u, 6u, 8u, 10u, 12u, 14u, 15u, 13u, 11u, 9u, 7u, 5u, 3u, 1u,
+        1u, 3u, 5u, 7u, 9u, 11u, 13u, 15u, 14u, 12u, 10u, 8u, 6u, 4u, 2u, 0u};
+    static constexpr std::array<std::int8_t, 16> iq4_nl_values{
+        -127, -104, -83, -65, -49, -35, -22, -10,
+        1,    13,   25,  38,  53,  69,  89,  113};
+
+    static void store_fixture(block_iq4_nl& block, std::uint32_t column,
+                              std::uint32_t block_index) {
+        const bool complement = ((column + block_index) & 1u) != 0u;
+        for (std::size_t byte = 0u; byte < packed_pattern_a.size(); ++byte) {
+            const std::uint8_t packed = packed_pattern_a[byte];
+            block.qs[byte] = static_cast<strata_u8>(
+                complement ? packed ^ 0xffu : packed);
+        }
+    }
+
+    static std::uint32_t oracle_code(std::uint32_t column,
+                                     std::uint32_t block_index,
+                                     std::uint32_t value) {
+        const std::uint32_t code = logical_codes_a[value];
+        const bool complement = ((column + block_index) & 1u) != 0u;
+        return complement ? 15u - code : code;
+    }
+
+    static float dequantized_value(std::uint32_t code) {
+        return static_cast<float>(iq4_nl_values[code]);
+    }
 };
 
 template <>
@@ -177,7 +226,6 @@ struct FormatTraits<block_q4_0> {
     static constexpr const char* name = "Q4_0";
     static constexpr std::uint32_t values_per_block = 32u;
     static constexpr std::uint32_t code_count = 16u;
-    static constexpr int zero_point = 8;
     static constexpr EncodeCommandBuffer encode = &encode_prefill_dequant_q4_0;
     static constexpr EncodeEncoder encode_encoder =
         &encode_prefill_dequant_q4_0;
@@ -189,6 +237,9 @@ struct FormatTraits<block_q4_0> {
             static_cast<strata_u8>((code & 0x0fu) << shift);
     }
 
+    static float dequantized_value(std::uint32_t code) {
+        return static_cast<float>(static_cast<int>(code) - 8);
+    }
 };
 
 template <>
@@ -196,7 +247,6 @@ struct FormatTraits<block_q5_0> {
     static constexpr const char* name = "Q5_0";
     static constexpr std::uint32_t values_per_block = 32u;
     static constexpr std::uint32_t code_count = 32u;
-    static constexpr int zero_point = 16;
     static constexpr EncodeCommandBuffer encode = &encode_prefill_dequant_q5_0;
     static constexpr EncodeEncoder encode_encoder =
         &encode_prefill_dequant_q5_0;
@@ -210,6 +260,9 @@ struct FormatTraits<block_q5_0> {
             static_cast<strata_u8>(((code >> 4u) & 1u) << (value & 7u));
     }
 
+    static float dequantized_value(std::uint32_t code) {
+        return static_cast<float>(static_cast<int>(code) - 16);
+    }
 };
 
 template <>
@@ -217,7 +270,6 @@ struct FormatTraits<block_q8_0> {
     static constexpr const char* name = "Q8_0";
     static constexpr std::uint32_t values_per_block = 32u;
     static constexpr std::uint32_t code_count = 255u;
-    static constexpr int zero_point = 127;
     static constexpr EncodeCommandBuffer encode = &encode_prefill_dequant_q8_0;
     static constexpr EncodeEncoder encode_encoder =
         &encode_prefill_dequant_q8_0;
@@ -228,6 +280,9 @@ struct FormatTraits<block_q8_0> {
             static_cast<strata_i8>(static_cast<int>(code) - 127);
     }
 
+    static float dequantized_value(std::uint32_t code) {
+        return static_cast<float>(static_cast<int>(code) - 127);
+    }
 };
 
 bool expect_rejected(Context& context, EncodeCommandBuffer encode,
@@ -294,7 +349,8 @@ bool test_dequant_format(Context& context) {
                      (value >> 4u) * 3u) %
                     Format::code_count;
                 std::uint32_t oracle_code = code;
-                if constexpr (std::is_same_v<Block, block_q2_0>) {
+                if constexpr (std::is_same_v<Block, block_q2_0> ||
+                              std::is_same_v<Block, block_iq4_nl>) {
                     if (value == 0u) {
                         Format::store_fixture(block, column, block_index);
                     }
@@ -308,9 +364,7 @@ bool test_dequant_format(Context& context) {
                 expected[static_cast<std::size_t>(k) * kColumns + column] =
                     strata::kernels::f16_from_f32(
                         expanded_scale *
-                        static_cast<float>(
-                            static_cast<int>(oracle_code) -
-                            Format::zero_point));
+                        Format::dequantized_value(oracle_code));
             }
         }
     }
@@ -526,6 +580,9 @@ int main(int argc, char** argv) {
     passed &= test_dequant_format<block_q2_0>(*context);
     passed &= test_validation_format<block_q2_0>(*context,
                                                   *foreign_context);
+    passed &= test_dequant_format<block_iq4_nl>(*context);
+    passed &= test_validation_format<block_iq4_nl>(*context,
+                                                    *foreign_context);
     passed &= test_dequant_format<block_q4_0>(*context);
     passed &= test_validation_format<block_q4_0>(*context,
                                                  *foreign_context);
