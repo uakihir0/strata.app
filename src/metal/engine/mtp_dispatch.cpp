@@ -3,6 +3,7 @@
 
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/gr_dispatch.hpp"
+#include "strata/metal/mtp.hpp"
 #include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/mv_dispatch.hpp"
 #include "strata/metal/qsa_dispatch.hpp"
@@ -33,6 +34,10 @@ constexpr std::uint32_t kMtpOutputProjectionInputWidth =
     N_HEAD_Q * HEAD_DIM;
 constexpr std::uint32_t kMtpRouterExperts = 512u;
 constexpr std::uint32_t kMtpRouterTopK = 10u;
+constexpr std::uint32_t kMtpRoutedExpertTopK = 10u;
+constexpr std::uint32_t kMtpRoutedExpertGroups = 40u;
+constexpr std::uint32_t kMtpRoutedExpertThreads = 256u;
+constexpr std::uint32_t kMtpRoutedExpertChunkValues = 32u;
 constexpr std::uint32_t kMtpQ8BlockValues = 32u;
 constexpr std::uint32_t kMtpQ81BlockBytes = 36u;
 constexpr std::uint32_t kMtpAddStreamsThreads = 256u;
@@ -56,6 +61,9 @@ static_assert(kMtpQueryProjectionWidth == 12'288u);
 static_assert(kMtpQueryHeadWidth == 6'144u);
 static_assert(kMtpOutputProjectionInputWidth == 6'144u);
 static_assert(kMtpWindowIdsStride == 2'048u);
+static_assert(kMtpRoutedExpertTopK == kMtpRouterTopK);
+static_assert(kMtpRoutedExpertTopK * N_FF == 6'400u);
+static_assert(kMtpExpertsFileBytes == 707'788'800u);
 
 template <class Address>
 bool ranges_overlap(Address left, std::size_t left_bytes,
@@ -1953,6 +1961,253 @@ bool encode_mtp_router(Context& context, CommandBuffer& command_buffer,
         context, command_buffer, "MTP router",
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_mtp_router(context, encoder, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_mtp_routed_experts(
+    Context& context, Encoder& encoder,
+    const MtpRoutedExpertsBuffers& buffers, std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "MTP routed experts require an ordered concurrent-group boundary";
+        return false;
+    }
+
+    constexpr char operation[] = "MTP routed experts";
+    constexpr std::size_t mixed_bytes =
+        static_cast<std::size_t>(N_EMBD) * sizeof(float);
+    constexpr std::size_t ids_bytes =
+        static_cast<std::size_t>(kMtpRoutedExpertTopK) *
+        sizeof(std::int32_t);
+    constexpr std::size_t expert_blob_bytes =
+        static_cast<std::size_t>(kMtpExpertsFileBytes);
+    constexpr std::size_t q8_mixed_bytes =
+        static_cast<std::size_t>(N_EMBD);
+    constexpr std::size_t q8_mixed_scales_bytes =
+        static_cast<std::size_t>(N_EMBD / kMtpRoutedExpertChunkValues) *
+        sizeof(float);
+    constexpr std::size_t routed_hidden_values =
+        static_cast<std::size_t>(kMtpRoutedExpertTopK) * N_FF;
+    constexpr std::size_t routed_hidden_bytes =
+        routed_hidden_values * sizeof(float);
+    constexpr std::size_t routed_hidden_q8_bytes = routed_hidden_values;
+    constexpr std::size_t routed_hidden_scales_bytes =
+        routed_hidden_values / kMtpRoutedExpertChunkValues * sizeof(float);
+    constexpr std::size_t parts_bytes =
+        static_cast<std::size_t>(kMtpRoutedExpertTopK) * N_EMBD *
+        sizeof(float);
+
+    const std::array<std::pair<const char*, ReadOnlyBufferRef>, 3> inputs{{
+        {"mixed", buffers.mixed},
+        {"route IDs", buffers.ids},
+        {"expert blob", buffers.expert_blob},
+    }};
+    const std::array<std::size_t, 3> input_bytes{
+        mixed_bytes, ids_bytes, expert_blob_bytes};
+    const std::array<std::size_t, 3> input_alignments{
+        alignof(float), alignof(std::int32_t), alignof(std::uint32_t)};
+    for (std::size_t index = 0u; index < inputs.size(); ++index) {
+        if (!validate_read_only_buffer(
+                context, inputs[index].second, input_bytes[index],
+                input_alignments[index], inputs[index].first, operation,
+                error)) {
+            return false;
+        }
+        for (std::size_t prior = 0u; prior < index; ++prior) {
+            if (overlaps(inputs[index].second, input_bytes[index],
+                         inputs[prior].second, input_bytes[prior])) {
+                error = std::string(operation) + " inputs " +
+                        inputs[index].first + " and " + inputs[prior].first +
+                        " overlap";
+                return false;
+            }
+        }
+    }
+
+    const std::array<std::pair<const char*, BufferRef>, 8> outputs{{
+        {"mixed Q8 codes", buffers.mq},
+        {"mixed Q8 scales", buffers.ms},
+        {"gate rows", buffers.gate},
+        {"up rows", buffers.up},
+        {"SwiGLU rows", buffers.eh},
+        {"SwiGLU Q8 codes", buffers.hq},
+        {"SwiGLU Q8 scales", buffers.hs},
+        {"down parts", buffers.parts},
+    }};
+    const std::array<std::size_t, 8> output_bytes{
+        q8_mixed_bytes, q8_mixed_scales_bytes, routed_hidden_bytes,
+        routed_hidden_bytes, routed_hidden_bytes, routed_hidden_q8_bytes,
+        routed_hidden_scales_bytes, parts_bytes};
+    for (std::size_t index = 0u; index < outputs.size(); ++index) {
+        if (!validate_buffer_view(
+                context, outputs[index].second, output_bytes[index],
+                alignof(std::uint32_t), operation, outputs[index].first,
+                error)) {
+            return false;
+        }
+        for (std::size_t input = 0u; input < inputs.size(); ++input) {
+            if (overlaps(inputs[input].second, input_bytes[input],
+                         outputs[index].second, output_bytes[index])) {
+                error = std::string(operation) + " output " +
+                        outputs[index].first + " overlaps input " +
+                        inputs[input].first;
+                return false;
+            }
+        }
+        for (std::size_t prior = 0u; prior < index; ++prior) {
+            if (overlaps(outputs[index].second, output_bytes[index],
+                         outputs[prior].second, output_bytes[prior])) {
+                error = std::string(operation) + " outputs " +
+                        outputs[index].first + " and " +
+                        outputs[prior].first + " overlap";
+                return false;
+            }
+        }
+    }
+
+    constexpr std::array<EncoderThreadgroupMemory, 0> no_threadgroup_memory{};
+    const std::uint32_t mixed_width = N_EMBD;
+    const EncoderBytesBinding mixed_width_binding{
+        &mixed_width, sizeof(mixed_width), 3u};
+    const std::array mixed_quantize_read_only{
+        EncoderReadOnlyBufferBinding{buffers.mixed, 0u, mixed_bytes,
+                                     alignof(float)},
+    };
+    const std::array mixed_quantize_writable{
+        EncoderBufferBinding{buffers.mq, 1u, q8_mixed_bytes,
+                             alignof(std::uint32_t)},
+        EncoderBufferBinding{buffers.ms, 2u, q8_mixed_scales_bytes,
+                             alignof(float)},
+    };
+    if (!encoder.dispatch(
+            "strata_q_q8_0_scaled", {1u, 1u, 1u}, {128u, 1u, 1u},
+            mixed_quantize_writable, mixed_quantize_read_only,
+            std::span<const EncoderBytesBinding>(&mixed_width_binding, 1u),
+            no_threadgroup_memory, error)) {
+        return false;
+    }
+
+    const std::array routed_read_only{
+        EncoderReadOnlyBufferBinding{buffers.ids, 0u, ids_bytes,
+                                     alignof(std::int32_t)},
+        EncoderReadOnlyBufferBinding{buffers.expert_blob, 1u,
+                                     expert_blob_bytes,
+                                     alignof(std::uint32_t)},
+        EncoderReadOnlyBufferBinding{context.buffers().read_only(buffers.mq),
+                                     2u, q8_mixed_bytes,
+                                     alignof(std::uint32_t)},
+        EncoderReadOnlyBufferBinding{context.buffers().read_only(buffers.ms),
+                                     3u, q8_mixed_scales_bytes,
+                                     alignof(float)},
+    };
+    const std::array routed_writable{
+        EncoderBufferBinding{buffers.gate, 4u, routed_hidden_bytes,
+                             alignof(float)},
+        EncoderBufferBinding{buffers.up, 5u, routed_hidden_bytes,
+                             alignof(float)},
+    };
+    if (!encoder.dispatch("strata_mtp_gu_s2",
+                          {kMtpRoutedExpertGroups,
+                           kMtpRoutedExpertTopK, 1u},
+                          {kMtpRoutedExpertThreads, 1u, 1u},
+                          routed_writable, routed_read_only, {}, {},
+                          error)) {
+        return false;
+    }
+
+    const auto gate_read_only = context.buffers().read_only(buffers.gate);
+    const auto up_read_only = context.buffers().read_only(buffers.up);
+    if (!gate_read_only || !up_read_only) {
+        error = std::string(operation) +
+                " could not form read-only gate/up views";
+        return false;
+    }
+    const std::array swiglu_read_only{
+        EncoderReadOnlyBufferBinding{gate_read_only, 0u,
+                                     routed_hidden_bytes, alignof(float)},
+        EncoderReadOnlyBufferBinding{up_read_only, 1u,
+                                     routed_hidden_bytes, alignof(float)},
+    };
+    const std::array swiglu_writable{
+        EncoderBufferBinding{buffers.eh, 2u, routed_hidden_bytes,
+                             alignof(float)},
+    };
+    if (!encoder.dispatch("strata_mtp_swiglu_s2",
+                          {25u, 1u, 1u}, {256u, 1u, 1u},
+                          swiglu_writable, swiglu_read_only, {}, {},
+                          error)) {
+        return false;
+    }
+
+    const std::uint32_t hidden_width =
+        static_cast<std::uint32_t>(routed_hidden_values);
+    const EncoderBytesBinding hidden_width_binding{
+        &hidden_width, sizeof(hidden_width), 3u};
+    const auto eh_read_only = context.buffers().read_only(buffers.eh);
+    if (!eh_read_only) {
+        error = std::string(operation) +
+                " could not form a read-only SwiGLU view";
+        return false;
+    }
+    const std::array hidden_quantize_read_only{
+        EncoderReadOnlyBufferBinding{eh_read_only, 0u, routed_hidden_bytes,
+                                     alignof(float)},
+    };
+    const std::array hidden_quantize_writable{
+        EncoderBufferBinding{buffers.hq, 1u, routed_hidden_q8_bytes,
+                             alignof(std::uint32_t)},
+        EncoderBufferBinding{buffers.hs, 2u, routed_hidden_scales_bytes,
+                             alignof(float)},
+    };
+    if (!encoder.dispatch(
+            "strata_q_q8_0_scaled", {2u, 1u, 1u}, {128u, 1u, 1u},
+            hidden_quantize_writable, hidden_quantize_read_only,
+            std::span<const EncoderBytesBinding>(&hidden_width_binding, 1u),
+            no_threadgroup_memory, error)) {
+        return false;
+    }
+
+    const auto hq_read_only = context.buffers().read_only(buffers.hq);
+    const auto hs_read_only = context.buffers().read_only(buffers.hs);
+    if (!hq_read_only || !hs_read_only) {
+        error = std::string(operation) +
+                " could not form read-only quantized activation views";
+        return false;
+    }
+    const std::array down_read_only{
+        EncoderReadOnlyBufferBinding{buffers.ids, 0u, ids_bytes,
+                                     alignof(std::int32_t)},
+        EncoderReadOnlyBufferBinding{buffers.expert_blob, 1u,
+                                     expert_blob_bytes,
+                                     alignof(std::uint32_t)},
+        EncoderReadOnlyBufferBinding{hq_read_only, 2u,
+                                     routed_hidden_q8_bytes,
+                                     alignof(std::uint32_t)},
+        EncoderReadOnlyBufferBinding{hs_read_only, 3u,
+                                     routed_hidden_scales_bytes,
+                                     alignof(float)},
+    };
+    const std::array down_writable{
+        EncoderBufferBinding{buffers.parts, 4u, parts_bytes,
+                             alignof(float)},
+    };
+    return encoder.dispatch("strata_mtp_down_s2",
+                            {kMtpRoutedExpertGroups,
+                             kMtpRoutedExpertTopK, 1u},
+                            {kMtpRoutedExpertThreads, 1u, 1u},
+                            down_writable, down_read_only, {}, {},
+                            error);
+}
+
+bool encode_mtp_routed_experts(
+    Context& context, CommandBuffer& command_buffer,
+    const MtpRoutedExpertsBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "MTP routed experts",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_mtp_routed_experts(context, encoder, buffers,
+                                             encode_error);
         },
         error);
 }

@@ -22,6 +22,10 @@ strata_embed_rows_bf16 safe 256 1 1
 strata_gr_broadcast safe 256 1 1
 strata_mtp_add_streams safe 256 1 1
 strata_mtp_window_ids safe 256 1 1
+strata_q_q8_0_scaled safe 128 1 1
+strata_mtp_gu_s2 safe 256 1 1
+strata_mtp_swiglu_s2 safe 256 1 1
+strata_mtp_down_s2 safe 256 1 1
 strata_embed_image safe 256 1 1
 strata_pf_gr_norm safe 256 1 1
 strata_pf_gr_norm_lo safe 256 1 1

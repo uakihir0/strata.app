@@ -191,6 +191,25 @@ struct MtpRouterBuffers {
     BufferRef matvec_sink;
 };
 
+/// Inputs and intermediate outputs for MTP stage 17. `expert_blob` must be
+/// one contiguous, complete S2 experts.bin image. `ids` contains ten device
+/// produced expert IDs from stage 16. All writable views must be disjoint
+/// from one another and from the inputs. Keep all views alive through GPU
+/// completion; the standalone command-buffer form is transactional.
+struct MtpRoutedExpertsBuffers {
+    ReadOnlyBufferRef mixed;
+    ReadOnlyBufferRef ids;
+    ReadOnlyBufferRef expert_blob;
+    BufferRef mq;
+    BufferRef ms;
+    BufferRef gate;
+    BufferRef up;
+    BufferRef eh;
+    BufferRef hq;
+    BufferRef hs;
+    BufferRef parts;
+};
+
 /// Add MTP hidden and embedding streams to the caller-owned Encoder segment.
 /// On failure, the enclosing Encoder::encode body must return false so prior
 /// work in that segment is discarded.
@@ -321,5 +340,19 @@ bool encode_mtp_router(Context& context, Encoder& encoder,
 bool encode_mtp_router(Context& context, CommandBuffer& command_buffer,
                        const MtpRouterBuffers& buffers,
                        std::string& error);
+
+/// Encode MTP stage 17 for T=1: quantize `mixed`, evaluate gate/up for ten
+/// routed S2 experts, apply SwiGLU, quantize the ten hidden rows, and evaluate
+/// each down projection into `parts`. The expert blob must be the complete
+/// contiguous 512-expert image. The caller-owned form requires an ordered
+/// concurrent-group boundary and must propagate failure from its enclosing
+/// `Encoder::encode` body.
+bool encode_mtp_routed_experts(Context& context, Encoder& encoder,
+                               const MtpRoutedExpertsBuffers& buffers,
+                               std::string& error);
+bool encode_mtp_routed_experts(Context& context,
+                               CommandBuffer& command_buffer,
+                               const MtpRoutedExpertsBuffers& buffers,
+                               std::string& error);
 
 }  // namespace strata::metal
