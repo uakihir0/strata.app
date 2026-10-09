@@ -2419,4 +2419,137 @@ bool encode_mtp_shared_ffn_write(
         error);
 }
 
+namespace {
+
+bool validate_mtp_final_mixer(Context& context,
+                              const MtpFinalMixerBuffers& buffers,
+                              WindowHeadMixerBuffers& mixer,
+                              std::string& error) {
+    constexpr char operation[] = "MTP final mixer";
+    std::uint32_t rows = 0u;
+    if (!read_mtp_rows(context, buffers.params, operation, rows, error)) {
+        return false;
+    }
+    if (rows != 1u) {
+        error = std::string(operation) +
+                " requires T=1 for the full-layer pass";
+        return false;
+    }
+    if (!validate_read_only_buffer(context, buffers.params,
+                                   sizeof(MtpParams), alignof(MtpParams),
+                                   "params", operation, error)) {
+        return false;
+    }
+
+    constexpr std::size_t residual_bytes =
+        static_cast<std::size_t>(HC_DIM) * sizeof(float);
+    constexpr std::size_t norm_gamma_bytes =
+        static_cast<std::size_t>(HC_DIM) * sizeof(float);
+    constexpr std::size_t mixer_weight_bytes =
+        static_cast<std::size_t>(HC_DIM) * HC_LOW_RANK *
+        sizeof(std::uint16_t);
+    constexpr std::size_t low_rank_bytes =
+        static_cast<std::size_t>(HC_LOW_RANK) * sizeof(float);
+    constexpr std::size_t mixed_bytes =
+        static_cast<std::size_t>(N_EMBD) * sizeof(float);
+
+    const std::array<std::pair<const char*, BufferRef>, 6> writable{{
+        {"residual", buffers.residual},
+        {"normalized", buffers.normalized},
+        {"low_rank", buffers.low_rank},
+        {"gate", buffers.gate},
+        {"mixed", buffers.mixed},
+        {"matvec_sink", buffers.matvec_sink},
+    }};
+    constexpr std::array<std::size_t, writable.size()> writable_bytes{{
+        residual_bytes, residual_bytes, low_rank_bytes, residual_bytes,
+        mixed_bytes, sizeof(float),
+    }};
+    for (std::size_t index = 0u; index < writable.size(); ++index) {
+        if (overlaps(buffers.params, sizeof(MtpParams),
+                     writable[index].second, writable_bytes[index])) {
+            error = std::string(operation) +
+                    " parameter block overlaps active view " +
+                    writable[index].first;
+            return false;
+        }
+    }
+
+    const std::array<std::pair<const char*, ReadOnlyBufferRef>, 3> inputs{{
+        {"norm_gamma", buffers.norm_gamma},
+        {"down_weights", buffers.down_weights},
+        {"up_weights", buffers.up_weights},
+    }};
+    constexpr std::array<std::size_t, inputs.size()> input_bytes{{
+        norm_gamma_bytes, mixer_weight_bytes, mixer_weight_bytes,
+    }};
+    for (std::size_t index = 0u; index < inputs.size(); ++index) {
+        if (overlaps(buffers.params, sizeof(MtpParams),
+                     inputs[index].second, input_bytes[index])) {
+            error = std::string(operation) +
+                    " parameter block overlaps active view " +
+                    inputs[index].first;
+            return false;
+        }
+        if (overlaps(inputs[index].second, input_bytes[index],
+                     buffers.residual, residual_bytes)) {
+            error = std::string(operation) +
+                    " residual overlaps read-only input " +
+                    inputs[index].first;
+            return false;
+        }
+    }
+
+    const ReadOnlyBufferRef active_rows =
+        buffers.params.slice(offsetof(MtpParams, T), sizeof(std::uint32_t));
+    if (!active_rows) {
+        error = std::string(operation) +
+                " could not form the active-row count view";
+        return false;
+    }
+    mixer = {
+        buffers.residual,
+        buffers.norm_gamma,
+        buffers.down_weights,
+        buffers.up_weights,
+        active_rows,
+        buffers.normalized,
+        buffers.low_rank,
+        buffers.gate,
+        buffers.mixed,
+        buffers.matvec_sink,
+    };
+    error.clear();
+    return true;
+}
+
+}  // namespace
+
+bool encode_mtp_final_mixer(Context& context, Encoder& encoder,
+                            const MtpFinalMixerBuffers& buffers,
+                            std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "MTP final mixer requires an ordered concurrent-group boundary";
+        return false;
+    }
+    WindowHeadMixerBuffers mixer{};
+    if (!validate_mtp_final_mixer(context, buffers, mixer, error)) {
+        return false;
+    }
+    return encode_window_head_mixer(context, encoder, 1u, mixer, error);
+}
+
+bool encode_mtp_final_mixer(Context& context, CommandBuffer& command_buffer,
+                            const MtpFinalMixerBuffers& buffers,
+                            std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "MTP final mixer",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_mtp_final_mixer(context, encoder, buffers,
+                                          encode_error);
+        },
+        error);
+}
+
 }  // namespace strata::metal

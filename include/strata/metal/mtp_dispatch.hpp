@@ -4,6 +4,7 @@
 #include "strata/metal/context.hpp"
 #include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/mtp_kv.hpp"
+#include "strata/metal/window_head_mixer.hpp"
 
 #include <string>
 
@@ -408,5 +409,34 @@ bool encode_mtp_shared_ffn_write(
 bool encode_mtp_shared_ffn_write(
     Context& context, CommandBuffer& command_buffer,
     const MtpSharedFFNWriteBuffers& buffers, std::string& error);
+
+/// Inputs and outputs for MTP stage 20's final GR head mixer. The wrapper
+/// derives the active row from `params.T` and requires T=1. The caller must
+/// keep every view alive, leave read-only inputs unchanged, and not read,
+/// modify or reuse any active view until GPU completion; the residual is read
+/// by the mixer.
+struct MtpFinalMixerBuffers {
+    ReadOnlyBufferRef params;
+    BufferRef residual;
+    ReadOnlyBufferRef norm_gamma;
+    ReadOnlyBufferRef down_weights;
+    ReadOnlyBufferRef up_weights;
+    BufferRef normalized;
+    BufferRef low_rank;
+    BufferRef gate;
+    BufferRef mixed;
+    BufferRef matvec_sink;
+};
+
+/// Encode MTP stage 20 by composing the validated Window head mixer for T=1.
+/// The standalone form is transactional; the caller-owned form requires an
+/// ordered concurrent-group boundary and must propagate failure from its
+/// enclosing `Encoder::encode` body.
+bool encode_mtp_final_mixer(Context& context, Encoder& encoder,
+                            const MtpFinalMixerBuffers& buffers,
+                            std::string& error);
+bool encode_mtp_final_mixer(Context& context, CommandBuffer& command_buffer,
+                            const MtpFinalMixerBuffers& buffers,
+                            std::string& error);
 
 }  // namespace strata::metal

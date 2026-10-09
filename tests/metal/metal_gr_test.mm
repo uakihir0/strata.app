@@ -3,6 +3,7 @@
 #include "strata/metal/context.hpp"
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/gr_dispatch.hpp"
+#include "strata/metal/mtp_dispatch.hpp"
 #include "strata/metal/window_dispatch.hpp"
 #include "strata/metal/window_pending_dispatch.hpp"
 #include "strata/metal/window_head_mixer.hpp"
@@ -10,6 +11,7 @@
 #include "twin.hpp"
 
 #include "../../src/metal/kernels/common/params.h"
+#include "../../src/metal/kernels/common/types.h"
 
 #import <Metal/Metal.h>
 
@@ -26,6 +28,7 @@
 #include <random>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unistd.h>
 #include <vector>
 
@@ -4610,6 +4613,10 @@ bool test_window_head_mixer(Context& context,
         "Window head mixer test up weights", weight_bytes, error);
     BufferRef active_rows = context.buffers().allocate(
         "Window head mixer test active rows", sizeof(std::uint32_t), error);
+    BufferRef mtp_params = context.buffers().allocate(
+        "MTP final mixer test params", sizeof(MtpParams), error);
+    BufferRef invalid_mtp_params = context.buffers().allocate(
+        "MTP final mixer invalid params", sizeof(MtpParams), error);
     BufferRef normalized = context.buffers().allocate(
         "Window head mixer test normalized",
         max_input_count * sizeof(float), error);
@@ -4626,7 +4633,8 @@ bool test_window_head_mixer(Context& context,
         "Window head mixer test matvec sink",
         max_sink_count * sizeof(float), error);
     if (!residual || !gamma || !down_weights || !up_weights ||
-        !active_rows || !normalized || !low_rank_output || !gate ||
+        !active_rows || !mtp_params || !invalid_mtp_params || !normalized ||
+        !low_rank_output || !gate ||
         !mixed || !sink) {
         check(false, "Window head mixer test allocations", error);
         return false;
@@ -4662,6 +4670,18 @@ bool test_window_head_mixer(Context& context,
         context.buffers().read_only(down_weights),
         context.buffers().read_only(up_weights),
         context.buffers().read_only(active_rows),
+        normalized,
+        low_rank_output,
+        gate,
+        mixed,
+        sink,
+    };
+    const MtpFinalMixerBuffers mtp_buffers{
+        context.buffers().read_only(mtp_params),
+        residual,
+        context.buffers().read_only(gamma),
+        context.buffers().read_only(down_weights),
+        context.buffers().read_only(up_weights),
         normalized,
         low_rank_output,
         gate,
@@ -4776,6 +4796,226 @@ bool test_window_head_mixer(Context& context,
                   std::memcmp(up_weights.contents, up_matrix.data(),
                               weight_bytes) == 0,
               label + " keeps model inputs unchanged");
+
+        if (rows == 1u) {
+            MtpParams parameters{};
+            parameters.T = 1u;
+            std::memcpy(mtp_params.contents, &parameters,
+                        sizeof(parameters));
+            const char* const dispatch_mode =
+                std::getenv("STRATA_METAL_DISPATCH");
+            const bool concurrent =
+                dispatch_mode != nullptr &&
+                std::string_view(dispatch_mode) == "concurrent";
+            auto mtp_command =
+                context.make_command_buffer("MTP final mixer T=1", error);
+            const bool mtp_encoded = mtp_command && (concurrent
+                ? Encoder::encode(
+                      context, *mtp_command, "MTP final mixer caller-owned",
+                      [&](Encoder& encoder, std::string& encode_error) {
+                          return encode_mtp_final_mixer(
+                              context, encoder, mtp_buffers, encode_error);
+                      },
+                      error)
+                : encode_mtp_final_mixer(context, *mtp_command, mtp_buffers,
+                                         error));
+            const bool mtp_dispatched =
+                mtp_encoded && mtp_command->commit(error) &&
+                mtp_command->wait_until_completed(error);
+            check(mtp_dispatched,
+                  concurrent ? "MTP final mixer caller-owned T=1"
+                             : "MTP final mixer standalone T=1",
+                  error);
+            passed &= mtp_dispatched;
+            if (mtp_dispatched) {
+                const auto mtp_actual = std::span<const float>(
+                    static_cast<const float*>(mixed.contents), output_count);
+                const auto mtp_mismatch = twin::compare_floats(
+                    mtp_actual, expected,
+                    {twin::Comparison::units, 256.0, 0.0, 0u});
+                if (mtp_mismatch) {
+                    twin::report_failure("MTP final mixer T=1", options, rows,
+                                         *mtp_mismatch);
+                }
+                check(!mtp_mismatch,
+                      "MTP final mixer T=1 scalar head-mixer oracle U(256)");
+                passed &= !mtp_mismatch;
+                check(std::memcmp(residual.contents, input.data(),
+                                  input.size() * sizeof(float)) == 0,
+                      "MTP final mixer preserves its residual input");
+                check(std::memcmp(mtp_params.contents, &parameters,
+                                  sizeof(parameters)) == 0 &&
+                          std::memcmp(gamma.contents, gamma_values.data(),
+                                      gamma_values.size() * sizeof(float)) ==
+                              0 &&
+                          std::memcmp(down_weights.contents,
+                                      down_matrix.data(), weight_bytes) == 0 &&
+                          std::memcmp(up_weights.contents, up_matrix.data(),
+                                      weight_bytes) == 0,
+                      "MTP final mixer preserves params and model inputs");
+                passed &= std::memcmp(residual.contents, input.data(),
+                                      input.size() * sizeof(float)) == 0 &&
+                          std::memcmp(mtp_params.contents, &parameters,
+                                      sizeof(parameters)) == 0 &&
+                          std::memcmp(gamma.contents, gamma_values.data(),
+                                      gamma_values.size() * sizeof(float)) ==
+                              0 &&
+                          std::memcmp(down_weights.contents,
+                                      down_matrix.data(), weight_bytes) == 0 &&
+                          std::memcmp(up_weights.contents, up_matrix.data(),
+                                      weight_bytes) == 0;
+            }
+        }
+    }
+
+    const std::array<BufferRef, 6u> mtp_state_views{
+        residual, normalized, low_rank_output, gate, mixed, sink};
+    const auto capture_mtp_state = [&] {
+        std::array<std::vector<std::uint8_t>, mtp_state_views.size()> state{};
+        for (std::size_t index = 0u; index < mtp_state_views.size(); ++index) {
+            const BufferRef& view = mtp_state_views[index];
+            const auto* begin =
+                static_cast<const std::uint8_t*>(view.contents);
+            state[index].assign(begin, begin + view.length);
+        }
+        return state;
+    };
+    const auto mtp_state_unchanged = [&](const auto& state) {
+        bool unchanged = true;
+        for (std::size_t index = 0u; index < mtp_state_views.size(); ++index) {
+            const BufferRef& view = mtp_state_views[index];
+            const auto* begin =
+                static_cast<const std::uint8_t*>(view.contents);
+            unchanged &= state[index].size() == view.length &&
+                std::equal(state[index].begin(), state[index].end(), begin);
+        }
+        return unchanged;
+    };
+
+    MtpParams invalid_parameters{};
+    invalid_parameters.T = 2u;
+    std::memcpy(invalid_mtp_params.contents, &invalid_parameters,
+                sizeof(invalid_parameters));
+    MtpFinalMixerBuffers invalid_rows = mtp_buffers;
+    invalid_rows.params = context.buffers().read_only(invalid_mtp_params);
+    const auto invalid_rows_before = capture_mtp_state();
+    auto invalid_mtp_command =
+        context.make_command_buffer("MTP final mixer rejects T=2", error);
+    const bool rejects_invalid_mtp_rows = invalid_mtp_command &&
+        !encode_mtp_final_mixer(context, *invalid_mtp_command, invalid_rows,
+                                error) &&
+        error.find("requires T=1") != std::string::npos;
+    const bool invalid_mtp_discarded =
+        invalid_mtp_command &&
+        invalid_mtp_command->unsafe_native_handle() == nullptr;
+    const bool invalid_mtp_unchanged =
+        mtp_state_unchanged(invalid_rows_before);
+    check(rejects_invalid_mtp_rows && invalid_mtp_discarded &&
+              invalid_mtp_unchanged,
+          "MTP final mixer rejects T=2 transactionally", error);
+    passed &= rejects_invalid_mtp_rows && invalid_mtp_discarded &&
+              invalid_mtp_unchanged;
+
+    MtpFinalMixerBuffers params_alias = mtp_buffers;
+    params_alias.params = context.buffers().read_only(residual);
+    std::uint32_t saved_residual_word = 0u;
+    std::memcpy(&saved_residual_word, residual.contents,
+                sizeof(saved_residual_word));
+    const std::uint32_t alias_rows = 1u;
+    std::memcpy(residual.contents, &alias_rows, sizeof(alias_rows));
+    const auto params_alias_before = capture_mtp_state();
+    auto params_alias_command =
+        context.make_command_buffer("MTP final mixer rejects params alias",
+                                    error);
+    const bool rejects_params_alias = params_alias_command &&
+        !encode_mtp_final_mixer(context, *params_alias_command, params_alias,
+                                error) &&
+        error.find("parameter block overlaps active view residual") !=
+            std::string::npos;
+    const bool params_alias_discarded =
+        params_alias_command &&
+        params_alias_command->unsafe_native_handle() == nullptr;
+    const bool params_alias_unchanged =
+        mtp_state_unchanged(params_alias_before);
+    std::memcpy(residual.contents, &saved_residual_word,
+                sizeof(saved_residual_word));
+    check(rejects_params_alias && params_alias_discarded &&
+              params_alias_unchanged,
+          "MTP final mixer rejects params/residual alias", error);
+    passed &= rejects_params_alias && params_alias_discarded &&
+              params_alias_unchanged;
+
+    MtpFinalMixerBuffers weight_alias = mtp_buffers;
+    weight_alias.norm_gamma = context.buffers().read_only(residual);
+    const auto weight_alias_before = capture_mtp_state();
+    auto weight_alias_command =
+        context.make_command_buffer("MTP final mixer rejects weight alias",
+                                    error);
+    const bool rejects_weight_alias = weight_alias_command &&
+        !encode_mtp_final_mixer(context, *weight_alias_command, weight_alias,
+                                error) &&
+        error.find("residual overlaps read-only input norm_gamma") !=
+            std::string::npos;
+    const bool weight_alias_discarded =
+        weight_alias_command &&
+        weight_alias_command->unsafe_native_handle() == nullptr;
+    const bool weight_alias_unchanged =
+        mtp_state_unchanged(weight_alias_before);
+    check(rejects_weight_alias && weight_alias_discarded &&
+              weight_alias_unchanged,
+          "MTP final mixer rejects residual/model-weight alias", error);
+    passed &= rejects_weight_alias && weight_alias_discarded &&
+              weight_alias_unchanged;
+
+    const auto rollback_before = capture_mtp_state();
+    auto rollback_command =
+        context.make_command_buffer("MTP final mixer caller-owned rollback",
+                                    error);
+    const bool rollback_rejected = rollback_command && !Encoder::encode(
+        context, *rollback_command, "MTP final mixer caller-owned rollback",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_mtp_final_mixer(context, encoder, mtp_buffers,
+                                          encode_error) &&
+                   encode_mtp_final_mixer(context, encoder, invalid_rows,
+                                          encode_error);
+        },
+        error);
+    const bool rollback_discarded =
+        rollback_command &&
+        rollback_command->unsafe_native_handle() == nullptr;
+    const bool rollback_unchanged = mtp_state_unchanged(rollback_before);
+    check(rollback_rejected && rollback_discarded && rollback_unchanged,
+          "MTP final mixer later failure rolls back earlier dispatches",
+          error);
+    passed &= rollback_rejected && rollback_discarded && rollback_unchanged;
+
+    const char* const dispatch_mode =
+        std::getenv("STRATA_METAL_DISPATCH");
+    const bool concurrent =
+        dispatch_mode != nullptr &&
+        std::string_view(dispatch_mode) == "concurrent";
+    if (concurrent) {
+        const auto group_before = capture_mtp_state();
+        auto group_command =
+            context.make_command_buffer("MTP final mixer rejects open group",
+                                        error);
+        const bool group_rejected = group_command && !Encoder::encode(
+            context, *group_command, "MTP final mixer rejects open group",
+            [&](Encoder& encoder, std::string& encode_error) {
+                if (!encoder.group_begin(encode_error)) return false;
+                return encode_mtp_final_mixer(context, encoder, mtp_buffers,
+                                              encode_error);
+            },
+            error) &&
+            error.find("ordered concurrent-group boundary") !=
+                std::string::npos;
+        const bool group_discarded =
+            group_command &&
+            group_command->unsafe_native_handle() == nullptr;
+        const bool group_unchanged = mtp_state_unchanged(group_before);
+        check(group_rejected && group_discarded && group_unchanged,
+              "MTP final mixer rejects an open concurrent group", error);
+        passed &= group_rejected && group_discarded && group_unchanged;
     }
 
     std::uint32_t invalid_active_rows = 7u;
