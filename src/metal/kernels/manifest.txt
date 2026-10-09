@@ -43,6 +43,7 @@ strata_pf_gemm_f16_mpp safe 128 1 1
 strata_pf_gemm_bf16_mpp safe 128 1 1
 strata_pf_gemm_f16_simd safe 128 1 1
 strata_pf_gemm_bf16_simd safe 128 1 1
+strata_pf_dequant_q8_0 safe 256 1 1
 strata_pf_gr_mix safe 256 1 1
 strata_pf_gr_mix_lo safe 256 1 1
 strata_pf_gr_silu safe 256 1 1
