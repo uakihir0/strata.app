@@ -497,6 +497,10 @@ set_source_files_properties(tests/metal/metal_mtp_test.mm
 add_dependencies(metal_mtp_test strata_metallib)
 strata_metal_test(metal_mtp_test metal metal_mtp_test ${STRATA_METALLIB})
 set_tests_properties(metal_mtp_test PROPERTIES TIMEOUT 120)
+strata_metal_test(metal_mtp_test_concurrent metal ${CMAKE_COMMAND} -E env
+  STRATA_METAL_DISPATCH=concurrent $<TARGET_FILE:metal_mtp_test>
+  ${STRATA_METALLIB})
+set_tests_properties(metal_mtp_test_concurrent PROPERTIES TIMEOUT 120)
 
 add_executable(metal_mtp_gr_test tests/metal/metal_mtp_gr_test.mm)
 target_include_directories(metal_mtp_gr_test PRIVATE ${STRATA_METAL_GENERATED_DIR})

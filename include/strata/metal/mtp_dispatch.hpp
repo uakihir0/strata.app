@@ -3,6 +3,7 @@
 
 #include "strata/metal/context.hpp"
 #include "strata/metal/moe_dispatch.hpp"
+#include "strata/metal/mv_dispatch.hpp"
 #include "strata/metal/mtp_kv.hpp"
 #include "strata/metal/window_head_mixer.hpp"
 
@@ -438,5 +439,36 @@ bool encode_mtp_final_mixer(Context& context, Encoder& encoder,
 bool encode_mtp_final_mixer(Context& context, CommandBuffer& command_buffer,
                             const MtpFinalMixerBuffers& buffers,
                             std::string& error);
+
+/// Inputs and outputs for MTP stage 21's draft head. An empty
+/// `draft_vocab_ids` selects every row in the full head; otherwise it maps
+/// subset output rows to full-head rows. `head_vocab_size` is the number of
+/// rows in `weights`. T must be 1. The caller keeps all views alive, leaves
+/// inputs unchanged and avoids CPU access or reuse until GPU completion.
+struct MtpDraftHeadBuffers {
+    ReadOnlyBufferRef params;
+    BufferRef sample;
+    ReadOnlyBufferRef weights;
+    ReadOnlyBufferRef draft_vocab_ids;
+    BufferRef activations_q8_1;
+    BufferRef logits;
+    BufferRef matvec_sink;
+};
+
+/// Encode MTP stage 21 by quantizing `sample` to Q8_1 and projecting it through
+/// the full or indexed model head. Indexed heads support Q5_K, Q6_K and IQ4_XS.
+/// The standalone form is transactional; the caller-owned form requires an
+/// ordered concurrent-group boundary and failure propagation.
+bool encode_mtp_draft_head(Context& context, Encoder& encoder,
+                           MatVecWeightFormat weight_format,
+                           std::uint32_t head_vocab_size,
+                           const MtpDraftHeadBuffers& buffers,
+                           std::string& error);
+bool encode_mtp_draft_head(Context& context,
+                           CommandBuffer& command_buffer,
+                           MatVecWeightFormat weight_format,
+                           std::uint32_t head_vocab_size,
+                           const MtpDraftHeadBuffers& buffers,
+                           std::string& error);
 
 }  // namespace strata::metal

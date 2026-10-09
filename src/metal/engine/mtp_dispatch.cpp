@@ -4,6 +4,7 @@
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/gr_dispatch.hpp"
 #include "strata/metal/mtp.hpp"
+#include "strata/metal/mtp_bind_layout.hpp"
 #include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/mv_dispatch.hpp"
 #include "strata/metal/qsa_dispatch.hpp"
@@ -16,6 +17,7 @@
 #include <limits>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "../kernels/common/params.h"
 #include "../kernels/common/types.h"
@@ -2548,6 +2550,273 @@ bool encode_mtp_final_mixer(Context& context, CommandBuffer& command_buffer,
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_mtp_final_mixer(context, encoder, buffers,
                                           encode_error);
+        },
+        error);
+}
+
+namespace {
+
+std::size_t mtp_head_row_bytes(MatVecWeightFormat format) {
+    constexpr std::uint32_t blocks_per_row =
+        static_cast<std::uint32_t>(N_EMBD) / 256u;
+    switch (format) {
+        case MatVecWeightFormat::q5_k:
+            return static_cast<std::size_t>(blocks_per_row) *
+                   sizeof(block_q5_K);
+        case MatVecWeightFormat::q6_k:
+            return static_cast<std::size_t>(blocks_per_row) *
+                   sizeof(block_q6_K);
+        case MatVecWeightFormat::iq4_xs:
+            return static_cast<std::size_t>(blocks_per_row) *
+                   sizeof(block_iq4_xs);
+        default:
+            return 0u;
+    }
+}
+
+bool validate_mtp_draft_head(
+    Context& context, MatVecWeightFormat format,
+    std::uint32_t head_vocab_size, const MtpDraftHeadBuffers& buffers,
+    ReadOnlyBufferRef& active_rows, std::uint32_t& output_rows,
+    std::size_t& weight_bytes, std::string& error) {
+    constexpr char operation[] = "MTP draft head";
+    std::uint32_t rows = 0u;
+    if (!read_mtp_rows(context, buffers.params, operation, rows, error)) {
+        return false;
+    }
+    if (rows != 1u) {
+        error = "MTP draft head requires T=1";
+        return false;
+    }
+    const std::size_t row_bytes = mtp_head_row_bytes(format);
+    if (row_bytes == 0u) {
+        error = "MTP draft head format must be Q5_K, Q6_K or IQ4_XS";
+        return false;
+    }
+    if (head_vocab_size == 0u ||
+        head_vocab_size > kMtpFullVocabularySize) {
+        error = "MTP draft head row count must be in 1..248320";
+        return false;
+    }
+    if (!checked_size_multiply(row_bytes, head_vocab_size, weight_bytes)) {
+        error = "MTP draft head weight extent overflows";
+        return false;
+    }
+
+    constexpr std::size_t params_bytes = sizeof(MtpParams);
+    constexpr std::size_t sample_bytes =
+        static_cast<std::size_t>(N_EMBD) * sizeof(float);
+    constexpr std::size_t q8_1_bytes =
+        static_cast<std::size_t>(N_EMBD / 32u) * kMtpQ81BlockBytes;
+    constexpr std::size_t sink_bytes = sizeof(float);
+    if (buffers.draft_vocab_ids) {
+        if (buffers.draft_vocab_ids.length() == 0u ||
+            buffers.draft_vocab_ids.length() % sizeof(std::int32_t) != 0u) {
+            error = "MTP draft head row map must contain int32 indices";
+            return false;
+        }
+        const std::size_t map_rows =
+            buffers.draft_vocab_ids.length() / sizeof(std::int32_t);
+        if (map_rows == 0u || map_rows > head_vocab_size ||
+            map_rows > kMtpFullVocabularySize) {
+            error = "MTP draft head row-map size exceeds the full head";
+            return false;
+        }
+        output_rows = static_cast<std::uint32_t>(map_rows);
+        if (!validate_read_only_buffer(
+                context, buffers.draft_vocab_ids,
+                buffers.draft_vocab_ids.length(), alignof(std::int32_t),
+                "draft vocabulary", operation, error)) {
+            return false;
+        }
+    } else {
+        output_rows = head_vocab_size;
+    }
+
+    std::size_t logits_bytes = 0u;
+    if (!checked_size_multiply(output_rows, sizeof(float), logits_bytes)) {
+        error = "MTP draft head logits extent overflows";
+        return false;
+    }
+    if (!validate_read_only_buffer(context, buffers.params, params_bytes,
+                                   alignof(MtpParams), "params", operation,
+                                   error) ||
+        !validate_output_buffer(context, buffers.sample, sample_bytes,
+                                operation, "sample", error) ||
+        !validate_read_only_buffer(context, buffers.weights, weight_bytes,
+                                   alignof(std::uint16_t), "head weights",
+                                   operation, error) ||
+        !validate_buffer_view(context, buffers.activations_q8_1, q8_1_bytes,
+                              256u, operation, "Q8_1 activation", error) ||
+        !validate_output_buffer(context, buffers.logits, logits_bytes,
+                                operation, "logits", error) ||
+        !validate_output_buffer(context, buffers.matvec_sink, sink_bytes,
+                                operation, "mat-vec sink", error)) {
+        return false;
+    }
+
+    const std::array<std::pair<const char*, ReadOnlyBufferRef>, 3> immutable{{
+        {"params", buffers.params},
+        {"head weights", buffers.weights},
+        {"draft vocabulary", buffers.draft_vocab_ids},
+    }};
+    const std::array<std::pair<const char*, BufferRef>, 4> writable{{
+        {"sample", buffers.sample},
+        {"Q8_1 activation", buffers.activations_q8_1},
+        {"logits", buffers.logits},
+        {"mat-vec sink", buffers.matvec_sink},
+    }};
+    const std::array<std::size_t, immutable.size()> active_immutable_bytes{{
+        params_bytes, weight_bytes,
+        buffers.draft_vocab_ids.length(),
+    }};
+    const std::array<std::size_t, writable.size()> active_writable_bytes{{
+        sample_bytes, q8_1_bytes, logits_bytes, sink_bytes,
+    }};
+
+    for (std::size_t index = 0u; index < immutable.size(); ++index) {
+        if (index != 0u &&
+            overlaps(buffers.params, params_bytes,
+                     immutable[index].second, active_immutable_bytes[index])) {
+            error = std::string(operation) +
+                    " parameter block overlaps " + immutable[index].first;
+            return false;
+        }
+        if (index == 1u &&
+            overlaps(buffers.weights, weight_bytes,
+                     buffers.draft_vocab_ids,
+                     active_immutable_bytes[2])) {
+            error = std::string(operation) +
+                    " head weights overlap the draft-vocabulary row map";
+            return false;
+        }
+        for (std::size_t output = 0u; output < writable.size(); ++output) {
+            if (active_immutable_bytes[index] != 0u &&
+                overlaps(immutable[index].second,
+                         active_immutable_bytes[index],
+                         writable[output].second,
+                         active_writable_bytes[output])) {
+                error = std::string(operation) + " " +
+                        immutable[index].first + " overlaps " +
+                        writable[output].first;
+                return false;
+            }
+        }
+    }
+    for (std::size_t left = 0u; left < writable.size(); ++left) {
+        for (std::size_t right = left + 1u; right < writable.size(); ++right) {
+            if (overlaps(writable[left].second,
+                         active_writable_bytes[left],
+                         writable[right].second,
+                         active_writable_bytes[right])) {
+                error = std::string(operation) + " writable views " +
+                        writable[left].first + " and " +
+                        writable[right].first + " overlap";
+                return false;
+            }
+        }
+    }
+
+    if (buffers.draft_vocab_ids) {
+        const auto* const row_map = static_cast<const std::int32_t*>(
+            buffers.draft_vocab_ids.contents());
+        std::vector<std::int32_t> sorted_rows;
+        sorted_rows.reserve(output_rows);
+        for (std::uint32_t row = 0u; row < output_rows; ++row) {
+            if (row_map[row] < 0 ||
+                static_cast<std::uint32_t>(row_map[row]) >= head_vocab_size) {
+                error = std::string(operation) +
+                        " draft-vocabulary row map contains an index outside the full head";
+                return false;
+            }
+            sorted_rows.push_back(row_map[row]);
+        }
+        std::sort(sorted_rows.begin(), sorted_rows.end());
+        if (std::adjacent_find(sorted_rows.begin(), sorted_rows.end()) !=
+            sorted_rows.end()) {
+            error = std::string(operation) +
+                    " draft-vocabulary row map contains duplicate head rows";
+            return false;
+        }
+    }
+
+    active_rows = buffers.params.slice(offsetof(MtpParams, T),
+                                      sizeof(std::uint32_t));
+    if (!active_rows) {
+        error = std::string(operation) +
+                " could not form the active-row count view";
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
+}  // namespace
+
+bool encode_mtp_draft_head(Context& context, Encoder& encoder,
+                           MatVecWeightFormat weight_format,
+                           std::uint32_t head_vocab_size,
+                           const MtpDraftHeadBuffers& buffers,
+                           std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "MTP draft head requires an ordered concurrent-group boundary";
+        return false;
+    }
+    ReadOnlyBufferRef active_rows;
+    std::uint32_t output_rows = 0u;
+    std::size_t weight_bytes = 0u;
+    if (!validate_mtp_draft_head(context, weight_format, head_vocab_size,
+                                 buffers, active_rows, output_rows,
+                                 weight_bytes, error)) {
+        return false;
+    }
+
+    if (!encode_q8_1(context, encoder, 1u, N_EMBD,
+                     {buffers.sample, buffers.activations_q8_1}, error)) {
+        return false;
+    }
+    const ReadOnlyBufferRef quantized =
+        context.buffers().read_only(buffers.activations_q8_1);
+    if (!quantized) {
+        error = "MTP draft head Q8_1 activation could not be bound read-only";
+        return false;
+    }
+    if (buffers.draft_vocab_ids) {
+        const ReadOnlyIndexedHeadMatVecBuffers matvec{
+            quantized,
+            buffers.weights,
+            active_rows,
+            buffers.logits,
+            buffers.matvec_sink,
+            buffers.draft_vocab_ids,
+        };
+        return encode_indexed_head_matvec(
+            context, encoder, weight_format, N_EMBD, head_vocab_size,
+            output_rows, matvec, error);
+    }
+    const ReadOnlyMatVecBuffers matvec{
+        quantized,
+        buffers.weights,
+        active_rows,
+        buffers.logits,
+        buffers.matvec_sink,
+    };
+    return encode_read_only_matvec(context, encoder, weight_format, N_EMBD,
+                                   head_vocab_size, 1u, 1u, matvec, error);
+}
+
+bool encode_mtp_draft_head(Context& context, CommandBuffer& command_buffer,
+                           MatVecWeightFormat weight_format,
+                           std::uint32_t head_vocab_size,
+                           const MtpDraftHeadBuffers& buffers,
+                           std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "MTP draft head",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_mtp_draft_head(context, encoder, weight_format,
+                                         head_vocab_size, buffers,
+                                         encode_error);
         },
         error);
 }
