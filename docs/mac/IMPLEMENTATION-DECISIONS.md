@@ -8683,8 +8683,9 @@ measuring L-15 remain open.
   references exercise the exact quantized codes, scales, gate/up values,
   SwiGLU and down projections, plus standalone/caller-owned parity, guards,
   invalid views, aliases and rollback. Expert 511 is included to cover the
-  final valid blob boundary. Q8 scales use a small relative tolerance because
-  GPU division can differ by a few ULPs; quantized codes remain exact. The
+  final valid blob boundary. Mixed-row Q8 scales and both quantized code
+  arrays match exactly. Only hidden-row Q8 scales use tight absolute and
+  relative tolerances because GPU division can differ by a few ULPs. The
   scalar oracle exposed a half-scale indexing error during implementation;
   the Metal indexing was corrected before the hostile full-diff review.
 - **Review required:** Decide how production binds per-expert `MtpRuntimeStorage`
@@ -8701,8 +8702,11 @@ measuring L-15 remain open.
   highest valid expert ID and that the decision/review records and README
   status were missing. The test now routes to expert 511 and checks the final
   blob boundary. The required records are added here; the README status is
-  updated with the final suite results. No direct arithmetic, ordering,
-  validation or rollback defect was reported.
+  updated with the final suite results. A follow-up review found that the
+  first tolerance summary overstated the hidden-scale tolerance; the record
+  now distinguishes exact mixed-row scales/codes from the hidden-row scale
+  tolerance. No direct arithmetic, ordering, validation or rollback defect
+  was reported.
 - **Disposition:** The independent oracle exposed and led to the fix for
   half-scale indexing. After adding the expert-511 fixture,
   `cmake --build --preset mac-dev` succeeded and the focused serial/concurrent
