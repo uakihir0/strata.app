@@ -3,11 +3,13 @@
 #include "strata/metal/mtp_storage.hpp"
 #include "strata/metal/mtp_runtime_storage.hpp"
 #include "strata/metal/kv.hpp"
+#include "strata/metal/encoder.hpp"
 #include "strata/metal/plan.hpp"
 #include "strata/metal/window_scratch.hpp"
 #include "strata/metal/weights.hpp"
 
 #include <cerrno>
+#include <array>
 #include <charconv>
 #include <cstdint>
 #include <cstring>
@@ -21,6 +23,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+#include "../../src/metal/kernels/common/params.h"
+#include "../../src/metal/kernels/common/types.h"
 
 namespace fs = std::filesystem;
 using namespace strata::metal;
@@ -508,6 +513,204 @@ int main(int argc, char** argv) {
                         static_cast<const std::uint8_t*>(
                             provisional_params_slot.contents)[0] == 0,
                     "MTP parameter slots begin zero-initialized");
+            BufferRef projection_table =
+                rollback_context->buffers().allocate(
+                    "MTP projection binding test embedding table",
+                    8u * N_EMBD * sizeof(std::uint16_t), error);
+            BufferRef projection_residual =
+                rollback_context->buffers().allocate(
+                    "MTP projection binding test residual",
+                    8u * HC_DIM * sizeof(float), error);
+            require(projection_table && projection_residual,
+                    "allocate MTP projection binding inputs: " + error);
+            std::memset(projection_table.contents, 0, projection_table.length);
+            std::memset(projection_residual.contents, 0,
+                        projection_residual.length);
+            MtpParams projection_params{};
+            projection_params.T = 5u;
+            projection_params.hid[0] = 8u;
+            projection_params.hid[1] = 8u;
+            projection_params.hid[2] = 4u;
+            std::memcpy(provisional_params_slot.contents, &projection_params,
+                        sizeof(projection_params));
+            MtpInputProjectionSources projection_sources{
+                9u,
+                MtpInputTokenSource::params_tokens,
+                {},
+                EmbedRowsFormat::bf16,
+                8u,
+                rollback_context->buffers().read_only(projection_table),
+                projection_residual,
+            };
+            MtpInputProjectionBuffers projection_buffers;
+            require(provisional_runtime->bind_input_projection(
+                        *rollback_context, projection_sources,
+                        projection_buffers, error),
+                    "bind MTP stage-1–5 runtime views: " + error);
+            const BufferRef projection_e2 =
+                provisional_runtime->bind_region(MtpBindRegionId::e2);
+            const std::size_t projection_active_e2_bytes =
+                5u * N_EMBD * sizeof(float);
+            require(projection_buffers.params.contents() ==
+                            provisional_params_slot.contents &&
+                        projection_buffers.token_embedding_table.contents() ==
+                            projection_table.contents &&
+                        projection_buffers.residual.handle ==
+                            projection_residual.handle &&
+                        projection_buffers.embedding.handle ==
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::emb).handle &&
+                        projection_buffers.embedding_norm.handle ==
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::en).handle &&
+                        projection_buffers.xq.handle ==
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::xq).handle &&
+                        projection_buffers.hidden_norm.handle ==
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::hn).handle &&
+                        projection_buffers.h2.handle ==
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::h2).handle &&
+                        projection_buffers.e2.handle == projection_e2.handle &&
+                        projection_buffers.matvec_sink.handle ==
+                            projection_e2.handle &&
+                        projection_buffers.matvec_sink.offset ==
+                            projection_e2.offset +
+                                projection_active_e2_bytes &&
+                        projection_buffers.matvec_sink.length >=
+                            3u * N_EMBD * sizeof(float) &&
+                        projection_buffers.fc_embedding_weights.contents() ==
+                            provisional_runtime->dense_weight(
+                                "fc_embedding.weight").contents &&
+                        projection_buffers.embedding_norm_gamma.contents() ==
+                            provisional_runtime->dense_weight(
+                                "pre_fc_norm_embedding.weight").contents &&
+                        projection_buffers.hidden_norm_gamma.contents() ==
+                            provisional_runtime->dense_weight(
+                                "pre_fc_norm_hidden.weight").contents &&
+                        projection_buffers.fc_hidden_weights.contents() ==
+                            provisional_runtime->dense_weight(
+                                "fc_hidden.weight").contents,
+                    "MTP stage-1–5 weights, parameter and T=5 scratch views are resolved");
+            auto t5_projection_command =
+                rollback_context->make_command_buffer(
+                    "MTP runtime-bound T=5 input projection", error);
+            require(t5_projection_command != nullptr &&
+                        encode_mtp_input_projection(
+                            *rollback_context, *t5_projection_command,
+                            projection_buffers, error) &&
+                        t5_projection_command->commit(error) &&
+                        t5_projection_command->wait_until_completed(error),
+                    "dispatch MTP T=5 projection with its padded e2-tail sink: " +
+                        error);
+
+            projection_params = {};
+            projection_params.T = 8u;
+            projection_params.hid[0] = 8u;
+            projection_params.hid[1] = 8u;
+            projection_params.hid[2] = 8u;
+            projection_params.hid[3] = 8u;
+            std::memcpy(provisional_params_slot.contents, &projection_params,
+                        sizeof(projection_params));
+            require(provisional_runtime->bind_input_projection(
+                        *rollback_context, projection_sources,
+                        projection_buffers, error),
+                    "bind T=8 MTP stage-1–5 runtime views: " + error);
+            const BufferRef projection_bo =
+                provisional_runtime->bind_region(MtpBindRegionId::bo);
+            require(projection_buffers.matvec_sink.handle ==
+                            projection_bo.handle &&
+                        projection_buffers.matvec_sink.offset ==
+                            projection_bo.offset &&
+                        projection_buffers.matvec_sink.length ==
+                            sizeof(float),
+                    "T=8 MTP projection uses the later-dead bo word as its required sink");
+            auto t8_projection_command =
+                rollback_context->make_command_buffer(
+                    "MTP runtime-bound T=8 input projection", error);
+            require(t8_projection_command != nullptr &&
+                        encode_mtp_input_projection(
+                            *rollback_context, *t8_projection_command,
+                            projection_buffers, error) &&
+                        t8_projection_command->commit(error) &&
+                        t8_projection_command->wait_until_completed(error),
+                    "dispatch MTP T=8 projection with its bo sink: " + error);
+
+            projection_params = {};
+            projection_params.T = 1u;
+            projection_params.hid[0] = 4u;
+            std::memcpy(provisional_params_slot.contents, &projection_params,
+                        sizeof(projection_params));
+            projection_sources.token_source =
+                MtpInputTokenSource::selected_token;
+            const BufferRef selected_token_view =
+                provisional_runtime->bind_region(MtpBindRegionId::out_ids)
+                    .slice(0u, sizeof(std::uint32_t));
+            projection_sources.selected_token =
+                rollback_context->buffers().read_only(selected_token_view);
+            const std::uint32_t stale_selected_token = 0xffffffffu;
+            std::memcpy(selected_token_view.contents, &stale_selected_token,
+                        sizeof(stale_selected_token));
+            require(provisional_runtime->bind_input_projection(
+                        *rollback_context, projection_sources,
+                        projection_buffers, error) &&
+                        projection_buffers.selected_token.contents() ==
+                            selected_token_view.contents,
+                    "MTP runtime binding preserves the separate GPU-produced T=1 token");
+            const ReadOnlyBufferRef projection_token_source =
+                rollback_context->buffers().read_only(
+                    provisional_params_slot.slice(
+                        offsetof(MtpParams, tokens),
+                        sizeof(std::uint32_t)));
+            const std::array projection_token_output{
+                EncoderBufferBinding{selected_token_view, 1u,
+                                     sizeof(std::uint32_t),
+                                     alignof(std::uint32_t)},
+            };
+            const std::array projection_token_input{
+                EncoderReadOnlyBufferBinding{
+                    projection_token_source, 0u, sizeof(std::uint32_t),
+                    alignof(std::uint32_t)},
+            };
+            constexpr std::array<EncoderBytesBinding, 0> no_bytes{};
+            constexpr std::array<EncoderThreadgroupMemory, 0> no_memory{};
+            auto projection_command = rollback_context->make_command_buffer(
+                "MTP runtime-bound input projection smoke", error);
+            require(projection_command != nullptr &&
+                        Encoder::encode(
+                            *rollback_context, *projection_command,
+                            "MTP runtime-bound GPU token producer and input projection",
+                            [&](Encoder& encoder,
+                                std::string& encode_error) {
+                                return encoder.dispatch(
+                                           "strata_selftest_copy_u32_one",
+                                           {1u, 1u, 1u}, {1u, 1u, 1u},
+                                           projection_token_output,
+                                           projection_token_input, no_bytes,
+                                           no_memory, encode_error) &&
+                                       encode_mtp_input_projection(
+                                           *rollback_context, encoder,
+                                           projection_buffers, encode_error);
+                            },
+                            error) &&
+                        projection_command->commit(error) &&
+                        projection_command->wait_until_completed(error),
+                    "dispatch MTP stages 1–5 after a GPU-produced selected token: " +
+                        error);
+            MtpInputProjectionSources invalid_projection_sources =
+                projection_sources;
+            invalid_projection_sources.params_slot = 10u;
+            require(!provisional_runtime->bind_input_projection(
+                        *rollback_context, invalid_projection_sources,
+                        projection_buffers, error) &&
+                        !error.empty() && !projection_buffers.params &&
+                        !projection_buffers.token_embedding_table &&
+                        !projection_buffers.fc_embedding_weights &&
+                        !projection_buffers.embedding &&
+                        !projection_buffers.matvec_sink,
+                    "failed MTP projection binding clears every returned view");
+
             const BufferRef bind_base = provisional_runtime->bind_region(
                 MtpBindRegionId::mtp_rin);
             require(bind_base &&
