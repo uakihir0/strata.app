@@ -12,6 +12,7 @@
 #include "strata/metal/ple_dispatch.hpp"
 #include "strata/metal/window_ple_stage.hpp"
 #include "strata/metal/window_t1_input.hpp"
+#include "strata/metal/window_speculative_input.hpp"
 #include "strata/metal/window_scratch.hpp"
 #include "strata/metal/window_output_projection.hpp"
 #include "strata/metal/window_output_head.hpp"
@@ -5108,18 +5109,90 @@ void run_fullmode_handoff_test(Context& context,
         const std::vector<std::uint32_t> generic_ple_tokens(3u, tokens[0]);
         std::vector<WindowSamplerSettings> generic_ple_samplers(
             generic_ple_tokens.size(), sampler_settings);
-        const BufferRef generic_ple_t3_params = params_ring->build_slot(
-            1u, 1u, generic_ple_tokens, generic_ple_samplers, 0u,
-            0x11223344u, 0x55667788u, error);
-        require(static_cast<bool>(generic_ple_t3_params),
-                "build T=3 generic PLE parameters: " + error);
+        const BufferRef speculative_ple_scratch = require_scratch_view(
+            context, *scratch, layout.ple_input,
+            "T=3 speculative PLE preparation scratch");
+        std::memset(speculative_ple_scratch.contents, 0x6du,
+                    speculative_ple_scratch.length);
+        const std::vector<std::uint8_t> speculative_ple_before_rejection(
+            static_cast<const std::uint8_t*>(
+                speculative_ple_scratch.contents),
+            static_cast<const std::uint8_t*>(speculative_ple_scratch.contents) +
+                speculative_ple_scratch.length);
+        std::vector<std::uint32_t> invalid_later_ple_tokens =
+            generic_ple_tokens;
+        invalid_later_ple_tokens[2] = runtime_geometry.vocab;
+        WindowSpeculativePreparedInput rejected_speculative_input;
+        require(!prepare_window_speculative_input(
+                    *session, runtime_geometry, *full_mode, *params_ring,
+                    *scratch, 1u, 1u, invalid_later_ple_tokens,
+                    generic_ple_samplers, 0x11223344u, 0x55667788u, true,
+                    rejected_speculative_input, error) &&
+                    error.find("outside the model vocabulary") !=
+                        std::string::npos &&
+                    !rejected_speculative_input.params &&
+                    !rejected_speculative_input.ple_input &&
+                    !params_ring->view(1u) &&
+                    std::equal(
+                        speculative_ple_before_rejection.begin(),
+                        speculative_ple_before_rejection.end(),
+                        static_cast<const std::uint8_t*>(
+                            speculative_ple_scratch.contents)),
+                "invalid final speculative token must preserve PLE scratch and the parameter slot");
+        auto* const aliased_tokens =
+            static_cast<std::uint32_t*>(speculative_ple_scratch.contents);
+        auto* const aliased_samplers =
+            reinterpret_cast<WindowSamplerSettings*>(
+                static_cast<std::uint8_t*>(
+                    speculative_ple_scratch.contents) +
+                256u);
+        std::copy(generic_ple_tokens.begin(), generic_ple_tokens.end(),
+                  aliased_tokens);
+        std::copy(generic_ple_samplers.begin(),
+                  generic_ple_samplers.end(), aliased_samplers);
+        WindowSpeculativePreparedInput generic_prepared_ple_input;
+        require(prepare_window_speculative_input(
+                    *session, runtime_geometry, *full_mode, *params_ring,
+                    *scratch, 1u, 1u,
+                    std::span<const std::uint32_t>(aliased_tokens, 3u),
+                    std::span<const WindowSamplerSettings>(aliased_samplers,
+                                                           3u),
+                    0x11223344u, 0x55667788u, true,
+                    generic_prepared_ple_input, error),
+                "prepare T=3 speculative Window parameters from spans backed by PLE scratch: " +
+                    error);
+        const BufferRef generic_ple_t3_params =
+            generic_prepared_ple_input.params;
+        const BufferRef generic_ple_input =
+            generic_prepared_ple_input.ple_input;
+        require(generic_ple_t3_params && generic_ple_input &&
+                    generic_ple_input.length ==
+                        3u * N_EMBD * sizeof(float),
+                "T=3 speculative preparation publishes active PLE rows");
+        require(session->ple_token_id_suffix().size() ==
+                    committed_tokens.size() &&
+                    std::equal(committed_tokens.begin(),
+                               committed_tokens.end(),
+                               session->ple_token_id_suffix().begin()),
+                "T=3 speculative input preparation leaves committed PLE token history unchanged");
         strata::metal::WindowParams generic_ple_parameter_values{};
         std::memcpy(&generic_ple_parameter_values,
                     generic_ple_t3_params.contents,
                     sizeof(generic_ple_parameter_values));
         require(generic_ple_parameter_values.T == 3u &&
-                    generic_ple_parameter_values.nc == 4u,
-                "generic PLE producer separates active rows from compiled columns");
+                    generic_ple_parameter_values.nc == 4u &&
+                    generic_ple_parameter_values.pos0 == 1u &&
+                    generic_ple_parameter_values.n_keep == 0u &&
+                    std::equal(generic_ple_tokens.begin(),
+                               generic_ple_tokens.end(),
+                               generic_ple_parameter_values.tokens) &&
+                    generic_ple_parameter_values.samp[0].temperature ==
+                        sampler_settings.temperature &&
+                    generic_ple_parameter_values.samp[0].top_k ==
+                        sampler_settings.top_k &&
+                    generic_ple_parameter_values.samp[0].hist_len ==
+                        sampler_settings.hist_len,
+                "generic PLE preparation snapshots token and sampler spans before staging into aliased scratch");
         WindowPleRows generic_ple_rows;
         require(session->build_ple_rows(generic_ple_tokens,
                                          runtime_geometry, generic_ple_rows,
@@ -5130,11 +5203,15 @@ void run_fullmode_handoff_test(Context& context,
         require(generic_ple_reader != nullptr &&
                     generic_ple_reader->is_open(),
                 "resolve open FullMode PLE reader for T=3 rows");
-        BufferRef generic_ple_input;
-        require(stage_window_ple_input(*generic_ple_reader,
-                                       generic_ple_rows, *scratch,
-                                       generic_ple_input, error),
-                "stage T=3 generic PLE table rows: " + error);
+        std::vector<float> generic_ple_direct_rows(
+            3u * static_cast<std::size_t>(N_EMBD));
+        require(generic_ple_reader->gather_batch(
+                    generic_ple_rows.all_rows().data(), 3u,
+                    generic_ple_direct_rows.data(), error) &&
+                    std::memcmp(generic_ple_input.contents,
+                                generic_ple_direct_rows.data(),
+                                generic_ple_input.length) == 0,
+                "T=3 speculative PLE preparation matches a direct table gather");
         // This compact fixture has a one-token vocabulary. Keep its valid
         // staged allocation, then use distinct synthetic row values to expose
         // row broadcast and row ordering mistakes in the T=3 composition.
@@ -5321,11 +5398,31 @@ void run_fullmode_handoff_test(Context& context,
         const std::vector<std::uint32_t> t8_tokens(8u, 0u);
         const std::vector<WindowSamplerSettings> t8_samplers(
             t8_tokens.size(), sampler_settings);
-        const BufferRef t8_params = params_ring->build_slot(
-            0u, 1u, t8_tokens, t8_samplers, 0u, 0x10203040u,
-            0x50607080u, error);
-        require(static_cast<bool>(t8_params),
-                "build T=8 speculative embedding parameters: " + error);
+        WindowSpeculativePreparedInput t8_prepared_input;
+        require(prepare_window_speculative_input(
+                    *session, runtime_geometry, *full_mode, *params_ring,
+                    *scratch, 0u, 1u, t8_tokens, t8_samplers,
+                    0x10203040u, 0x50607080u, false, t8_prepared_input,
+                    error),
+                "prepare T=8 speculative Window parameters: " + error);
+        const BufferRef t8_params = t8_prepared_input.params;
+        strata::metal::WindowParams t8_parameter_values{};
+        std::memcpy(&t8_parameter_values, t8_params.contents,
+                    sizeof(t8_parameter_values));
+        require(t8_params && !t8_prepared_input.ple_input &&
+                    t8_parameter_values.T == 8u &&
+                    t8_parameter_values.nc == 8u &&
+                    t8_parameter_values.pos0 == 1u &&
+                    t8_parameter_values.n_keep == 0u &&
+                    std::equal(t8_tokens.begin(), t8_tokens.end(),
+                               t8_parameter_values.tokens),
+                "T=8 speculative preparation builds parameters without touching PLE history");
+        require(session->ple_token_id_suffix().size() ==
+                    committed_tokens.size() &&
+                    std::equal(committed_tokens.begin(),
+                               committed_tokens.end(),
+                               session->ple_token_id_suffix().begin()),
+                "T=8 no-PLE preparation does not advance committed PLE token history");
         constexpr std::size_t t8_tail_bytes = 64u;
         const std::size_t t8_embedding_active_bytes =
             8u * N_EMBD * sizeof(float);

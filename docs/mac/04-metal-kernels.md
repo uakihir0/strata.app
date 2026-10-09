@@ -2383,11 +2383,14 @@ embedding/stream tails, and rejects an invalid later token and nonzero `n_keep` 
 The T=3 FullMode-to-PLE integration now uses `encode_window_moe_full_mode_input_step`; standalone
 and caller-owned late PLE output failures verify transaction rollback, with the caller-owned test
 propagating false from its enclosing `Encoder::encode` body. `prepare_window_t1_input`
-builds the T=1 `WindowParams` ring slot and, for
-PLE, builds row IDs from the test token and committed history, then stages the sixteen IQ4_NL rows
-from the synthetic FullMode GGUF's mapped table. An uninitialized session is rejected without
+builds the legacy T=1 `WindowParams` ring slot and, for PLE, stages the sixteen IQ4_NL rows
+derived from the test token and committed history. An uninitialized session is rejected without
 changing the ring slot or PLE scratch. The test compares staged values against a direct table gather
-and verifies preparation leaves token history unchanged. It resolves the PLE projection, normalization and
+and verifies preparation leaves token history unchanged. The new
+`prepare_window_speculative_input` prepares T=3 PLE parameters and session-derived rows and T=8
+no-PLE parameters; an invalid final token preserves both the ring slot and staged-input scratch,
+successful T=3 staging matches a direct batch table gather, and token/sampler spans backed by the
+PLE output scratch retain their original values in the published parameters. It resolves the PLE projection, normalization and
 convolution weights from deterministic, correctly typed tensors in that sparse
 GGUF fixture and binds them through `ReadOnlyBufferRef`. These branch-specific
 tests do not select a production scheduler branch or establish parity against a
