@@ -658,6 +658,21 @@ int main(int argc, char** argv) {
                         projection_buffers.selected_token.contents() ==
                             selected_token_view.contents,
                     "MTP runtime binding preserves the separate GPU-produced T=1 token");
+            MtpAddStreamsBuffers add_streams_buffers;
+            require(provisional_runtime->bind_add_streams(
+                        *rollback_context, 9u, add_streams_buffers, error) &&
+                        add_streams_buffers.params.contents() ==
+                            provisional_params_slot.contents &&
+                        add_streams_buffers.h2.contents() ==
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::h2).contents &&
+                        add_streams_buffers.e2.contents() ==
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::e2).contents &&
+                        add_streams_buffers.output.handle ==
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::mtp_rin).handle,
+                    "MTP runtime binding resolves stage-6 input and residual views");
             const ReadOnlyBufferRef projection_token_source =
                 rollback_context->buffers().read_only(
                     provisional_params_slot.slice(
@@ -691,12 +706,15 @@ int main(int argc, char** argv) {
                                            no_memory, encode_error) &&
                                        encode_mtp_input_projection(
                                            *rollback_context, encoder,
-                                           projection_buffers, encode_error);
+                                           projection_buffers, encode_error) &&
+                                       encode_mtp_add_streams(
+                                           *rollback_context, encoder,
+                                           add_streams_buffers, encode_error);
                             },
                             error) &&
                         projection_command->commit(error) &&
                         projection_command->wait_until_completed(error),
-                    "dispatch MTP stages 1–5 after a GPU-produced selected token: " +
+                    "dispatch MTP stages 1–6 after a GPU-produced selected token: " +
                         error);
             MtpInputProjectionSources invalid_projection_sources =
                 projection_sources;
