@@ -303,7 +303,7 @@ column points to the specification. "Threads" is the manifest value.
 | `strata_pf_gdn_gates`, `strata_pf_gdn_conv_tiled`, `strata_pf_gdn_conv_hist`, `strata_pf_gdn_l2`, `strata_pf_gdn_rec`, `strata_pf_gdn_out_norm` | | 6.4 |
 | `strata_pf_gate_attn` | | 6.5 |
 | `strata_idx_append_first`, `strata_idx_append_blocks`, `strata_idx_append_tail` | | 6.5 |
-| `strata_pf_dequant_{iq4_nl,q2_0,q3_k,iq4_xs,q4_0,q4_k,q5_k,q5_0,q6_k,q8_0}` | these ten of the 11 dense formats; IQ3_S remains planned | 6.2 |
+| `strata_pf_dequant_{iq4_nl,q2_0,q3_k,iq4_xs,q4_0,q4_k,q5_k,q5_0,q6_k,q8_0,iq3_s}` | all 11 dense formats in the current inventory | 6.2 |
 | `strata_pf_gemm_f16` | `mpp`, `simd` | 6.2 |
 | `strata_pf_gemm_bf16` | `mpp`, `simd` | 6.2 |
 | `strata_pf_gemm_bf16_mpp` | isolated Apple10 MPP component; not the production selector | 6.2 |
@@ -3880,8 +3880,8 @@ Mac runs its own tiles. The projections:
 - **The routed experts** do not use these kernels. They dequantise inside their own tiles (section 6.6).
 
 The repository implements standalone IQ4_NL, Q2_0, Q3_K, IQ4_XS, Q4_0,
-Q4_K, Q5_K, Q5_0, Q6_K and Q8_0 variants as
-`strata_pf_dequant_{iq4_nl,q2_0,q3_k,iq4_xs,q4_0,q4_k,q5_k,q5_0,q6_k,q8_0}`,
+Q4_K, Q5_K, Q5_0, Q6_K, Q8_0 and IQ3_S variants as
+`strata_pf_dequant_{iq4_nl,q2_0,q3_k,iq4_xs,q4_0,q4_k,q5_k,q5_0,q6_k,q8_0,iq3_s}`,
 exposed by matching `encode_prefill_dequant_*` functions. IQ4_NL maps
 low/high nibbles through the 16-entry nonlinear codebook; Q2_0 expands
 64-value blocks by extracting four two-bit codes per byte and subtracting
@@ -3889,27 +3889,29 @@ one; Q3_K expands 256-value blocks from packed two-bit codes and a per-value
 high-bit mask, then applies packed six-bit scales for each 16-value group;
 IQ4_XS expands eight 32-value groups from packed low/high code nibbles and
 combines four-bit scale lows with two-bit scale highs before applying the
-16-entry nonlinear codebook; Q4_0 extracts low/high nibbles from each
-16-byte code array; Q4_K
-expands 256-value blocks using eight packed six-bit scale/min groups and
-low/high nibbles; Q5_K expands 256-value blocks by combining each nibble
-with the matching bit from its 5-bit `qh` plane and applying the packed
-six-bit scale/min groups; Q5_0 additionally reads the fourth-bit plane from
-`qh`; Q6_K combines a four-bit nibble with the matching two bits from `qh`,
-applies its signed 16-element scales, and subtracts the 32-value midpoint;
-Q8_0 reads signed bytes. Each applies its format's F32 dequantization
-expression, converts once to F16, and writes K-major scratch. The serial and
-concurrent GPU tests compare exact F16 bits from logical codes independent of
-the packed-block decoder, preserve the source, and check guards, invalid
-extents, aliases, Context ownership and transactional discard. IQ3_S and all
-production `Prefill::run` wiring remain open; these component tests do not
-establish end-to-end prefill or model inference.
+16-entry nonlinear codebook; IQ3_S expands 256-value, 110-byte blocks by
+combining `qs` bytes with the ninth grid-index bit from `qh`, selecting four
+unsigned magnitudes from the 512-entry grid, applying each subgroup's sign
+mask and multiplying by `d · (1 + 2·scale_nibble)`; Q4_0 extracts low/high
+nibbles from each 16-byte code array; Q4_K expands 256-value blocks using
+eight packed six-bit scale/min groups and low/high nibbles; Q5_K expands
+256-value blocks by combining each nibble with the matching bit from its
+5-bit `qh` plane and applying the packed six-bit scale/min groups; Q5_0
+additionally reads the fourth-bit plane from `qh`; Q6_K combines a four-bit
+nibble with the matching two bits from `qh`, applies its signed 16-element
+scales, and subtracts the 32-value midpoint; Q8_0 reads signed bytes. Each
+applies its format's F32 dequantization expression, converts once to F16, and
+writes K-major scratch. Serial and concurrent GPU tests compare exact F16
+bits with format-specific scalar/reference oracles, preserve the source, and
+check guards, invalid extents, aliases, Context ownership and transactional
+discard. Production `Prefill::run` wiring remains open; these component tests
+do not establish end-to-end prefill or model inference.
 
 **`strata_pf_dequant_<fmt>`**, one pipeline per implemented format of section
 5.8. Grid (⌈n_out / 256⌉, K / values_per_block) × 256: thread n = 256·tg.x +
 tid decodes block g = tg.y of row n; Q2_0 uses 64 values per block, Q3_K,
-IQ4_XS, Q4_K, Q5_K and Q6_K use 256, and the other implemented formats use
-32.
+    IQ3_S, IQ4_XS, Q4_K, Q5_K and Q6_K use 256, and the other implemented
+formats use 32.
 
 ```c++
 n = 256*tg.x + tid;  g = tg.y;

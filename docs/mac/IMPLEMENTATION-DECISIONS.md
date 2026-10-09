@@ -10721,3 +10721,55 @@ measuring L-15 remain open.
   mac-host passed 44 tests and skipped one real-input test because its model
   inputs are unavailable; `test_map` passed with the updated D-IMPL-372 and
   REV-169 references.
+
+### D-IMPL-373: Add the IQ3_S Prefill dequantizer
+
+- **Decision:** Add `strata_pf_dequant_iq3_s` and matching caller-owned and
+  standalone `encode_prefill_dequant_iq3_s` APIs. Decode the native
+  256-value, 110-byte block by combining each `qs` byte with the ninth grid
+  index bit from `qh`, reading four unsigned magnitudes from `iq3s_grid`,
+  applying the matching bit from the subgroup sign mask, and multiplying by
+  `d * (1 + 2 * scale_nibble)`. Evaluate in F32, round once to F16, and write
+  K-major `[k][n_out]` scratch.
+- **Reason:** IQ3_S was the last format missing from the current dense
+  Prefill dequantization inventory. The isolated conversion completes format
+  coverage at the component boundary; production `Prefill::run` scheduling
+  and inference remain separate open work.
+- **Review items:** Compare `qs`/`qh` indexing, both qh bits per eight-value
+  subgroup, all four bytes in each grid word, sign-mask bit order, packed
+  scale-nibble order and arithmetic against the Metal embedding decoder,
+  CUDA reference and scalar oracle. Confirm that fixtures expose lane and
+  record errors across the 257-column, two-block geometry, and retain the
+  extent, alignment, ownership, overlap, immutability, guard, rollback,
+  manifest and progress-documentation checks.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the mac-dev build succeeded and the full `mac-metal` suite passed
+  90/90 after adding IQ3_S. After strengthening the oracle, focused
+  serial/concurrent tests passed 2/2. A negative control that reversed the
+  four-byte grid lane failed the exact F16 comparison; restoring the kernel
+  passed both focused tests. The review finding and disposition are recorded
+  in REV-170.
+
+### REV-170: Hostile review of IQ3_S Prefill dequantization
+
+- **Scope:** IQ3_S's 256-value/110-byte block, `qs` and `qh` grid-index
+  reconstruction, four-byte grid lanes, sign masks, packed scales, F32
+  arithmetic and F16 conversion; checked host dispatch, test-fixture
+  independence, manifest and documentation.
+- **Findings and fixes:** The first review verified the kernel against the
+  Metal embedding and CUDA references but found that the scalar oracle reused
+  the kernel's value-indexed record/lane mapping. The oracle now decodes the
+  actual fixture bytes by walking each pair of four-value grid words and
+  scattering those quartets into K order. This separates expected values from
+  the fixture's logical index generator and the GPU's per-value mapping. A
+  negative control that reverses the GPU grid-byte lane fails the exact F16
+  assertion.
+- **Disposition:** No decode defect was found. The oracle-independence finding
+  is fixed; the remaining kernel, host-validation, layout and arithmetic
+  checks matched the reference contracts. IQ3_S remains an isolated
+  dequantizer; production `Prefill::run` and model-backed inference remain
+  open.
+- **Validation:** The mac-dev build and full `mac-metal` suite passed 90/90
+  before the oracle refinement. The rebuilt serial/concurrent IQ3_S tests
+  passed 2/2 afterwards; the reversed-lane negative control failed as
+  expected. `git diff --check` and `test_map` are recorded with this change.
