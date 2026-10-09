@@ -10,6 +10,8 @@
 #include "strata/metal/qsa_dispatch.hpp"
 #include "strata/metal/sampler_dispatch.hpp"
 
+#include "mv_dispatch_internal.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -1073,11 +1075,6 @@ bool validate_mtp_window_ids(Context& context,
                              std::uint32_t& active_width,
                              std::string& error) {
     constexpr char operation[] = "MTP window IDs";
-    if (buffers.window == 0u) {
-        error = std::string(operation) +
-                " requires a positive finite window";
-        return false;
-    }
     if (buffers.window >
         static_cast<std::uint32_t>(
             std::numeric_limits<std::int32_t>::max())) {
@@ -1126,12 +1123,14 @@ bool validate_mtp_window_ids(Context& context,
                 " StepRow n_kv must be positive";
         return false;
     }
-    active_width = std::min(static_cast<std::uint32_t>(step.n_kv),
-                            buffers.window);
+    const std::uint32_t n_kv = static_cast<std::uint32_t>(step.n_kv);
+    active_width = buffers.window == 0u
+                       ? n_kv
+                       : std::min(n_kv, buffers.window);
     if (step.width < 0 ||
         static_cast<std::uint32_t>(step.width) != active_width) {
         error = std::string(operation) +
-                " StepRow width does not match n_kv and the finite window";
+                " StepRow width does not match n_kv and the selected window";
         return false;
     }
     if (active_width > id_capacity) {
@@ -2405,8 +2404,6 @@ bool encode_mtp_routed_experts(
     constexpr std::size_t ids_bytes =
         static_cast<std::size_t>(kMtpRoutedExpertTopK) *
         sizeof(std::int32_t);
-    constexpr std::size_t expert_blob_bytes =
-        static_cast<std::size_t>(kMtpExpertsFileBytes);
     constexpr std::size_t q8_mixed_bytes =
         static_cast<std::size_t>(N_EMBD);
     constexpr std::size_t q8_mixed_scales_bytes =
@@ -2423,15 +2420,13 @@ bool encode_mtp_routed_experts(
         static_cast<std::size_t>(kMtpRoutedExpertTopK) * N_EMBD *
         sizeof(float);
 
-    const std::array<std::pair<const char*, ReadOnlyBufferRef>, 3> inputs{{
+    const std::array<std::pair<const char*, ReadOnlyBufferRef>, 2> inputs{{
         {"mixed", buffers.mixed},
         {"route IDs", buffers.ids},
-        {"expert blob", buffers.expert_blob},
     }};
-    const std::array<std::size_t, 3> input_bytes{
-        mixed_bytes, ids_bytes, expert_blob_bytes};
-    const std::array<std::size_t, 3> input_alignments{
-        alignof(float), alignof(std::int32_t), alignof(std::uint32_t)};
+    const std::array<std::size_t, 2> input_bytes{mixed_bytes, ids_bytes};
+    const std::array<std::size_t, 2> input_alignments{
+        alignof(float), alignof(std::int32_t)};
     for (std::size_t index = 0u; index < inputs.size(); ++index) {
         if (!validate_read_only_buffer(
                 context, inputs[index].second, input_bytes[index],
@@ -2448,6 +2443,69 @@ bool encode_mtp_routed_experts(
                 return false;
             }
         }
+    }
+
+    std::vector<MtpExpertBlobWindow> expert_windows;
+    if (!buffers.expert_windows.empty()) {
+        if (buffers.expert_blob) {
+            error = std::string(operation) +
+                    " accepts either a complete expert image or expert windows";
+            return false;
+        }
+        expert_windows = buffers.expert_windows;
+    } else {
+        expert_windows.push_back(
+            {buffers.expert_blob, 0u, kMtpExpertCount});
+    }
+    std::uint32_t next_expert = 0u;
+    for (std::size_t index = 0u; index < expert_windows.size(); ++index) {
+        const MtpExpertBlobWindow& window = expert_windows[index];
+        if (window.expert_count == 0u ||
+            window.first_expert != next_expert ||
+            window.expert_count > kMtpExpertCount - next_expert) {
+            error = std::string(operation) +
+                    " expert windows must cover the expert table in order";
+            return false;
+        }
+        const std::size_t window_bytes =
+            static_cast<std::size_t>(window.expert_count) *
+            static_cast<std::size_t>(kMtpExpertBlobBytes);
+        const std::string name =
+            "expert window " + std::to_string(index);
+        if (!validate_read_only_buffer(
+                context, window.bytes, window_bytes, alignof(std::uint32_t),
+                name.c_str(), operation, error)) {
+            return false;
+        }
+        for (std::size_t input_index = 0u;
+             input_index < inputs.size(); ++input_index) {
+            const auto& input = inputs[input_index];
+            if (overlaps(input.second, input_bytes[input_index],
+                         window.bytes, window_bytes)) {
+                error = std::string(operation) + " input " + input.first +
+                        " overlaps " + name;
+                return false;
+            }
+        }
+        for (std::size_t prior = 0u; prior < index; ++prior) {
+            const MtpExpertBlobWindow& prior_window =
+                expert_windows[prior];
+            const std::size_t prior_bytes =
+                static_cast<std::size_t>(prior_window.expert_count) *
+                static_cast<std::size_t>(kMtpExpertBlobBytes);
+            if (overlaps(window.bytes, window_bytes, prior_window.bytes,
+                         prior_bytes)) {
+                error = std::string(operation) +
+                        " expert windows overlap";
+                return false;
+            }
+        }
+        next_expert += window.expert_count;
+    }
+    if (next_expert != kMtpExpertCount) {
+        error = std::string(operation) +
+                " expert windows do not cover all 512 experts";
+        return false;
     }
 
     const std::array<std::pair<const char*, BufferRef>, 8> outputs{{
@@ -2477,6 +2535,18 @@ bool encode_mtp_routed_experts(
                 error = std::string(operation) + " output " +
                         outputs[index].first + " overlaps input " +
                         inputs[input].first;
+                return false;
+            }
+        }
+        for (const MtpExpertBlobWindow& window : expert_windows) {
+            const std::size_t window_bytes =
+                static_cast<std::size_t>(window.expert_count) *
+                static_cast<std::size_t>(kMtpExpertBlobBytes);
+            if (overlaps(window.bytes, window_bytes,
+                         outputs[index].second, output_bytes[index])) {
+                error = std::string(operation) + " output " +
+                        outputs[index].first +
+                        " overlaps an expert input window";
                 return false;
             }
         }
@@ -2513,32 +2583,51 @@ bool encode_mtp_routed_experts(
         return false;
     }
 
-    const std::array routed_read_only{
-        EncoderReadOnlyBufferBinding{buffers.ids, 0u, ids_bytes,
-                                     alignof(std::int32_t)},
-        EncoderReadOnlyBufferBinding{buffers.expert_blob, 1u,
-                                     expert_blob_bytes,
-                                     alignof(std::uint32_t)},
-        EncoderReadOnlyBufferBinding{context.buffers().read_only(buffers.mq),
-                                     2u, q8_mixed_bytes,
-                                     alignof(std::uint32_t)},
-        EncoderReadOnlyBufferBinding{context.buffers().read_only(buffers.ms),
-                                     3u, q8_mixed_scales_bytes,
-                                     alignof(float)},
-    };
     const std::array routed_writable{
         EncoderBufferBinding{buffers.gate, 4u, routed_hidden_bytes,
                              alignof(float)},
         EncoderBufferBinding{buffers.up, 5u, routed_hidden_bytes,
                              alignof(float)},
     };
-    if (!encoder.dispatch("strata_mtp_gu_s2",
-                          {kMtpRoutedExpertGroups,
-                           kMtpRoutedExpertTopK, 1u},
-                          {kMtpRoutedExpertThreads, 1u, 1u},
-                          routed_writable, routed_read_only, {}, {},
-                          error)) {
+    const auto mixed_q8_read_only =
+        context.buffers().read_only(buffers.mq);
+    const auto mixed_scales_read_only =
+        context.buffers().read_only(buffers.ms);
+    if (!mixed_q8_read_only || !mixed_scales_read_only) {
+        error = std::string(operation) +
+                " could not form read-only mixed activation views";
         return false;
+    }
+    for (const MtpExpertBlobWindow& window : expert_windows) {
+        const std::size_t window_bytes =
+            static_cast<std::size_t>(window.expert_count) *
+            static_cast<std::size_t>(kMtpExpertBlobBytes);
+        const std::array routed_read_only{
+            EncoderReadOnlyBufferBinding{buffers.ids, 0u, ids_bytes,
+                                         alignof(std::int32_t)},
+            EncoderReadOnlyBufferBinding{window.bytes, 1u, window_bytes,
+                                         alignof(std::uint32_t)},
+            EncoderReadOnlyBufferBinding{mixed_q8_read_only, 2u,
+                                         q8_mixed_bytes,
+                                         alignof(std::uint32_t)},
+            EncoderReadOnlyBufferBinding{mixed_scales_read_only, 3u,
+                                         q8_mixed_scales_bytes,
+                                         alignof(float)},
+        };
+        const std::array<std::uint32_t, 2> expert_range{
+            window.first_expert, window.expert_count};
+        const EncoderBytesBinding expert_range_binding{
+            expert_range.data(), sizeof(expert_range), 6u};
+        if (!encoder.dispatch(
+                "strata_mtp_gu_s2",
+                {kMtpRoutedExpertGroups, kMtpRoutedExpertTopK, 1u},
+                {kMtpRoutedExpertThreads, 1u, 1u},
+                routed_writable, routed_read_only,
+                std::span<const EncoderBytesBinding>(
+                    &expert_range_binding, 1u),
+                no_threadgroup_memory, error)) {
+            return false;
+        }
     }
 
     const auto gate_read_only = context.buffers().read_only(buffers.gate);
@@ -2600,29 +2689,42 @@ bool encode_mtp_routed_experts(
                 " could not form read-only quantized activation views";
         return false;
     }
-    const std::array down_read_only{
-        EncoderReadOnlyBufferBinding{buffers.ids, 0u, ids_bytes,
-                                     alignof(std::int32_t)},
-        EncoderReadOnlyBufferBinding{buffers.expert_blob, 1u,
-                                     expert_blob_bytes,
-                                     alignof(std::uint32_t)},
-        EncoderReadOnlyBufferBinding{hq_read_only, 2u,
-                                     routed_hidden_q8_bytes,
-                                     alignof(std::uint32_t)},
-        EncoderReadOnlyBufferBinding{hs_read_only, 3u,
-                                     routed_hidden_scales_bytes,
-                                     alignof(float)},
-    };
     const std::array down_writable{
         EncoderBufferBinding{buffers.parts, 4u, parts_bytes,
                              alignof(float)},
     };
-    return encoder.dispatch("strata_mtp_down_s2",
-                            {kMtpRoutedExpertGroups,
-                             kMtpRoutedExpertTopK, 1u},
-                            {kMtpRoutedExpertThreads, 1u, 1u},
-                            down_writable, down_read_only, {}, {},
-                            error);
+    for (const MtpExpertBlobWindow& window : expert_windows) {
+        const std::size_t window_bytes =
+            static_cast<std::size_t>(window.expert_count) *
+            static_cast<std::size_t>(kMtpExpertBlobBytes);
+        const std::array down_read_only{
+            EncoderReadOnlyBufferBinding{buffers.ids, 0u, ids_bytes,
+                                         alignof(std::int32_t)},
+            EncoderReadOnlyBufferBinding{window.bytes, 1u, window_bytes,
+                                         alignof(std::uint32_t)},
+            EncoderReadOnlyBufferBinding{hq_read_only, 2u,
+                                         routed_hidden_q8_bytes,
+                                         alignof(std::uint32_t)},
+            EncoderReadOnlyBufferBinding{hs_read_only, 3u,
+                                         routed_hidden_scales_bytes,
+                                         alignof(float)},
+        };
+        const std::array<std::uint32_t, 2> expert_range{
+            window.first_expert, window.expert_count};
+        const EncoderBytesBinding expert_range_binding{
+            expert_range.data(), sizeof(expert_range), 6u};
+        if (!encoder.dispatch(
+                "strata_mtp_down_s2",
+                {kMtpRoutedExpertGroups, kMtpRoutedExpertTopK, 1u},
+                {kMtpRoutedExpertThreads, 1u, 1u},
+                down_writable, down_read_only,
+                std::span<const EncoderBytesBinding>(
+                    &expert_range_binding, 1u),
+                no_threadgroup_memory, error)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool encode_mtp_routed_experts(
@@ -3247,7 +3349,7 @@ bool encode_mtp_draft_head(Context& context, Encoder& encoder,
             buffers.matvec_sink,
             buffers.draft_vocabulary.rows(),
         };
-        return encode_indexed_head_matvec(
+        return encode_indexed_head_matvec_prevalidated(
             context, encoder, weight_format, N_EMBD, head_vocab_size,
             output_rows, matvec, error);
     }

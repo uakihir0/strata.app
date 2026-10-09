@@ -79,8 +79,11 @@ struct Fixture {
         block.step[0].n_kv = n_kv;
         block.step[0].width =
             n_kv > 0
-                ? static_cast<std::int32_t>(std::min<std::uint32_t>(
-                      static_cast<std::uint32_t>(n_kv), window))
+                ? static_cast<std::int32_t>(
+                      window == 0u
+                          ? static_cast<std::uint32_t>(n_kv)
+                          : std::min<std::uint32_t>(
+                                static_cast<std::uint32_t>(n_kv), window))
                 : 0;
         std::memcpy(params.payload().data(), &block, sizeof(block));
         std::fill(typed<std::int32_t>(mtp_ids).begin(),
@@ -129,8 +132,10 @@ bool execute_case(Context& context, Fixture& fixture, std::int32_t n_kv,
     fixture.initialize(n_kv, window);
     fixture.capture();
     const auto buffers = fixture.buffers(context, window);
-    const std::uint32_t width = std::min(
-        static_cast<std::uint32_t>(n_kv), window);
+    const std::uint32_t width =
+        window == 0u
+            ? static_cast<std::uint32_t>(n_kv)
+            : std::min(static_cast<std::uint32_t>(n_kv), window);
     const std::uint32_t start = static_cast<std::uint32_t>(n_kv) - width;
 
     std::string error;
@@ -182,6 +187,55 @@ bool execute_case(Context& context, Fixture& fixture, std::int32_t n_kv,
     return ids_match && tail_unchanged && guards_ok;
 }
 
+bool test_finite_to_unwindowed_reset(Context& context, Fixture& fixture) {
+    if (!execute_case(context, fixture, 9, 4u, false)) {
+        return false;
+    }
+
+    MtpParams block{};
+    block.T = 1u;
+    block.step[0].n_kv = 9;
+    block.step[0].width = 9;
+    std::memcpy(fixture.params.payload().data(), &block, sizeof(block));
+    fixture.capture();
+    const auto buffers = fixture.buffers(context, 0u);
+    std::string error;
+    auto command = context.make_command_buffer(
+        "MTP stage-12 finite-to-unwindowed reset", error);
+    const bool encoded = command &&
+        encode_mtp_window_ids(context, *command, buffers, error);
+    check(encoded, "MTP stage 12 accepts zero as the unwindowed pass", error);
+    if (!encoded) return false;
+    const bool completed = submit_and_wait(
+        command, "MTP stage-12 finite-to-unwindowed reset", error);
+    check(completed,
+          "MTP stage-12 finite-to-unwindowed reset GPU completion", error);
+    if (!completed) return false;
+
+    const auto actual = std::span<const std::int32_t>(
+        typed<std::int32_t>(fixture.mtp_ids));
+    bool identity = true;
+    for (std::uint32_t index = 0u; index < 9u; ++index) {
+        identity &= actual[index] == static_cast<std::int32_t>(index);
+    }
+    const bool tail_unchanged =
+        std::all_of(actual.begin() + 9u, actual.end(),
+                    [](std::int32_t value) { return value == kSentinel; });
+    const std::array<twin::ByteRange, 1> written{{
+        {0u, 9u * sizeof(std::int32_t)},
+    }};
+    const bool guards_ok =
+        fixture.inputs_unchanged() &&
+        !fixture.mtp_ids.first_unwritten_change(written);
+    check(identity,
+          "MTP stage 12 refreshes stale finite-window IDs to identity");
+    check(tail_unchanged,
+          "MTP stage 12 leaves the unwindowed inactive suffix untouched");
+    check(guards_ok,
+          "MTP stage-12 reset preserves params and allocation guards");
+    return identity && tail_unchanged && guards_ok;
+}
+
 bool reject_case(Context& context, const MtpWindowIdsBuffers& buffers,
                  const std::string& label,
                  std::string_view expected_error = {}) {
@@ -217,10 +271,18 @@ bool test_validation(Context& context, Context& foreign_context,
                           "MTP stage 12 rejects T=2",
                           "requires T=1");
 
-    fixture.initialize(3, kDefaultWindow);
+    fixture.initialize(3, 0u);
+    MtpParams zero_window_width_mismatch{};
+    zero_window_width_mismatch.T = 1u;
+    zero_window_width_mismatch.step[0].n_kv = 3;
+    zero_window_width_mismatch.step[0].width = 0;
+    std::memcpy(fixture.params.payload().data(),
+                &zero_window_width_mismatch,
+                sizeof(zero_window_width_mismatch));
     buffers = fixture.buffers(context, 0u);
-    passed &= reject_case(context, buffers, "MTP stage 12 rejects no window",
-                          "positive finite window");
+    passed &= reject_case(context, buffers,
+                          "MTP stage 12 rejects a zero-window width mismatch",
+                          "StepRow width does not match");
     buffers = fixture.buffers(context, kDefaultWindow + 1u);
     passed &= reject_case(context, buffers, "MTP stage 12 rejects a window "
                                              "larger than ID capacity",
@@ -364,7 +426,7 @@ bool test_late_rollback(Context& context, Fixture& fixture) {
     fixture.capture();
     const auto good = fixture.buffers(context, kDefaultWindow);
     auto bad = good;
-    bad.window = 0u;
+    bad.window = kIdCapacity + 1u;
 
     std::string error;
     auto command = context.make_command_buffer("MTP stage-12 rollback", error);
@@ -427,6 +489,7 @@ int main(int argc, char** argv) {
     if (!expanded_allocated) return 1;
 
     bool passed = execute_case(*context, fixture, 3, 64u, false);
+    passed &= execute_case(*context, fixture, 3, 0u, false);
     passed &= execute_case(*context, fixture, 64, 64u, false);
     passed &= execute_case(*context, fixture, 75, 64u, false);
     passed &= execute_case(*context, fixture, 262'144, 64u, false);
@@ -436,6 +499,7 @@ int main(int argc, char** argv) {
         *context, fixture, std::numeric_limits<std::int32_t>::max(), 1u,
         false);
     passed &= execute_case(*context, fixture, 75, 64u, true);
+    passed &= test_finite_to_unwindowed_reset(*context, fixture);
     passed &= test_validation(*context, *foreign_context, fixture);
     passed &= test_concurrent_group_boundary(*context, fixture);
     passed &= test_late_rollback(*context, fixture);

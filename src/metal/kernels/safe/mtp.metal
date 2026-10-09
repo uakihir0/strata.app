@@ -34,8 +34,8 @@ kernel void strata_mtp_window_ids(
     uint3 tid3 [[thread_position_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]]) {
     const uint n_kv = uint(params->step[0].n_kv);
-    const uint start = n_kv > window ? n_kv - window : 0u;
-    const uint width = n_kv - start;
+    const uint width = window == 0u ? n_kv : min(n_kv, window);
+    const uint start = n_kv - width;
 
     for (uint index = 256u * group.x + tid3.x; index < width;
          index += 2048u) {
@@ -99,11 +99,15 @@ kernel void strata_mtp_gu_s2(
     device const float* input_scales [[buffer(3)]],
     device float* gate [[buffer(4)]],
     device float* up [[buffer(5)]],
+    constant uint2& expert_range [[buffer(6)]],
     uint tid [[thread_index_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]]) {
     const uint rank = group.y;
     const int expert = ids[rank];
-    if (expert < 0 || expert >= 512) return;
+    if (expert < 0 || uint(expert) < expert_range.x ||
+        uint(expert) - expert_range.x >= expert_range.y) {
+        return;
+    }
 
     threadgroup int activations[640];
     threadgroup float scales[80];
@@ -120,7 +124,7 @@ kernel void strata_mtp_gu_s2(
     const uint warp = tid / 32u;
     const uint lane = tid % 32u;
     const device uchar* blob =
-        expert_blob + uint(expert) * 1'382'400u;
+        expert_blob + (uint(expert) - expert_range.x) * 1'382'400u;
     for (uint row_in_group = warp; row_in_group < 32u;
          row_in_group += 8u) {
         const uint slot = 32u * group.x + row_in_group;
@@ -169,11 +173,15 @@ kernel void strata_mtp_down_s2(
     device const char* input_codes [[buffer(2)]],
     device const float* input_scales [[buffer(3)]],
     device float* parts [[buffer(4)]],
+    constant uint2& expert_range [[buffer(6)]],
     uint tid [[thread_index_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]]) {
     const uint rank = group.y;
     const int expert = ids[rank];
-    if (expert < 0 || expert >= 512) return;
+    if (expert < 0 || uint(expert) < expert_range.x ||
+        uint(expert) - expert_range.x >= expert_range.y) {
+        return;
+    }
 
     threadgroup int activations[160];
     threadgroup float scales[20];
@@ -190,7 +198,7 @@ kernel void strata_mtp_down_s2(
     const uint warp = tid / 32u;
     const uint lane = tid % 32u;
     const device uchar* blob =
-        expert_blob + uint(expert) * 1'382'400u;
+        expert_blob + (uint(expert) - expert_range.x) * 1'382'400u;
     for (uint row_in_group = warp; row_in_group < 64u;
          row_in_group += 8u) {
         const uint row = 64u * group.x + row_in_group;

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace strata::metal {
 
@@ -168,12 +169,14 @@ struct MtpAttentionQueryNormBuffers {
     bool kv_rot = false;
 };
 
-/// Inputs and output for MTP stage 12's finite-window ID generation.
+/// Inputs and output for MTP stage 12's attention ID generation. A zero
+/// `window` writes the full identity prefix for an unwindowed pass; a
+/// positive value writes the suffix positions for a finite window.
 /// `params` is an immutable CPU-visible T=1 MtpParams block whose first
 /// StepRow contains the host-published `n_kv` and matching `width`. `mtp_ids`
-/// is the named int32 ID region with capacity at least `window`; only its
-/// active prefix is written. Keep both views alive through completion and
-/// keep params unchanged while the GPU reads it.
+/// is the named int32 ID region with capacity for the active prefix; only
+/// that prefix is written. Keep both views alive through completion and keep
+/// params unchanged while the GPU reads it.
 struct MtpWindowIdsBuffers {
     ReadOnlyBufferRef params;
     BufferRef mtp_ids;
@@ -251,11 +254,19 @@ struct MtpRouterBuffers {
     BufferRef matvec_sink;
 };
 
-/// Inputs and intermediate outputs for MTP stage 17. `expert_blob` must be
-/// one contiguous, complete S2 experts.bin image. `ids` contains ten device
-/// produced expert IDs from stage 16. All writable views must be disjoint
-/// from one another and from the inputs. Keep all views alive through GPU
-/// completion; the standalone command-buffer form is transactional.
+/// One contiguous range of complete MTP S2 expert blobs.
+struct MtpExpertBlobWindow {
+    ReadOnlyBufferRef bytes;
+    std::uint32_t first_expert = 0;
+    std::uint32_t expert_count = 0;
+};
+
+/// Inputs and intermediate outputs for MTP stage 17. Supply either one
+/// complete `expert_blob` or `expert_windows`, whose ordered ranges must cover
+/// all 512 experts without gaps. `ids` contains ten device-produced expert
+/// IDs from stage 16. All writable views must be disjoint from one another
+/// and from the inputs. Keep all views alive through GPU completion; the
+/// standalone command-buffer form is transactional.
 struct MtpRoutedExpertsBuffers {
     ReadOnlyBufferRef mixed;
     ReadOnlyBufferRef ids;
@@ -268,6 +279,7 @@ struct MtpRoutedExpertsBuffers {
     BufferRef hq;
     BufferRef hs;
     BufferRef parts;
+    std::vector<MtpExpertBlobWindow> expert_windows;
 };
 
 /// MTP stages 18–19: shared-expert inputs/scratch plus the residual write.
@@ -379,10 +391,11 @@ bool encode_mtp_attention_query_norm(
     Context& context, CommandBuffer& command_buffer,
     const MtpAttentionQueryNormBuffers& buffers, std::string& error);
 
-/// Encode MTP stage 12 for a finite window. The active ID prefix contains
-/// absolute KV cell positions from max(0, n_kv - window) to n_kv. Both forms
-/// require an ordered concurrent-group boundary; the standalone form is
-/// transactional and caller-owned failures must be propagated.
+/// Encode MTP stage 12. A zero window refreshes the full identity prefix so
+/// a previous finite-window pass cannot leave stale IDs; a positive window
+/// writes positions from max(0, n_kv - window) to n_kv. Both forms require
+/// an ordered concurrent-group boundary; the standalone form is transactional
+/// and caller-owned failures must be propagated.
 bool encode_mtp_window_ids(Context& context, Encoder& encoder,
                            const MtpWindowIdsBuffers& buffers,
                            std::string& error);

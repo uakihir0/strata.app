@@ -166,14 +166,12 @@ struct Oracle {
     std::vector<float> parts;
 
     void build(std::span<const float> mixed,
-               std::span<const std::int32_t> ids,
-               const std::uint8_t* expert_blob) {
+               const std::array<std::vector<std::uint8_t>, kTopK>& expert_blobs) {
         quantize_q8_scaled(mixed, mixed_q8, mixed_scales);
         gate.assign(kHiddenValues, 0.0f);
         up.assign(kHiddenValues, 0.0f);
         for (std::size_t rank = 0u; rank < kTopK; ++rank) {
-            const std::size_t expert_base =
-                static_cast<std::size_t>(ids[rank]) * kExpertBlobBytes;
+            const std::uint8_t* expert_blob = expert_blobs[rank].data();
             for (std::uint32_t slot = 0u;
                  slot < 2u * kExpertHiddenWidth; ++slot) {
                 std::array<float, 32u> lanes{};
@@ -181,14 +179,14 @@ struct Oracle {
                     for (std::uint32_t chunk = lane; chunk < 80u;
                          chunk += 32u) {
                         const std::size_t codes_offset =
-                            expert_base + kExpertGateUpCodesOffset +
+                            kExpertGateUpCodesOffset +
                             static_cast<std::size_t>(slot) * 640u +
                             static_cast<std::size_t>(chunk) * 8u;
                         const int dot = s2_chunk_dot(
                             expert_blob + codes_offset,
                             mixed_q8.data() + chunk * kQuantBlock);
                         const std::size_t scale_offset =
-                            expert_base + kExpertGateUpScalesOffset +
+                            kExpertGateUpScalesOffset +
                             static_cast<std::size_t>(slot) * 80u +
                             2u * (chunk >> 1u);
                         const float weight_scale =
@@ -216,13 +214,12 @@ struct Oracle {
         parts.assign(static_cast<std::size_t>(kTopK) * kExpertInputWidth,
                      0.0f);
         for (std::size_t rank = 0u; rank < kTopK; ++rank) {
-            const std::size_t expert_base =
-                static_cast<std::size_t>(ids[rank]) * kExpertBlobBytes;
+            const std::uint8_t* expert_blob = expert_blobs[rank].data();
             for (std::uint32_t row = 0u; row < kExpertInputWidth; ++row) {
                 std::array<float, 32u> lanes{};
                 for (std::uint32_t lane = 0u; lane < 20u; ++lane) {
                     const std::size_t codes_offset =
-                        expert_base + kExpertDownCodesOffset +
+                        kExpertDownCodesOffset +
                         static_cast<std::size_t>(row) * 160u +
                         static_cast<std::size_t>(lane) * 8u;
                     const int dot = s2_chunk_dot(
@@ -231,7 +228,7 @@ struct Oracle {
                             rank * kExpertHiddenWidth +
                             lane * kQuantBlock);
                     const std::size_t scale_offset =
-                        expert_base + kExpertDownScalesOffset +
+                        kExpertDownScalesOffset +
                         static_cast<std::size_t>(row) * 20u +
                         2u * (lane >> 1u);
                     const float weight_scale =
@@ -253,30 +250,78 @@ struct Fixture {
     twin::GuardedBuffer ids;
     std::array<twin::GuardedBuffer, kOutputCount> outputs;
     BufferRef expert_blob;
+    std::vector<BufferRef> expert_window_buffers;
+    std::vector<MtpExpertBlobWindow> expert_windows;
+    std::array<std::vector<std::uint8_t>, kTopK> selected_expert_data;
     std::vector<std::uint8_t> selected_experts_before;
     Oracle oracle;
 
     BufferRef output(OutputIndex index) { return outputs[index].view(); }
 
+    BufferRef expert_view(std::uint32_t expert_id) const {
+        if (expert_id >= kMtpExpertCount) return {};
+        if (expert_blob) {
+            return expert_blob.slice(
+                static_cast<std::size_t>(expert_id) * kExpertBlobBytes,
+                kExpertBlobBytes);
+        }
+        for (std::size_t index = 0u; index < expert_windows.size(); ++index) {
+            const MtpExpertBlobWindow& window = expert_windows[index];
+            if (expert_id >= window.first_expert &&
+                expert_id - window.first_expert < window.expert_count) {
+                const std::size_t local =
+                    static_cast<std::size_t>(expert_id - window.first_expert);
+                return expert_window_buffers[index].slice(
+                    local * kExpertBlobBytes, kExpertBlobBytes);
+            }
+        }
+        return {};
+    }
+
     MtpRoutedExpertsBuffers buffers(Context& context) {
-        return {context.buffers().read_only(mixed.view()),
-                context.buffers().read_only(ids.view()),
-                context.buffers().read_only(expert_blob),
-                output(kMixedQ8),
-                output(kMixedScales),
-                output(kGate),
-                output(kUp),
-                output(kSwiGlu),
-                output(kHiddenQ8),
-                output(kHiddenScales),
-                output(kParts)};
+        MtpRoutedExpertsBuffers result{
+            context.buffers().read_only(mixed.view()),
+            context.buffers().read_only(ids.view()),
+            context.buffers().read_only(expert_blob),
+            output(kMixedQ8),
+            output(kMixedScales),
+            output(kGate),
+            output(kUp),
+            output(kSwiGlu),
+            output(kHiddenQ8),
+            output(kHiddenScales),
+            output(kParts),
+            {}};
+        if (!expert_blob) result.expert_windows = expert_windows;
+        return result;
+    }
+
+    MtpRoutedExpertsBuffers windowed_buffers(Context& context) {
+        MtpRoutedExpertsBuffers result = buffers(context);
+        if (!expert_blob) return result;
+        result.expert_blob = {};
+        constexpr std::array<std::uint32_t, 4> boundaries{0u, 4u, 9u, 512u};
+        for (std::size_t index = 0u; index + 1u < boundaries.size(); ++index) {
+            const std::uint32_t first = boundaries[index];
+            const std::uint32_t count = boundaries[index + 1u] - first;
+            const std::size_t offset =
+                static_cast<std::size_t>(first) * kExpertBlobBytes;
+            const std::size_t bytes =
+                static_cast<std::size_t>(count) * kExpertBlobBytes;
+            const BufferRef window = expert_blob.slice(offset, bytes);
+            result.expert_windows.push_back(
+                {context.buffers().read_only(window), first, count});
+        }
+        return result;
     }
 
     bool allocate(Context& context) {
         std::string error;
-        if (context.device_facts().max_buffer_length < kMtpExpertsFileBytes) {
-            check(false, "complete S2 expert image fits maxBufferLength",
-                  "MTP stage 17 currently binds the complete contiguous 675 MiB file");
+        const std::uint64_t max_buffer_length =
+            context.device_facts().max_buffer_length;
+        if (max_buffer_length < kExpertBlobBytes) {
+            check(false, "one S2 expert blob fits maxBufferLength",
+                  "the device cannot hold even one complete MTP expert");
             return false;
         }
         if (!mixed.allocate(context, "MTP stage 17 mixed", kMixedBytes,
@@ -297,14 +342,41 @@ struct Fixture {
                 return false;
             }
         }
-        expert_blob = context.buffers().allocate(
-            "MTP stage 17 complete S2 expert image",
-            static_cast<std::size_t>(kMtpExpertsFileBytes), error);
-        if (!expert_blob || expert_blob.contents == nullptr) {
-            check(false, "MTP stage 17 complete expert-image allocation",
-                  error.empty() ? "CPU-visible shared mapping unavailable"
-                                : error);
-            return false;
+        if (max_buffer_length >= kMtpExpertsFileBytes) {
+            expert_blob = context.buffers().allocate(
+                "MTP stage 17 complete S2 expert image",
+                static_cast<std::size_t>(kMtpExpertsFileBytes), error);
+            if (!expert_blob || expert_blob.contents == nullptr) {
+                check(false, "MTP stage 17 complete expert-image allocation",
+                      error.empty() ? "CPU-visible shared mapping unavailable"
+                                    : error);
+                return false;
+            }
+        } else {
+            const std::uint64_t experts_per_window =
+                max_buffer_length / kExpertBlobBytes;
+            for (std::uint32_t first = 0u; first < kMtpExpertCount;) {
+                const std::uint32_t count = static_cast<std::uint32_t>(
+                    std::min<std::uint64_t>(
+                        experts_per_window, kMtpExpertCount - first));
+                const std::size_t bytes =
+                    static_cast<std::size_t>(count) * kExpertBlobBytes;
+                BufferRef window = context.buffers().allocate(
+                    "MTP stage 17 expert window " +
+                        std::to_string(expert_window_buffers.size()),
+                    bytes, error);
+                if (!window || window.contents == nullptr) {
+                    check(false, "MTP stage 17 expert-window allocation",
+                          error.empty()
+                              ? "CPU-visible shared mapping unavailable"
+                              : error);
+                    return false;
+                }
+                expert_window_buffers.push_back(window);
+                expert_windows.push_back(
+                    {context.buffers().read_only(window), first, count});
+                first += count;
+            }
         }
 
         std::span<float> mixed_values = typed<float>(mixed);
@@ -318,13 +390,13 @@ struct Fixture {
             route_ids[index] = kRouteIds[index];
         }
 
-        auto* blob = static_cast<std::uint8_t*>(expert_blob.contents);
         selected_experts_before.resize(kTopK * kExpertBlobBytes);
         for (std::uint32_t expert = 0u; expert < kTopK; ++expert) {
             const std::uint32_t expert_id =
                 static_cast<std::uint32_t>(kRouteIds[expert]);
-            std::uint8_t* expert_data =
-                blob + static_cast<std::size_t>(expert_id) * kExpertBlobBytes;
+            std::vector<std::uint8_t>& expert_data =
+                selected_expert_data[expert];
+            expert_data.resize(kExpertBlobBytes);
             for (std::size_t index = 0u; index < kExpertBlobBytes; ++index) {
                 expert_data[index] = static_cast<std::uint8_t>(
                     (index * 13u + expert_id * 29u + index / 640u * 3u) &
@@ -337,7 +409,7 @@ struct Fixture {
                         0.012f + static_cast<float>(expert_id % 7u) * 0.0007f +
                         static_cast<float>(slot % 13u) * 0.00021f +
                         static_cast<float>(pair % 3u) * 0.00008f;
-                    set_half(expert_data + kExpertGateUpScalesOffset +
+                    set_half(expert_data.data() + kExpertGateUpScalesOffset +
                                  static_cast<std::size_t>(slot) * 80u +
                                  static_cast<std::size_t>(pair) * 2u,
                              scale);
@@ -349,7 +421,7 @@ struct Fixture {
                         0.004f + static_cast<float>(expert_id % 7u) * 0.0003f +
                         static_cast<float>(row % 9u) * 0.00007f +
                         static_cast<float>(pair % 2u) * 0.00004f;
-                    set_half(expert_data + kExpertDownScalesOffset +
+                    set_half(expert_data.data() + kExpertDownScalesOffset +
                                  static_cast<std::size_t>(row) * 20u +
                                  static_cast<std::size_t>(pair) * 2u,
                              scale);
@@ -358,10 +430,18 @@ struct Fixture {
             std::memcpy(selected_experts_before.data() +
                             static_cast<std::size_t>(expert) *
                                 kExpertBlobBytes,
-                        expert_data, kExpertBlobBytes);
+                        expert_data.data(), kExpertBlobBytes);
+            BufferRef expert_gpu_view = expert_view(expert_id);
+            if (!expert_gpu_view || expert_gpu_view.contents == nullptr) {
+                check(false, "MTP stage-17 selected expert window",
+                      "selected expert is outside runtime test windows");
+                return false;
+            }
+            std::memcpy(expert_gpu_view.contents, expert_data.data(),
+                        kExpertBlobBytes);
         }
 
-        oracle.build(mixed_values, route_ids, blob);
+        oracle.build(mixed_values, selected_expert_data);
         reset_outputs();
         return true;
     }
@@ -391,17 +471,15 @@ struct Fixture {
         if (mixed.first_unwritten_change({}) || ids.first_unwritten_change({})) {
             return false;
         }
-        const auto* blob = static_cast<const std::uint8_t*>(expert_blob.contents);
         for (std::size_t rank = 0u; rank < kTopK; ++rank) {
-            const std::size_t base =
-                static_cast<std::size_t>(kRouteIds[rank]) *
-                kExpertBlobBytes;
+            const BufferRef expert_gpu_view =
+                expert_view(static_cast<std::uint32_t>(kRouteIds[rank]));
             const std::size_t snapshot_base = rank * kExpertBlobBytes;
-            for (std::size_t index = 0u; index < kExpertBlobBytes; ++index) {
-                if (blob[base + index] !=
-                    selected_experts_before[snapshot_base + index]) {
-                    return false;
-                }
+            if (!expert_gpu_view || expert_gpu_view.contents == nullptr ||
+                std::memcmp(expert_gpu_view.contents,
+                            selected_experts_before.data() + snapshot_base,
+                            kExpertBlobBytes) != 0) {
+                return false;
             }
         }
         return true;
@@ -531,7 +609,8 @@ bool submit_and_wait(std::unique_ptr<CommandBuffer>& command,
 }
 
 bool run(Context& context, Fixture& fixture, bool caller_owned,
-         std::array<std::vector<std::uint8_t>, kOutputCount>& outputs) {
+         std::array<std::vector<std::uint8_t>, kOutputCount>& outputs,
+         bool windowed = false) {
     fixture.reset_outputs();
     fixture.capture();
     std::string error;
@@ -543,7 +622,8 @@ bool run(Context& context, Fixture& fixture, bool caller_owned,
     if (!command) return false;
 
     bool encoded = false;
-    const auto views = fixture.buffers(context);
+    const auto views = windowed ? fixture.windowed_buffers(context)
+                                : fixture.buffers(context);
     if (caller_owned) {
         encoded = Encoder::encode(
             context, *command, "MTP routed experts caller-owned segment",
@@ -645,12 +725,39 @@ bool test_validation(Context& context, Context& foreign_context,
     passed &= expect_rejected(context, bad, "Stage 17 rejects short mixed",
                               "undersized or misaligned");
 
-    bad = valid;
-    bad.expert_blob = context.buffers().read_only(
-        fixture.expert_blob.slice(1u, fixture.expert_blob.length - 1u));
+    bad = fixture.windowed_buffers(context);
+    if (fixture.expert_blob) {
+        bad.expert_blob = context.buffers().read_only(
+            fixture.expert_blob.slice(1u,
+                                      fixture.expert_blob.length - 1u));
+        bad.expert_windows.clear();
+    } else {
+        const BufferRef first_window =
+            fixture.expert_window_buffers.front();
+        bad.expert_windows.front().bytes = context.buffers().read_only(
+            first_window.slice(1u, first_window.length - 1u));
+    }
     passed &= expect_rejected(context, bad,
                               "Stage 17 rejects misaligned expert image",
                               "undersized or misaligned");
+
+    bad = fixture.windowed_buffers(context);
+    bad.expert_windows.pop_back();
+    passed &= expect_rejected(context, bad,
+                              "Stage 17 rejects incomplete expert windows",
+                              "do not cover all 512 experts");
+
+    bad = fixture.windowed_buffers(context);
+    ++bad.expert_windows[1].first_expert;
+    passed &= expect_rejected(context, bad,
+                              "Stage 17 rejects gapped expert windows",
+                              "cover the expert table in order");
+
+    bad = fixture.windowed_buffers(context);
+    bad.expert_blob = valid.expert_blob;
+    passed &= expect_rejected(context, bad,
+                              "Stage 17 rejects ambiguous expert inputs",
+                              "either a complete expert image or expert windows");
 
     bad = valid;
     bad.ids = context.buffers().read_only(
@@ -808,6 +915,15 @@ int main(int argc, char** argv) {
     std::array<std::vector<std::uint8_t>, kOutputCount> standalone_outputs;
     passed &= run(*context, fixture, false, standalone_outputs);
     passed &= verify_oracle(fixture);
+    std::array<std::vector<std::uint8_t>, kOutputCount> windowed_outputs;
+    passed &= run(*context, fixture, false, windowed_outputs, true);
+    bool window_parity = true;
+    for (std::size_t index = 0u; index < kOutputCount; ++index) {
+        window_parity &= standalone_outputs[index] == windowed_outputs[index];
+    }
+    check(window_parity,
+          "MTP stage-17 windowed and complete-image outputs are byte-identical");
+    passed &= window_parity;
     const bool immutable = fixture.inputs_unchanged();
     const bool guards = fixture.output_guards_unchanged();
     check(immutable,

@@ -3,6 +3,7 @@
 
 #include "strata/metal/mv_dispatch.hpp"
 #include "strata/metal/encoder.hpp"
+#include "mv_dispatch_internal.hpp"
 #include "metal_fence.hpp"
 #include "../kernels/common/params.h"
 #include "../kernels/common/types.h"
@@ -1108,7 +1109,8 @@ bool encode_read_only_indexed_head_matvec_impl(
     Context& context, Encoder& encoder, MatVecWeightFormat format,
     std::uint32_t n_in, std::uint32_t weight_rows,
     std::uint32_t output_rows,
-    const ReadOnlyIndexedHeadMatVecBuffers& buffers, std::string& error) {
+    const ReadOnlyIndexedHeadMatVecBuffers& buffers,
+    bool validate_row_values, std::string& error) {
     constexpr std::string_view operation = "indexed head mat-vec";
     error.clear();
 
@@ -1211,14 +1213,18 @@ bool encode_read_only_indexed_head_matvec_impl(
         error = "mat-vec active-row buffer does not match active_columns";
         return false;
     }
-    const auto* const indices =
-        static_cast<const std::int32_t*>(buffers.row_map.contents());
-    for (std::uint32_t output_row = 0u; output_row < output_rows;
-         ++output_row) {
-        if (indices[output_row] < 0 ||
-            static_cast<std::uint32_t>(indices[output_row]) >= weight_rows) {
-            error = "mat-vec row map contains an index outside the full head";
-            return false;
+    if (validate_row_values) {
+        const auto* const indices =
+            static_cast<const std::int32_t*>(buffers.row_map.contents());
+        for (std::uint32_t output_row = 0u; output_row < output_rows;
+             ++output_row) {
+            if (indices[output_row] < 0 ||
+                static_cast<std::uint32_t>(indices[output_row]) >=
+                    weight_rows) {
+                error =
+                    "mat-vec row map contains an index outside the full head";
+                return false;
+            }
         }
     }
 
@@ -1637,7 +1643,17 @@ bool encode_indexed_head_matvec(
     const ReadOnlyIndexedHeadMatVecBuffers& buffers, std::string& error) {
     return encode_read_only_indexed_head_matvec_impl(
         context, encoder, format, n_in, weight_rows, output_rows, buffers,
-        error);
+        true, error);
+}
+
+bool encode_indexed_head_matvec_prevalidated(
+    Context& context, Encoder& encoder, MatVecWeightFormat format,
+    std::uint32_t n_in, std::uint32_t weight_rows,
+    std::uint32_t output_rows,
+    const ReadOnlyIndexedHeadMatVecBuffers& buffers, std::string& error) {
+    return encode_read_only_indexed_head_matvec_impl(
+        context, encoder, format, n_in, weight_rows, output_rows, buffers,
+        false, error);
 }
 
 }  // namespace strata::metal

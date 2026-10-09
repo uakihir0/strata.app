@@ -8,6 +8,7 @@
 #include "strata/metal/window_scratch.hpp"
 #include "strata/metal/weights.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <array>
 #include <charconv>
@@ -19,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -437,6 +439,7 @@ int main(int argc, char** argv) {
         BufferRef provisional_dense;
         BufferRef provisional_bind_view;
         BufferRef provisional_params_slot;
+        MtpAttentionPassBuffers runtime_bound_attention_pass;
         {
             auto outer = rollback_context->buffers().transaction();
             provisional_main_rope = provisional_main_kv->rope();
@@ -619,10 +622,28 @@ int main(int argc, char** argv) {
                        actual.contents == expected.contents &&
                        actual.gpu_address == expected.gpu_address;
             };
+            const auto same_read_only_view =
+                [](const ReadOnlyBufferRef& actual,
+                   const BufferRef& expected) {
+                    return actual && expected &&
+                           actual.offset() == expected.offset &&
+                           actual.length() == expected.length &&
+                           actual.contents() == expected.contents &&
+                           actual.gpu_address() == expected.gpu_address;
+                };
+            const auto same_read_only_buffers =
+                [](const ReadOnlyBufferRef& actual,
+                   const ReadOnlyBufferRef& expected) {
+                    return actual && expected &&
+                           actual.offset() == expected.offset() &&
+                           actual.length() == expected.length() &&
+                           actual.contents() == expected.contents() &&
+                           actual.gpu_address() == expected.gpu_address();
+                };
             require(same_view(
                             t5_add_streams_buffers.output,
                             provisional_runtime->bind_region(
-                                MtpBindRegionId::mtp_rin)) &&
+                                MtpBindRegionId::residual)) &&
                         same_view(t5_attention_read_buffers.residual,
                                   t5_add_streams_buffers.output) &&
                         same_view(t5_attention_read_buffers.dead_h2_scratch,
@@ -741,7 +762,9 @@ int main(int argc, char** argv) {
                         same_view(
                             t8_add_streams_buffers.output,
                             provisional_runtime->bind_region(
-                                MtpBindRegionId::mtp_rin)) &&
+                                MtpBindRegionId::residual)) &&
+                        same_view(t8_attention_read_buffers.residual,
+                                  t8_add_streams_buffers.output) &&
                         same_view(t8_attention_read_buffers.dead_h2_scratch,
                                   provisional_runtime->bind_region(
                                       MtpBindRegionId::h2)) &&
@@ -792,6 +815,7 @@ int main(int argc, char** argv) {
             projection_params = {};
             projection_params.T = 1u;
             projection_params.hid[0] = 4u;
+            projection_params.step[0] = StepRow{2, 3, 0, 1};
             std::memcpy(provisional_params_slot.contents, &projection_params,
                         sizeof(projection_params));
             projection_sources.token_source =
@@ -823,17 +847,417 @@ int main(int argc, char** argv) {
                                 MtpBindRegionId::e2).contents &&
                         add_streams_buffers.output.handle ==
                             provisional_runtime->bind_region(
-                                MtpBindRegionId::mtp_rin).handle,
-                    "MTP runtime binding resolves stage-6 input and residual views");
+                                MtpBindRegionId::residual).handle,
+                    "MTP runtime binding resolves stage-6 residual view");
             MtpAttentionReadBuffers attention_read_buffers;
             MtpAttentionKvProjectionBuffers kv_projection_buffers;
+            MtpAttentionPassBuffers attention_pass_buffers;
+            MtpFeedForwardReadBuffers feed_forward_buffers;
+            MtpRouterBuffers router_buffers;
+            MtpRoutedExpertsBuffers routed_expert_buffers;
+            const MtpAttentionRuntimeMode attention_mode{true};
             require(provisional_runtime->bind_attention_read(
                         *rollback_context, 9u, attention_read_buffers,
                         error) &&
                         provisional_runtime->bind_attention_kv_projection(
                             *rollback_context, 9u, kv_projection_buffers,
-                            error),
-                    "bind MTP runtime views for stages 7–8: " + error);
+                            error) &&
+                        provisional_runtime->bind_attention_pass(
+                            *rollback_context, 9u, attention_mode, 1u,
+                            attention_pass_buffers,
+                            error) &&
+                        provisional_runtime->bind_feed_forward_read(
+                            *rollback_context, 9u, feed_forward_buffers,
+                            error) &&
+                        provisional_runtime->bind_router(
+                            *rollback_context, 9u, router_buffers, error) &&
+                        provisional_runtime->bind_routed_experts(
+                            *rollback_context, routed_expert_buffers, error),
+                    "bind MTP runtime views for stages 7–17: " + error);
+            runtime_bound_attention_pass = attention_pass_buffers;
+            const MtpAttentionQueryPrefixBuffers& query_prefix_buffers =
+                attention_pass_buffers.query_prefix();
+            const MtpAttentionKvAppendBuffers& kv_append_buffers =
+                query_prefix_buffers.kv_append();
+            const MtpAttentionQueryProjectionBuffers& query_projection_buffers =
+                query_prefix_buffers.query_projection();
+            const MtpAttentionQueryNormBuffers& query_norm_buffers =
+                query_prefix_buffers.query_norm();
+            MtpKvViews expected_kv_views;
+            require(provisional_runtime->kv_views(expected_kv_views, error) &&
+                        attention_read_buffers.norm.contents ==
+                            provisional_runtime->dense_weight(
+                                "attn_hyper_connection.hc_norm.weight").contents &&
+                        attention_read_buffers.hc_down.contents ==
+                            provisional_runtime->dense_weight(
+                                "attn_hyper_connection.input_mix_weight_down.weight").contents &&
+                        same_view(kv_append_buffers.kcur,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::kcur)) &&
+                        same_view(kv_append_buffers.vcur,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::vcur)) &&
+                        kv_append_buffers.k_norm.contents ==
+                            provisional_runtime->dense_weight(
+                                "self_attn.k_norm.weight").contents &&
+                        same_view(kv_append_buffers.rope,
+                                  provisional_shared_rope) &&
+                        kv_append_buffers.kv_layout.storage_format ==
+                            provisional_runtime->kv_layout().storage_format &&
+                        kv_append_buffers.kv_layout.cell_capacity ==
+                            provisional_runtime->kv_layout().cell_capacity &&
+                        same_view(kv_append_buffers.kv_views.k,
+                                  expected_kv_views.k) &&
+                        same_view(kv_append_buffers.kv_views.v,
+                                  expected_kv_views.v) &&
+                        kv_append_buffers.kv_layout.storage_format ==
+                            KvFormat::Int8 &&
+                        kv_append_buffers.kv_rot ==
+                            attention_mode.kv_rot() &&
+                        same_view(query_projection_buffers.xq,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::xq)) &&
+                        query_projection_buffers.q_weights.contents() ==
+                            provisional_runtime->dense_weight(
+                                "self_attn.q_proj.weight").contents &&
+                        same_view(query_projection_buffers.q_full,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::q_full)) &&
+                        same_view(query_projection_buffers.sink,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::bo)
+                                      .slice(0u, sizeof(float))) &&
+                        query_norm_buffers.params.contents ==
+                            provisional_params_slot.contents &&
+                        same_view(query_norm_buffers.q_full,
+                                  query_projection_buffers.q_full) &&
+                        query_norm_buffers.q_norm.contents ==
+                            provisional_runtime->dense_weight(
+                                "self_attn.q_norm.weight").contents &&
+                        same_view(query_norm_buffers.rope,
+                                  provisional_shared_rope) &&
+                        same_view(query_norm_buffers.qcur,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::qcur)) &&
+                        query_norm_buffers.kv_rot ==
+                            attention_mode.kv_rot() &&
+                        attention_pass_buffers.window_ids().window == 1u &&
+                        attention_pass_buffers.window_ids().params.contents() ==
+                            provisional_params_slot.contents &&
+                        same_view(attention_pass_buffers.window_ids().mtp_ids,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::mtp_ids)) &&
+                        attention_pass_buffers.attention().id_row_stride ==
+                            provisional_runtime->bind_layout().capacity &&
+                        same_view(attention_pass_buffers.attention().qcur,
+                                  query_norm_buffers.qcur) &&
+                        same_view(attention_pass_buffers.attention().att_scratch,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::att_scratch)) &&
+                        same_view(attention_pass_buffers.attention().attn,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::attn)) &&
+                        attention_pass_buffers.attention().kv_rot ==
+                            attention_mode.kv_rot() &&
+                        same_view(
+                            attention_pass_buffers.output_projection().attn32,
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::attn32)) &&
+                        same_view(
+                            attention_pass_buffers.output_projection().xq,
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::xq)) &&
+                        attention_pass_buffers.output_projection()
+                                .o_weights.contents() ==
+                            provisional_runtime->dense_weight(
+                                "self_attn.o_proj.weight").contents &&
+                        same_view(
+                            attention_pass_buffers.output_projection().bo,
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::bo)) &&
+                        same_view(
+                            attention_pass_buffers.output_projection().sink,
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::y)
+                                .slice(0u, sizeof(float))),
+                    "MTP stages 9–14 resolve planned cache, weights, RoPE and scratch views");
+            require(feed_forward_buffers.params.contents() ==
+                            provisional_params_slot.contents &&
+                        same_view(feed_forward_buffers.residual,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::residual)) &&
+                        same_view(feed_forward_buffers.residual,
+                                  add_streams_buffers.output) &&
+                        same_view(feed_forward_buffers.bo,
+                                  attention_pass_buffers.output_projection().bo) &&
+                        same_view(feed_forward_buffers.inj,
+                                  attention_read_buffers.inject_out) &&
+                        same_view(feed_forward_buffers.normalized,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::xn)) &&
+                        same_view(feed_forward_buffers.rs,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::rs)) &&
+                        same_view(feed_forward_buffers.lo,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::lo)) &&
+                        same_view(feed_forward_buffers.inject_out,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::inj2)) &&
+                        same_view(feed_forward_buffers.mixed,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::mixed)) &&
+                        feed_forward_buffers.norm.contents ==
+                            provisional_runtime->dense_weight(
+                                "mlp_hyper_connection.hc_norm.weight").contents &&
+                        feed_forward_buffers.hc_down.contents ==
+                            provisional_runtime->dense_weight(
+                                "mlp_hyper_connection.input_mix_weight_down.weight").contents &&
+                        feed_forward_buffers.hc_inject.contents ==
+                            provisional_runtime->dense_weight(
+                                "mlp_hyper_connection.block_inject_weight.weight").contents &&
+                        feed_forward_buffers.hc_up.contents ==
+                            provisional_runtime->dense_weight(
+                                "mlp_hyper_connection.input_mix_weight_up.weight").contents &&
+                        router_buffers.params.contents() ==
+                            provisional_params_slot.contents &&
+                        router_buffers.mixed.contents() ==
+                            feed_forward_buffers.mixed.contents &&
+                        router_buffers.mixed.gpu_address() ==
+                            feed_forward_buffers.mixed.gpu_address &&
+                        router_buffers.mixed.length() ==
+                            feed_forward_buffers.mixed.length &&
+                        router_buffers.router_weights.contents() ==
+                            provisional_runtime->dense_weight(
+                                "mlp.gate.weight").contents &&
+                        same_view(router_buffers.logits_r,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::logits_r)) &&
+                        same_view(router_buffers.ids,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::ids)) &&
+                        same_view(router_buffers.weights,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::wts)) &&
+                        same_view(router_buffers.matvec_sink,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::y)
+                                      .slice(0u, sizeof(float))) &&
+                        feed_forward_buffers.norm.contents ==
+                            provisional_runtime->dense_weight(
+                                "mlp_hyper_connection.hc_norm.weight").contents &&
+                        feed_forward_buffers.hc_down.contents ==
+                            provisional_runtime->dense_weight(
+                                "mlp_hyper_connection.input_mix_weight_down.weight").contents &&
+                        same_read_only_view(
+                            routed_expert_buffers.mixed,
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::mixed)) &&
+                        same_read_only_view(
+                            routed_expert_buffers.ids,
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::ids)) &&
+                        routed_expert_buffers.expert_windows.size() ==
+                            provisional_runtime->layout().expert_windows.size() &&
+                        same_view(routed_expert_buffers.parts,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::parts)),
+                    "MTP stages 15–17 resolve the R, routing, expert-window and scratch views");
+
+            MtpSharedFFNWriteBuffers shared_ffn_buffers;
+            MtpFinalMixerBuffers final_mixer_buffers;
+            MtpDraftHeadBuffers draft_head_buffers;
+            MtpDraftSamplingBuffers draft_sampling_buffers;
+            BufferRef main_head_fixture = rollback_context->buffers().allocate(
+                "MTP runtime binder main output-head fixture",
+                sizeof(std::uint64_t), error);
+            const ReadOnlyBufferRef main_head_weights =
+                rollback_context->buffers().read_only(main_head_fixture);
+            require(main_head_fixture && main_head_weights &&
+                        provisional_runtime->bind_shared_ffn_write(
+                            *rollback_context, 9u, shared_ffn_buffers,
+                            error) &&
+                        provisional_runtime->bind_final_mixer(
+                            *rollback_context, 9u, final_mixer_buffers,
+                            error) &&
+                        provisional_runtime->bind_draft_head(
+                            *rollback_context, 9u, main_head_weights,
+                            kMtpFullVocabularySize, draft_head_buffers,
+                            error) &&
+                        provisional_runtime->bind_draft_sampling(
+                            *rollback_context, 9u,
+                            draft_head_buffers.draft_vocabulary,
+                            draft_sampling_buffers, error),
+                    "bind MTP runtime views for stages 18–22: " + error);
+            const ReadOnlyBufferRef device_vocab_ids =
+                draft_head_buffers.draft_vocabulary.rows();
+            require(!provisional_runtime->bind_region(
+                        MtpBindRegionId::draft_vocab_ids),
+                    "MTP runtime does not expose the cached vocabulary map mutably");
+            require(shared_ffn_buffers.params.contents() ==
+                            provisional_params_slot.contents &&
+                        same_view(shared_ffn_buffers.mixed,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::mixed)) &&
+                        same_view(shared_ffn_buffers.mixed_q8_1,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::xq)) &&
+                        shared_ffn_buffers.shared.gate_weights.contents() ==
+                            provisional_runtime->dense_weight(
+                                "mlp.shared_expert.gate_proj.weight").contents &&
+                        shared_ffn_buffers.shared.up_weights.contents() ==
+                            provisional_runtime->dense_weight(
+                                "mlp.shared_expert.up_proj.weight").contents &&
+                        shared_ffn_buffers.shared.down_weights.contents() ==
+                            provisional_runtime->dense_weight(
+                                "mlp.shared_expert.down_proj.weight").contents &&
+                        shared_ffn_buffers.shared.shared_gate_weights.contents() ==
+                            provisional_runtime->dense_weight(
+                                "mlp.shared_expert_gate.weight").contents &&
+                        same_read_only_view(
+                            shared_ffn_buffers.shared.routed_parts,
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::parts)) &&
+                        same_read_only_view(
+                            shared_ffn_buffers.shared.route_weights,
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::wts)) &&
+                        same_view(shared_ffn_buffers.shared.gate,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::sg)) &&
+                        same_view(shared_ffn_buffers.shared.up,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::su)) &&
+                        same_view(shared_ffn_buffers.shared.hidden,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::sh)) &&
+                        same_view(shared_ffn_buffers.shared.down_activations,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::shq)) &&
+                        same_view(shared_ffn_buffers.shared.shared_output,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::shx)) &&
+                        same_view(shared_ffn_buffers.shared.shared_gate_logits,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::gl)) &&
+                        same_view(shared_ffn_buffers.shared.output,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::y)) &&
+                        same_view(shared_ffn_buffers.shared.gate_sink,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::sample)
+                                      .slice(0u, sizeof(float))) &&
+                        same_view(shared_ffn_buffers.shared.up_sink,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::bo)
+                                      .slice(0u, sizeof(float))) &&
+                        same_view(shared_ffn_buffers.shared.down_sink,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::q_full)
+                                      .slice(0u, sizeof(float))) &&
+                        same_view(shared_ffn_buffers.shared.shared_gate_sink,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::attn32)
+                                      .slice(0u, sizeof(float))) &&
+                        same_view(shared_ffn_buffers.shared.residual,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::residual)) &&
+                        same_view(shared_ffn_buffers.shared.inject,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::inj2)),
+                    "MTP stages 18–19 bind shared-expert weights and routed/residual scratch");
+            require(final_mixer_buffers.params.contents() ==
+                            provisional_params_slot.contents &&
+                        same_view(final_mixer_buffers.residual,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::residual)) &&
+                        final_mixer_buffers.norm_gamma.contents() ==
+                            provisional_runtime->dense_weight(
+                                "hyper_connection_mixer.hc_norm.weight").contents &&
+                        final_mixer_buffers.down_weights.contents() ==
+                            provisional_runtime->dense_weight(
+                                "hyper_connection_mixer.input_mix_weight_down.weight").contents &&
+                        final_mixer_buffers.up_weights.contents() ==
+                            provisional_runtime->dense_weight(
+                                "hyper_connection_mixer.input_mix_weight_up.weight").contents &&
+                        same_view(final_mixer_buffers.normalized,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::xn)) &&
+                        same_view(final_mixer_buffers.low_rank,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::lo)) &&
+                        same_view(final_mixer_buffers.gate,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::gate)) &&
+                        same_view(final_mixer_buffers.mixed,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::sample)) &&
+                        same_view(final_mixer_buffers.matvec_sink,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::y)
+                                      .slice(0u, sizeof(float))),
+                    "MTP stage 20 binds the GR head mixer and sample output");
+            require(draft_head_buffers.params.contents() ==
+                            provisional_params_slot.contents &&
+                        same_view(draft_head_buffers.sample,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::sample)) &&
+                        draft_head_buffers.weights.contents() ==
+                            main_head_weights.contents() &&
+                        draft_head_buffers.draft_vocabulary.row_count() ==
+                            provisional_runtime->draft_vocab_ids().size() &&
+                        draft_head_buffers.draft_vocabulary.full_head_size() ==
+                            kMtpFullVocabularySize &&
+                        same_read_only_buffers(
+                            draft_head_buffers.draft_vocabulary.rows(),
+                            device_vocab_ids) &&
+                        same_view(draft_head_buffers.activations_q8_1,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::xq)) &&
+                        same_view(draft_head_buffers.logits,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::hl)) &&
+                        same_view(draft_head_buffers.matvec_sink,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::y)
+                                      .slice(0u, sizeof(float))) &&
+                        same_view(draft_sampling_buffers.params,
+                                  provisional_params_slot) &&
+                        same_view(draft_sampling_buffers.logits,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::hl)) &&
+                        draft_sampling_buffers.draft_vocabulary.row_count() ==
+                            draft_head_buffers.draft_vocabulary.row_count() &&
+                        same_view(draft_sampling_buffers.output_ids,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::out_ids)) &&
+                        same_view(draft_sampling_buffers.probabilities,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::probs)),
+                    "MTP stages 21–22 bind the caller head, cached vocabulary and sampler outputs");
+            MtpDraftHeadBuffers rejected_head_buffers;
+            require(!provisional_runtime->bind_draft_head(
+                        *rollback_context, 9u, main_head_weights,
+                        kMtpFullVocabularySize - 1u,
+                        rejected_head_buffers, error) &&
+                        !error.empty() && !rejected_head_buffers.params &&
+                        !rejected_head_buffers.sample &&
+                        !rejected_head_buffers.weights &&
+                        rejected_head_buffers.draft_vocabulary.row_count() ==
+                            0u &&
+                        !rejected_head_buffers.logits,
+                    "MTP draft-head binding rejects a mismatched main vocabulary and clears its outputs");
+            MtpDraftSamplingBuffers rejected_sampling_buffers;
+            require(!provisional_runtime->bind_draft_sampling(
+                        *rollback_context, 9u, MtpDraftVocabularyMap{},
+                        rejected_sampling_buffers, error) &&
+                        !error.empty() &&
+                        !rejected_sampling_buffers.params &&
+                        !rejected_sampling_buffers.logits &&
+                        !rejected_sampling_buffers.output_ids &&
+                        !rejected_sampling_buffers.probabilities,
+                    "MTP draft-sampling binding rejects a different vocabulary map and clears its outputs");
+
             const ReadOnlyBufferRef projection_token_source =
                 rollback_context->buffers().read_only(
                     provisional_params_slot.slice(
@@ -851,6 +1275,30 @@ int main(int argc, char** argv) {
             };
             constexpr std::array<EncoderBytesBinding, 0> no_bytes{};
             constexpr std::array<EncoderThreadgroupMemory, 0> no_memory{};
+            MtpKvViews runtime_kv_seed;
+            require(provisional_runtime->kv_views(runtime_kv_seed, error) &&
+                        provisional_runtime->kv_layout().storage_format ==
+                            KvFormat::Int8,
+                    "resolve int8 MTP K/V before the runtime attention regression: " +
+                        error);
+            auto* const seed_keys =
+                static_cast<std::int8_t*>(runtime_kv_seed.k.contents);
+            auto* const seed_key_scales =
+                static_cast<std::uint16_t*>(runtime_kv_seed.k_scale.contents);
+            auto* const seed_values =
+                static_cast<std::int8_t*>(runtime_kv_seed.v.contents);
+            auto* const seed_value_scales =
+                static_cast<std::uint16_t*>(runtime_kv_seed.v_scale.contents);
+            for (std::size_t row = 0u; row < 4u; ++row) {
+                std::fill_n(seed_keys + row * HEAD_DIM, HEAD_DIM,
+                            std::int8_t{0});
+                std::fill_n(seed_key_scales + row * 4u, 4u,
+                            std::uint16_t{0x3c00u});
+                std::fill_n(seed_values + row * HEAD_DIM, HEAD_DIM,
+                            std::int8_t{96});
+                std::fill_n(seed_value_scales + row * 4u, 4u,
+                            std::uint16_t{0x3c00u});
+            }
             auto projection_command = rollback_context->make_command_buffer(
                 "MTP runtime-bound input projection smoke", error);
             require(projection_command != nullptr &&
@@ -878,13 +1326,113 @@ int main(int argc, char** argv) {
                                        encode_mtp_attention_kv_projection(
                                            *rollback_context, encoder,
                                            kv_projection_buffers,
+                                           encode_error) &&
+                                       encode_mtp_attention_pass(
+                                           *rollback_context, encoder,
+                                           attention_pass_buffers,
+                                           encode_error) &&
+                                       encode_mtp_feed_forward_read(
+                                           *rollback_context, encoder,
+                                           feed_forward_buffers,
+                                           encode_error) &&
+                                       encode_mtp_router(
+                                           *rollback_context, encoder,
+                                           router_buffers, encode_error) &&
+                                       encode_mtp_routed_experts(
+                                           *rollback_context, encoder,
+                                           routed_expert_buffers,
                                            encode_error);
                             },
                             error) &&
                         projection_command->commit(error) &&
                         projection_command->wait_until_completed(error),
-                    "dispatch MTP stages 1–8 after a GPU-produced selected token: " +
+                    "dispatch MTP stages 1–17 after a GPU-produced selected token: " +
                         error);
+            const BufferRef finite_attention_output =
+                attention_pass_buffers.attention().attn;
+            std::vector<std::uint8_t> finite_attention_bytes(
+                finite_attention_output.length);
+            std::memcpy(finite_attention_bytes.data(),
+                        finite_attention_output.contents,
+                        finite_attention_bytes.size());
+            auto shared_output_command =
+                rollback_context->make_command_buffer(
+                    "MTP runtime-bound stages 18–20", error);
+            require(shared_output_command != nullptr &&
+                        Encoder::encode(
+                            *rollback_context, *shared_output_command,
+                            "MTP runtime-bound shared expert to final mixer",
+                            [&](Encoder& encoder,
+                                std::string& encode_error) {
+                                return encode_mtp_shared_ffn_write(
+                                           *rollback_context, encoder,
+                                           shared_ffn_buffers,
+                                           encode_error) &&
+                                       encode_mtp_final_mixer(
+                                           *rollback_context, encoder,
+                                           final_mixer_buffers,
+                                           encode_error);
+                            },
+                            error) &&
+                        shared_output_command->commit(error) &&
+                        shared_output_command->wait_until_completed(error),
+                    "dispatch MTP runtime-bound stages 18–20 after routed experts: " +
+                        error);
+            const BufferRef runtime_window_ids =
+                provisional_runtime->bind_region(MtpBindRegionId::mtp_ids);
+            require(runtime_window_ids &&
+                        static_cast<const std::int32_t*>(
+                            runtime_window_ids.contents)[0] == 2,
+                    "finite runtime attention pass writes its one-ID suffix");
+            projection_params.step[0].width = 3;
+            std::memcpy(provisional_params_slot.contents, &projection_params,
+                        sizeof(projection_params));
+            MtpAttentionPassBuffers unwindowed_attention_pass;
+            require(provisional_runtime->bind_attention_pass(
+                        *rollback_context, 9u, attention_mode, 0u,
+                        unwindowed_attention_pass, error),
+                    "bind the runtime's unwindowed attention pass: " + error);
+            auto unwindowed_attention_command =
+                rollback_context->make_command_buffer(
+                    "MTP runtime-bound finite-to-unwindowed attention", error);
+            require(unwindowed_attention_command != nullptr &&
+                        encode_mtp_attention_pass(
+                            *rollback_context, *unwindowed_attention_command,
+                            unwindowed_attention_pass, error) &&
+                        unwindowed_attention_command->commit(error) &&
+                        unwindowed_attention_command->wait_until_completed(error),
+                    "dispatch grouped MTP attention after switching to full history: " +
+                        error);
+            std::vector<std::uint8_t> grouped_unwindowed_attention_bytes(
+                finite_attention_output.length);
+            std::memcpy(grouped_unwindowed_attention_bytes.data(),
+                        finite_attention_output.contents,
+                        grouped_unwindowed_attention_bytes.size());
+            const auto* refreshed_runtime_ids =
+                static_cast<const std::int32_t*>(runtime_window_ids.contents);
+            require(refreshed_runtime_ids[0] == 0 &&
+                        refreshed_runtime_ids[1] == 1 &&
+                        refreshed_runtime_ids[2] == 2,
+                    "grouped runtime attention refreshes finite-window IDs to the identity prefix");
+            auto direct_identity_attention_command =
+                rollback_context->make_command_buffer(
+                    "MTP direct attention with refreshed identity IDs", error);
+            require(direct_identity_attention_command != nullptr &&
+                        encode_mtp_attention(
+                            *rollback_context,
+                            *direct_identity_attention_command,
+                            unwindowed_attention_pass.attention(), error) &&
+                        direct_identity_attention_command->commit(error) &&
+                        direct_identity_attention_command->wait_until_completed(error),
+                    "dispatch direct attention using the refreshed identity prefix: " +
+                        error);
+            require(std::memcmp(grouped_unwindowed_attention_bytes.data(),
+                                finite_attention_output.contents,
+                                grouped_unwindowed_attention_bytes.size()) == 0 &&
+                        std::memcmp(grouped_unwindowed_attention_bytes.data(),
+                                    finite_attention_bytes.data(),
+                                    grouped_unwindowed_attention_bytes.size()) != 0,
+                    "grouped unwindowed attention matches the identity-ID oracle and differs from the finite-window result");
             MtpInputProjectionSources invalid_projection_sources =
                 projection_sources;
             invalid_projection_sources.params_slot = 10u;
@@ -908,6 +1456,11 @@ int main(int argc, char** argv) {
                 const auto id = static_cast<MtpBindRegionId>(index);
                 const MtpBindRegion region = bind_layout.region(id);
                 const BufferRef view = provisional_runtime->bind_region(id);
+                if (id == MtpBindRegionId::draft_vocab_ids) {
+                    require(!view,
+                            "draft vocabulary IDs must stay outside mutable bind views");
+                    continue;
+                }
                 if (region.bytes == 0) {
                     require(!view,
                             std::string(mtp_bind_region_name(id)) +
@@ -929,17 +1482,15 @@ int main(int argc, char** argv) {
                         std::string(mtp_bind_region_name(id)) +
                             " does not resolve to its bounded bind-arena view");
             }
-            const BufferRef device_vocab_ids = provisional_runtime->bind_region(
-                MtpBindRegionId::draft_vocab_ids);
             const auto& inspected_vocab_ids =
                 provisional_runtime->draft_vocab_ids();
             require(device_vocab_ids &&
-                        device_vocab_ids.length ==
+                        device_vocab_ids.length() ==
                             inspected_vocab_ids.size() *
                                 sizeof(std::uint32_t) &&
-                        std::memcmp(device_vocab_ids.contents,
+                        std::memcmp(device_vocab_ids.contents(),
                                     inspected_vocab_ids.data(),
-                                    device_vocab_ids.length) == 0,
+                                    device_vocab_ids.length()) == 0,
                     "MTP device vocabulary map was not initialized from inspection");
             const BufferRef window_ids = provisional_runtime->bind_region(
                 MtpBindRegionId::mtp_ids);
@@ -1034,6 +1585,71 @@ int main(int argc, char** argv) {
                         short_read_params_slot.length == kMtpParamsSlotBytes &&
                         !no_prefill_runtime->mtp_params_slot(9),
                     "short-read catch-up slot is not bounded to the no-prefill plan");
+            const MtpAttentionRuntimeMode unbound_attention_mode{true};
+            MtpAttentionKvAppendBuffers failed_kv_append_buffers;
+            failed_kv_append_buffers.params = short_read_params_slot;
+            failed_kv_append_buffers.kcur =
+                no_prefill_runtime->bind_region(MtpBindRegionId::kcur);
+            failed_kv_append_buffers.vcur =
+                no_prefill_runtime->bind_region(MtpBindRegionId::vcur);
+            failed_kv_append_buffers.kv_rot = true;
+            require(!no_prefill_runtime->bind_attention_kv_append(
+                        *rollback_context, 8u, unbound_attention_mode,
+                        failed_kv_append_buffers, error) &&
+                        !error.empty() && !failed_kv_append_buffers.params &&
+                        !failed_kv_append_buffers.kcur &&
+                        !failed_kv_append_buffers.vcur &&
+                        !failed_kv_append_buffers.k_norm &&
+                        !failed_kv_append_buffers.rope &&
+                        !failed_kv_append_buffers.kv_views.k &&
+                        !failed_kv_append_buffers.kv_views.v &&
+                        !failed_kv_append_buffers.kv_rot,
+                    "MTP K/V append bind without shared RoPE clears partial output");
+            MtpAttentionPassBuffers failed_attention_pass =
+                runtime_bound_attention_pass;
+            require(!no_prefill_runtime->bind_attention_pass(
+                        *rollback_context, 8u, unbound_attention_mode,
+                        1u, failed_attention_pass, error) &&
+                        !error.empty() &&
+                        !failed_attention_pass.query_prefix()
+                             .kv_append().params &&
+                        !failed_attention_pass.query_prefix()
+                             .query_projection().params &&
+                        !failed_attention_pass.query_prefix()
+                             .query_norm().params &&
+                        !failed_attention_pass.window_ids().params &&
+                        !failed_attention_pass.attention().params &&
+                        !failed_attention_pass.output_projection().params &&
+                        !failed_attention_pass.query_prefix()
+                             .kv_append().kv_rot &&
+                        !failed_attention_pass.query_prefix()
+                             .query_norm().kv_rot &&
+                        !failed_attention_pass.attention().kv_rot,
+                    "failed MTP attention pass binding clears all stage 9–14 views");
+            MtpAttentionQueryProjectionBuffers failed_query_projection_buffers;
+            failed_query_projection_buffers.params =
+                rollback_context->buffers().read_only(short_read_params_slot);
+            failed_query_projection_buffers.xq =
+                no_prefill_runtime->bind_region(MtpBindRegionId::xq);
+            failed_query_projection_buffers.q_weights =
+                rollback_context->buffers().read_only(
+                    no_prefill_runtime->dense_weight(
+                        "self_attn.q_proj.weight"));
+            failed_query_projection_buffers.q_full =
+                no_prefill_runtime->bind_region(MtpBindRegionId::q_full);
+            failed_query_projection_buffers.sink =
+                no_prefill_runtime->bind_region(MtpBindRegionId::bo)
+                    .slice(0u, sizeof(float));
+            require(!no_prefill_runtime->bind_attention_query_projection(
+                        *rollback_context, 9u,
+                        failed_query_projection_buffers, error) &&
+                        !error.empty() &&
+                        !failed_query_projection_buffers.params &&
+                        !failed_query_projection_buffers.xq &&
+                        !failed_query_projection_buffers.q_weights &&
+                        !failed_query_projection_buffers.q_full &&
+                        !failed_query_projection_buffers.sink,
+                    "MTP query-projection bind rejects an invalid slot and clears output");
         }
         require(no_prefill_runtime != nullptr &&
                     !no_prefill_runtime->is_valid() &&

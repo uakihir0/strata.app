@@ -16,6 +16,109 @@ namespace strata::metal {
 
 class KvStore;
 
+/// One immutable rotation choice shared by every attention-stage binder in
+/// the same MTP pass. Construct once from the caller's runtime configuration.
+class MtpAttentionRuntimeMode final {
+public:
+    explicit MtpAttentionRuntimeMode(bool kv_rot) noexcept : kv_rot_(kv_rot) {}
+    MtpAttentionRuntimeMode(const MtpAttentionRuntimeMode&) = delete;
+    MtpAttentionRuntimeMode& operator=(const MtpAttentionRuntimeMode&) = delete;
+
+    bool kv_rot() const noexcept { return kv_rot_; }
+
+private:
+    bool kv_rot_ = false;
+};
+
+/// Runtime-bound MTP stages 9–11, sharing one parameter slot and rotation
+/// choice. The contained encoder views are immutable to callers so they
+/// cannot be independently reconfigured after binding.
+class MtpAttentionQueryPrefixBuffers final {
+public:
+    MtpAttentionQueryPrefixBuffers() = default;
+
+    const MtpAttentionKvAppendBuffers& kv_append() const noexcept {
+        return kv_append_;
+    }
+    const MtpAttentionQueryProjectionBuffers& query_projection() const noexcept {
+        return query_projection_;
+    }
+    const MtpAttentionQueryNormBuffers& query_norm() const noexcept {
+        return query_norm_;
+    }
+
+private:
+    MtpAttentionKvAppendBuffers kv_append_;
+    MtpAttentionQueryProjectionBuffers query_projection_;
+    MtpAttentionQueryNormBuffers query_norm_;
+
+    friend class MtpRuntimeStorage;
+    friend bool encode_mtp_attention_query_prefix(
+        Context&, Encoder&, const MtpAttentionQueryPrefixBuffers&,
+        std::string&);
+    friend bool encode_mtp_attention_query_prefix(
+        Context&, CommandBuffer&, const MtpAttentionQueryPrefixBuffers&,
+        std::string&);
+};
+
+/// Encode the runtime-bound stage-9 append, stage-10 query projection and
+/// stage-11 query norm in order. The views and rotation mode are validated as
+/// one pass before any dispatch is recorded. Caller-owned encoding failures
+/// must be propagated from the enclosing Encoder::encode body.
+bool encode_mtp_attention_query_prefix(
+    Context& context, Encoder& encoder,
+    const MtpAttentionQueryPrefixBuffers& buffers, std::string& error);
+bool encode_mtp_attention_query_prefix(
+    Context& context, CommandBuffer& command_buffer,
+    const MtpAttentionQueryPrefixBuffers& buffers, std::string& error);
+
+/// Runtime-bound full MTP attention pass, stages 9–14. Its private views
+/// preserve one parameter slot, cache rotation choice and ordered scratch
+/// handoffs from K/V append through O projection.
+class MtpAttentionPassBuffers final {
+public:
+    MtpAttentionPassBuffers() = default;
+
+    const MtpAttentionQueryPrefixBuffers& query_prefix() const noexcept {
+        return query_prefix_;
+    }
+    const MtpWindowIdsBuffers& window_ids() const noexcept {
+        return window_ids_;
+    }
+    const MtpAttentionBuffers& attention() const noexcept {
+        return attention_;
+    }
+    const MtpAttentionOutputProjectionBuffers& output_projection() const noexcept {
+        return output_projection_;
+    }
+
+private:
+    MtpAttentionQueryPrefixBuffers query_prefix_;
+    MtpWindowIdsBuffers window_ids_;
+    MtpAttentionBuffers attention_;
+    MtpAttentionOutputProjectionBuffers output_projection_;
+
+    friend class MtpRuntimeStorage;
+    friend bool encode_mtp_attention_pass(
+        Context&, Encoder&, const MtpAttentionPassBuffers&, std::string&);
+    friend bool encode_mtp_attention_pass(
+        Context&, CommandBuffer&, const MtpAttentionPassBuffers&,
+        std::string&);
+};
+
+/// Encode MTP stages 9–14 in order. Stage 12 refreshes the active IDs on every
+/// pass: a positive finite window selects a suffix, while zero writes the full
+/// identity prefix. Cross-stage parameters, views and rotation are validated
+/// before dispatch. Caller-owned failures must be propagated from the
+/// enclosing Encoder::encode body.
+bool encode_mtp_attention_pass(Context& context, Encoder& encoder,
+                               const MtpAttentionPassBuffers& buffers,
+                               std::string& error);
+bool encode_mtp_attention_pass(Context& context,
+                               CommandBuffer& command_buffer,
+                               const MtpAttentionPassBuffers& buffers,
+                               std::string& error);
+
 /// Caller-owned inputs needed to resolve stage-1–5 views from MTP storage.
 /// The token table and residual belong to the same Context as the runtime.
 struct MtpInputProjectionSources {
@@ -68,6 +171,8 @@ public:
     const std::vector<std::uint32_t>& draft_vocab_ids() const noexcept;
     BufferRef expert(std::uint32_t expert_index) const noexcept;
     BufferRef dense_weight(const std::string& tensor_name) const noexcept;
+    /// Return a mutable named scratch view. The cached device vocabulary map
+    /// is intentionally withheld; bind_draft_head exposes it read-only.
     BufferRef bind_region(MtpBindRegionId id) const noexcept;
     BufferRef mtp_params_slot(std::uint32_t slot) const noexcept;
     /// Resolve the MTP-owned weights and scratch for stages 1–5. The main
@@ -93,6 +198,64 @@ public:
         Context& context, std::uint32_t params_slot,
         MtpAttentionKvProjectionBuffers& buffers,
         std::string& error) const;
+    /// Resolve runtime views for MTP stages 9–11 using one shared rotation
+    /// mode for the whole MTP attention pass.
+    bool bind_attention_kv_append(Context& context,
+                                  std::uint32_t params_slot,
+                                  const MtpAttentionRuntimeMode& mode,
+                                  MtpAttentionKvAppendBuffers& buffers,
+                                  std::string& error) const;
+    bool bind_attention_query_projection(
+        Context& context, std::uint32_t params_slot,
+        MtpAttentionQueryProjectionBuffers& buffers,
+        std::string& error) const;
+    /// Resolve stages 9–11 into one immutable pass binding with shared params
+    /// and `kv_rot` mode. Use this coordinator for runtime-bound MTP attention.
+    bool bind_attention_query_prefix(
+        Context& context, std::uint32_t params_slot,
+        const MtpAttentionRuntimeMode& mode,
+        MtpAttentionQueryPrefixBuffers& buffers,
+        std::string& error) const;
+    /// Resolve runtime views for stages 9–14. Stage 12 always refreshes the
+    /// IDs: a positive `window` selects a suffix and zero selects full history.
+    bool bind_attention_pass(
+        Context& context, std::uint32_t params_slot,
+        const MtpAttentionRuntimeMode& mode, std::uint32_t window,
+        MtpAttentionPassBuffers& buffers, std::string& error) const;
+    bool bind_feed_forward_read(
+        Context& context, std::uint32_t params_slot,
+        MtpFeedForwardReadBuffers& buffers, std::string& error) const;
+    bool bind_router(Context& context, std::uint32_t params_slot,
+                     MtpRouterBuffers& buffers, std::string& error) const;
+    /// Resolve the stage-17 scratch and every bounded expert window. The
+    /// encoder dispatches only route IDs owned by each window.
+    bool bind_routed_experts(Context& context,
+                             MtpRoutedExpertsBuffers& buffers,
+                             std::string& error) const;
+    /// Resolve stages 18–19 and their dead-region mat-vec sinks from the MTP
+    /// arena. The residual and stage-15 GR injection are shared in place.
+    bool bind_shared_ffn_write(Context& context,
+                               std::uint32_t params_slot,
+                               MtpSharedFFNWriteBuffers& buffers,
+                               std::string& error) const;
+    /// Resolve stage 20's mixer weights and its stage-21 sample output.
+    bool bind_final_mixer(Context& context, std::uint32_t params_slot,
+                          MtpFinalMixerBuffers& buffers,
+                          std::string& error) const;
+    /// Resolve stage 21 against the caller's read-only main output head.
+    /// The inspected draft vocabulary is validated once when this runtime
+    /// opens and reused by every returned draft-head binding.
+    bool bind_draft_head(Context& context, std::uint32_t params_slot,
+                         ReadOnlyBufferRef output_weights,
+                         std::uint32_t full_head_vocab_size,
+                         MtpDraftHeadBuffers& buffers,
+                         std::string& error) const;
+    /// Resolve stage 22 and require the exact vocabulary token returned by
+    /// bind_draft_head, so logits and final token IDs use one mapping.
+    bool bind_draft_sampling(
+        Context& context, std::uint32_t params_slot,
+        const MtpDraftVocabularyMap& draft_vocabulary,
+        MtpDraftSamplingBuffers& buffers, std::string& error) const;
     /// Borrowed main RoPE view, or empty when unbound or this owner is invalid.
     BufferRef shared_rope() const noexcept;
     bool kv_views(MtpKvViews& views, std::string& error) const;
