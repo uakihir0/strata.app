@@ -10,6 +10,7 @@
 #include "strata/metal/prefill_gr_norm_dispatch.hpp"
 #include "strata/metal/prefill_gr_silu_dispatch.hpp"
 #include "strata/metal/prefill_gdn_gates_dispatch.hpp"
+#include "strata/metal/prefill_gdn_conv_dispatch.hpp"
 #include "strata/metal/prefill_gr_write_norm_dispatch.hpp"
 #include "twin.hpp"
 
@@ -38,6 +39,8 @@ namespace {
 constexpr std::uint32_t kWidth = 2560u;
 constexpr std::uint32_t kStreams = 4u;
 constexpr std::uint32_t kGdnHeads = 48u;
+constexpr std::uint32_t kGdnConvChannels = 10240u;
+constexpr std::uint32_t kGdnConvKernel = 4u;
 constexpr std::uint32_t kThreads = 256u;
 constexpr float kEpsilon = 1.0e-6f;
 constexpr std::size_t kGuardBytes = 4096u;
@@ -2339,6 +2342,412 @@ bool test_prefill_gdn_gates_failure_discards_prior_dispatch(
     return unchanged;
 }
 
+float prefill_gdn_conv_input_oracle(std::span<const float> history,
+                                    std::span<const float> qkv, int row,
+                                    std::uint32_t channel) {
+    if (row < 0) {
+        const std::size_t index =
+            static_cast<std::size_t>(channel) * (kGdnConvKernel - 1u) +
+            static_cast<std::size_t>(row + 3);
+        return history[index];
+    }
+    return qkv[static_cast<std::size_t>(row) * kGdnConvChannels + channel];
+}
+
+bool run_prefill_gdn_conv_tiled_case(Context& context, std::uint32_t rows,
+                                     bool shared_encoder) {
+    const std::string label =
+        "Prefill GDN tiled convolution T=" + std::to_string(rows) +
+        (shared_encoder ? " shared" : " standalone");
+    const std::size_t history_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) *
+        (kGdnConvKernel - 1u) * sizeof(float);
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(rows) * kGdnConvChannels * sizeof(float);
+    const std::size_t weight_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) * kGdnConvKernel *
+        sizeof(float);
+    const std::size_t value_count =
+        static_cast<std::size_t>(rows) * kGdnConvChannels;
+    std::vector<float> history(history_bytes / sizeof(float));
+    std::vector<float> qkv(value_count);
+    std::vector<float> weights(weight_bytes / sizeof(float));
+    std::vector<float> expected(value_count);
+    const auto input_pattern = [](std::size_t index) {
+        const int centered =
+            static_cast<int>((index * 37u + 13u) % 127u) - 63;
+        return static_cast<float>(centered) * (1.0f / 128.0f);
+    };
+    const auto weight_pattern = [](std::size_t index) {
+        const int centered =
+            static_cast<int>((index * 19u + 5u) % 31u) - 15;
+        return static_cast<float>(centered) * (1.0f / 64.0f);
+    };
+    for (std::size_t index = 0u; index < history.size(); ++index) {
+        history[index] = input_pattern(index + 101u);
+    }
+    for (std::size_t index = 0u; index < qkv.size(); ++index) {
+        qkv[index] = input_pattern(index + 211u);
+    }
+    for (std::size_t index = 0u; index < weights.size(); ++index) {
+        weights[index] = weight_pattern(index + 307u);
+    }
+    if (rows > 1u) {
+        // For output row 1, the documented nested FMA order produces
+        // 31.999998f. Reversing the FMA order rounds the same terms to 32.0f.
+        // The non-dyadic 1.0001f × 255.9744f product creates the cancellation
+        // residual that the later positive term keeps observable.
+        history[1u] = -256.0f;
+        history[2u] = 1.0001f;
+        qkv[0u] = 32.0f;
+        qkv[kGdnConvChannels] = 0.0f;
+        weights[0u] = 1.0f;
+        weights[1u] = 255.9744f;
+        weights[2u] = 1.0f;
+        weights[3u] = 1.0f;
+    }
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        for (std::uint32_t channel = 0u; channel < kGdnConvChannels;
+             ++channel) {
+            const std::size_t out =
+                static_cast<std::size_t>(row) * kGdnConvChannels + channel;
+            const std::size_t weight_base =
+                static_cast<std::size_t>(channel) * kGdnConvKernel;
+            const float x0 = prefill_gdn_conv_input_oracle(
+                history, qkv, static_cast<int>(row) - 3, channel);
+            const float x1 = prefill_gdn_conv_input_oracle(
+                history, qkv, static_cast<int>(row) - 2, channel);
+            const float x2 = prefill_gdn_conv_input_oracle(
+                history, qkv, static_cast<int>(row) - 1, channel);
+            const float x3 = qkv[out];
+            const float conv = std::fma(
+                x3, weights[weight_base + 3u],
+                std::fma(x2, weights[weight_base + 2u],
+                         std::fma(x1, weights[weight_base + 1u],
+                                  x0 * weights[weight_base])));
+            expected[out] = conv / (1.0f + std::exp(-conv));
+        }
+    }
+    bool order_control_passed = true;
+    if (rows > 1u) {
+        const float x0 = history[1u];
+        const float x1 = history[2u];
+        const float x2 = qkv[0u];
+        const float x3 = qkv[kGdnConvChannels];
+        const float documented = std::fma(
+            x3, weights[3u],
+            std::fma(x2, weights[2u],
+                     std::fma(x1, weights[1u], x0 * weights[0u])));
+        const float reordered = std::fma(
+            x0, weights[0u],
+            std::fma(x1, weights[1u],
+                     std::fma(x2, weights[2u], x3 * weights[3u])));
+        order_control_passed =
+            documented == expected[kGdnConvChannels] &&
+            expected[kGdnConvChannels] != reordered;
+        check(order_control_passed, label + " FMA order negative control",
+              "documented=" + std::to_string(documented) +
+                  ", reordered=" + std::to_string(reordered));
+    }
+
+    TestBuffer history_buffer, qkv_buffer, weight_buffer, output_buffer;
+    std::string error;
+    const bool allocated =
+        history_buffer.allocate(context, label + " history", history_bytes,
+                                error) &&
+        qkv_buffer.allocate(context, label + " qkv", row_bytes, error) &&
+        weight_buffer.allocate(context, label + " weights", weight_bytes,
+                               error) &&
+        output_buffer.allocate(context, label + " output", row_bytes, error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    std::memcpy(history_buffer.payload().data(), history.data(),
+                history_bytes);
+    std::memcpy(qkv_buffer.payload().data(), qkv.data(), row_bytes);
+    std::memcpy(weight_buffer.payload().data(), weights.data(), weight_bytes);
+    const auto history_before = std::vector<std::uint8_t>(
+        history_buffer.allocation().begin(), history_buffer.allocation().end());
+    const auto qkv_before = std::vector<std::uint8_t>(
+        qkv_buffer.allocation().begin(), qkv_buffer.allocation().end());
+    const auto weights_before = std::vector<std::uint8_t>(
+        weight_buffer.allocation().begin(), weight_buffer.allocation().end());
+    const PrefillGDNConvTiledBuffers buffers{
+        context.buffers().read_only(history_buffer.view()),
+        context.buffers().read_only(qkv_buffer.view()),
+        context.buffers().read_only(weight_buffer.view()),
+        output_buffer.view()};
+    auto command = context.make_command_buffer(label, error);
+    check(command != nullptr, label + " command buffer", error);
+    if (!command) return false;
+    const bool encoded = shared_encoder
+        ? Encoder::encode(
+              context, *command, "shared Prefill GDN tiled convolution",
+              [&](Encoder& encoder, std::string& encode_error) {
+                  return encode_prefill_gdn_conv_tiled(
+                      context, encoder, rows, buffers, encode_error);
+              },
+              error)
+        : encode_prefill_gdn_conv_tiled(context, *command, rows, buffers,
+                                        error);
+    check(encoded, label + " production encode", error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    if (!submit_and_wait(command, label, error)) {
+        check(false, label + " Metal dispatch", error);
+        return false;
+    }
+
+    const auto actual = std::span<const float>(
+        reinterpret_cast<const float*>(output_buffer.payload().data()),
+        value_count);
+    std::uint64_t max_ulp = 0u;
+    for (std::size_t index = 0u; index < expected.size(); ++index) {
+        max_ulp =
+            std::max(max_ulp, float_ulp_distance(actual[index], expected[index]));
+    }
+    const bool values_match = max_ulp <= 64u;
+    check(values_match, label + " tiled convolution oracle",
+          "max ULP=" + std::to_string(max_ulp) + ", limit=64");
+    const bool sentinel_match =
+        rows <= 1u || actual[kGdnConvChannels] == expected[kGdnConvChannels];
+    check(sentinel_match, label + " cancellation-sensitive FMA sentinel");
+    const bool inputs_unchanged =
+        std::equal(history_before.begin(), history_before.end(),
+                   history_buffer.allocation().begin()) &&
+        std::equal(qkv_before.begin(), qkv_before.end(),
+                   qkv_buffer.allocation().begin()) &&
+        std::equal(weights_before.begin(), weights_before.end(),
+                   weight_buffer.allocation().begin());
+    check(inputs_unchanged, label + " inputs remain read-only");
+    const bool guards =
+        history_buffer.guards_intact() && qkv_buffer.guards_intact() &&
+        weight_buffer.guards_intact() && output_buffer.guards_intact();
+    check(guards, label + " guard regions");
+    return order_control_passed && values_match && sentinel_match &&
+           inputs_unchanged && guards;
+}
+
+bool reject_prefill_gdn_conv_tiled_call(
+    Context& context, std::uint32_t rows,
+    const PrefillGDNConvTiledBuffers& buffers,
+    std::string_view expected_error, const std::string& label) {
+    std::string error;
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, "rejected Prefill GDN tiled convolution",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_gdn_conv_tiled(
+                context, encoder, rows, buffers, encode_error);
+        },
+        error);
+    const bool right_error =
+        !encoded && error.find(expected_error) != std::string::npos;
+    check(right_error, label, error);
+    return right_error;
+}
+
+bool test_prefill_gdn_conv_tiled_validation(Context& context,
+                                            Context& foreign_context) {
+    const std::string label = "Prefill GDN tiled convolution validation";
+    constexpr std::size_t history_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) *
+        (kGdnConvKernel - 1u) * sizeof(float);
+    constexpr std::size_t row_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) * sizeof(float);
+    constexpr std::size_t weight_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) * kGdnConvKernel *
+        sizeof(float);
+    TestBuffer history, qkv, weights, output, foreign, overlapping_inputs;
+    std::string error;
+    const bool allocated =
+        history.allocate(context, label + " history", history_bytes, error) &&
+        qkv.allocate(context, label + " qkv", row_bytes, error) &&
+        weights.allocate(context, label + " weights", weight_bytes, error) &&
+        output.allocate(context, label + " output", row_bytes, error) &&
+        foreign.allocate(foreign_context, label + " foreign", history_bytes,
+                         error) &&
+        overlapping_inputs.allocate(context, label + " overlapping read-only",
+                                    weight_bytes, error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    const ReadOnlyBufferRef history_ro =
+        context.buffers().read_only(history.view());
+    const ReadOnlyBufferRef qkv_ro = context.buffers().read_only(qkv.view());
+    const ReadOnlyBufferRef weights_ro =
+        context.buffers().read_only(weights.view());
+    const PrefillGDNConvTiledBuffers valid{
+        history_ro, qkv_ro, weights_ro, output.view()};
+    bool passed = true;
+    auto overlap_command =
+        context.make_command_buffer(label + " read-only overlap", error);
+    if (!overlap_command) {
+        check(false, label + " read-only overlap command buffer", error);
+        return false;
+    }
+    const ReadOnlyBufferRef shared_ro =
+        context.buffers().read_only(overlapping_inputs.view());
+    const bool readonly_overlap_accepted = Encoder::encode(
+        context, *overlap_command, "Prefill GDN overlapping read-only inputs",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_gdn_conv_tiled(
+                context, encoder, 1u,
+                {shared_ro.slice(0u, history_bytes),
+                 shared_ro.slice(0u, row_bytes),
+                 shared_ro.slice(0u, weight_bytes), output.view()},
+                encode_error);
+        },
+        error);
+    overlap_command->discard();
+    check(readonly_overlap_accepted,
+          label + " accepts overlapping read-only inputs", error);
+    passed &= readonly_overlap_accepted;
+    passed &= reject_prefill_gdn_conv_tiled_call(
+        context, 0u, valid, "row count", label + " rejects zero rows");
+    passed &= reject_prefill_gdn_conv_tiled_call(
+        context, kPrefillMaxShaderRows + 1u, {}, "row count",
+        label + " rejects shader-unsafe rows");
+    passed &= reject_prefill_gdn_conv_tiled_call(
+        context, 1u,
+        {history_ro.slice(0u, history_bytes - sizeof(float)), qkv_ro,
+         weights_ro, output.view()},
+        "undersized", label + " rejects short history");
+    passed &= reject_prefill_gdn_conv_tiled_call(
+        context, 1u,
+        {history_ro, qkv_ro.slice(0u, row_bytes - sizeof(float)), weights_ro,
+         output.view()},
+        "undersized", label + " rejects short QKV");
+    passed &= reject_prefill_gdn_conv_tiled_call(
+        context, 1u,
+        {history_ro, qkv_ro, weights_ro.slice(0u, weight_bytes - sizeof(float)),
+         output.view()},
+        "undersized", label + " rejects short weights");
+    passed &= reject_prefill_gdn_conv_tiled_call(
+        context, 1u,
+        {history_ro, qkv_ro, weights_ro, qkv.view()},
+        "output overlaps a read-only input",
+        label + " rejects output/input overlap");
+    passed &= reject_prefill_gdn_conv_tiled_call(
+        context, 1u,
+        {foreign_context.buffers().read_only(foreign.view()), qkv_ro,
+         weights_ro, output.view()},
+        "not owned by this Context",
+        label + " rejects foreign Context input");
+    return passed;
+}
+
+bool test_prefill_gdn_conv_tiled_open_concurrent_group_rejected(
+    Context& context) {
+    const char* const dispatch = std::getenv("STRATA_METAL_DISPATCH");
+    if (dispatch == nullptr || std::string_view(dispatch) != "concurrent") {
+        return true;
+    }
+    const std::string label =
+        "Prefill GDN tiled convolution rejects open concurrent group";
+    constexpr std::size_t history_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) *
+        (kGdnConvKernel - 1u) * sizeof(float);
+    constexpr std::size_t row_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) * sizeof(float);
+    constexpr std::size_t weight_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) * kGdnConvKernel *
+        sizeof(float);
+    TestBuffer history, qkv, weights, output;
+    std::string error;
+    const bool allocated =
+        history.allocate(context, label + " history", history_bytes, error) &&
+        qkv.allocate(context, label + " qkv", row_bytes, error) &&
+        weights.allocate(context, label + " weights", weight_bytes, error) &&
+        output.allocate(context, label + " output", row_bytes, error);
+    if (!allocated) {
+        check(false, label + " allocate buffers", error);
+        return false;
+    }
+    const PrefillGDNConvTiledBuffers buffers{
+        context.buffers().read_only(history.view()),
+        context.buffers().read_only(qkv.view()),
+        context.buffers().read_only(weights.view()), output.view()};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, "open concurrent Prefill GDN convolution",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encoder.group_begin(encode_error)) return false;
+            return encode_prefill_gdn_conv_tiled(
+                context, encoder, 1u, buffers, encode_error);
+        },
+        error);
+    const bool rejected =
+        !encoded && error.find("ordered concurrent-group boundary") !=
+                        std::string::npos;
+    check(rejected, label, error);
+    return rejected;
+}
+
+bool test_prefill_gdn_conv_tiled_failure_discards_prior_dispatch(
+    Context& context) {
+    const std::string label =
+        "Prefill GDN tiled convolution failure discards prior dispatch";
+    constexpr std::size_t history_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) *
+        (kGdnConvKernel - 1u) * sizeof(float);
+    constexpr std::size_t row_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) * sizeof(float);
+    constexpr std::size_t weight_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) * kGdnConvKernel *
+        sizeof(float);
+    TestBuffer history, qkv, weights, output;
+    std::string error;
+    const bool allocated =
+        history.allocate(context, label + " history", history_bytes, error) &&
+        qkv.allocate(context, label + " qkv", row_bytes, error) &&
+        weights.allocate(context, label + " weights", weight_bytes, error) &&
+        output.allocate(context, label + " output", row_bytes, error);
+    if (!allocated) {
+        check(false, label + " allocate buffers", error);
+        return false;
+    }
+    const auto output_before = std::vector<std::uint8_t>(
+        output.allocation().begin(), output.allocation().end());
+    const PrefillGDNConvTiledBuffers buffers{
+        context.buffers().read_only(history.view()),
+        context.buffers().read_only(qkv.view()),
+        context.buffers().read_only(weights.view()), output.view()};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, "Prefill GDN tiled convolution rollback fixture",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_prefill_gdn_conv_tiled(context, encoder, 1u, buffers,
+                                               encode_error)) {
+                return false;
+            }
+            return encode_prefill_gdn_conv_tiled(context, encoder, 0u, {},
+                                                 encode_error);
+        },
+        error);
+    const bool discarded = command->unsafe_native_handle() == nullptr;
+    const bool unchanged =
+        !encoded && discarded && error.find("row count") != std::string::npos &&
+        std::equal(output_before.begin(), output_before.end(),
+                   output.allocation().begin());
+    check(unchanged, label,
+          error + (discarded ? " (command buffer discarded)"
+                             : " (command buffer remained submit-capable)"));
+    return unchanged;
+}
+
 bool reject_gr_write_norm_call(Context& context, std::uint32_t rows,
                                PrefillBF16X2Mode mode,
                                const PrefillGRWriteNormBuffers& buffers,
@@ -2646,6 +3055,8 @@ int main(int argc, char** argv) {
     passed &= test_silu_encoder_validation(*context, *foreign_context);
     passed &= test_gr_write_norm_validation(*context, *foreign_context);
     passed &= test_prefill_gdn_gates_validation(*context, *foreign_context);
+    passed &= test_prefill_gdn_conv_tiled_validation(*context,
+                                                     *foreign_context);
     const std::array<std::uint32_t, 3> rows{1u, 3u, 8u};
     const std::array<PrefillBF16X2Mode, 3> modes{
         PrefillBF16X2Mode::off,
@@ -2684,6 +3095,8 @@ int main(int argc, char** argv) {
     passed &= test_gr_mix_failure_discards_prior_dispatch(*context);
     passed &= test_gr_write_norm_failure_discards_prior_dispatch(*context);
     passed &= test_prefill_gdn_gates_failure_discards_prior_dispatch(*context);
+    passed &=
+        test_prefill_gdn_conv_tiled_failure_discards_prior_dispatch(*context);
     passed &= test_open_concurrent_group_rejected(*context);
     passed &= test_silu_open_concurrent_group_rejected(*context);
     passed &= test_gr_mix_open_concurrent_group_rejected(*context);
@@ -2698,15 +3111,21 @@ int main(int argc, char** argv) {
     }
     passed &= test_gr_write_norm_open_concurrent_group_rejected(*context);
     passed &= test_prefill_gdn_gates_open_concurrent_group_rejected(*context);
+    passed &=
+        test_prefill_gdn_conv_tiled_open_concurrent_group_rejected(*context);
     for (const std::uint32_t gate_rows : {1u, 3u, 8u}) {
         passed &= run_prefill_gdn_gates_case(*context, gate_rows, false);
         passed &= run_prefill_gdn_gates_case(*context, gate_rows, true);
+    }
+    for (const std::uint32_t conv_rows : {1u, 3u, 64u, 65u, 129u}) {
+        passed &= run_prefill_gdn_conv_tiled_case(*context, conv_rows, false);
+        passed &= run_prefill_gdn_conv_tiled_case(*context, conv_rows, true);
     }
     if (g_failures != 0) {
         std::fprintf(stderr, "%d Prefill Metal test(s) failed\n", g_failures);
         return 1;
     }
     if (!passed) return 1;
-    std::puts("all Prefill GR and GDN gate tests passed");
+    std::puts("all Prefill GR and GDN tests passed");
     return 0;
 }
