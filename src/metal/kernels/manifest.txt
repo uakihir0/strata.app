@@ -3,6 +3,7 @@
 # (docs/mac/08-build-and-distribution.md, section 5.4).
 strata_selftest_add safe 256 1 1
 strata_selftest_copy_u32 safe 256 1 1
+strata_selftest_copy_u32_one safe 1 1 1
 strata_selftest_exp fast 256 1 1
 strata_selftest_layout safe 1 1 1
 strata_selftest_math safe 256 1 1

@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -709,6 +710,122 @@ bool test_embed_rows_encoder_validation(Context& context,
           "committed embedding rows command completes", error);
     passed &= committed_completes;
     return passed;
+}
+
+bool test_gpu_written_embedding_token_bounds(Context& context) {
+    constexpr std::uint32_t vocabulary_size = 4u;
+    constexpr std::size_t table_bytes =
+        static_cast<std::size_t>(vocabulary_size) * kEmbeddingWidth *
+        sizeof(std::uint16_t);
+    constexpr std::size_t embedding_bytes =
+        static_cast<std::size_t>(kEmbeddingWidth) * sizeof(float);
+    const std::uint32_t stale_token = 2u;
+    const std::uint32_t gpu_token = 0x80000001u;
+    std::string error;
+
+    twin::GuardedBuffer table;
+    twin::GuardedBuffer source_token;
+    twin::GuardedBuffer token;
+    twin::GuardedBuffer embedding;
+    const bool allocated =
+        table.allocate(context, "GPU-token embedding table", table_bytes,
+                       error) &&
+        source_token.allocate(context, "GPU-token embedding source",
+                              sizeof(std::uint32_t), error) &&
+        token.allocate(context, "GPU-token embedding destination",
+                       sizeof(std::uint32_t), error) &&
+        embedding.allocate(context, "GPU-token embedding output",
+                           embedding_bytes, error);
+    check(allocated, "allocate GPU-token embedding bounds fixture", error);
+    if (!allocated) return false;
+
+    std::memset(table.payload().data(), 0, table_bytes);
+    std::memcpy(source_token.payload().data(), &gpu_token,
+                sizeof(gpu_token));
+    std::memcpy(token.payload().data(), &stale_token, sizeof(stale_token));
+    std::fill(embedding.payload().begin(), embedding.payload().end(),
+              kPoisonByte);
+    table.capture_before_dispatch();
+    source_token.capture_before_dispatch();
+    token.capture_before_dispatch();
+    embedding.capture_before_dispatch();
+
+    const std::array token_output{
+        EncoderBufferBinding{token.view(), 1u, sizeof(std::uint32_t),
+                             alignof(std::uint32_t)},
+    };
+    const std::array token_input{
+        EncoderReadOnlyBufferBinding{
+            context.buffers().read_only(source_token.view()), 0u,
+            sizeof(std::uint32_t), alignof(std::uint32_t)},
+    };
+    constexpr std::array<EncoderBytesBinding, 0> no_bytes{};
+    constexpr std::array<EncoderThreadgroupMemory, 0> no_memory{};
+    const EmbedRowsReadOnlyBuffers gather{
+        context.buffers().read_only(table.view()),
+        context.buffers().read_only(token.view()),
+        embedding.view(),
+        true,
+    };
+
+    auto command =
+        context.make_command_buffer("GPU-written embedding token bounds",
+                                    error);
+    check(command != nullptr, "create GPU-token embedding command", error);
+    if (!command) return false;
+    const bool encoded = Encoder::encode(
+        context, *command, "GPU-written token producer and embedding gather",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encoder.dispatch("strata_selftest_copy_u32_one",
+                                    {1u, 1u, 1u}, {1u, 1u, 1u},
+                                    token_output, token_input, no_bytes,
+                                    no_memory, encode_error) &&
+                   encode_embed_rows(context, encoder, 1u, vocabulary_size,
+                                     EmbedRowsFormat::bf16, gather,
+                                     encode_error);
+        },
+        error);
+    check(encoded,
+          "accept GPU-written token without reading stale CPU contents",
+          error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    const bool completed =
+        submit_and_wait(*command, "GPU-written embedding token bounds",
+                        error);
+    check(completed, "complete GPU-token embedding bounds fixture", error);
+    if (!completed) return false;
+
+    const auto output = std::span<const float>(
+        reinterpret_cast<const float*>(embedding.payload().data()),
+        kEmbeddingWidth);
+    const bool invalid_token_signaled =
+        std::all_of(output.begin(), output.end(),
+                    [](float value) {
+                        return std::bit_cast<std::uint32_t>(value) ==
+                               0x7fc00000u;
+                    });
+    const std::array<twin::ByteRange, 1> token_written{{
+        {0u, sizeof(std::uint32_t)},
+    }};
+    const bool token_written_by_gpu =
+        std::memcmp(token.payload().data(), &gpu_token,
+                    sizeof(gpu_token)) == 0 &&
+        !token.first_unwritten_change(token_written);
+    const std::array<twin::ByteRange, 1> embedding_written{{
+        {0u, embedding_bytes},
+    }};
+    const bool guards =
+        !table.first_unwritten_change({}) &&
+        !source_token.first_unwritten_change({}) &&
+        !embedding.first_unwritten_change(embedding_written);
+    check(invalid_token_signaled,
+          "GPU OOV token is safely signaled without reading past the table");
+    check(token_written_by_gpu, "GPU token producer replaces the stale token");
+    check(guards, "GPU-token gather preserves all guards and immutable inputs");
+    return invalid_token_signaled && token_written_by_gpu && guards;
 }
 
 bool test_gr_broadcast(Context& context, std::uint32_t rows, twin::InputSet set,
@@ -2558,6 +2675,7 @@ int main(int argc, char** argv) {
         }
     }
     passed &= test_embed_rows_encoder_validation(*context, argv[1]);
+    passed &= test_gpu_written_embedding_token_bounds(*context);
     passed &= test_embed_image_encoder_validation(*context, argv[1]);
     passed &= test_gr_broadcast_encoder_validation(*context, argv[1]);
     passed &= test_window_t1_embedding_stage(*context);

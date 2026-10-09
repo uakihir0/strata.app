@@ -27,6 +27,14 @@ kernel void strata_selftest_copy_u32(device const uint* input [[buffer(0)]],
 }
 
 [[max_total_threads_per_threadgroup(1)]]
+kernel void strata_selftest_copy_u32_one(
+    device const uint* input [[buffer(0)]],
+    device uint* output [[buffer(1)]],
+    uint i [[thread_position_in_grid]]) {
+    if (i == 0u) output[0] = input[0];
+}
+
+[[max_total_threads_per_threadgroup(1)]]
 kernel void strata_selftest_layout(device uint* out [[buffer(0)]],
                                    uint i [[thread_position_in_grid]]) {
     if (i != 0) return;

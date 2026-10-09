@@ -7,6 +7,7 @@
 #include "oracles/iq4_xs_mv.hpp"
 #include "oracles/q5_k_mv.hpp"
 #include "oracles/q6_k_mv.hpp"
+#include "oracles/q8_0_mv.hpp"
 #include "oracles/q8_1.hpp"
 #include "twin.hpp"
 
@@ -31,6 +32,8 @@
 #include <string_view>
 #include <vector>
 
+#include "strata/kernels/bf16_bits.hpp"
+
 using namespace strata::metal;
 
 namespace {
@@ -45,6 +48,7 @@ constexpr std::size_t kE2Bytes = kE2Values * sizeof(float);
 constexpr std::size_t kOutputPayloadBytes = kH2Bytes + 8u;
 constexpr std::size_t kH2PayloadBytes = kH2Bytes + 8u;
 constexpr std::size_t kE2PayloadBytes = kE2Bytes + 8u;
+constexpr std::uint32_t kImageTokenFlag = 0x80000000u;
 
 int g_failures = 0;
 
@@ -540,6 +544,739 @@ bool execute_draft_head_case(
            !sample.first_unwritten_change({}) &&
            !weights.first_unwritten_change({}) &&
            (row_map.empty() || !row_map_buffer.first_unwritten_change({}));
+}
+
+bool test_mtp_input_projection(Context& context) {
+    constexpr std::uint32_t vocabulary = 8u;
+    constexpr std::size_t embedding_table_row_bytes =
+        static_cast<std::size_t>(N_EMBD) * sizeof(std::uint16_t);
+    constexpr std::size_t embedding_capacity =
+        static_cast<std::size_t>(kMaxRows) * N_EMBD * sizeof(float);
+    constexpr std::size_t residual_capacity =
+        static_cast<std::size_t>(kMaxRows) * HC_DIM * sizeof(float);
+    constexpr std::size_t hidden_rows_capacity =
+        static_cast<std::size_t>(kMaxRows) * 4u;
+    constexpr std::size_t q8_row_bytes =
+        static_cast<std::size_t>(N_EMBD / 32u) * sizeof(Q81);
+    constexpr std::size_t q8_capacity =
+        hidden_rows_capacity * q8_row_bytes;
+    constexpr std::size_t hidden_output_capacity =
+        hidden_rows_capacity * N_EMBD * sizeof(float);
+    constexpr std::size_t sink_capacity =
+        4u * static_cast<std::size_t>(N_EMBD) * sizeof(float);
+
+    std::string error;
+    twin::GuardedBuffer params;
+    twin::GuardedBuffer selected_token;
+    twin::GuardedBuffer table;
+    twin::GuardedBuffer embedding_gamma;
+    twin::GuardedBuffer fc_embedding;
+    twin::GuardedBuffer residual;
+    twin::GuardedBuffer hidden_gamma;
+    twin::GuardedBuffer fc_hidden;
+    twin::GuardedBuffer embedding;
+    twin::GuardedBuffer embedding_norm;
+    twin::GuardedBuffer xq;
+    twin::GuardedBuffer e2;
+    twin::GuardedBuffer hidden_norm;
+    twin::GuardedBuffer h2;
+    twin::GuardedBuffer sink;
+    const bool allocated =
+        params.allocate(context, "MTP input projection params", 256u,
+                        error) &&
+        selected_token.allocate(context, "MTP selected token",
+                                sizeof(std::uint32_t), error) &&
+        table.allocate(context, "MTP BF16 token embeddings",
+                       vocabulary * embedding_table_row_bytes, error) &&
+        embedding_gamma.allocate(context, "MTP embedding norm gamma",
+                                 N_EMBD * sizeof(float), error) &&
+        fc_embedding.allocate(
+            context, "MTP fc_embedding Q8_0",
+            static_cast<std::size_t>(N_EMBD) * (N_EMBD / 32u) *
+                sizeof(block_q8_0),
+            error) &&
+        residual.allocate(context, "MTP input residual", residual_capacity,
+                          error) &&
+        hidden_gamma.allocate(context, "MTP hidden norm gamma",
+                              HC_DIM * sizeof(float), error) &&
+        fc_hidden.allocate(
+            context, "MTP fc_hidden Q8_0",
+            static_cast<std::size_t>(N_EMBD) * (N_EMBD / 32u) *
+                sizeof(block_q8_0),
+            error) &&
+        embedding.allocate(context, "MTP embedding scratch",
+                           embedding_capacity, error) &&
+        embedding_norm.allocate(context, "MTP normalized embedding",
+                                embedding_capacity, error) &&
+        xq.allocate(context, "MTP input projection Q8_1", q8_capacity,
+                    error) &&
+        e2.allocate(context, "MTP projected embedding", embedding_capacity,
+                    error) &&
+        hidden_norm.allocate(context, "MTP normalized hidden",
+                             residual_capacity, error) &&
+        h2.allocate(context, "MTP projected hidden", hidden_output_capacity,
+                    error) &&
+        sink.allocate(context, "MTP input projection mat-vec sink",
+                      sink_capacity, error);
+    check(allocated, "MTP stages 1–5 allocations", error);
+    if (!allocated) return false;
+
+    auto table_values = std::span<std::uint16_t>(
+        reinterpret_cast<std::uint16_t*>(table.payload().data()),
+        table.payload().size() / sizeof(std::uint16_t));
+    for (std::uint32_t token = 0u; token < vocabulary; ++token) {
+        for (std::uint32_t column = 0u; column < N_EMBD; ++column) {
+            const auto centered = static_cast<std::int32_t>(
+                                      (token * 43u + column * 17u) % 251u) -
+                                  125;
+            const float value = static_cast<float>(centered) * 0.0078125f;
+            table_values[static_cast<std::size_t>(token) * N_EMBD + column] =
+                strata::kernels::bf16_from_f32(value);
+        }
+    }
+    auto embedding_gamma_values =
+        std::span<float>(reinterpret_cast<float*>(
+                             embedding_gamma.payload().data()),
+                         N_EMBD);
+    for (std::size_t index = 0u; index < embedding_gamma_values.size();
+         ++index) {
+        embedding_gamma_values[index] =
+            0.875f + static_cast<float>(index % 31u) * 0.0078125f;
+    }
+    auto hidden_gamma_values = std::span<float>(
+        reinterpret_cast<float*>(hidden_gamma.payload().data()), HC_DIM);
+    for (std::size_t index = 0u; index < hidden_gamma_values.size(); ++index) {
+        hidden_gamma_values[index] =
+            0.8125f + static_cast<float>(index % 47u) * 0.0078125f;
+    }
+    auto residual_values =
+        std::span<float>(reinterpret_cast<float*>(residual.payload().data()),
+                         residual_capacity / sizeof(float));
+    for (std::size_t index = 0u; index < residual_values.size(); ++index) {
+        const auto centered =
+            static_cast<std::int32_t>((index * 29u + 13u) % 263u) - 131;
+        residual_values[index] = static_cast<float>(centered) * 0.00390625f;
+    }
+
+    const std::size_t weight_blocks_per_row = N_EMBD / 32u;
+    auto fill_q8_weights = [&](twin::GuardedBuffer& buffer,
+                               std::uint32_t output_rows,
+                               std::uint32_t salt) {
+        auto weights = std::span<block_q8_0>(
+            reinterpret_cast<block_q8_0*>(buffer.payload().data()),
+            buffer.payload().size() / sizeof(block_q8_0));
+        for (std::uint32_t row = 0u; row < output_rows; ++row) {
+            for (std::size_t block = 0u; block < weight_blocks_per_row;
+                 ++block) {
+                auto& weight =
+                    weights[static_cast<std::size_t>(row) *
+                                weight_blocks_per_row +
+                            block];
+                weight.d = strata::kernels::f16_from_f32(0.03125f);
+                for (std::uint32_t lane = 0u; lane < 32u; ++lane) {
+                    const auto centered = static_cast<std::int32_t>(
+                                              (row * 11u + block * 7u +
+                                               lane * 5u + salt) %
+                                              15u) -
+                                          7;
+                    weight.qs[lane] = static_cast<std::int8_t>(centered);
+                }
+            }
+        }
+    };
+    fill_q8_weights(fc_embedding, N_EMBD, 3u);
+    fill_q8_weights(fc_hidden, N_EMBD, 9u);
+
+    auto make_params = [&](std::uint32_t rows,
+                           std::uint32_t first_token) {
+        MtpParams value{};
+        value.T = rows;
+        for (std::uint32_t pass = 0u; pass < 4u; ++pass) {
+            const std::uint32_t offset = pass * 8u;
+            value.hid[pass] =
+                offset < rows * 4u ? std::min(8u, rows * 4u - offset) : 0u;
+        }
+        for (std::uint32_t row = 0u; row < rows; ++row) {
+            value.tokens[row] = (first_token + row * 3u) % vocabulary;
+        }
+        std::memset(params.payload().data(), 0, params.payload().size());
+        std::memcpy(params.payload().data(), &value, sizeof(value));
+        return value;
+    };
+    auto make_expected_norm = [](std::span<const float> input,
+                                 std::span<const float> gamma,
+                                 std::uint32_t rows,
+                                 std::uint32_t width) {
+        std::vector<twin::tf> result(
+            static_cast<std::size_t>(rows) * width);
+        for (std::uint32_t row = 0u; row < rows; ++row) {
+            const std::size_t row_offset =
+                static_cast<std::size_t>(row) * width;
+            double sum_squares = 0.0;
+            for (std::uint32_t column = 0u; column < width; ++column) {
+                const double value = input[row_offset + column];
+                sum_squares += value * value;
+            }
+            const float scale = static_cast<float>(
+                1.0 / std::sqrt(sum_squares / width + 1.0e-6));
+            for (std::uint32_t column = 0u; column < width; ++column) {
+                const std::size_t index = row_offset + column;
+                result[index] =
+                    twin::tf{(scale * input[index]) * gamma[column]};
+            }
+        }
+        return result;
+    };
+    auto capture_inputs = [&](bool external_token) {
+        params.capture_before_dispatch();
+        table.capture_before_dispatch();
+        embedding_gamma.capture_before_dispatch();
+        fc_embedding.capture_before_dispatch();
+        residual.capture_before_dispatch();
+        hidden_gamma.capture_before_dispatch();
+        fc_hidden.capture_before_dispatch();
+        if (external_token) selected_token.capture_before_dispatch();
+    };
+    auto poison_outputs = [&] {
+        std::fill(embedding.payload().begin(), embedding.payload().end(),
+                  0xa5u);
+        std::fill(embedding_norm.payload().begin(),
+                  embedding_norm.payload().end(), 0xa5u);
+        std::fill(xq.payload().begin(), xq.payload().end(), 0xa5u);
+        std::fill(e2.payload().begin(), e2.payload().end(), 0xa5u);
+        std::fill(hidden_norm.payload().begin(), hidden_norm.payload().end(),
+                  0xa5u);
+        std::fill(h2.payload().begin(), h2.payload().end(), 0xa5u);
+        std::fill(sink.payload().begin(), sink.payload().end(), 0xa5u);
+        embedding.capture_before_dispatch();
+        embedding_norm.capture_before_dispatch();
+        xq.capture_before_dispatch();
+        e2.capture_before_dispatch();
+        hidden_norm.capture_before_dispatch();
+        h2.capture_before_dispatch();
+        sink.capture_before_dispatch();
+    };
+    auto run_case = [&](std::uint32_t rows, std::uint32_t first_token,
+                        MtpInputTokenSource token_source, bool in_place_norm,
+                        bool caller_owned, const std::string& label) {
+        MtpParams params_value = make_params(rows, first_token);
+        const bool external =
+            token_source == MtpInputTokenSource::selected_token;
+        const std::uint32_t external_id = first_token;
+        const std::uint32_t stale_token = vocabulary + 3u;
+        const std::array<twin::ByteRange, 1> token_writer_range{{
+            {0u, sizeof(std::uint32_t)},
+        }};
+        std::memcpy(selected_token.payload().data(), &stale_token,
+                    sizeof(stale_token));
+        const BufferRef embedding_output =
+            in_place_norm ? embedding_norm.view() : embedding.view();
+        MtpInputProjectionBuffers buffers{
+            context.buffers().read_only(params.view()),
+            token_source,
+            external ? context.buffers().read_only(selected_token.view())
+                     : ReadOnlyBufferRef{},
+            EmbedRowsFormat::bf16,
+            vocabulary,
+            context.buffers().read_only(table.view()),
+            context.buffers().read_only(embedding_gamma.view()),
+            context.buffers().read_only(fc_embedding.view()),
+            residual.view(),
+            context.buffers().read_only(hidden_gamma.view()),
+            context.buffers().read_only(fc_hidden.view()),
+            embedding_output,
+            in_place_norm ? embedding_output : embedding_norm.view(),
+            xq.view(),
+            e2.view(),
+            hidden_norm.view(),
+            h2.view(),
+            sink.view(),
+        };
+
+        poison_outputs();
+        capture_inputs(external);
+        auto command = context.make_command_buffer(label, error);
+        check(command != nullptr, label + " command buffer", error);
+        if (!command) return false;
+        bool encoded = false;
+        if (external) {
+            const ReadOnlyBufferRef source_token =
+                context.buffers().read_only(params.view().slice(
+                    offsetof(MtpParams, tokens), sizeof(std::uint32_t)));
+            const std::array token_output{
+                EncoderBufferBinding{selected_token.view(), 1u,
+                                     sizeof(std::uint32_t),
+                                     alignof(std::uint32_t)},
+            };
+            const std::array token_input{
+                EncoderReadOnlyBufferBinding{
+                    source_token, 0u, sizeof(std::uint32_t),
+                    alignof(std::uint32_t)},
+            };
+            constexpr std::array<EncoderBytesBinding, 0> no_bytes{};
+            constexpr std::array<EncoderThreadgroupMemory, 0> no_memory{};
+            encoded = Encoder::encode(
+                context, *command, label + " GPU token producer and projection",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    if (!encoder.dispatch(
+                            "strata_selftest_copy_u32_one", {1u, 1u, 1u},
+                            {1u, 1u, 1u}, token_output, token_input, no_bytes,
+                            no_memory, encode_error)) {
+                        return false;
+                    }
+                    return encode_mtp_input_projection(
+                        context, encoder, buffers, encode_error);
+                },
+                error);
+        } else {
+            encoded =
+                caller_owned
+                    ? Encoder::encode(
+                          context, *command,
+                          label + " caller-owned segment",
+                          [&](Encoder& encoder,
+                              std::string& encode_error) {
+                              return encode_mtp_input_projection(
+                                  context, encoder, buffers, encode_error);
+                          },
+                          error)
+                    : encode_mtp_input_projection(
+                          context, *command, buffers, error);
+        }
+        check(encoded, label + " encode", error);
+        if (!encoded) {
+            command->discard();
+            return false;
+        }
+        const bool completed = submit_and_wait(command, label, error);
+        check(completed, label + " GPU completion", error);
+        if (!completed) return false;
+
+        std::vector<std::uint32_t> token_ids(rows);
+        if (external) {
+            token_ids[0] = external_id;
+        } else {
+            for (std::uint32_t row = 0u; row < rows; ++row) {
+                token_ids[row] = params_value.tokens[row];
+            }
+        }
+        std::vector<float> expected_embedding(
+            static_cast<std::size_t>(rows) * N_EMBD);
+        for (std::uint32_t row = 0u; row < rows; ++row) {
+            for (std::uint32_t column = 0u; column < N_EMBD; ++column) {
+                expected_embedding[static_cast<std::size_t>(row) * N_EMBD +
+                                   column] =
+                    strata::kernels::f32_from_bf16(
+                        table_values[static_cast<std::size_t>(token_ids[row]) *
+                                         N_EMBD +
+                                     column]);
+            }
+        }
+        const auto expected_embedding_norm = make_expected_norm(
+            expected_embedding, embedding_gamma_values, rows, N_EMBD);
+        const auto expected_hidden_norm = make_expected_norm(
+            residual_values.first(static_cast<std::size_t>(rows) * HC_DIM),
+            hidden_gamma_values, rows, HC_DIM);
+
+        const std::size_t embedding_bytes =
+            static_cast<std::size_t>(rows) * N_EMBD * sizeof(float);
+        const std::size_t hidden_bytes =
+            static_cast<std::size_t>(rows) * HC_DIM * sizeof(float);
+        const std::size_t q8_bytes =
+            static_cast<std::size_t>(rows) * 4u * q8_row_bytes;
+        const std::uint32_t embedding_columns =
+            rows <= 1u ? 1u : rows <= 2u ? 2u : rows <= 4u ? 4u : 8u;
+        const std::size_t sink_written_bytes =
+            static_cast<std::size_t>(embedding_columns - rows) * N_EMBD *
+            sizeof(float);
+
+        if (!in_place_norm) {
+            const auto actual_embedding =
+                std::span<const std::uint8_t>(embedding.payload().data(),
+                                              embedding_bytes);
+            const auto expected_embedding_bytes =
+                std::span<const std::uint8_t>(
+                    reinterpret_cast<const std::uint8_t*>(
+                        expected_embedding.data()),
+                    embedding_bytes);
+            const auto embedding_failure =
+                twin::compare_bytes(actual_embedding,
+                                    expected_embedding_bytes);
+            check(!embedding_failure, label + " BF16 token gather oracle",
+                  embedding_failure ? embedding_failure->reason : "");
+        }
+        const auto actual_embedding_norm = std::span<const float>(
+            reinterpret_cast<const float*>(embedding_norm.payload().data()),
+            static_cast<std::size_t>(rows) * N_EMBD);
+        const auto embedding_norm_failure = twin::compare_floats(
+            actual_embedding_norm, expected_embedding_norm,
+            {twin::Comparison::units, 64.0, 0.0, 0u});
+        check(!embedding_norm_failure, label + " embedding RMSNorm U(64)",
+              embedding_norm_failure ? embedding_norm_failure->reason : "");
+        const auto actual_hidden_norm = std::span<const float>(
+            reinterpret_cast<const float*>(hidden_norm.payload().data()),
+            static_cast<std::size_t>(rows) * HC_DIM);
+        const auto hidden_norm_failure = twin::compare_floats(
+            actual_hidden_norm, expected_hidden_norm,
+            {twin::Comparison::units, 64.0, 0.0, 0u});
+        check(!hidden_norm_failure, label + " hidden RMSNorm U(64)",
+              hidden_norm_failure ? hidden_norm_failure->reason : "");
+
+        std::vector<float> padded_embedding(
+            static_cast<std::size_t>(embedding_columns) * N_EMBD);
+        const auto actual_embedding_norm_values =
+            std::span<const float>(actual_embedding_norm);
+        for (std::uint32_t row = 0u; row < embedding_columns; ++row) {
+            const std::uint32_t source_row = row < rows ? row : 0u;
+            for (std::uint32_t column = 0u; column < N_EMBD; ++column) {
+                padded_embedding[static_cast<std::size_t>(row) * N_EMBD +
+                                 column] =
+                    actual_embedding_norm_values[
+                        static_cast<std::size_t>(source_row) * N_EMBD +
+                        column];
+            }
+        }
+        std::vector<Q81> embedding_activations;
+        check(twin::quantize_q8_1_reference(
+                  padded_embedding, N_EMBD, embedding_columns,
+                  embedding_activations, error),
+              label + " embedding Q8_1 scalar oracle", error);
+        const auto embedding_weights = std::span<const block_q8_0>(
+            reinterpret_cast<const block_q8_0*>(fc_embedding.payload().data()),
+            fc_embedding.payload().size() / sizeof(block_q8_0));
+        std::vector<float> expected_e2_padded;
+        check(twin::q8_0_matvec_reference(
+                  embedding_weights, embedding_activations, N_EMBD, N_EMBD,
+                  embedding_columns, rows, expected_e2_padded, error),
+              label + " fc_embedding Q8_0 scalar oracle", error);
+        const std::size_t e2_bytes =
+            static_cast<std::size_t>(rows) * N_EMBD * sizeof(float);
+        const auto expected_e2_bytes = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(
+                expected_e2_padded.data()),
+            e2_bytes);
+        const auto e2_failure = twin::compare_bytes(
+            e2.payload().first(e2_bytes), expected_e2_bytes);
+        check(!e2_failure, label + " fc_embedding exact oracle",
+              e2_failure ? e2_failure->reason : "");
+
+        // The downstream Q8_1 oracle consumes the GPU RMS output. The norm
+        // itself is independently compared above; this avoids making a
+        // floating reduction's final ulp change the input to a quantizer.
+        std::vector<float> hidden_norm_values(actual_hidden_norm.begin(),
+                                              actual_hidden_norm.end());
+        std::vector<Q81> hidden_activations;
+        check(twin::quantize_q8_1_reference(
+                  hidden_norm_values, N_EMBD, rows * 4u,
+                  hidden_activations, error),
+              label + " fc_hidden Q8_1 scalar oracle", error);
+        const auto hidden_weights = std::span<const block_q8_0>(
+            reinterpret_cast<const block_q8_0*>(fc_hidden.payload().data()),
+            fc_hidden.payload().size() / sizeof(block_q8_0));
+        std::vector<float> expected_h2(
+            static_cast<std::size_t>(rows) * 4u * N_EMBD);
+        for (std::uint32_t pass = 0u; pass < (rows * 4u + 7u) / 8u;
+             ++pass) {
+            const std::uint32_t row_offset = pass * 8u;
+            const std::uint32_t active_rows =
+                std::min(8u, rows * 4u - row_offset);
+            const auto pass_activations =
+                std::span<const Q81>(hidden_activations)
+                    .subspan(static_cast<std::size_t>(row_offset) *
+                                 (N_EMBD / 32u),
+                             static_cast<std::size_t>(active_rows) *
+                                 (N_EMBD / 32u));
+            std::vector<float> pass_output;
+            check(twin::q8_0_matvec_reference(
+                      hidden_weights, pass_activations, N_EMBD, N_EMBD,
+                      active_rows, active_rows, pass_output, error),
+                  label + " fc_hidden pass " + std::to_string(pass) +
+                      " Q8_0 scalar oracle",
+                  error);
+            std::copy(pass_output.begin(), pass_output.end(),
+                      expected_h2.begin() +
+                          static_cast<std::size_t>(row_offset) * N_EMBD);
+        }
+        const auto q8_failure = twin::compare_bytes(
+            xq.payload().first(q8_bytes),
+            {reinterpret_cast<const std::uint8_t*>(
+                 hidden_activations.data()),
+             q8_bytes});
+        check(!q8_failure, label + " fc_hidden Q8_1 exact oracle",
+              q8_failure ? q8_failure->reason : "");
+        const std::size_t h2_bytes =
+            static_cast<std::size_t>(rows) * 4u * N_EMBD * sizeof(float);
+        const auto expected_h2_bytes = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(expected_h2.data()),
+            h2_bytes);
+        const auto h2_failure =
+            twin::compare_bytes(h2.payload().first(h2_bytes),
+                                expected_h2_bytes);
+        check(!h2_failure, label + " fc_hidden exact oracle",
+              h2_failure ? h2_failure->reason : "");
+
+        const std::array<twin::ByteRange, 1> embedding_written{{
+            {0u, in_place_norm ? 0u : embedding_bytes},
+        }};
+        const std::array<twin::ByteRange, 1> embedding_norm_written{{
+            {0u, embedding_bytes},
+        }};
+        const std::array<twin::ByteRange, 1> q8_written{{{0u, q8_bytes}}};
+        const std::array<twin::ByteRange, 1> e2_written{{{0u, e2_bytes}}};
+        const std::array<twin::ByteRange, 1> hidden_norm_written{{
+            {0u, hidden_bytes},
+        }};
+        const std::array<twin::ByteRange, 1> h2_written{{{0u, h2_bytes}}};
+        const std::array<twin::ByteRange, 1> sink_written{{
+            {0u, sink_written_bytes},
+        }};
+        const bool output_guards =
+            !embedding.first_unwritten_change(
+                in_place_norm ? std::span<const twin::ByteRange>{}
+                              : std::span<const twin::ByteRange>(
+                                    embedding_written)) &&
+            !embedding_norm.first_unwritten_change(embedding_norm_written) &&
+            !xq.first_unwritten_change(q8_written) &&
+            !e2.first_unwritten_change(e2_written) &&
+            !hidden_norm.first_unwritten_change(hidden_norm_written) &&
+            !h2.first_unwritten_change(h2_written) &&
+            !sink.first_unwritten_change(
+                sink_written_bytes == 0u
+                    ? std::span<const twin::ByteRange>{}
+                    : std::span<const twin::ByteRange>(sink_written));
+        check(output_guards, label + " output guards and inactive tails");
+        const bool input_guards =
+            !params.first_unwritten_change({}) &&
+            !table.first_unwritten_change({}) &&
+            !embedding_gamma.first_unwritten_change({}) &&
+            !fc_embedding.first_unwritten_change({}) &&
+            !residual.first_unwritten_change({}) &&
+            !hidden_gamma.first_unwritten_change({}) &&
+            !fc_hidden.first_unwritten_change({}) &&
+            (!external ||
+             (std::memcmp(selected_token.payload().data(), &external_id,
+                          sizeof(external_id)) == 0 &&
+              !selected_token.first_unwritten_change(token_writer_range)));
+        check(input_guards, label + " immutable inputs");
+        return !embedding_norm_failure && !hidden_norm_failure && !e2_failure &&
+               !q8_failure && !h2_failure && output_guards && input_guards;
+    };
+
+    bool passed = true;
+    passed &= run_case(1u, 1u, MtpInputTokenSource::params_tokens, false,
+                       false, "MTP stages 1–5 K/V T=1");
+    passed &= run_case(2u, 2u, MtpInputTokenSource::params_tokens, false,
+                       false, "MTP stages 1–5 K/V T=2");
+    passed &= run_case(3u, 3u, MtpInputTokenSource::params_tokens, false,
+                       false, "MTP stages 1–5 K/V T=3");
+    passed &= run_case(8u, 0u, MtpInputTokenSource::params_tokens, false,
+                       true, "MTP stages 1–5 K/V T=8");
+    passed &= run_case(1u, 2u, MtpInputTokenSource::selected_token, true,
+                       false, "MTP stages 1–5 full-layer selected token");
+
+    // Host-side shape and alias validation must fail before appending any
+    // dispatches to the transactional command buffer.
+    MtpParams invalid_hid = make_params(3u, 2u);
+    invalid_hid.hid[1] = 8u;
+    std::memcpy(params.payload().data(), &invalid_hid, sizeof(invalid_hid));
+    MtpInputProjectionBuffers valid_candidate{
+        context.buffers().read_only(params.view()),
+        MtpInputTokenSource::params_tokens,
+        {},
+        EmbedRowsFormat::bf16,
+        vocabulary,
+        context.buffers().read_only(table.view()),
+        context.buffers().read_only(embedding_gamma.view()),
+        context.buffers().read_only(fc_embedding.view()),
+        residual.view(),
+        context.buffers().read_only(hidden_gamma.view()),
+        context.buffers().read_only(fc_hidden.view()),
+        embedding.view(),
+        embedding_norm.view(),
+        xq.view(),
+        e2.view(),
+        hidden_norm.view(),
+        h2.view(),
+        sink.view(),
+    };
+    poison_outputs();
+    capture_inputs(false);
+    auto reject_candidate = [&](const MtpInputProjectionBuffers& candidate,
+                                const std::string& label,
+                                const std::string& expected_error) {
+        auto command = context.make_command_buffer(label, error);
+        check(command != nullptr, label + " command buffer", error);
+        if (!command) return false;
+        const bool rejected = !encode_mtp_input_projection(
+            context, *command, candidate, error);
+        const bool expected =
+            rejected && error.find(expected_error) != std::string::npos;
+        const bool outputs_unchanged =
+            !embedding.first_unwritten_change({}) &&
+            !embedding_norm.first_unwritten_change({}) &&
+            !xq.first_unwritten_change({}) && !e2.first_unwritten_change({}) &&
+            !hidden_norm.first_unwritten_change({}) &&
+            !h2.first_unwritten_change({}) && !sink.first_unwritten_change({});
+        check(expected, label, error);
+        check(outputs_unchanged, label + " preserves outputs");
+        command->discard();
+        return expected && outputs_unchanged;
+    };
+    passed &= reject_candidate(valid_candidate, "reject MTP input hid shape",
+                               "hid");
+
+    MtpParams invalid_token = make_params(3u, 2u);
+    invalid_token.tokens[1] = vocabulary;
+    std::memcpy(params.payload().data(), &invalid_token,
+                sizeof(invalid_token));
+    capture_inputs(false);
+    passed &= reject_candidate(valid_candidate, "reject MTP input OOV token",
+                               "outside the vocabulary");
+
+    MtpParams image_marker_token = make_params(3u, 2u);
+    image_marker_token.tokens[1] = kImageTokenFlag;
+    std::memcpy(params.payload().data(), &image_marker_token,
+                sizeof(image_marker_token));
+    capture_inputs(false);
+    passed &= reject_candidate(
+        valid_candidate, "reject MTP input image-marker token",
+        "reserved image-token flag");
+
+    MtpParams valid_t3 = make_params(3u, 2u);
+    std::memcpy(params.payload().data(), &valid_t3, sizeof(valid_t3));
+    auto alias_candidate = valid_candidate;
+    alias_candidate.e2 = alias_candidate.embedding;
+    capture_inputs(false);
+    passed &= reject_candidate(alias_candidate, "reject MTP input output alias",
+                               "overlap");
+
+    auto selected_multirow = valid_candidate;
+    selected_multirow.token_source = MtpInputTokenSource::selected_token;
+    selected_multirow.selected_token =
+        context.buffers().read_only(selected_token.view());
+    capture_inputs(true);
+    passed &= reject_candidate(selected_multirow,
+                               "reject multi-row selected MTP token",
+                               "requires T=1");
+
+    MtpParams valid_t1 = make_params(1u, 2u);
+    std::memcpy(params.payload().data(), &valid_t1, sizeof(valid_t1));
+    auto selected_params_alias = valid_candidate;
+    selected_params_alias.params =
+        context.buffers().read_only(params.view());
+    selected_params_alias.token_source = MtpInputTokenSource::selected_token;
+    selected_params_alias.selected_token =
+        context.buffers().read_only(params.view().slice(
+            offsetof(MtpParams, T), sizeof(std::uint32_t)));
+    capture_inputs(false);
+    passed &= reject_candidate(
+        selected_params_alias, "reject selected MTP token/params alias",
+        "overlaps the MtpParams block");
+
+    // A downstream failure discards the already encoded stage-1–5 segment.
+    MtpParams rollback_params = make_params(3u, 1u);
+    std::memcpy(params.payload().data(), &rollback_params,
+                sizeof(rollback_params));
+    MtpInputProjectionBuffers rollback_buffers = valid_candidate;
+    poison_outputs();
+    capture_inputs(false);
+    twin::GuardedBuffer invalid_params;
+    twin::GuardedBuffer rollback_output;
+    const bool rollback_allocated =
+        invalid_params.allocate(context, "MTP stage rollback params", 256u,
+                                error) &&
+        rollback_output.allocate(context, "MTP stage rollback output",
+                                 hidden_output_capacity, error);
+    check(rollback_allocated, "MTP stage rollback buffers", error);
+    if (!rollback_allocated) return false;
+    MtpParams invalid_block{};
+    std::memcpy(invalid_params.payload().data(), &invalid_block,
+                sizeof(invalid_block));
+    rollback_output.capture_before_dispatch();
+    auto rollback_command =
+        context.make_command_buffer("MTP input projection caller rollback",
+                                    error);
+    check(rollback_command != nullptr,
+          "MTP input projection rollback command buffer", error);
+    if (!rollback_command) return false;
+    bool projection_encoded = false;
+    bool later_rejected = false;
+    const bool rollback_succeeded = Encoder::encode(
+        context, *rollback_command, "MTP input projection rollback segment",
+        [&](Encoder& encoder, std::string& encode_error) {
+            projection_encoded = encode_mtp_input_projection(
+                context, encoder, rollback_buffers, encode_error);
+            if (!projection_encoded) return false;
+            const MtpAddStreamsBuffers invalid_downstream{
+                context.buffers().read_only(invalid_params.view()),
+                context.buffers().read_only(h2.view()),
+                context.buffers().read_only(e2.view()),
+                rollback_output.view(),
+            };
+            later_rejected = !encode_mtp_add_streams(
+                context, encoder, invalid_downstream, encode_error);
+            return false;
+        },
+        error);
+    const bool discarded = projection_encoded && later_rejected &&
+                           !rollback_succeeded &&
+                           rollback_command->unsafe_native_handle() == nullptr;
+    check(discarded, "MTP stages 1–5 caller-owned rollback", error);
+    const bool rollback_outputs_unchanged =
+        !embedding.first_unwritten_change({}) &&
+        !embedding_norm.first_unwritten_change({}) &&
+        !xq.first_unwritten_change({}) && !e2.first_unwritten_change({}) &&
+        !hidden_norm.first_unwritten_change({}) &&
+        !h2.first_unwritten_change({}) &&
+        !rollback_output.first_unwritten_change({});
+    check(rollback_outputs_unchanged,
+          "MTP stages 1–5 rollback preserves scratch");
+    passed &= discarded && rollback_outputs_unchanged;
+    rollback_command->discard();
+
+    const char* dispatch_mode = std::getenv("STRATA_METAL_DISPATCH");
+    if (dispatch_mode != nullptr &&
+        std::string_view(dispatch_mode) == "concurrent") {
+        poison_outputs();
+        capture_inputs(false);
+        auto group_command =
+            context.make_command_buffer("MTP input projection group boundary",
+                                        error);
+        check(group_command != nullptr,
+              "MTP input projection group command buffer", error);
+        if (!group_command) return false;
+        const bool group_rejected = Encoder::encode(
+            context, *group_command, "MTP input projection group validation",
+            [&](Encoder& encoder, std::string& encode_error) {
+                if (!encoder.group_begin(encode_error)) return false;
+                std::string stage_error;
+                const bool rejected = !encode_mtp_input_projection(
+                    context, encoder, valid_candidate, stage_error);
+                if (!encoder.group_end(encode_error)) return false;
+                if (!rejected ||
+                    stage_error.find("ordered concurrent-group boundary") ==
+                        std::string::npos) {
+                    encode_error =
+                        "MTP input projection accepted an open group";
+                    return false;
+                }
+                return true;
+            },
+            error);
+        const bool group_outputs_unchanged =
+            !embedding.first_unwritten_change({}) &&
+            !embedding_norm.first_unwritten_change({}) &&
+            !xq.first_unwritten_change({}) && !e2.first_unwritten_change({}) &&
+            !hidden_norm.first_unwritten_change({}) &&
+            !h2.first_unwritten_change({}) && !sink.first_unwritten_change({});
+        check(group_rejected, "MTP stages 1–5 reject open concurrent group",
+              error);
+        check(group_outputs_unchanged,
+              "MTP stages 1–5 open-group refusal preserves scratch");
+        passed &= group_rejected && group_outputs_unchanged;
+        group_command->discard();
+    }
+    return passed;
 }
 
 bool test_mtp_draft_head(Context& context) {
@@ -1346,6 +2083,7 @@ int main(int argc, char** argv) {
     passed &= test_validation(*context, *foreign_context, params, h2, e2,
                               output);
     passed &= test_caller_owned_rollback(*context, params, h2, e2, output);
+    passed &= test_mtp_input_projection(*context);
     passed &= test_mtp_draft_head(*context);
     passed &= test_mtp_draft_head_validation(*context, *foreign_context);
     passed &= test_mtp_draft_sampling(*context);
@@ -1354,6 +2092,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "metal_mtp_test: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::puts("metal_mtp_test: MTP stages 6, 21 and 22 OK");
+    std::puts("metal_mtp_test: MTP stages 1–6, 21 and 22 OK");
     return 0;
 }
