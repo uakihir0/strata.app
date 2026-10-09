@@ -3709,10 +3709,10 @@ section 6.5, in this order:
   slot needs nothing else.
 - Kernels that run over the whole chunk bind `PrefillParams` itself, whose first field is T.
 
-`build_prefill_chunk_schedule` in `src/metal/engine/prefill.cpp` splits a prompt token count into contiguous,
-non-empty ranges no larger than the configured chunk size. Each range carries its token offset, absolute `p0` and row
-count; the last range is not padded. Empty prompts produce no ranges. Invalid chunk sizes and prompt positions that
-exceed the signed `StepRow` range are rejected without changing the output.
+`build_prefill_chunk_schedule` in `src/metal/engine/prefill.cpp` creates a compact, constant-space schedule for
+contiguous, non-empty ranges no larger than the configured chunk size. `range_at` derives each range's token offset,
+absolute `p0` and row count on demand; the last range is not padded. Empty prompts produce no ranges. Invalid chunk
+sizes and prompt positions that exceed the signed `StepRow` range are rejected without changing the output.
 
 `build_prefill_chunk_metadata` constructs the host inputs for one scheduled range: it copies the token words,
 derives the six slot row counts and `PrefillParams`, builds one signed `StepRow` per token, and records whether any

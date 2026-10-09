@@ -10281,18 +10281,20 @@ measuring L-15 remain open.
 
 ### D-IMPL-363: Plan bounded Prefill chunk ranges on the host
 
-- **Decision:** Add `build_prefill_chunk_schedule`, which converts a prompt
-  token count into contiguous ranges containing a token offset, absolute
-  starting position and live row count. Require `1 <= chunk_rows <=
-  kPrefillMaxShaderRows`, leave the final range unpadded, return an empty
-  schedule for an empty prompt, and reject a non-empty prompt whose positions
-  exceed the signed `StepRow` range. Preserve the caller's previous schedule
-  on failure. The caller can pass each token subspan to
-  `build_prefill_chunk_metadata`; the planner does not duplicate token data.
+- **Decision:** Add `build_prefill_chunk_schedule`, which stores only the
+  prompt token count, starting position and chunk size; `range_at` derives
+  each contiguous range's token offset, absolute starting position and live
+  row count on demand. Require `1 <= chunk_rows <= kPrefillMaxShaderRows`,
+  leave the final range unpadded, return an empty schedule for an empty prompt,
+  and reject a non-empty prompt whose positions exceed the signed `StepRow`
+  range. Preserve the caller's previous schedule on failure. The caller can
+  pass each token subspan to `build_prefill_chunk_metadata`; the planner uses
+  constant space regardless of the resulting chunk count.
 - **Reason:** The documented `Prefill::run` loop needs exact chunk boundaries
   and absolute positions before it can prepare each chunk's metadata. A
-  device-free planner gives that loop a testable, bounded host primitive while
-  avoiding token copies and keeping prompt execution explicitly unimplemented.
+  constant-space, device-free planner gives that loop a testable, bounded host
+  primitive without allocating one descriptor per chunk or copying token
+  data, while keeping prompt execution explicitly unimplemented.
 - **Review items:** Preserve non-empty contiguous coverage, no padding, the
   empty-prompt behavior, signed-position rejection and failure atomicity when
   this planner is wired into `Prefill::run`.
@@ -10304,9 +10306,15 @@ measuring L-15 remain open.
 
 - **Scope:** Range construction, integer bounds, empty and tail chunks,
   output preservation, tests, and documentation.
-- **Findings and fixes:** An independent adversarial review found no
-  actionable issues and required no code changes. The tests exercise both
-  chunk ranges and their handoff to `build_prefill_chunk_metadata`.
+- **Findings and fixes:** The first independent adversarial review found no
+  actionable issues. A follow-up engineering pass replaced the vector of
+  per-chunk descriptors with a compact `range_at` schedule, avoiding memory
+  proportional to the number of chunks. A focused test caught that the empty
+  schedule did not retain its requested chunk size; the builder now records the
+  schedule parameters before handling the zero-token case. A fresh adversarial
+  review of the constant-space API and its arithmetic found no actionable
+  issues. The tests exercise indexed ranges and their handoff to
+  `build_prefill_chunk_metadata`.
 - **Disposition:** The host planner is verified independently of GPU
   execution. Production chunk submission, layer scheduling and model-backed
   Prefill remain open.
