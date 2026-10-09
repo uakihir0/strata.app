@@ -81,6 +81,20 @@ struct MtpAttentionKvAppendBuffers {
     bool kv_rot = false;
 };
 
+/// Inputs and outputs for MTP stage 10. This full-layer projection consumes
+/// the single Q8_1 activation row already produced by stage 8 and writes the
+/// 24×512 Q values into the full `q_full` tensor; `sink` must provide the
+/// Q8_0 encoder's required one-float minimum. Keep all views alive through
+/// command-buffer completion, and keep `params`, `xq` and `q_weights`
+/// unchanged while the GPU reads them.
+struct MtpAttentionQueryProjectionBuffers {
+    ReadOnlyBufferRef params;
+    BufferRef xq;
+    ReadOnlyBufferRef q_weights;
+    BufferRef q_full;
+    BufferRef sink;
+};
+
 /// Add MTP hidden and embedding streams to the caller-owned Encoder segment.
 /// On failure, the enclosing Encoder::encode body must return false so prior
 /// work in that segment is discarded.
@@ -130,5 +144,16 @@ bool encode_mtp_attention_kv_append(
 bool encode_mtp_attention_kv_append(
     Context& context, CommandBuffer& command_buffer,
     const MtpAttentionKvAppendBuffers& buffers, std::string& error);
+
+/// Encode MTP stage 10 for T=1: project stage 8's Q8_1 `xq` row through the
+/// Q8_0 query matrix into the full 24×512 `q_full` tensor. The standalone form
+/// is transactional; the caller-owned form must propagate failure from its
+/// enclosing Encoder::encode body.
+bool encode_mtp_attention_query_projection(
+    Context& context, Encoder& encoder,
+    const MtpAttentionQueryProjectionBuffers& buffers, std::string& error);
+bool encode_mtp_attention_query_projection(
+    Context& context, CommandBuffer& command_buffer,
+    const MtpAttentionQueryProjectionBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal

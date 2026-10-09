@@ -7741,6 +7741,7 @@ measuring L-15 remain open.
 | REV-120 | Compose the MTP stage-7 attention GR read | Initial hostile review found a P2 gap: MTP parameters could alias a GR writable output and be overwritten; stage 7 now rejects overlap between `MtpParams` and all 11 active GR views before delegation. Regressions alias the params with both the normalized output and norm input, and prove that an enclosing caller-owned segment discards an already encoded stage 6 after a late stage-7 alias rejection. Review also found P3 stale stage-6-only documentation and the missing REV-120 ledger row; the stage-6/7 descriptions, plan, test inventory and this record are synchronized. A follow-up found that the original finite `0xa5` marker could hide partially unwritten outputs; all five outputs now start with a qNaN poison and every active element must change its sentinel bits and be finite. Final hostile follow-up found no remaining actionable P1–P3 findings. The full mac-dev build passes; the focused stage-6/stage-7/concurrent tests pass 3/3; mac-metal passes 57/57; mac-host passes 44/44 with the unavailable real-input case skipped; `test_map` and `git diff --check` pass. | Keep MTP runtime-storage composition, later stages, complete drafter behavior and model-backed draft/KV parity open; retain the reviewed dead-h2 placeholder lifetime contract |
 | REV-121 | Implement MTP drafter stage 8 key/value projection | Hostile review found no actionable P1–P3 findings. The stage-8 fixture originally allocated an oversized sink; it now models the named `bo` region at exactly 2560 floats and proves its largest active padded sink use (1536 floats) fits. The scalar oracle independently builds Q8_1 activations and Q8_0 key/value projections for T=1..8 and verifies padded NC rows. `mac-dev` builds; focused stage 6/7/8 and concurrent CTests pass 5/5; `mac-metal` passes 59/59; `mac-host` passes 44/44 with one unavailable real-input case skipped; `test_map` and `git diff --check` pass; the documented `.venv` Python suite passes 35/35 modules (two optional structured-schema tests skipped). | Verify the NC/T active-row contract and scratch lifetimes against model-backed MTP weights; stage 8 remains a typed standalone encoder without runtime-storage wiring |
 | REV-122 | Compose MTP stage 9 K normalization, RoPE, optional rotation and KV append | Hostile review found two P2 lifetime-contract gaps: the API had to require CPU-validated `MtpParams`/StepRows to stay alive and unchanged while GPU dispatches read them, then also name K norm and RoPE as asynchronous read inputs that must remain unchanged through completion. The public contract and both engine/kernel guides now distinguish stable caller inputs from the stage's in-place K, optional V and cache writes. Final hostile re-review found no remaining actionable P1–P3 findings. The `mac-dev` build passes; the focused stage-9 serial/concurrent pair passes 2/2; `mac-metal` passes 61/61; `mac-host` passes 44/44 with one unavailable real-input test skipped; the documented `.venv` Python suite passes 35/35 modules; `test_map` and `git diff --check` pass. | Verify `kv_rot` against the selected runtime KV configuration and establish stage-8→9 parity through `MtpRuntimeStorage` and an inspected model |
+| REV-123 | Implement MTP drafter stage 10 query projection | Initial hostile review identified two P3 gaps: tests did not exercise output/input overlap through stage-8 `xq` (including partial overlap), and engine/kernel docs omitted output-view lifetime. Regressions now use a same-allocation partial `q_full`/`xq` overlap and a `sink`/`xq` overlap; docs require all views to live through GPU completion. The fixture uses the exact named 24×512 `q_full` bind region. Final review confirmed the aligned 2,816-byte partial overlap reaches the alias validator and found no remaining actionable P1–P3 findings. The complete mac-dev build, focused serial/concurrent pair (2/2), mac-metal (63/63), mac-host (44/44 with the unavailable real-input test skipped), Python suite (35/35 modules), test map and diff check pass. | Keep all views alive through completion, reject unsafe read/write aliases, preserve the exact `q_full` bind extent, and compose runtime storage/model-backed parity only in later work |
 
 ### D-IMPL-313: Add a per-layer GDN write-through Window block
 
@@ -8371,3 +8372,29 @@ measuring L-15 remain open.
   `MtpRuntimeStorage` and compare a recorded drafter round with an inspected
   model. The remaining drafter stages and production proposal/acceptance
   scheduler stay open.
+
+### D-IMPL-326: Implement MTP drafter stage 10 query projection
+
+- **Decision:** Add caller-owned Encoder and standalone transactional forms
+  for the full-layer T=1 Q projection. Read T from the CPU-visible MTP
+  parameter slot and require exactly one row; reuse stage 8's Q8_1 `xq`
+  without requantization; project with the Q8_0 query weights into the full
+  24×512 `q_full` tensor; and require the first float of the `bo` region as
+  the mat-vec sink. Reject unsafe parameter/input/output/sink aliases and
+  open concurrent groups before dispatch.
+- **Reason:** Section 5.11 specifies stage 10 as a single-row Q8_0 query
+  projection in the full-layer pass, and nothing modifies stage 8's quantized
+  `xq` between those stages. Reusing that view avoids redundant quantization.
+  The existing read-only Q8_0 mat-vec encoder supplies the arithmetic and
+  validation; its sink parameter remains part of the ABI even with NC=1.
+  Using the `bo` region preserves the fixed bind layout, and later stage 14
+  is its next writer. This typed encoder does not resolve model weights,
+  bind `MtpRuntimeStorage`, or imply a complete MTP/full-layer pass.
+- **Validation:** The exact 24×512 `q_full` fixture matches its named bind
+  region. A scalar oracle checks all output values; tests exercise malformed
+  T, short and foreign views, partial output/`xq` and sink/`xq` aliases,
+  concurrent-group rejection and caller-owned rollback. The full mac-dev
+  build, focused CTests and full host/Metal/Python/map validations pass.
+- **Review required:** See REV-123. Confirm the input and sink lifetimes and
+  alias rules; runtime-storage composition and inspected-model stage 8→10
+  query parity remain open.

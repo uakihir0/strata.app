@@ -23,6 +23,8 @@ namespace {
 constexpr std::uint32_t kMtpKvProjectionWidth = 512u;
 constexpr std::uint32_t kMtpKvHeadRows = 2u;
 constexpr std::uint32_t kMtpKvHeadWidth = 256u;
+constexpr std::uint32_t kMtpQueryProjectionWidth =
+    N_HEAD_Q * 2u * HEAD_DIM;
 constexpr std::uint32_t kMtpQ8BlockValues = 32u;
 constexpr std::uint32_t kMtpQ81BlockBytes = 36u;
 constexpr std::uint32_t kMtpAddStreamsThreads = 256u;
@@ -36,6 +38,7 @@ static_assert(HC_DIM % kMtpAddStreamsThreads == 0u);
 static_assert(sizeof(MtpParams) == 236u);
 static_assert(offsetof(MtpParams, T) == 0u);
 static_assert(sizeof(Q81) == kMtpQ81BlockBytes);
+static_assert(kMtpQueryProjectionWidth == 12'288u);
 
 template <class Address>
 bool ranges_overlap(Address left, std::size_t left_bytes,
@@ -568,6 +571,88 @@ bool validate_mtp_kv_append(
     return true;
 }
 
+bool validate_mtp_query_projection(
+    Context& context, const MtpAttentionQueryProjectionBuffers& buffers,
+    ReadOnlyBufferRef& active_rows, std::string& error) {
+    constexpr char operation[] = "MTP attention query projection";
+    std::uint32_t rows = 0u;
+    if (!read_mtp_rows(context, buffers.params, operation, rows, error)) {
+        return false;
+    }
+    if (rows != 1u) {
+        error = std::string(operation) +
+                " requires T=1 for the full-layer pass";
+        return false;
+    }
+    const std::size_t activation_bytes =
+        static_cast<std::size_t>(N_EMBD / kMtpQ8BlockValues) *
+        kMtpQ81BlockBytes;
+    const std::size_t weight_bytes =
+        static_cast<std::size_t>(kMtpQueryProjectionWidth) *
+        (N_EMBD / kMtpQ8BlockValues) * sizeof(block_q8_0);
+    const std::size_t output_bytes =
+        static_cast<std::size_t>(kMtpQueryProjectionWidth) * sizeof(float);
+    constexpr std::size_t sink_bytes = sizeof(float);
+
+    if (!validate_read_only_buffer(context, buffers.params,
+                                   sizeof(MtpParams), alignof(MtpParams),
+                                   "params", operation, error) ||
+        !validate_buffer_view(context, buffers.xq, activation_bytes, 256u,
+                              operation, "stage-8 xq", error) ||
+        !validate_read_only_buffer(context, buffers.q_weights, weight_bytes,
+                                   alignof(std::uint16_t), "q_proj weights",
+                                   operation, error) ||
+        !validate_output_buffer(context, buffers.q_full, output_bytes,
+                                operation, "q_full", error) ||
+        !validate_output_buffer(context, buffers.sink, sink_bytes,
+                                operation, "sink", error)) {
+        return false;
+    }
+
+    active_rows =
+        buffers.params.slice(offsetof(MtpParams, T), sizeof(std::uint32_t));
+    if (!active_rows) {
+        error = std::string(operation) +
+                " cannot form its active-row metadata view";
+        return false;
+    }
+
+    const ReadOnlyBufferRef activations =
+        context.buffers().read_only(buffers.xq);
+    const std::array<std::pair<const char*, BufferRef>, 2> outputs{{
+        {"q_full", buffers.q_full},
+        {"sink", buffers.sink},
+    }};
+    const std::array<std::size_t, 2> output_extents{
+        output_bytes, sink_bytes};
+    for (std::size_t output = 0u; output < outputs.size(); ++output) {
+        if (overlaps(buffers.params, sizeof(MtpParams),
+                     outputs[output].second, output_extents[output]) ||
+            overlaps(activations, activation_bytes, outputs[output].second,
+                     output_extents[output]) ||
+            overlaps(buffers.q_weights, weight_bytes,
+                     outputs[output].second, output_extents[output])) {
+            error = std::string(operation) + " " + outputs[output].first +
+                    " overlaps an input";
+            return false;
+        }
+    }
+    if (overlaps(buffers.q_full, output_bytes, buffers.sink, sink_bytes)) {
+        error = std::string(operation) +
+                " q_full and sink outputs overlap";
+        return false;
+    }
+    if (overlaps(buffers.params, sizeof(MtpParams), activations,
+                 activation_bytes) ||
+        overlaps(buffers.params, sizeof(MtpParams), buffers.q_weights,
+                 weight_bytes)) {
+        error = std::string(operation) +
+                " parameter block overlaps a projection input";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 bool encode_mtp_add_streams(Context& context, Encoder& encoder,
@@ -852,6 +937,43 @@ bool encode_mtp_attention_kv_append(
         context, command_buffer, "MTP attention K/V append",
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_mtp_attention_kv_append(
+                context, encoder, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_mtp_attention_query_projection(
+    Context& context, Encoder& encoder,
+    const MtpAttentionQueryProjectionBuffers& buffers,
+    std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error =
+            "MTP attention query projection requires an ordered concurrent-group boundary";
+        return false;
+    }
+    ReadOnlyBufferRef active_rows;
+    if (!validate_mtp_query_projection(context, buffers, active_rows,
+                                       error)) {
+        return false;
+    }
+    const ReadOnlyBufferRef activations =
+        context.buffers().read_only(buffers.xq);
+    return encode_q8_0_matvec(
+        context, encoder, N_EMBD, kMtpQueryProjectionWidth, 1u, 1u,
+        {activations, buffers.q_weights, active_rows, buffers.q_full,
+         buffers.sink},
+        error);
+}
+
+bool encode_mtp_attention_query_projection(
+    Context& context, CommandBuffer& command_buffer,
+    const MtpAttentionQueryProjectionBuffers& buffers,
+    std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "MTP attention query projection",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_mtp_attention_query_projection(
                 context, encoder, buffers, encode_error);
         },
         error);

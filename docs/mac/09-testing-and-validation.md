@@ -1160,7 +1160,7 @@ name, except `row_t_independent`, which is step 6 of every twin and has no test 
 
 ### 9.1 CTest tests
 
-With every work item done, a `mac-dev` build registers 141 tests: 46 `host`, 67 `metal` and 28 `model`. The 28 tests
+With every work item done, a `mac-dev` build registers 143 tests: 46 `host`, 69 `metal` and 28 `model`. The 28 tests
 of the bootstrap ([08](08-build-and-distribution.md), section 6.4) are among them.
 
 | Label | Preset | Runs on |
@@ -1204,7 +1204,7 @@ of the bootstrap ([08](08-build-and-distribution.md), section 6.4) are among the
 | `prompts_manifest_test` | Section 2.2 | `python3 -m unittest tools.metal.test_make_prompts`: the prompt sets against their manifest |
 | `test_map` | Section 9.4 | `python3 tools/metal/test_map.py` with `STRATA_BUILD_DIR` set |
 
-**`metal` (67).**
+**`metal` (69).**
 
 The `metal_ple_test` fixture chains the three weighted RMS norms, PLE gate,
 value broadcast, convolution-residual and history update at T=1, 2 and 8. The
@@ -1245,6 +1245,8 @@ CTest cases pass.
 | `metal_mtp_kv_projection_test_concurrent` | [04](04-metal-kernels.md), section 5.11; D-IMPL-324; REV-121 | Repeats stage 8 with concurrent dispatch and verifies rejection inside an open group with all fixture buffers unchanged |
 | `metal_mtp_kv_append_test` | [04](04-metal-kernels.md), section 5.11; D-IMPL-325; REV-122 | MTP stage 9 for T=1..8: fp16, int8 unrotated/rotated, q4_0 rotated and K8v4-requested→int8 storage match scalar QSA norm/RoPE, FWHT and byte-exact append oracles. Verifies cache untouched cells/tails, K/V active-row bounds, immutable params/norm/RoPE, duplicate/out-of-capacity positions, forged layout, short/foreign views, invalid `kv_rot`, open-group rejection and caller-owned late rollback. Runtime setting of `kv_rot`, MTP runtime-storage wiring and model-backed drafter parity are not covered |
 | `metal_mtp_kv_append_test_concurrent` | [04](04-metal-kernels.md), section 5.11; D-IMPL-325; REV-122 | Repeats the stage-9 format matrix under concurrent dispatch and verifies open-group rejection with all fixture buffers unchanged |
+| `metal_mtp_query_projection_test` | [04](04-metal-kernels.md), section 5.11; D-IMPL-326; REV-123 | MTP stage 10 requires T=1, reuses the Q8_1 row from stage 8 and compares the 2560→12288 Q8_0 query projection with an independent scalar oracle. Checks every value in the full 24×512 q_full tensor, allocation guards, untouched sink and immutable inputs, invalid T, short weights/sink, foreign weights, q_full/sink and partial q_full/xq plus sink/xq aliases, ordered-group rejection and caller-owned rollback. Runtime-storage wiring and model-backed drafter parity are not covered |
+| `metal_mtp_query_projection_test_concurrent` | [04](04-metal-kernels.md), section 5.11; D-IMPL-326; REV-123 | Repeats stage 10 with concurrent dispatch and verifies ordered-group rejection with all fixture buffers unchanged |
 | `window_params_ring_test` | [04](04-metal-kernels.md), section 4.2; work item L9 | T=1 and T=8 blocks are built into a fixed-address two-slot Shared ring with 256-byte strides; invalid construction preserves published bytes, slots remain bounded and generation-checked, outer rollback invalidates views, and a too-small live `maxBufferLength` is rejected before allocation |
 | `metal_window_scratch_storage_test` | [04](04-metal-kernels.md), section 4.4; D-IMPL-183 | One Context-owned Shared allocation with exact logical size; bounded views for every named region; allocator poison, maxBufferLength refusal, unsupported-input refusal and outer-transaction rollback |
 | `metal_window_storage_test` | [05](05-memory-and-residency.md), work item U3; L9 prerequisite | A nine-expert synthetic GGUF validates exact-plan union checking, full-mode tables, checked named dense tensor views for mapped and BF16-converted weights including a second row at nonzero offset, rejection of expert slabs, the separate per-layer embedding PLE table (`per_layer_token_embd.weight`), unknown and rolled-back views, and CPU/GPU warm-up; it checks that the full-mode PLE reader view has row access but no public open/close lifecycle, while tiered publishes no reader. The FullMode T=1 PLE handoff also clears its caller-supplied projection/norm/convolution views and uses a deliberately incorrect key format to verify that the wrapper resolves all six mapped model tensors itself |
