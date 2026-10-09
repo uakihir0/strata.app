@@ -4,10 +4,161 @@ if(NOT DEFINED STRATA OR NOT DEFINED FIXTURE_TOOL OR NOT DEFINED PYTHON OR
     "STRATA, FIXTURE_TOOL, PYTHON, FIXTURE_HELPER, BUILD_ROOT and TEST_ROOT are required")
 endif()
 
-string(RANDOM LENGTH 32 ALPHABET 0123456789abcdef _fixture_run_id)
-set(_test_dir "${TEST_ROOT}-${_fixture_run_id}")
-if(EXISTS "${_test_dir}" OR IS_SYMLINK "${_test_dir}")
-  message(FATAL_ERROR "refusing to reuse an existing WeightStore CLI test directory")
+if(NOT _STRATA_WEIGHT_STORE_CLI_CHILD)
+  set(_build_root_input "${BUILD_ROOT}")
+  set(_test_root_input "${TEST_ROOT}")
+  cmake_path(ABSOLUTE_PATH _build_root_input NORMALIZE
+             OUTPUT_VARIABLE _build_root_abs)
+  cmake_path(ABSOLUTE_PATH _test_root_input NORMALIZE
+             OUTPUT_VARIABLE _test_root_abs)
+  set(_expected_test_root
+      "${_build_root_abs}/metal/weight-store-cli/fixtures")
+  if(NOT _test_root_abs STREQUAL _expected_test_root)
+    message(FATAL_ERROR "refusing cleanup outside the dedicated WeightStore CLI build directory")
+  endif()
+
+  set(_child_common_args
+      "-DSTRATA=${STRATA}"
+      "-DFIXTURE_TOOL=${FIXTURE_TOOL}"
+      "-DPYTHON=${PYTHON}"
+      "-DFIXTURE_HELPER=${FIXTURE_HELPER}"
+      "-DBUILD_ROOT=${_build_root_abs}"
+      "-DTEST_ROOT=${_test_root_abs}"
+      "-D_STRATA_WEIGHT_STORE_CLI_CHILD=TRUE")
+
+  string(RANDOM LENGTH 32 ALPHABET 0123456789abcdef _fixture_run_id)
+  set(_test_dir "${_test_root_abs}-${_fixture_run_id}")
+  if(EXISTS "${_test_dir}" OR IS_SYMLINK "${_test_dir}")
+    message(FATAL_ERROR "refusing to reuse an existing WeightStore CLI test directory")
+  endif()
+  execute_process(
+    COMMAND "${PYTHON}" "${FIXTURE_HELPER}"
+            --create-weight-cli-test-root "${_build_root_abs}"
+            "fixtures-${_fixture_run_id}"
+    RESULT_VARIABLE _create_root_rc
+    OUTPUT_VARIABLE _create_root_out
+    ERROR_VARIABLE _create_root_err)
+  if(NOT _create_root_rc EQUAL 0)
+    message(FATAL_ERROR
+      "could not securely create the WeightStore CLI test directory "
+      "(${_create_root_rc}): ${_create_root_err}${_create_root_out}")
+  endif()
+  string(STRIP "${_create_root_out}" _test_root_identity)
+  if(NOT _test_root_identity MATCHES "^([0-9]+) +([0-9]+)$")
+    message(FATAL_ERROR "fixture helper returned an invalid directory identity")
+  endif()
+  set(_test_root_device "${CMAKE_MATCH_1}")
+  set(_test_root_inode "${CMAKE_MATCH_2}")
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}" ${_child_common_args}
+            "-D_STRATA_WEIGHT_STORE_CLI_RUN_ID=${_fixture_run_id}"
+            -P "${CMAKE_CURRENT_LIST_FILE}"
+    RESULT_VARIABLE _test_rc
+    OUTPUT_VARIABLE _test_out
+    ERROR_VARIABLE _test_err)
+  execute_process(
+    COMMAND "${PYTHON}" "${FIXTURE_HELPER}"
+            --remove-weight-cli-test-root "${_build_root_abs}"
+            "fixtures-${_fixture_run_id}" "${_test_root_device}"
+            "${_test_root_inode}"
+    RESULT_VARIABLE _remove_root_rc
+    OUTPUT_VARIABLE _remove_root_out
+    ERROR_VARIABLE _remove_root_err)
+  if(NOT _remove_root_rc EQUAL 0)
+    message(FATAL_ERROR
+      "could not securely remove the WeightStore CLI test directory "
+      "(${_remove_root_rc}): ${_remove_root_err}${_remove_root_out}")
+  endif()
+  if(NOT _test_rc EQUAL 0)
+    message(FATAL_ERROR "WeightStore CLI test failed (${_test_rc}): ${_test_err}${_test_out}")
+  endif()
+
+  string(RANDOM LENGTH 32 ALPHABET 0123456789abcdef _failure_run_id)
+  set(_failure_dir "${_test_root_abs}-${_failure_run_id}")
+  if(EXISTS "${_failure_dir}" OR IS_SYMLINK "${_failure_dir}")
+    message(FATAL_ERROR "refusing to reuse an existing cleanup-test directory")
+  endif()
+  execute_process(
+    COMMAND "${PYTHON}" "${FIXTURE_HELPER}"
+            --create-weight-cli-test-root "${_build_root_abs}"
+            "fixtures-${_failure_run_id}"
+    RESULT_VARIABLE _create_failure_root_rc
+    OUTPUT_VARIABLE _create_failure_root_out
+    ERROR_VARIABLE _create_failure_root_err)
+  if(NOT _create_failure_root_rc EQUAL 0)
+    message(FATAL_ERROR
+      "could not securely create the injected-failure test directory "
+      "(${_create_failure_root_rc}): "
+      "${_create_failure_root_err}${_create_failure_root_out}")
+  endif()
+  string(STRIP "${_create_failure_root_out}" _failure_root_identity)
+  if(NOT _failure_root_identity MATCHES "^([0-9]+) +([0-9]+)$")
+    message(FATAL_ERROR "cleanup test helper returned an invalid directory identity")
+  endif()
+  set(_failure_root_device "${CMAKE_MATCH_1}")
+  set(_failure_root_inode "${CMAKE_MATCH_2}")
+  set(_cleanup_sentinel
+      "${_build_root_abs}/metal/weight-store-cli/cleanup-sentinel-${_failure_run_id}")
+  if(EXISTS "${_cleanup_sentinel}" OR IS_SYMLINK "${_cleanup_sentinel}")
+    message(FATAL_ERROR "refusing to reuse an existing cleanup sentinel")
+  endif()
+  file(WRITE "${_cleanup_sentinel}" "preserve cleanup sentinel\n")
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}" ${_child_common_args}
+            "-D_STRATA_WEIGHT_STORE_CLI_RUN_ID=${_failure_run_id}"
+            "-D_STRATA_WEIGHT_STORE_CLI_SENTINEL=${_cleanup_sentinel}"
+            -D_STRATA_WEIGHT_STORE_CLI_INJECT_FAILURE=TRUE
+            -P "${CMAKE_CURRENT_LIST_FILE}"
+    RESULT_VARIABLE _failure_rc
+    OUTPUT_VARIABLE _failure_out
+    ERROR_VARIABLE _failure_err)
+  execute_process(
+    COMMAND "${PYTHON}" "${FIXTURE_HELPER}"
+            --remove-weight-cli-test-root "${_build_root_abs}"
+            "fixtures-${_failure_run_id}" "${_failure_root_device}"
+            "${_failure_root_inode}"
+    RESULT_VARIABLE _remove_failure_root_rc
+    OUTPUT_VARIABLE _remove_failure_root_out
+    ERROR_VARIABLE _remove_failure_root_err)
+  if(NOT _remove_failure_root_rc EQUAL 0)
+    message(FATAL_ERROR
+      "could not securely remove the injected-failure test directory "
+      "(${_remove_failure_root_rc}): "
+      "${_remove_failure_root_err}${_remove_failure_root_out}")
+  endif()
+  if(_failure_rc EQUAL 0 OR
+     NOT "${_failure_err}" MATCHES "injected WeightStore CLI failure")
+    message(FATAL_ERROR
+      "cleanup lifecycle self-test did not observe the injected failure: "
+      "${_failure_out}${_failure_err}")
+  endif()
+  if(NOT EXISTS "${_cleanup_sentinel}" OR IS_SYMLINK "${_cleanup_sentinel}")
+    message(FATAL_ERROR "cleanup followed an external test symlink")
+  endif()
+  file(READ "${_cleanup_sentinel}" _cleanup_sentinel_content)
+  if(NOT _cleanup_sentinel_content STREQUAL "preserve cleanup sentinel\n")
+    message(FATAL_ERROR "cleanup changed the external sentinel")
+  endif()
+  file(REMOVE "${_cleanup_sentinel}")
+  return()
+endif()
+
+if(NOT DEFINED _STRATA_WEIGHT_STORE_CLI_RUN_ID)
+  message(FATAL_ERROR "invalid WeightStore CLI test run identity")
+endif()
+string(LENGTH "${_STRATA_WEIGHT_STORE_CLI_RUN_ID}" _fixture_run_id_length)
+if(NOT _fixture_run_id_length EQUAL 32 OR
+   NOT _STRATA_WEIGHT_STORE_CLI_RUN_ID MATCHES "^[0-9a-f]+$")
+  message(FATAL_ERROR "invalid WeightStore CLI test run identity")
+endif()
+
+set(_test_dir "${TEST_ROOT}-${_STRATA_WEIGHT_STORE_CLI_RUN_ID}")
+if(NOT IS_DIRECTORY "${_test_dir}" OR IS_SYMLINK "${_test_dir}")
+  message(FATAL_ERROR "missing or unsafe owned WeightStore CLI test directory")
+endif()
+set(_test_owner_path "${_test_dir}/.strata-owned-fixture")
+if(NOT EXISTS "${_test_owner_path}" OR IS_SYMLINK "${_test_owner_path}")
+  message(FATAL_ERROR "missing or unsafe WeightStore CLI directory ownership marker")
 endif()
 file(MAKE_DIRECTORY "${_test_dir}")
 set(_input "${_test_dir}/input")
@@ -19,6 +170,16 @@ execute_process(
   ERROR_VARIABLE _fixture_err)
 if(NOT _fixture_rc EQUAL 0)
   message(FATAL_ERROR "could not create sparse WeightStore fixture (${_fixture_rc}): ${_fixture_err}")
+endif()
+if(_STRATA_WEIGHT_STORE_CLI_INJECT_FAILURE)
+  if(DEFINED _STRATA_WEIGHT_STORE_CLI_SENTINEL)
+    file(CREATE_LINK "${_STRATA_WEIGHT_STORE_CLI_SENTINEL}"
+         "${_test_dir}/external-sentinel-link" SYMBOLIC RESULT _sentinel_link_result)
+    if(NOT _sentinel_link_result STREQUAL "0")
+      message(FATAL_ERROR "could not create the cleanup sentinel link: ${_sentinel_link_result}")
+    endif()
+  endif()
+  message(FATAL_ERROR "injected WeightStore CLI failure after fixture generation")
 endif()
 
 set(_protected_fixture "${_test_dir}/protected-fixture")

@@ -159,8 +159,14 @@ def _verify_owner(directory_fd: int) -> None:
         ) from error
     try:
         status = os.fstat(owner_fd)
-        if not stat.S_ISREG(status.st_mode):
-            raise FixtureError("MTP fixture ownership marker is not a regular file")
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_uid != os.geteuid()
+            or status.st_mode & 0o077
+        ):
+            raise FixtureError(
+                "MTP fixture ownership marker must be a private file owned by the current user"
+            )
         with os.fdopen(os.dup(owner_fd), "rb") as marker:
             if marker.read(len(_OWNER_CONTENT) + 1) != _OWNER_CONTENT:
                 raise FixtureError("MTP fixture ownership marker is invalid")
@@ -203,6 +209,67 @@ def _write_owner_marker(directory_fd: int) -> os.stat_result:
     return owner_status
 
 
+def _rollback_empty_fixture_directory(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+    expected_status: os.stat_result,
+) -> None:
+    """Roll back only a still-pinned new directory with no unexpected entries."""
+    _verify_fixture_parent(parent_fd)
+    opened_status = _verify_fixture_directory(directory_fd)
+    if (opened_status.st_dev, opened_status.st_ino) != (
+        expected_status.st_dev,
+        expected_status.st_ino,
+    ):
+        raise FixtureError("new MTP fixture identity changed before rollback")
+    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(current.st_mode) or (
+        current.st_dev,
+        current.st_ino,
+    ) != (opened_status.st_dev, opened_status.st_ino):
+        raise FixtureError("new MTP fixture path was replaced before rollback")
+
+    entries = os.listdir(directory_fd)
+    if entries == [_OWNER_NAME]:
+        marker_fd = os.open(_OWNER_NAME, _FILE_FLAGS, dir_fd=directory_fd)
+        try:
+            marker_status = os.fstat(marker_fd)
+            with os.fdopen(os.dup(marker_fd), "rb") as marker:
+                content = marker.read(len(_OWNER_CONTENT) + 1)
+            if (
+                not stat.S_ISREG(marker_status.st_mode)
+                or marker_status.st_uid != os.geteuid()
+                or marker_status.st_mode & 0o077
+                or len(content) > len(_OWNER_CONTENT)
+                or not _OWNER_CONTENT.startswith(content)
+            ):
+                raise FixtureError("refusing to roll back an unrecognized marker")
+            current_marker = os.stat(
+                _OWNER_NAME, dir_fd=directory_fd, follow_symlinks=False
+            )
+            if (current_marker.st_dev, current_marker.st_ino) != (
+                marker_status.st_dev,
+                marker_status.st_ino,
+            ):
+                raise FixtureError("MTP fixture marker changed during rollback")
+        finally:
+            os.close(marker_fd)
+        os.unlink(_OWNER_NAME, dir_fd=directory_fd)
+    elif entries:
+        raise FixtureError("refusing to roll back a fixture with unexpected data")
+
+    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(current.st_mode) or (
+        current.st_dev,
+        current.st_ino,
+    ) != (opened_status.st_dev, opened_status.st_ino):
+        raise FixtureError("new MTP fixture path changed during rollback")
+    if os.listdir(directory_fd):
+        raise FixtureError("new MTP fixture changed during rollback")
+    os.rmdir(name, dir_fd=parent_fd)
+
+
 def _create_owned_fixture_directory(
     parent_fd: int, name: str
 ) -> tuple[int, os.stat_result]:
@@ -217,6 +284,8 @@ def _create_owned_fixture_directory(
         # Without a pinned descriptor the entry may have been replaced, so do
         # not attempt path-based cleanup.
         raise FixtureError(f"cannot pin the new MTP fixture directory: {error}") from error
+    opened_status: os.stat_result | None = None
+    identity_verified = False
     try:
         opened_status = _verify_fixture_directory(directory_fd)
         try:
@@ -228,13 +297,27 @@ def _create_owned_fixture_directory(
             opened_status.st_ino,
         ) != (current_status.st_dev, current_status.st_ino):
             raise FixtureError("new MTP fixture directory changed while opening")
+        identity_verified = True
         _verify_empty_owned_fixture(directory_fd)
         _write_owner_marker(directory_fd)
         _verify_owner(directory_fd)
         _verify_only_owner_marker(directory_fd)
         return directory_fd, opened_status
-    except BaseException:
+    except BaseException as creation_error:
+        rollback_error = None
+        if identity_verified and opened_status is not None:
+            try:
+                _rollback_empty_fixture_directory(
+                    parent_fd, name, directory_fd, opened_status
+                )
+            except Exception as error:
+                rollback_error = error
         os.close(directory_fd)
+        if rollback_error is not None:
+            raise FixtureError(
+                f"{creation_error}; MTP fixture rollback left the directory "
+                f"for inspection: {rollback_error}"
+            ) from creation_error
         raise
 
 
@@ -245,7 +328,101 @@ def _verify_created_fixture(directory_fd: int) -> None:
         raise FixtureError("MTP fixture generator did not write the runtime files")
 
 
-def _with_prepared_fixture(build_root: str, fixture_tool: str, action):
+def _remove_fixture_contents(
+    directory_fd: int, *, preserve_owner_marker: bool = False
+) -> None:
+    """Remove entries relative to pinned directory handles without following links."""
+    for name in os.listdir(directory_fd):
+        if preserve_owner_marker and name == _OWNER_NAME:
+            # Keep the ownership proof until all other entries are removed.
+            continue
+        entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(entry.st_mode):
+            child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+            try:
+                child_status = os.fstat(child_fd)
+                if (child_status.st_dev, child_status.st_ino) != (
+                    entry.st_dev,
+                    entry.st_ino,
+                ):
+                    raise FixtureError(
+                        "MTP fixture entry changed while opening it for cleanup"
+                    )
+                _remove_fixture_contents(child_fd)
+                current = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if (current.st_dev, current.st_ino) != (
+                    child_status.st_dev,
+                    child_status.st_ino,
+                ):
+                    raise FixtureError(
+                        "MTP fixture directory changed during cleanup"
+                    )
+                os.rmdir(name, dir_fd=directory_fd)
+            finally:
+                os.close(child_fd)
+        else:
+            # unlink removes a symlink itself; it never follows its target.
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def _remove_owned_fixture_directory(
+    parent_fd: int,
+    fixture_name: str,
+    directory_fd: int,
+    expected_status: os.stat_result,
+    *,
+    fixture_prefix: str = _FIXTURE_PREFIX,
+) -> None:
+    """Delete only the still-pinned, private fixture owned by this helper."""
+    if (
+        os.path.basename(fixture_name) != fixture_name
+        or re.fullmatch(
+            re.escape(fixture_prefix) + r"[0-9a-f]{32}", fixture_name
+        )
+        is None
+    ):
+        raise FixtureError("refusing to clean an invalid MTP fixture name")
+    _verify_fixture_parent(parent_fd)
+    opened_status = _verify_fixture_directory(directory_fd)
+    _verify_owner(directory_fd)
+    if (opened_status.st_dev, opened_status.st_ino) != (
+        expected_status.st_dev,
+        expected_status.st_ino,
+    ):
+        raise FixtureError("MTP fixture identity changed before cleanup")
+    try:
+        current = os.stat(
+            fixture_name, dir_fd=parent_fd, follow_symlinks=False
+        )
+    except FileNotFoundError as error:
+        raise FixtureError("MTP fixture path disappeared before cleanup") from error
+    if not stat.S_ISDIR(current.st_mode) or (
+        current.st_dev,
+        current.st_ino,
+    ) != (opened_status.st_dev, opened_status.st_ino):
+        raise FixtureError("MTP fixture path was replaced before cleanup")
+
+    _remove_fixture_contents(directory_fd, preserve_owner_marker=True)
+    current = os.stat(fixture_name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(current.st_mode) or (
+        current.st_dev,
+        current.st_ino,
+    ) != (opened_status.st_dev, opened_status.st_ino):
+        raise FixtureError("MTP fixture path changed during cleanup")
+    if os.listdir(directory_fd) != [_OWNER_NAME]:
+        raise FixtureError("MTP fixture changed while being cleaned")
+    _verify_owner(directory_fd)
+    os.unlink(_OWNER_NAME, dir_fd=directory_fd)
+    if os.listdir(directory_fd):
+        raise FixtureError("MTP fixture changed before final removal")
+    os.rmdir(fixture_name, dir_fd=parent_fd)
+
+
+def _with_prepared_fixture(
+    build_root: str, fixture_tool: str, action, *, cleanup_after_run: bool = False
+):
     resolved_root = os.path.realpath(os.path.abspath(build_root))
     parent_fd, opened_root = _open_build_parent(resolved_root)
     try:
@@ -258,26 +435,45 @@ def _with_prepared_fixture(build_root: str, fixture_tool: str, action):
             parent_fd, fixture_name
         )
         try:
-            result = subprocess.run(
-                [
-                    fixture_tool,
-                    "--create-fixture-with-mtp-in-dir-fd",
-                    str(directory_fd),
-                    str(directory_status.st_dev),
-                    str(directory_status.st_ino),
-                ],
-                pass_fds=(directory_fd,),
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                raise FixtureError(
-                    f"fixture generator exited with status {result.returncode}: "
-                    f"{result.stderr.strip()}"
+            try:
+                result = subprocess.run(
+                    [
+                        fixture_tool,
+                        "--create-fixture-with-mtp-in-dir-fd",
+                        str(directory_fd),
+                        str(directory_status.st_dev),
+                        str(directory_status.st_ino),
+                    ],
+                    pass_fds=(directory_fd,),
+                    check=False,
+                    capture_output=True,
+                    text=True,
                 )
-            _verify_created_fixture(directory_fd)
-            return action(directory_fd, directory_status, fixture_name)
+                if result.returncode != 0:
+                    raise FixtureError(
+                        f"fixture generator exited with status {result.returncode}: "
+                        f"{result.stderr.strip()}"
+                    )
+                _verify_created_fixture(directory_fd)
+                action_result = action(
+                    directory_fd, directory_status, fixture_name
+                )
+            except BaseException as run_error:
+                if cleanup_after_run:
+                    try:
+                        _remove_owned_fixture_directory(
+                            parent_fd, fixture_name, directory_fd, directory_status
+                        )
+                    except Exception as cleanup_error:
+                        raise FixtureError(
+                            f"{run_error}; fixture cleanup also failed: {cleanup_error}"
+                        ) from run_error
+                raise
+            if cleanup_after_run:
+                _remove_owned_fixture_directory(
+                    parent_fd, fixture_name, directory_fd, directory_status
+                )
+            return action_result
         finally:
             os.close(directory_fd)
     finally:
@@ -405,7 +601,12 @@ def _run_storage_test(
             + ordinary.stdout
         )
 
-    return _with_prepared_fixture(build_root, fixture_tool, run_pinned_test)
+    return _with_prepared_fixture(
+        build_root,
+        fixture_tool,
+        run_pinned_test,
+        cleanup_after_run=True,
+    )
 
 
 def _open_weight_cli_fixture_parent(build_root: str, parent_dir: str) -> int:
@@ -439,6 +640,96 @@ def _open_weight_cli_fixture_parent(build_root: str, parent_dir: str) -> int:
         for descriptor in reversed(descriptors):
             if not keep_fixture_parent or descriptor != fixture_parent_fd:
                 os.close(descriptor)
+
+
+def _open_weight_cli_test_output_parent(build_root: str) -> int:
+    """Open build/metal/weight-store-cli without following path components."""
+    root_input = os.path.normpath(os.path.abspath(build_root))
+    resolved_root = os.path.realpath(root_input)
+    if resolved_root != root_input:
+        raise FixtureError("WeightStore CLI build root must not contain symlink components")
+    root_fd = _absolute_directory_fd(resolved_root)
+    metal_fd = -1
+    cli_root_fd = -1
+    keep_cli_root = False
+    try:
+        metal_fd = os.open("metal", _DIRECTORY_FLAGS, dir_fd=root_fd)
+        cli_root_fd = os.open(
+            "weight-store-cli", _DIRECTORY_FLAGS, dir_fd=metal_fd
+        )
+        _verify_fixture_parent(cli_root_fd)
+        keep_cli_root = True
+        return cli_root_fd
+    except OSError as error:
+        raise FixtureError(
+            f"cannot securely open WeightStore CLI fixture output: {error}"
+        ) from error
+    finally:
+        if cli_root_fd >= 0 and not keep_cli_root:
+            os.close(cli_root_fd)
+        if metal_fd >= 0:
+            os.close(metal_fd)
+        os.close(root_fd)
+
+
+def _validate_weight_cli_test_name(fixture_name: str) -> None:
+    if (
+        os.path.basename(fixture_name) != fixture_name
+        or re.fullmatch(r"fixtures-[0-9a-f]{32}", fixture_name) is None
+    ):
+        raise FixtureError("invalid WeightStore CLI test fixture name")
+
+
+def _create_weight_cli_test_root(
+    build_root: str, fixture_name: str
+) -> tuple[int, int]:
+    _validate_weight_cli_test_name(fixture_name)
+    parent_fd = _open_weight_cli_test_output_parent(build_root)
+    try:
+        directory_fd, directory_status = _create_owned_fixture_directory(
+            parent_fd, fixture_name
+        )
+        try:
+            return directory_status.st_dev, directory_status.st_ino
+        finally:
+            os.close(directory_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _remove_weight_cli_test_root(
+    build_root: str, fixture_name: str, expected_device: int, expected_inode: int
+) -> None:
+    _validate_weight_cli_test_name(fixture_name)
+    parent_fd = _open_weight_cli_test_output_parent(build_root)
+    directory_fd = -1
+    try:
+        directory_fd = os.open(
+            fixture_name, _DIRECTORY_FLAGS, dir_fd=parent_fd
+        )
+        directory_status = os.fstat(directory_fd)
+        if (directory_status.st_dev, directory_status.st_ino) != (
+            expected_device,
+            expected_inode,
+        ):
+            raise FixtureError(
+                "WeightStore CLI fixture was replaced before cleanup"
+            )
+        _remove_owned_fixture_directory(
+            parent_fd,
+            fixture_name,
+            directory_fd,
+            directory_status,
+            fixture_prefix="fixtures-",
+        )
+    except OSError as error:
+        raise FixtureError(
+            f"cannot securely remove WeightStore CLI fixture: {error}"
+        ) from error
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        os.close(parent_fd)
 
 
 def _create_weight_cli_child(
@@ -555,6 +846,169 @@ def _run_self_tests(fixture_tool: str) -> None:
         with open(broad_sentinel, "rb") as source:
             if source.read() != b"broad path\n":
                 raise FixtureError("broad-path refusal changed its sentinel")
+
+        cleanup_parent_fd, _ = _open_build_parent(root)
+        cleanup_name = _FIXTURE_PREFIX + "a" * 32
+        cleanup_fd, cleanup_status = _create_owned_fixture_directory(
+            cleanup_parent_fd, cleanup_name
+        )
+        try:
+            os.mkdir("nested", 0o700, dir_fd=cleanup_fd)
+            nested_fd = os.open("nested", _DIRECTORY_FLAGS, dir_fd=cleanup_fd)
+            try:
+                payload_fd = os.open(
+                    "payload",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=nested_fd,
+                )
+                try:
+                    os.write(payload_fd, b"generated fixture\n")
+                finally:
+                    os.close(payload_fd)
+            finally:
+                os.close(nested_fd)
+            os.symlink(sentinel, "external-link", dir_fd=cleanup_fd)
+            _expect_refusal(
+                lambda: _remove_owned_fixture_directory(
+                    cleanup_parent_fd,
+                    "../sentinel",
+                    cleanup_fd,
+                    cleanup_status,
+                ),
+                "a path-traversing fixture name during cleanup",
+            )
+            _remove_owned_fixture_directory(
+                cleanup_parent_fd,
+                cleanup_name,
+                cleanup_fd,
+                cleanup_status,
+            )
+            try:
+                os.stat(cleanup_name, dir_fd=cleanup_parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise FixtureError("owned MTP fixture directory remained after cleanup")
+        finally:
+            os.close(cleanup_fd)
+            os.close(cleanup_parent_fd)
+        with open(sentinel, "rb") as source:
+            if source.read() != b"keep\n":
+                raise FixtureError("fixture cleanup followed a symlink outside its root")
+
+        cleanup_lifecycle_root = os.path.join(temporary, "cleanup-lifecycle-build")
+        os.makedirs(os.path.join(cleanup_lifecycle_root, "metal"))
+        removed_name = _with_prepared_fixture(
+            cleanup_lifecycle_root,
+            fixture_tool,
+            lambda _fd, _status, name: name,
+            cleanup_after_run=True,
+        )
+        if os.path.lexists(
+            os.path.join(cleanup_lifecycle_root, "metal", removed_name)
+        ):
+            raise FixtureError("successful fixture action did not clean its directory")
+
+        failed_cleanup_root = os.path.join(temporary, "failed-cleanup-build")
+        os.makedirs(os.path.join(failed_cleanup_root, "metal"))
+
+        def fail_fixture_action(_fd, _status, _name):
+            raise FixtureError("intentional cleanup lifecycle failure")
+
+        _expect_refusal(
+            lambda: _with_prepared_fixture(
+                failed_cleanup_root,
+                fixture_tool,
+                fail_fixture_action,
+                cleanup_after_run=True,
+            ),
+            "fixture action failure",
+        )
+        failed_names = os.listdir(os.path.join(failed_cleanup_root, "metal"))
+        if failed_names:
+            raise FixtureError("failed fixture action left its generated directory behind")
+
+        combined_error_root = os.path.join(temporary, "combined-error-build")
+        os.makedirs(os.path.join(combined_error_root, "metal"))
+        original_remove_fixture = globals()["_remove_owned_fixture_directory"]
+
+        def fail_fixture_cleanup(*_args, **_kwargs):
+            raise RuntimeError("simulated cleanup exception")
+
+        globals()["_remove_owned_fixture_directory"] = fail_fixture_cleanup
+        try:
+            try:
+                _with_prepared_fixture(
+                    combined_error_root,
+                    fixture_tool,
+                    fail_fixture_action,
+                    cleanup_after_run=True,
+                )
+            except FixtureError as error:
+                if (
+                    "intentional cleanup lifecycle failure" not in str(error)
+                    or "simulated cleanup exception" not in str(error)
+                ):
+                    raise FixtureError(
+                        "combined fixture failure report omitted the action or cleanup error"
+                    ) from error
+            else:
+                raise FixtureError("combined fixture failure self-test did not fail")
+        finally:
+            globals()["_remove_owned_fixture_directory"] = original_remove_fixture
+
+        replacement_name = _FIXTURE_PREFIX + "b" * 32
+        replacement_parent_fd, _ = _open_build_parent(root)
+        replacement_fd, replacement_status = _create_owned_fixture_directory(
+            replacement_parent_fd, replacement_name
+        )
+        replacement_path = os.path.join(parent, replacement_name)
+        replacement_payload = os.path.join(replacement_path, "sentinel")
+        try:
+            os.rename(
+                replacement_name,
+                replacement_name + ".held",
+                src_dir_fd=replacement_parent_fd,
+                dst_dir_fd=replacement_parent_fd,
+            )
+            os.mkdir(replacement_name, 0o700, dir_fd=replacement_parent_fd)
+            replacement_path_fd = os.open(
+                replacement_name,
+                _DIRECTORY_FLAGS,
+                dir_fd=replacement_parent_fd,
+            )
+            try:
+                payload_fd = os.open(
+                    "sentinel",
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=replacement_path_fd,
+                )
+                try:
+                    os.write(payload_fd, b"preserve replacement\n")
+                finally:
+                    os.close(payload_fd)
+            finally:
+                os.close(replacement_path_fd)
+            _expect_refusal(
+                lambda: _remove_owned_fixture_directory(
+                    replacement_parent_fd,
+                    replacement_name,
+                    replacement_fd,
+                    replacement_status,
+                ),
+                "a replaced fixture path during cleanup",
+            )
+        finally:
+            os.close(replacement_fd)
+            os.close(replacement_parent_fd)
+        with open(replacement_payload, "rb") as source:
+            if source.read() != b"preserve replacement\n":
+                raise FixtureError("fixture cleanup changed a replacement sentinel")
 
         parent_link_root = os.path.join(temporary, "parent-link-build")
         os.mkdir(parent_link_root)
@@ -934,22 +1388,147 @@ def _run_self_tests(fixture_tool: str) -> None:
             os.open = original_open
             os.fstat = original_fstat
             os.close(parent_fd)
-        if not failed_marker_stat or len(marker_fds) != 1:
+        if not failed_marker_stat or len(marker_fds) != 2:
             raise FixtureError("ownership-marker post-open failure self-test did not run")
-        try:
-            original_fstat(marker_fds[0])
-        except OSError:
-            pass
-        else:
-            raise FixtureError("failed ownership-marker initialization leaked its descriptor")
+        for marker_fd in marker_fds:
+            try:
+                original_fstat(marker_fd)
+            except OSError:
+                pass
+            else:
+                raise FixtureError(
+                    "failed ownership-marker initialization leaked its descriptor"
+                )
         incomplete_marker = os.path.join(
             marker_failure_root, "metal", _FIXTURE_NAME, _OWNER_NAME
         )
-        if not os.path.isfile(incomplete_marker) or os.path.getsize(incomplete_marker) != 0:
-            raise FixtureError("marker initialization failure did not leave an inert partial marker")
+        if os.path.lexists(incomplete_marker) or os.path.lexists(
+            os.path.dirname(incomplete_marker)
+        ):
+            raise FixtureError("owned partial fixture was not rolled back safely")
+
+        partial_marker_root = os.path.join(temporary, "partial-marker-build")
+        os.makedirs(os.path.join(partial_marker_root, "metal"))
+        partial_parent_fd, _ = _open_build_parent(partial_marker_root)
+        original_open = os.open
+        original_write = os.write
+        partial_marker_fds: list[int] = []
+        partial_marker_written = False
+
+        def capture_partial_marker_open(path, flags, mode=0o777, *, dir_fd=None):
+            descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+            if path == _OWNER_NAME and dir_fd is not None:
+                partial_marker_fds.append(descriptor)
+            return descriptor
+
+        def fail_after_partial_marker_write(descriptor, data):
+            nonlocal partial_marker_written
+            if (
+                partial_marker_fds
+                and descriptor == partial_marker_fds[0]
+                and not partial_marker_written
+            ):
+                prefix = data[:8]
+                if original_write(descriptor, prefix) != len(prefix):
+                    raise FixtureError("partial marker write self-test was short")
+                partial_marker_written = True
+                raise OSError("simulated failure after partial marker write")
+            return original_write(descriptor, data)
+
+        try:
+            os.open = capture_partial_marker_open
+            os.write = fail_after_partial_marker_write
+            _expect_refusal(
+                lambda: _create_owned_fixture_directory(
+                    partial_parent_fd, _FIXTURE_NAME
+                ),
+                "an ownership-marker write failure after a valid prefix",
+            )
+        finally:
+            os.open = original_open
+            os.write = original_write
+            os.close(partial_parent_fd)
+        if not partial_marker_written or len(partial_marker_fds) != 2:
+            raise FixtureError("partial ownership-marker write self-test did not run")
+        for marker_fd in partial_marker_fds:
+            try:
+                original_fstat(marker_fd)
+            except OSError:
+                pass
+            else:
+                raise FixtureError("partial-marker rollback leaked a descriptor")
+        partial_marker_path = os.path.join(
+            partial_marker_root, "metal", _FIXTURE_NAME
+        )
+        if os.path.lexists(partial_marker_path):
+            raise FixtureError("a valid partial marker fixture was not rolled back")
+
+        unrecognized_marker_root = os.path.join(
+            temporary, "unrecognized-marker-build"
+        )
+        os.makedirs(os.path.join(unrecognized_marker_root, "metal"))
+        unrecognized_parent_fd, _ = _open_build_parent(unrecognized_marker_root)
+        unrecognized_fd, unrecognized_status = _create_owned_fixture_directory(
+            unrecognized_parent_fd, _FIXTURE_NAME
+        )
+        try:
+            marker_fd = os.open(
+                _OWNER_NAME,
+                os.O_WRONLY | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=unrecognized_fd,
+            )
+            try:
+                os.write(marker_fd, b"unrecognized marker")
+            finally:
+                os.close(marker_fd)
+            _expect_refusal(
+                lambda: _rollback_empty_fixture_directory(
+                    unrecognized_parent_fd,
+                    _FIXTURE_NAME,
+                    unrecognized_fd,
+                    unrecognized_status,
+                ),
+                "a non-prefix ownership marker",
+            )
+            with open(
+                os.path.join(
+                    unrecognized_marker_root, "metal", _FIXTURE_NAME, _OWNER_NAME
+                ),
+                "rb",
+            ) as marker:
+                if marker.read() != b"unrecognized marker":
+                    raise FixtureError(
+                        "rollback changed an unrecognized ownership marker"
+                    )
+        finally:
+            os.close(unrecognized_fd)
+            os.close(unrecognized_parent_fd)
 
 
 def main(arguments: list[str]) -> int:
+    if len(arguments) == 3 and arguments[0] == "--create-weight-cli-test-root":
+        try:
+            device, inode = _create_weight_cli_test_root(
+                arguments[1], arguments[2]
+            )
+            print(f"{device} {inode}")
+            return 0
+        except (FixtureError, OSError, subprocess.SubprocessError) as error:
+            print(f"prepare_mtp_storage_fixture: {error}", file=sys.stderr)
+            return 1
+    if len(arguments) == 5 and arguments[0] == "--remove-weight-cli-test-root":
+        try:
+            _remove_weight_cli_test_root(
+                arguments[1],
+                arguments[2],
+                int(arguments[3]),
+                int(arguments[4]),
+            )
+            return 0
+        except (FixtureError, OSError, subprocess.SubprocessError) as error:
+            print(f"prepare_mtp_storage_fixture: {error}", file=sys.stderr)
+            return 1
     if len(arguments) == 6 and arguments[0] == "--run-storage-test":
         try:
             output = _run_storage_test(*arguments[1:])
@@ -983,6 +1562,8 @@ def main(arguments: list[str]) -> int:
             "usage: prepare_mtp_storage_fixture.py --prepare BUILD_ROOT FIXTURE_TOOL "
             "| --run-storage-test BUILD_ROOT FIXTURE_TOOL STORAGE_TEST METALLIB "
             "ENGINE "
+            "| --create-weight-cli-test-root BUILD_ROOT FIXTURE_NAME "
+            "| --remove-weight-cli-test-root BUILD_ROOT FIXTURE_NAME DEVICE INODE "
             "| --self-test FIXTURE_TOOL",
             file=sys.stderr,
         )
