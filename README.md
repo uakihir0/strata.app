@@ -25,6 +25,11 @@ quantized-weight dequantizer with the F16 GEMM in one ordered encoder segment.
 Synthetic tests cover the component chain and rollback; production
 `Prefill::run` still does not call it.
 
+One Prefill GR read half now composes normalization, down projection, SiLU,
+up projection and injection. Serial and concurrent synthetic tests cover all
+BF16X2 modes; the remaining mixer/MoE layers and production chunk execution
+are still unimplemented.
+
 ## Build and test entry points
 
 The CMake presets target arm64 and macOS 27. The `mac-dev` preset enables the Metal backend and

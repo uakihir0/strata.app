@@ -450,11 +450,11 @@
     },
     "metal_prefill_test": {
       "label": "metal",
-      "origin": "04 6.4 / 09 9.1 / D-IMPL-355 / REV-152"
+      "origin": "04 6.3/6.4 / 09 9.1 / D-IMPL-355/375 / REV-152/172"
     },
     "metal_prefill_test_concurrent": {
       "label": "metal",
-      "origin": "04 6.4 / 09 9.1 / D-IMPL-355 / REV-152"
+      "origin": "04 6.3/6.4 / 09 9.1 / D-IMPL-355/375 / REV-152/172"
     },
     "metal_prefill_dequant_test": {
       "label": "metal",
@@ -466,15 +466,15 @@
     },
     "metal_prefill_gemm_auto_test": {
       "label": "metal",
-      "origin": "04 §6.2/§10.5 / D-IMPL-359/362 / REV-156/159"
+      "origin": "04 §6.2/§10.5 / D-IMPL-359/362/375 / REV-156/159"
     },
     "metal_prefill_gemm_auto_test_concurrent": {
       "label": "metal",
-      "origin": "04 §6.2/§10.5 / D-IMPL-359/362 / REV-156/159"
+      "origin": "04 §6.2/§10.5 / D-IMPL-359/362/375 / REV-156/159"
     },
     "metal_prefill_gemm_override_simd_test": {
       "label": "metal",
-      "origin": "04 §6.2/§10.5 / D-IMPL-359/362 / REV-156/159"
+      "origin": "04 §6.2/§10.5 / D-IMPL-359/362/375 / REV-156/159"
     },
     "metal_prefill_gemm_invalid_setting_test": {
       "label": "metal",
@@ -482,19 +482,19 @@
     },
     "metal_prefill_gemm_test": {
       "label": "metal",
-      "origin": "04 §6.2/§10.5 / 09 9.1 / D-IMPL-356/357/362 / REV-153/154/159"
+      "origin": "04 §6.2/§10.5 / 09 9.1 / D-IMPL-356/357/362/375 / REV-153/154/159/172"
     },
     "metal_prefill_gemm_test_concurrent": {
       "label": "metal",
-      "origin": "04 §6.2/§10.5 / 09 9.1 / D-IMPL-356/357/362 / REV-153/154/159"
+      "origin": "04 §6.2/§10.5 / 09 9.1 / D-IMPL-356/357/362/375 / REV-153/154/159/172"
     },
     "metal_prefill_gemm_simd_test": {
       "label": "metal",
-      "origin": "04 §6.2/§10.5 / 09 9.1 / D-IMPL-358/362 / REV-155/159"
+      "origin": "04 §6.2/§10.5 / 09 9.1 / D-IMPL-358/362/375 / REV-155/159"
     },
     "metal_prefill_gemm_simd_test_concurrent": {
       "label": "metal",
-      "origin": "04 §6.2/§10.5 / 09 9.1 / D-IMPL-358/362 / REV-155/159"
+      "origin": "04 §6.2/§10.5 / 09 9.1 / D-IMPL-358/362/375 / REV-155/159"
     },
     "metal_qsa_test": {
       "label": "metal",

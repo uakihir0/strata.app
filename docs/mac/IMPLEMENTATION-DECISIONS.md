@@ -10825,3 +10825,53 @@ measuring L-15 remain open.
   and `mac-host` passed 45/45 with one unavailable-model-input test skipped.
   After the follow-up oracle-strengthening probe, the rebuilt serial/concurrent
   dequant tests passed 2/2. `test_map` and `git diff --check` passed.
+
+### D-IMPL-375: Compose one Prefill GR read half
+
+- **Decision:** Add a caller-owned `Encoder` overload for BF16X2 GEMM, then
+  implement `encode_prefill_gr_read` as the ordered sequence of Prefill GR
+  normalization, BF16 down projection, low-rank SiLU conversion, BF16 up
+  projection and BF16 injection projection. Modes 0 and 2 do not bind
+  remainders for the GR read; mode 1 writes both normalization and SiLU
+  remainders and applies BF16X2 to all three projections. Validate every
+  active buffer extent and cross-stage writable alias before dispatch. Keep
+  the standalone form transactional and require caller-owned users to
+  propagate failures from their enclosing `Encoder::encode` body.
+- **Reason:** These are the documented steps 1–5 of the Prefill GR read half,
+  and the individual normalization, SiLU and GEMM encoders already exist.
+  Connecting them gives a directly testable unit with the specified BF16X2
+  behavior while preserving the remaining chunk scheduler, mixer, MoE and
+  production scratch decisions for later work.
+- **Review required:** Check projection extents/layouts and ordering against
+  docs/mac/04 §6.2–6.3; verify modes 0/1/2, required-range alias detection
+  across writable and read-only views, serial/concurrent ordering, late
+  failure behavior, and that direct-chain tests cannot pass with a missing or
+  reordered stage. Confirm docs still call this an isolated GR read half and
+  do not imply production `Prefill::run` or model inference.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `cmake --build --preset mac-dev` succeeded. The Prefill GR
+  serial/concurrent tests passed 2/2, and the BF16/F16 GEMM serial/concurrent,
+  auto-selector, forced-SIMD and invalid-setting tests passed 8/8. The
+  synthetic fixtures use no model inputs; the production chunk loop remains
+  unimplemented.
+
+### REV-172: Hostile review of the Prefill GR read composition
+
+- **Scope:** Projection shapes and numeric oracles, coordinator ordering,
+  required-range aliases, BF16X2 modes, and rollback after a late stage fails.
+- **Findings and fixes:** The first review found that output parity against a
+  direct chain of the same GPU encoders could miss a shared GEMM defect,
+  especially at K=10240. Added independent FP64 product oracles for down, up
+  and injection, with high and low BF16 inputs checked in every active mode.
+  It also found that no test failed after the normalization dispatch had been
+  encoded. Added a deterministic invalid `STRATA_METAL_GEMM` selector case
+  that verifies the downstream error, command-buffer discard and unchanged
+  output allocations through both the transactional CommandBuffer wrapper and
+  the caller-owned Encoder form.
+- **Disposition:** The initial P2 coverage findings are fixed. An adversarial
+  follow-up review of the added tests is pending.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the rebuilt `mac-dev` target succeeded and the strengthened
+  Prefill GR serial/concurrent tests passed 2/2. The full `mac-metal` suite
+  passed 90/90 before the final oracle and rollback assertions were added;
+  rerun it after the follow-up review.

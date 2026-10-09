@@ -33,6 +33,14 @@ tests match the direct two-component chain and verify that a late GEMM failure
 discards dequantization, and a caller-owned IQ3_S segment verifies late-failure
 propagation; this remains synthetic component coverage, not production
 `Prefill::run` or model inference.
+
+The GR read half now composes Prefill normalization, BF16 down projection,
+low-rank SiLU, BF16 up projection and injection. Its serial and concurrent
+tests cover modes 0/1/2, compare each output with the direct component chain,
+and check normalization/SiLU oracles, independent FP64 projection oracles,
+input immutability, guards, cross-stage aliases and late-failure rollback
+through both API forms. This does not include the layer mixer/MoE, production
+arena scheduling or `Prefill::run`.
 REV-163 replaced Q2_0's initially coupled pack/unpack test fixture with literal
 packed bytes and a separate logical-code table; hostile follow-up review found
 no further issue. REV-164 reviewed the IQ4_NL codebook path and found no
