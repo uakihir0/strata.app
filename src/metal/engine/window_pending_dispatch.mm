@@ -196,7 +196,8 @@ void append_pending_consumer_views(
 
 bool validate_embedding_liveness(
     BufferRef embedding, const WindowT1MoeLayer0FullBuffers& layer0,
-    const WindowMoePendingConsumer& consumer, std::string& error) {
+    const WindowMoePendingConsumer& consumer, const char* stage,
+    std::string& error) {
     std::vector<BufferRef> writable;
     std::vector<ReadOnlyBufferRef> readonly;
     append_fullmode_layer0_views(layer0, writable, readonly);
@@ -209,14 +210,14 @@ bool validate_embedding_liveness(
             same_view(view, pending_output)) {
             continue;
         }
-        error =
-            "T=1 embedding scratch overlaps a later FullMode producer or consumer buffer";
+        error = std::string(stage) +
+                " embedding scratch overlaps a later FullMode producer or consumer buffer";
         return false;
     }
     for (ReadOnlyBufferRef view : readonly) {
         if (views_overlap(embedding, view)) {
-            error =
-                "T=1 embedding scratch overlaps a later read-only FullMode input";
+            error = std::string(stage) +
+                    " embedding scratch overlaps a later read-only FullMode input";
             return false;
         }
     }
@@ -670,7 +671,7 @@ bool encode_window_t1_full_mode_step(
         return false;
     }
     if (!validate_embedding_liveness(buffers.embedding, buffers.layer0,
-                                     consumer, error)) {
+                                     consumer, "T=1", error)) {
         return false;
     }
 
@@ -687,6 +688,93 @@ bool encode_window_t1_full_mode_step(
     }
     return encode_window_moe_pending_consumer(
         context, encoder, 1u, ple_enabled, consumer, error);
+}
+
+bool encode_window_moe_full_mode_input_step(
+    Context& context, const FullModeStorage& full_mode, Encoder& encoder,
+    std::uint32_t vocabulary_size, std::uint32_t experts,
+    MoeExpertFormat gate_up_format, MoeDownFormat down_format,
+    bool ple_enabled, const WindowMoeFullModeInputStepBuffers& buffers,
+    std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "speculative FullMode input step requires ordered dispatch boundaries";
+        return false;
+    }
+
+    const GRReadBuffers& attention =
+        buffers.layer0.producer.router.layer0.attention;
+    if (!same_view(buffers.streams, attention.residual)) {
+        error = "speculative FullMode streams must be the layer-0 attention residual view";
+        return false;
+    }
+
+    const bool has_ple =
+        std::holds_alternative<WindowMoePendingPLEConsumer>(
+            buffers.consumer);
+    if (ple_enabled != has_ple) {
+        error = "Window pending-MoE consumer does not match the selected PLE branch";
+        return false;
+    }
+    WindowMoePendingConsumer consumer = buffers.consumer;
+    if (ple_enabled &&
+        !resolve_ple_model_weights(full_mode, consumer, error)) {
+        return false;
+    }
+    const WindowMoeLayer0FullModeStepBuffers producer_consumer{
+        buffers.layer0, consumer};
+
+    FullModeTensorView token_embedding;
+    if (!full_mode.dense_tensor_view("token_embd.weight", token_embedding,
+                                     error)) {
+        return false;
+    }
+    if (token_embedding.shape.size() != 2u ||
+        token_embedding.shape[0] != kWindowEmbeddingWidth ||
+        token_embedding.shape[1] != vocabulary_size) {
+        error = "FullMode token embedding must have shape [2560, vocabulary_size]";
+        return false;
+    }
+    EmbedRowsFormat format{};
+    if (!embedding_format(token_embedding.ggml_type, format)) {
+        error = "FullMode token embedding uses an unsupported row format";
+        return false;
+    }
+    if (!validate_embedding_liveness(buffers.embedding, buffers.layer0,
+                                     consumer, "speculative", error)) {
+        return false;
+    }
+
+    const BufferRef params =
+        buffers.layer0.producer.router.layer0.params;
+    const WindowEmbeddingBuffers embedding_buffers{
+        params, token_embedding.buffer, buffers.embedding, buffers.streams};
+    if (!encode_window_speculative_embedding(
+            context, encoder, vocabulary_size, format, embedding_buffers,
+            error)) {
+        return false;
+    }
+    return encode_window_moe_layer0_full_mode_step(
+        context, full_mode, encoder, vocabulary_size, experts,
+        gate_up_format, down_format, ple_enabled, producer_consumer, error);
+}
+
+bool encode_window_moe_full_mode_input_step(
+    Context& context, const FullModeStorage& full_mode,
+    CommandBuffer& command_buffer, std::uint32_t vocabulary_size,
+    std::uint32_t experts, MoeExpertFormat gate_up_format,
+    MoeDownFormat down_format, bool ple_enabled,
+    const WindowMoeFullModeInputStepBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer,
+        "Window speculative FullMode input, producer and consumer",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_moe_full_mode_input_step(
+                context, full_mode, encoder, vocabulary_size, experts,
+                gate_up_format, down_format, ple_enabled, buffers,
+                encode_error);
+        },
+        error);
 }
 
 bool encode_window_t1_full_mode_step(

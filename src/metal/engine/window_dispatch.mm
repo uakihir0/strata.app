@@ -299,6 +299,58 @@ bool encode_window_embedding(Context& context, Encoder& encoder,
                                {embedding_input, buffers.streams}, error);
 }
 
+bool encode_window_speculative_embedding(
+    Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
+    EmbedRowsFormat format, const WindowEmbeddingBuffers& buffers,
+    std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "speculative Window embedding requires an ordered dispatch boundary";
+        return false;
+    }
+
+    WindowParams params{};
+    if (!validate_speculative_window_params(
+            context, buffers.params, vocabulary_size, params, error)) {
+        return false;
+    }
+    if (params.n_keep != 0u) {
+        error = "speculative Window embedding requires n_keep == 0";
+        return false;
+    }
+    if (buffer_views_overlap(buffers.params, buffers.embedding) ||
+        buffer_views_overlap(buffers.params, buffers.streams)) {
+        error = "speculative Window scratch outputs must not overlap the parameter block";
+        return false;
+    }
+
+    const ReadOnlyBufferRef read_only_params =
+        context.buffers().read_only(buffers.params);
+    const ReadOnlyBufferRef token_view = read_only_params.slice(
+        offsetof(WindowParams, tokens),
+        static_cast<std::size_t>(params.T) * sizeof(std::uint32_t));
+    if (!token_view) {
+        error = "speculative Window token rows are not a live read-only view";
+        return false;
+    }
+    if (!encode_embed_rows(
+            context, encoder, params.T, vocabulary_size, format,
+            EmbedRowsReadOnlyBuffers{buffers.table, token_view,
+                                     buffers.embedding},
+            error)) {
+        return false;
+    }
+
+    const ReadOnlyBufferRef embedding_input =
+        context.buffers().read_only(buffers.embedding);
+    if (!embedding_input) {
+        error = "speculative Window embedding scratch is not a live read-only view";
+        return false;
+    }
+    return encode_gr_broadcast(context, encoder, params.T,
+                               {embedding_input, buffers.streams}, error);
+}
+
 namespace {
 
 std::array<BufferRef, 12> gr_read_views(const GRReadBuffers& buffers) {
@@ -1595,6 +1647,21 @@ bool encode_window_embedding(Context& context, CommandBuffer& command_buffer,
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_window_embedding(context, encoder, vocabulary_size,
                                            format, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_window_speculative_embedding(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size, EmbedRowsFormat format,
+    const WindowEmbeddingBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer,
+        "Window speculative embedding and GR initialization",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_speculative_embedding(
+                context, encoder, vocabulary_size, format, buffers,
+                encode_error);
         },
         error);
 }

@@ -17,7 +17,7 @@ struct WindowEmbeddingBuffers {
     BufferRef params;
     /// Read-only token embedding tensor from full-mode model storage.
     ReadOnlyBufferRef table;
-    /// T=1 embedding and four-stream residual scratch regions.
+    /// Active-row embedding and four-stream residual scratch regions.
     BufferRef embedding;
     BufferRef streams;
 };
@@ -122,6 +122,22 @@ bool encode_window_embedding(Context& context, CommandBuffer& command_buffer,
                              EmbedRowsFormat format,
                              const WindowEmbeddingBuffers& buffers,
                              std::string& error);
+
+/// Encode the speculative T=1..8 input stem. Infer rows from validated
+/// WindowParams, gather all token embeddings, then broadcast them into the
+/// four initial GR streams. The parameter block must describe an ordinary
+/// speculative window (`n_keep == 0`) and remain unchanged through completion.
+/// Propagate false from the enclosing Encoder::encode body to discard the
+/// gather if stream initialization fails.
+bool encode_window_speculative_embedding(
+    Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
+    EmbedRowsFormat format, const WindowEmbeddingBuffers& buffers,
+    std::string& error);
+/// Standalone transactional form for a fresh command buffer.
+bool encode_window_speculative_embedding(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size, EmbedRowsFormat format,
+    const WindowEmbeddingBuffers& buffers, std::string& error);
 
 /// Encode the L9 T=1 layer-0 attention read (`pending(0) == 0`) followed by
 /// its speculative GDN block in the same ordered segment. This assumes the

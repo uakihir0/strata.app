@@ -2323,8 +2323,12 @@ The separate `encode_window_moe_layer0_full_mode` producer accepts T=1..8 from v
 plan and shared-FFN rows, and treats `WindowParams.nc` only as the padded compiled-column width.
 It preserves the same FullMode table ownership and pending-output policy. This producer can be
 followed by the generic pending-consumer selector in a caller-owned Encoder segment, but does not
-compose token embedding, GR broadcast or the consumer itself; the integrated FullMode token step
-remains T=1.
+compose token embedding or GR broadcast. The legacy integrated FullMode token step remains T=1;
+`encode_window_moe_full_mode_input_step` is its speculative T=1..8 sibling and composes row-wise
+embedding gather, four-stream GR broadcast, the generic FullMode producer and exactly one pending
+consumer. It derives `T` and token rows from validated `WindowParams`, requires `n_keep == 0`, and
+retains the T=1 exact `shared.output` scratch reuse rule. This layer-0 input composition still does
+not schedule later layers or commit speculative state.
 The generic speculative router prefix supports T=1..8 and uses `WindowParams.T` for active router,
 route and Q8_1 rows while `nc` determines padded BF16 mat-vec columns. Its plan-prefix companion
 continues through the layer-0 `strata_moe_plan` kernel for either full or tiered mode. Full mode
@@ -2373,7 +2377,12 @@ the residual against a direct T=3 PLE-entry reference, while checking padded out
 deferred PLE history. The compact fixture has a one-token vocabulary, so the T=3 row-sensitive
 oracle supplies synthetic input values after staging its table allocation. Speculative PLE
 composition rejects `advance_rows` and a PLE table-input alias to the pending MoE output before
-encoding. `prepare_window_t1_input`
+encoding. The speculative input stem compares T=3 and T=8 embedding gather and four-stream
+broadcast against direct row-wise encoder calls, checks nonzero T=8 reference data and untouched
+embedding/stream tails, and rejects an invalid later token and nonzero `n_keep` before dispatch.
+The T=3 FullMode-to-PLE integration now uses `encode_window_moe_full_mode_input_step`; standalone
+and caller-owned late PLE output failures verify transaction rollback, with the caller-owned test
+propagating false from its enclosing `Encoder::encode` body. `prepare_window_t1_input`
 builds the T=1 `WindowParams` ring slot and, for
 PLE, builds row IDs from the test token and committed history, then stages the sixteen IQ4_NL rows
 from the synthetic FullMode GGUF's mapped table. An uninitialized session is rejected without

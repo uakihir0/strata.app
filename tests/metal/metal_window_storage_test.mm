@@ -5172,20 +5172,278 @@ void run_fullmode_handoff_test(Context& context,
         constexpr std::uint32_t generic_ple_rows_count = 3u;
         std::memcpy(gdn_active_rows.contents, &generic_ple_rows_count,
                     sizeof(generic_ple_rows_count));
-        auto* const generic_ple_residual =
-            static_cast<float*>(residual.contents);
-        for (std::uint32_t row = 0u; row < 3u; ++row) {
-            for (std::size_t index = 0u; index < 4u * N_EMBD; ++index) {
-                generic_ple_residual[
-                    static_cast<std::size_t>(row) * 4u * N_EMBD + index] =
-                    static_cast<float>((row + 2u) * (index % 17u + 1u)) *
-                    0.0007f;
-            }
-        }
+        const std::size_t generic_ple_embedding_bytes =
+            generic_ple_rows_count * N_EMBD * sizeof(float);
+        const std::size_t generic_ple_stream_bytes =
+            generic_ple_rows_count * HC_DIM * sizeof(float);
+        const BufferRef generic_ple_embedding = allocate(
+            "T=3 speculative FullMode embedding",
+            generic_ple_embedding_bytes);
+        const BufferRef direct_generic_ple_embedding = allocate(
+            "T=3 direct embedding reference", generic_ple_embedding_bytes);
+        const BufferRef direct_generic_ple_streams = allocate(
+            "T=3 direct GR broadcast reference", generic_ple_stream_bytes);
+        const ReadOnlyBufferRef generic_ple_token_rows =
+            generic_ple_t3_params_read_only.slice(
+                offsetof(strata::metal::WindowParams, tokens),
+                generic_ple_rows_count * sizeof(std::uint32_t));
+        require(static_cast<bool>(generic_ple_token_rows),
+                "bind T=3 speculative token rows");
+        auto direct_input_command = context.make_command_buffer(
+            "Direct T=3 embedding and GR broadcast reference", error);
+        require(direct_input_command != nullptr,
+                "create direct T=3 embedding reference command: " + error);
+        require(Encoder::encode(
+                    context, *direct_input_command,
+                    "direct T=3 embedding and GR broadcast",
+                    [&](Encoder& encoder, std::string& encode_error) {
+                        if (!encode_embed_rows(
+                                context, encoder, generic_ple_rows_count,
+                                kVocabulary, EmbedRowsFormat::q3_k,
+                                EmbedRowsReadOnlyBuffers{
+                                    token_embedding_view.buffer,
+                                    generic_ple_token_rows,
+                                    direct_generic_ple_embedding},
+                                encode_error)) {
+                            return false;
+                        }
+                        return encode_gr_broadcast(
+                            context, encoder, generic_ple_rows_count,
+                            {context.buffers().read_only(
+                                 direct_generic_ple_embedding),
+                             direct_generic_ple_streams},
+                            encode_error);
+                    },
+                    error),
+                "encode direct T=3 embedding and GR broadcast: " + error);
+        require(direct_input_command->commit(error),
+                "commit direct T=3 embedding reference: " + error);
+        require(direct_input_command->wait_until_completed(error),
+                "wait for direct T=3 embedding reference: " + error);
+        std::memset(residual.contents, 0xa5u, residual.length);
+        const WindowEmbeddingBuffers generic_ple_embedding_buffers{
+            generic_ple_t3_params, token_embedding_view.buffer,
+            generic_ple_embedding, residual};
+        auto speculative_input_command = context.make_command_buffer(
+            "T=3 speculative embedding and GR broadcast", error);
+        require(speculative_input_command != nullptr,
+                "create T=3 speculative embedding command: " + error);
+        require(encode_window_speculative_embedding(
+                    context, *speculative_input_command, kVocabulary,
+                    EmbedRowsFormat::q3_k, generic_ple_embedding_buffers,
+                    error),
+                "encode T=3 speculative embedding and GR broadcast: " +
+                    error);
+        require(speculative_input_command->commit(error),
+                "commit T=3 speculative embedding: " + error);
+        require(speculative_input_command->wait_until_completed(error),
+                "wait for T=3 speculative embedding: " + error);
+        require(std::memcmp(generic_ple_embedding.contents,
+                            direct_generic_ple_embedding.contents,
+                            generic_ple_embedding_bytes) == 0 &&
+                    std::memcmp(residual.contents,
+                                direct_generic_ple_streams.contents,
+                                generic_ple_stream_bytes) == 0,
+                "T=3 speculative embedding and stream broadcast match direct row-wise references");
+        const auto* const residual_tail =
+            static_cast<const std::uint8_t*>(residual.contents) +
+            generic_ple_stream_bytes;
+        require(std::all_of(
+                    residual_tail,
+                    static_cast<const std::uint8_t*>(residual.contents) +
+                        residual.length,
+                    [](std::uint8_t value) { return value == 0xa5u; }),
+                "T=3 speculative stream broadcast preserves inactive tails");
         const std::vector<std::uint8_t> generic_ple_reference_residual_input(
             static_cast<const std::uint8_t*>(residual.contents),
             static_cast<const std::uint8_t*>(residual.contents) +
                 residual.length);
+        const std::vector<std::uint8_t> generic_embedding_before_rejection(
+            static_cast<const std::uint8_t*>(generic_ple_embedding.contents),
+            static_cast<const std::uint8_t*>(generic_ple_embedding.contents) +
+                generic_ple_embedding.length);
+        const std::vector<std::uint8_t> generic_streams_before_rejection(
+            static_cast<const std::uint8_t*>(residual.contents),
+            static_cast<const std::uint8_t*>(residual.contents) +
+                residual.length);
+        strata::metal::WindowParams invalid_token_values{};
+        std::memcpy(&invalid_token_values, generic_ple_t3_params.contents,
+                    sizeof(invalid_token_values));
+        invalid_token_values.tokens[2] = kVocabulary;
+        const BufferRef invalid_token_params = allocate(
+            "T=3 invalid token parameter block",
+            sizeof(invalid_token_values));
+        std::memcpy(invalid_token_params.contents, &invalid_token_values,
+                    sizeof(invalid_token_values));
+        WindowEmbeddingBuffers invalid_token_input{
+            invalid_token_params, token_embedding_view.buffer,
+            generic_ple_embedding, residual};
+        auto invalid_token_command = context.make_command_buffer(
+            "Reject invalid final speculative token", error);
+        require(invalid_token_command != nullptr,
+                "create invalid speculative token command: " + error);
+        const bool invalid_token_encoded =
+            encode_window_speculative_embedding(
+                context, *invalid_token_command, kVocabulary,
+                EmbedRowsFormat::q3_k, invalid_token_input, error);
+        require(!invalid_token_encoded &&
+                    invalid_token_command->unsafe_native_handle() == nullptr &&
+                    error.find("token id is outside") != std::string::npos &&
+                    std::equal(
+                        generic_embedding_before_rejection.begin(),
+                        generic_embedding_before_rejection.end(),
+                        static_cast<const std::uint8_t*>(
+                            generic_ple_embedding.contents)) &&
+                    std::equal(
+                        generic_streams_before_rejection.begin(),
+                        generic_streams_before_rejection.end(),
+                        static_cast<const std::uint8_t*>(residual.contents)),
+                "T=3 speculative embedding rejects an invalid later token before dispatch");
+        std::memcpy(&invalid_token_values, generic_ple_t3_params.contents,
+                    sizeof(invalid_token_values));
+        invalid_token_values.n_keep = 1u;
+        std::memcpy(invalid_token_params.contents, &invalid_token_values,
+                    sizeof(invalid_token_values));
+        auto non_speculative_command = context.make_command_buffer(
+            "Reject committed rows in speculative input stem", error);
+        require(non_speculative_command != nullptr,
+                "create non-speculative input rejection command: " + error);
+        const bool non_speculative_encoded =
+            encode_window_speculative_embedding(
+                context, *non_speculative_command, kVocabulary,
+                EmbedRowsFormat::q3_k, invalid_token_input, error);
+        require(!non_speculative_encoded &&
+                    non_speculative_command->unsafe_native_handle() ==
+                        nullptr &&
+                    error.find("n_keep == 0") != std::string::npos,
+                "generic input stem rejects committed rows before dispatch");
+
+        const std::vector<std::uint32_t> t8_tokens(8u, 0u);
+        const std::vector<WindowSamplerSettings> t8_samplers(
+            t8_tokens.size(), sampler_settings);
+        const BufferRef t8_params = params_ring->build_slot(
+            0u, 1u, t8_tokens, t8_samplers, 0u, 0x10203040u,
+            0x50607080u, error);
+        require(static_cast<bool>(t8_params),
+                "build T=8 speculative embedding parameters: " + error);
+        constexpr std::size_t t8_tail_bytes = 64u;
+        const std::size_t t8_embedding_active_bytes =
+            8u * N_EMBD * sizeof(float);
+        const std::size_t t8_streams_active_bytes =
+            8u * HC_DIM * sizeof(float);
+        const BufferRef t8_embedding = allocate(
+            "T=8 speculative embedding",
+            t8_embedding_active_bytes + t8_tail_bytes);
+        const BufferRef t8_streams = allocate(
+            "T=8 speculative GR streams",
+            t8_streams_active_bytes + t8_tail_bytes);
+        const BufferRef t8_direct_embedding = allocate(
+            "T=8 direct embedding reference", t8_embedding_active_bytes);
+        const BufferRef t8_direct_streams = allocate(
+            "T=8 direct GR broadcast reference", t8_streams_active_bytes);
+        std::memset(t8_embedding.contents, 0xa5u, t8_embedding.length);
+        std::memset(t8_streams.contents, 0xa5u, t8_streams.length);
+        const ReadOnlyBufferRef t8_params_read_only =
+            context.buffers().read_only(t8_params);
+        const ReadOnlyBufferRef t8_token_rows = t8_params_read_only.slice(
+            offsetof(strata::metal::WindowParams, tokens),
+            t8_tokens.size() * sizeof(std::uint32_t));
+        require(static_cast<bool>(t8_token_rows),
+                "bind T=8 speculative token rows");
+        auto t8_reference_command = context.make_command_buffer(
+            "Direct T=8 embedding and GR broadcast reference", error);
+        require(t8_reference_command != nullptr,
+                "create direct T=8 embedding reference command: " + error);
+        require(Encoder::encode(
+                    context, *t8_reference_command,
+                    "direct T=8 embedding and GR broadcast",
+                    [&](Encoder& encoder, std::string& encode_error) {
+                        if (!encode_embed_rows(
+                                context, encoder, 8u, kVocabulary,
+                                EmbedRowsFormat::q3_k,
+                                EmbedRowsReadOnlyBuffers{
+                                    token_embedding_view.buffer, t8_token_rows,
+                                    t8_direct_embedding},
+                                encode_error)) {
+                            return false;
+                        }
+                        return encode_gr_broadcast(
+                            context, encoder, 8u,
+                            {context.buffers().read_only(t8_direct_embedding),
+                             t8_direct_streams},
+                            encode_error);
+                    },
+                    error),
+                "encode direct T=8 embedding and GR broadcast: " + error);
+        require(t8_reference_command->commit(error),
+                "commit direct T=8 embedding reference: " + error);
+        require(t8_reference_command->wait_until_completed(error),
+                "wait for direct T=8 embedding reference: " + error);
+        require(std::any_of(
+                    static_cast<const float*>(t8_direct_embedding.contents),
+                    static_cast<const float*>(t8_direct_embedding.contents) +
+                        t8_embedding_active_bytes / sizeof(float),
+                    [](float value) {
+                        return std::isfinite(value) &&
+                               std::abs(value) > 1.0e-7f;
+                    }),
+                "T=8 direct embedding reference contains nonzero data");
+        const WindowEmbeddingBuffers t8_embedding_buffers{
+            t8_params, token_embedding_view.buffer, t8_embedding,
+            t8_streams};
+        auto t8_embedding_command = context.make_command_buffer(
+            "T=8 speculative embedding and broadcast", error);
+        require(t8_embedding_command != nullptr,
+                "create T=8 speculative embedding command: " + error);
+        require(encode_window_speculative_embedding(
+                    context, *t8_embedding_command, kVocabulary,
+                    EmbedRowsFormat::q3_k, t8_embedding_buffers, error),
+                "encode T=8 speculative embedding and broadcast: " + error);
+        require(t8_embedding_command->commit(error),
+                "commit T=8 speculative embedding: " + error);
+        require(t8_embedding_command->wait_until_completed(error),
+                "wait for T=8 speculative embedding: " + error);
+        require(std::memcmp(t8_embedding.contents,
+                            t8_direct_embedding.contents,
+                            t8_embedding_active_bytes) == 0 &&
+                    std::memcmp(t8_streams.contents, t8_direct_streams.contents,
+                                t8_streams_active_bytes) == 0,
+                "T=8 speculative embedding and broadcast match direct row-wise references");
+        const auto* const t8_embedding_tail =
+            static_cast<const std::uint8_t*>(t8_embedding.contents) +
+            t8_embedding_active_bytes;
+        const auto* const t8_stream_tail =
+            static_cast<const std::uint8_t*>(t8_streams.contents) +
+            t8_streams_active_bytes;
+        require(std::all_of(
+                    t8_embedding_tail,
+                    static_cast<const std::uint8_t*>(t8_embedding.contents) +
+                        t8_embedding.length,
+                    [](std::uint8_t value) { return value == 0xa5u; }) &&
+                    std::all_of(
+                        t8_stream_tail,
+                        static_cast<const std::uint8_t*>(t8_streams.contents) +
+                            t8_streams.length,
+                        [](std::uint8_t value) { return value == 0xa5u; }),
+                "T=8 speculative embedding and broadcast preserve inactive tails");
+        for (std::uint32_t row = 1u; row < 8u; ++row) {
+            require(std::memcmp(
+                        t8_embedding.contents,
+                        static_cast<const std::uint8_t*>(
+                            t8_embedding.contents) +
+                            static_cast<std::size_t>(row) * N_EMBD *
+                                sizeof(float),
+                        N_EMBD * sizeof(float)) == 0,
+                    "T=8 embedding gather fills each repeated-token row");
+            require(std::memcmp(
+                        t8_streams.contents,
+                        static_cast<const std::uint8_t*>(
+                            t8_streams.contents) +
+                            static_cast<std::size_t>(row) * HC_DIM *
+                                sizeof(float),
+                        HC_DIM * sizeof(float)) == 0,
+                    "T=8 GR broadcast initializes each row");
+        }
         WindowMoePendingConsumer generic_ple_multi_consumer =
             pending_consumer;
         auto& generic_ple_payload =
@@ -5199,8 +5457,9 @@ void run_fullmode_handoff_test(Context& context,
             generic_ple_t3_params_read_only.slice(
                 offsetof(strata::metal::WindowParams, T),
                 sizeof(std::uint32_t));
-        const WindowMoeLayer0FullModeStepBuffers generic_ple_multi_step{
-            generic_ple_multi_producer, generic_ple_multi_consumer};
+        const WindowMoeFullModeInputStepBuffers generic_ple_multi_step{
+            pending_output, residual, generic_ple_multi_producer,
+            generic_ple_multi_consumer};
 
         const std::array<std::size_t, 6u> generic_ple_active_bytes{
             3u * HC_DIM * sizeof(float), 3u * N_EMBD * sizeof(float),
@@ -5211,19 +5470,130 @@ void run_fullmode_handoff_test(Context& context,
         }
         std::memcpy(ple_block.post.history.contents,
                     ple_history_initial.data(), ple_history_initial.size());
+        WindowMoeFullModeInputStepBuffers late_input_failure =
+            generic_ple_multi_step;
+        auto& late_ple_consumer =
+            std::get<WindowMoePendingPLEConsumer>(
+                late_input_failure.consumer);
+        late_ple_consumer.buffers.ple.post.gated =
+            late_ple_consumer.buffers.ple.post.gated.slice(0u, 0u);
+        require(static_cast<bool>(
+                    late_ple_consumer.buffers.ple.post.gated),
+                "form an owned empty late PLE output view");
+        const std::vector<std::uint8_t> pending_before_late_failure(
+            static_cast<const std::uint8_t*>(pending_output.contents),
+            static_cast<const std::uint8_t*>(pending_output.contents) +
+                pending_output.length);
+        const std::vector<std::uint8_t> residual_before_late_failure(
+            static_cast<const std::uint8_t*>(residual.contents),
+            static_cast<const std::uint8_t*>(residual.contents) +
+                residual.length);
+        const BufferRef usage_view = full_mode->usage_table();
+        const std::vector<std::uint8_t> usage_before_late_failure(
+            static_cast<const std::uint8_t*>(usage_view.contents),
+            static_cast<const std::uint8_t*>(usage_view.contents) +
+                usage_view.length);
+        const std::vector<std::uint8_t> embedding_before_late_failure(
+            static_cast<const std::uint8_t*>(generic_ple_embedding.contents),
+            static_cast<const std::uint8_t*>(generic_ple_embedding.contents) +
+                generic_ple_embedding.length);
+        std::vector<std::vector<std::uint8_t>>
+            ple_outputs_before_late_failure;
+        ple_outputs_before_late_failure.reserve(outputs.size());
+        for (BufferRef output : outputs) {
+            ple_outputs_before_late_failure.emplace_back(
+                static_cast<const std::uint8_t*>(output.contents),
+                static_cast<const std::uint8_t*>(output.contents) +
+                    output.length);
+        }
+        const std::vector<std::uint8_t> ple_history_before_late_failure(
+            static_cast<const std::uint8_t*>(ple_block.post.history.contents),
+            static_cast<const std::uint8_t*>(ple_block.post.history.contents) +
+                ple_block.post.history.length);
+        const auto late_writes_unchanged = [&]() {
+            if (!std::equal(
+                    pending_before_late_failure.begin(),
+                    pending_before_late_failure.end(),
+                    static_cast<const std::uint8_t*>(
+                        pending_output.contents)) ||
+                !std::equal(
+                    residual_before_late_failure.begin(),
+                    residual_before_late_failure.end(),
+                    static_cast<const std::uint8_t*>(residual.contents)) ||
+                !std::equal(
+                    usage_before_late_failure.begin(),
+                    usage_before_late_failure.end(),
+                    static_cast<const std::uint8_t*>(usage_view.contents)) ||
+                !std::equal(
+                    embedding_before_late_failure.begin(),
+                    embedding_before_late_failure.end(),
+                    static_cast<const std::uint8_t*>(
+                        generic_ple_embedding.contents)) ||
+                !std::equal(
+                    ple_history_before_late_failure.begin(),
+                    ple_history_before_late_failure.end(),
+                    static_cast<const std::uint8_t*>(
+                        ple_block.post.history.contents))) {
+                return false;
+            }
+            for (std::size_t index = 0u; index < outputs.size(); ++index) {
+                const BufferRef output = outputs[index];
+                if (!std::equal(
+                        ple_outputs_before_late_failure[index].begin(),
+                        ple_outputs_before_late_failure[index].end(),
+                        static_cast<const std::uint8_t*>(output.contents))) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        auto late_input_command = context.make_command_buffer(
+            "Rollback T=3 embedding and FullMode on late PLE failure", error);
+        require(late_input_command != nullptr,
+                "create T=3 late FullMode input failure command: " + error);
+        const bool late_input_encoded =
+            encode_window_moe_full_mode_input_step(
+                context, *full_mode, *late_input_command, kVocabulary,
+                kExperts, MoeExpertFormat::q2_0, MoeDownFormat::q2_0, true,
+                late_input_failure, error);
+        require(!late_input_encoded &&
+                    late_input_command->unsafe_native_handle() == nullptr &&
+                    late_writes_unchanged(),
+                "late T=3 PLE failure discards input, FullMode producer and consumer writes");
+        auto caller_owned_late_input_command = context.make_command_buffer(
+            "Rollback caller-owned T=3 FullMode input on late PLE failure",
+            error);
+        require(caller_owned_late_input_command != nullptr,
+                "create caller-owned late FullMode input failure command: " +
+                    error);
+        const bool caller_owned_late_input_encoded = Encoder::encode(
+            context, *caller_owned_late_input_command,
+            "caller-owned T=3 FullMode input failure",
+            [&](Encoder& encoder, std::string& encode_error) {
+                return encode_window_moe_full_mode_input_step(
+                    context, *full_mode, encoder, kVocabulary, kExperts,
+                    MoeExpertFormat::q2_0, MoeDownFormat::q2_0, true,
+                    late_input_failure, encode_error);
+            },
+            error);
+        require(!caller_owned_late_input_encoded &&
+                    caller_owned_late_input_command->unsafe_native_handle() ==
+                        nullptr &&
+                    late_writes_unchanged(),
+                "caller-owned encoder body propagates late PLE failure and discards the entire input/producer/consumer segment");
         auto generic_ple_multi_command = context.make_command_buffer(
-            "T=3 generic FullMode producer and PLE consumer", error);
+            "T=3 generic FullMode input and PLE consumer", error);
         require(generic_ple_multi_command != nullptr,
                 "create T=3 generic FullMode-to-PLE command: " + error);
         require(session->track_use(*generic_ple_multi_command, error),
                 "track GDN state through T=3 generic FullMode-to-PLE step: " +
                     error);
-        require(encode_window_moe_layer0_full_mode_step(
+        require(encode_window_moe_full_mode_input_step(
                     context, *full_mode, *generic_ple_multi_command,
                     kVocabulary, kExperts, MoeExpertFormat::q2_0,
                     MoeDownFormat::q2_0, true, generic_ple_multi_step,
                     error),
-                "encode T=3 generic FullMode-to-PLE step: " + error);
+                "encode T=3 generic FullMode input-to-PLE step: " + error);
         require(generic_ple_multi_command->commit(error),
                 "commit T=3 generic FullMode-to-PLE step: " + error);
         require(generic_ple_multi_command->wait_until_completed(error),
