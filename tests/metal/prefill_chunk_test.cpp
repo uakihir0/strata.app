@@ -1,6 +1,7 @@
 // Device-free tests for the host metadata of a Metal Prefill chunk.
 #include "strata/metal/prefill.hpp"
 
+#include <array>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -128,6 +129,111 @@ void computes_batch_remainders() {
     }
 }
 
+void builds_chunk_schedule_without_padding() {
+    using namespace strata::metal;
+    const std::vector<std::uint32_t> tokens{
+        3u, 5u, kPrefillImageTokenFlag | 7u, 11u, 13u,
+        17u, 19u, 23u, 29u, 31u,
+    };
+    std::vector<PrefillChunkRange> schedule;
+    std::string error;
+    check(build_prefill_chunk_schedule(7u, tokens.size(), 4u, schedule,
+                                       error),
+          "plans a prompt as fixed-size chunks with a short tail");
+    check(schedule.size() == 3u,
+          "the schedule contains one range for each non-empty chunk");
+    if (schedule.size() != 3u) return;
+
+    const std::array<PrefillChunkRange, 3> expected{{
+        {0u, 7u, 4u},
+        {4u, 11u, 4u},
+        {8u, 15u, 2u},
+    }};
+    std::size_t covered_rows = 0u;
+    for (std::size_t index = 0u; index < schedule.size(); ++index) {
+        const auto& range = schedule[index];
+        check(range.token_offset == expected[index].token_offset &&
+                  range.pos0 == expected[index].pos0 &&
+                  range.rows == expected[index].rows,
+              "scheduled ranges are contiguous and retain absolute positions");
+        check(range.rows <= 4u && range.rows != 0u,
+              "scheduled chunks are non-empty and never exceed the requested size");
+        covered_rows += range.rows;
+
+        PrefillChunkMetadata metadata;
+        const auto chunk_tokens =
+            std::span<const std::uint32_t>(tokens).subspan(range.token_offset,
+                                                           range.rows);
+        check(build_prefill_chunk_metadata(range.pos0, chunk_tokens, metadata,
+                                           error),
+              "each scheduled range builds valid chunk metadata");
+        if (metadata.params.T != 0u) {
+            check(metadata.params.T == range.rows &&
+                      metadata.params.p0 == range.pos0 &&
+                      metadata.tokens.size() == range.rows,
+                  "chunk metadata matches its scheduled token slice");
+        }
+    }
+    check(covered_rows == tokens.size(),
+          "scheduled chunks cover every prompt token exactly once");
+
+    std::vector<PrefillChunkRange> empty_schedule{{0u, 9u, 1u}};
+    check(build_prefill_chunk_schedule(
+              std::numeric_limits<std::uint32_t>::max(), 0u, 4u,
+              empty_schedule, error) &&
+              empty_schedule.empty(),
+          "an empty prompt produces an empty schedule and clears old ranges");
+}
+
+void rejects_invalid_chunk_schedules_transactionally() {
+    using namespace strata::metal;
+    std::vector<PrefillChunkRange> schedule{{5u, 17u, 3u}};
+    std::string error;
+    const auto remains_unchanged = [&] {
+        return schedule.size() == 1u && schedule[0].token_offset == 5u &&
+               schedule[0].pos0 == 17u && schedule[0].rows == 3u;
+    };
+
+    check(!build_prefill_chunk_schedule(0u, 3u, 0u, schedule, error) &&
+              error.find("shader row limit") != std::string::npos,
+          "rejects a zero-row chunk size");
+    check(remains_unchanged(),
+          "zero-row chunk-size failure preserves the previous schedule");
+
+    check(!build_prefill_chunk_schedule(
+              0u, 3u, kPrefillMaxShaderRows + 1u, schedule, error) &&
+              error.find("shader row limit") != std::string::npos,
+          "rejects a chunk size above the shader row limit");
+    check(remains_unchanged(),
+          "oversized chunk-size failure preserves the previous schedule");
+
+    const auto last_valid_pos = static_cast<std::uint32_t>(
+        std::numeric_limits<std::int32_t>::max() - 1);
+    check(build_prefill_chunk_schedule(last_valid_pos, 1u, 1u, schedule,
+                                       error) &&
+              schedule.size() == 1u &&
+              schedule[0].pos0 == last_valid_pos &&
+              schedule[0].rows == 1u,
+          "accepts the final position whose n_kv fits signed StepRow");
+
+    check(!build_prefill_chunk_schedule(last_valid_pos, 2u, 1u, schedule,
+                                        error) &&
+              error.find("signed StepRow") != std::string::npos,
+          "rejects a prompt whose final chunk would overflow signed StepRow");
+    check(schedule.size() == 1u && schedule[0].pos0 == last_valid_pos &&
+              schedule[0].rows == 1u,
+          "position-overflow failure preserves the previous schedule");
+
+    check(!build_prefill_chunk_schedule(
+              1u, std::numeric_limits<std::size_t>::max(), 1u, schedule,
+              error) &&
+              error.find("signed StepRow") != std::string::npos,
+          "rejects an unrepresentable prompt count before chunk arithmetic");
+    check(schedule.size() == 1u && schedule[0].pos0 == last_valid_pos &&
+              schedule[0].rows == 1u,
+          "unrepresentable-count failure preserves the previous schedule");
+}
+
 void rejects_invalid_chunks_transactionally() {
     using namespace strata::metal;
     std::string error;
@@ -189,6 +295,8 @@ int main() {
     builds_chunk_metadata();
     computes_position_boundaries();
     computes_batch_remainders();
+    builds_chunk_schedule_without_padding();
+    rejects_invalid_chunk_schedules_transactionally();
     rejects_invalid_chunks_transactionally();
     if (failures != 0) {
         std::cerr << "prefill_chunk_test: " << failures << " failure(s)\n";

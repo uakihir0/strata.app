@@ -36,6 +36,51 @@ static_assert(strata::metal::kPrefillMaxShaderRows ==
 
 namespace strata::metal {
 
+bool build_prefill_chunk_schedule(
+    std::uint32_t pos0, std::size_t token_count, std::uint32_t chunk_rows,
+    std::vector<PrefillChunkRange>& output, std::string& error) {
+    if (chunk_rows == 0u || chunk_rows > kPrefillMaxShaderRows) {
+        error = "Prefill chunk size must fit the shader row limit";
+        return false;
+    }
+
+    std::vector<PrefillChunkRange> next;
+    if (token_count != 0u) {
+        const auto max_step_value = static_cast<std::uint64_t>(
+            std::numeric_limits<std::int32_t>::max());
+        if (pos0 >= max_step_value ||
+            token_count > static_cast<std::size_t>(max_step_value - pos0)) {
+            error = "Prefill prompt positions exceed the signed StepRow range";
+            return false;
+        }
+
+        const std::size_t chunk_count =
+            1u + (token_count - 1u) / chunk_rows;
+        if (chunk_count > next.max_size()) {
+            error = "Prefill chunk schedule is too large";
+            return false;
+        }
+        next.reserve(chunk_count);
+
+        for (std::size_t offset = 0u; offset < token_count;) {
+            const auto rows = static_cast<std::uint32_t>(
+                std::min(token_count - offset,
+                         static_cast<std::size_t>(chunk_rows)));
+            next.push_back({
+                offset,
+                static_cast<std::uint32_t>(
+                    static_cast<std::uint64_t>(pos0) + offset),
+                rows,
+            });
+            offset += rows;
+        }
+    }
+
+    output.swap(next);
+    error.clear();
+    return true;
+}
+
 bool build_prefill_chunk_metadata(std::uint32_t pos0,
                                   std::span<const std::uint32_t> tokens,
                                   PrefillChunkMetadata& output,

@@ -40,6 +40,24 @@ struct PrefillChunkMetadata {
     bool has_image_rows = false;
 };
 
+/// A contiguous, unpadded range in the prompt passed to Prefill.
+struct PrefillChunkRange {
+    std::size_t token_offset = 0;
+    std::uint32_t pos0 = 0;
+    std::uint32_t rows = 0;
+};
+
+/// Split a prompt into non-empty ranges no larger than `chunk_rows`.
+///
+/// An empty prompt produces an empty schedule. Non-empty prompt positions must
+/// fit the signed StepRow range used by `build_prefill_chunk_metadata`. The
+/// output is unchanged on failure.
+bool build_prefill_chunk_schedule(std::uint32_t pos0,
+                                  std::size_t token_count,
+                                  std::uint32_t chunk_rows,
+                                  std::vector<PrefillChunkRange>& output,
+                                  std::string& error);
+
 /// Build the host inputs for one non-empty chunk.
 ///
 /// Tokens are copied verbatim, including bit 31 on image rows. Position
