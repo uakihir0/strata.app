@@ -2921,6 +2921,14 @@ writes, with `row(c) = {c, c + 1, (c + 1) / 4, window > 0 ? min(c + 1, window) :
   validates extents, Context ownership and aliases before dispatch, and
   refuses an open concurrent group. This isolated encoder does not bind
   `MtpRuntimeStorage` or establish model-backed attention parity.
+- Stage 15's `encode_mtp_feed_forward_read` composes the GR normalization,
+  down/injection and up/mix stages with `apply=true`. It reads the residual
+  `R`, stage-14 `bo`, stage-7 `inj`, normalization and GR weights, then writes
+  the updated `R`, `inject_out` and `mixed` views. It requires T=1, keeps the
+  MTP parameter block disjoint from every active GR view, and preserves
+  normalize→down→up ordering at a closed concurrent-group boundary. This
+  isolated encoder does not bind `MtpRuntimeStorage` or establish
+  model-backed parity.
 - Stages 2 and 4 are upstream's `native_qsa_rms_norm_weighted`, whose `norm<1024>` (for rows of 1024 or more) is
   the same arithmetic as `native_gr_rms_norm_weighted`. `strata_rms_norm_w` serves both with `n_cols` and the gamma
   period `gp` as `setBytes` constants (section 5.4).

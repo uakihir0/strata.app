@@ -8575,3 +8575,47 @@ measuring L-15 remain open.
   changes with goldens still valid. The full `mac-dev` build passed.
 - **Review required:** Production runtime-view wiring and inspected-model
   stage-14/full-drafter parity remain open under D-IMPL-330.
+
+### D-IMPL-331: Compose MTP drafter stage 15 feed-forward read
+
+- **Decision:** Add caller-owned Encoder and standalone transactional forms
+  for the T=1 MTP GR read with `apply=true`. Map the MTP residual, stage-14
+  attention output, stage-7 injection, normalization and GR weights into the
+  existing `GRReadBuffers` chain. Require the CPU-visible parameter block to
+  be disjoint from every active GR view and reject encoding inside an open
+  concurrent group.
+- **Reason:** Stage 15 uses the same ordered GR normalize/down/injection/up
+  operations as the main model. Delegating to the validated GR encoder keeps
+  its arithmetic, barriers and alias rules aligned. Requiring T=1 matches the
+  documented full-layer MTP pass. This stage remains isolated from
+  `MtpRuntimeStorage` and does not establish model parity.
+- **Validation:** The stage twin compares all six written GR outputs from
+  standalone and caller-owned MTP forms with the direct `encode_gr_read`
+  `apply=true` chain. Existing GR tests cover the scalar oracle, including an
+  integrated `apply=true` case. The twin also checks bounds, aliases,
+  immutable inputs, guards, rollback and concurrent-group rejection.
+  Complete build and suite outcomes are recorded in REV-128.
+- **Review required:** Bind stages 6–15 to production runtime views, compose
+  the remaining drafter stages, and establish parity against an inspected
+  model. The scheduler and upstream-compatible MTP API also remain open.
+
+### REV-128: Hostile review of MTP drafter stage 15
+
+- **Scope:** The MTP feed-forward GR coordinator, its Metal twin, CMake
+  registration, test-map entry and stage-status documentation.
+- **Adversarial review:** Confirmed T=1 handling, the 12-view mapping to
+  `GRReadBuffers`, parameter-block separation, GR dispatch ordering, all six
+  output comparisons, standalone transactionality, caller-owned rollback and
+  open-group rejection. No actionable findings.
+- **Disposition:** The focused serial/concurrent CTests passed 2/2;
+  `cmake --build --preset mac-dev` succeeded; `ctest --preset mac-metal
+  --output-on-failure` passed 73/73; and `ctest --preset mac-host
+  --output-on-failure` ran all 44 registered tests with the documented
+  unavailable-real-input case skipped. `test_map.py` passed with the expected
+  planned-work and missing-requirement diagnostics, `check_drift.py` found no
+  upstream changes and confirmed the golden files remain valid, and
+  `git diff --check` was clean. The run was on Mac17,9 (64 GB, macOS 27.0.1,
+  Xcode 27.0 build 27A266a). The README reports 117 registered host/Metal
+  tests, with 116 passed and one expected skip.
+- **Review required:** Production MTP runtime wiring and inspected-model
+  stage-15/full-drafter parity remain open under D-IMPL-331.
