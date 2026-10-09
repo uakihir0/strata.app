@@ -42,6 +42,21 @@ struct MtpAttentionReadBuffers {
     BufferRef mixed;
 };
 
+/// Inputs and outputs for MTP stage 8. The Q8_0 projections use the same
+/// quantized activation rows and active T metadata, but have independent
+/// weights and F32 outputs. `sink` receives padded compiled columns and is
+/// reused by the ordered key and value matvec dispatches.
+struct MtpAttentionKvProjectionBuffers {
+    ReadOnlyBufferRef params;
+    BufferRef mixed;
+    BufferRef xq;
+    ReadOnlyBufferRef key_weights;
+    ReadOnlyBufferRef value_weights;
+    BufferRef kcur;
+    BufferRef vcur;
+    BufferRef sink;
+};
+
 /// Add MTP hidden and embedding streams to the caller-owned Encoder segment.
 /// On failure, the enclosing Encoder::encode body must return false so prior
 /// work in that segment is discarded.
@@ -65,5 +80,18 @@ bool encode_mtp_attention_read(Context& context,
                                CommandBuffer& command_buffer,
                                const MtpAttentionReadBuffers& buffers,
                                std::string& error);
+
+/// Encode MTP stage 8: quantize `mixed` to Q8_1 and run the key and value
+/// Q8_0 projections for T rows. T is read from the CPU-visible MtpParams
+/// block; the smallest supported compiled matvec width (1, 2, 4, or 8) is
+/// selected automatically. Views must remain alive and unchanged until GPU
+/// completion. The standalone form is transactional; the caller-owned form
+/// must propagate failure from its enclosing Encoder::encode body.
+bool encode_mtp_attention_kv_projection(
+    Context& context, Encoder& encoder,
+    const MtpAttentionKvProjectionBuffers& buffers, std::string& error);
+bool encode_mtp_attention_kv_projection(
+    Context& context, CommandBuffer& command_buffer,
+    const MtpAttentionKvProjectionBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal

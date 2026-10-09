@@ -7739,6 +7739,7 @@ measuring L-15 remain open.
 | REV-118 | Prepare speculative Window inputs for T=1..8 | Hostile review found a P2 input-lifetime issue: PLE staging could overwrite caller token or sampler spans if they were backed by the same scratch region, before those values were copied to `WindowParams`. The implementation now snapshots both spans before any staging, and a T=3 regression sources both arrays from the PLE scratch being overwritten and verifies the published token and sampler values. Review also found that D321/test-map references preceded this audit entry; this record resolves the missing attribution. Final hostile follow-up found no remaining actionable issues. The affected four-Ctest matrix passes 4/4; mac-metal passes 54/54; mac-host passes 44/44 with one unavailable-input test skipped; the Python suite passes 35/35 modules in the isolated pinned-requirements environment. `test_map.py` and `git diff --check` pass with existing planned-work and missing-check diagnostics. | Preserve input rows when they alias staging scratch; retain caller-owned scratch/ring quiescence and keep proposal generation, accepted-prefix scheduling, production `Window::run` and model parity open |
 | REV-119 | Implement MTP drafter stage 6 | Initial hostile review found a P2 oracle gap: the original input values could not distinguish FP32 addition from binary16 rounding. The fixture now sets `h2[0]=1024.0f` and `e2[0]=0.25f`, whose required FP32 result is exactly 1024.25 while binary16 addition rounds to 1024.0, and checks that witness for every T=1..8 case. The review also found a missing review-ledger row and stale docs claiming no MTP kernel consumed runtime views; REV-119 and the 04/06 descriptions now record that stage 6 is standalone while production runtime-view composition and the other stages remain open. Final hostile follow-up found no remaining actionable findings. The focused `metal_mtp_test` passes 1/1; the full `mac-metal` suite passes 55/55; `mac-host` passes 44/44 with the unavailable real-input case skipped. The full `mac-dev` build, `test_map` CTest and `git diff --check` pass. | Preserve the exact FP32 witness and active-row alias/rollback coverage. Wire all MTP stages through `MtpRuntimeStorage`, then establish replay parity for draft IDs, probabilities and K/V before claiming L11 or production inference |
 | REV-120 | Compose the MTP stage-7 attention GR read | Initial hostile review found a P2 gap: MTP parameters could alias a GR writable output and be overwritten; stage 7 now rejects overlap between `MtpParams` and all 11 active GR views before delegation. Regressions alias the params with both the normalized output and norm input, and prove that an enclosing caller-owned segment discards an already encoded stage 6 after a late stage-7 alias rejection. Review also found P3 stale stage-6-only documentation and the missing REV-120 ledger row; the stage-6/7 descriptions, plan, test inventory and this record are synchronized. A follow-up found that the original finite `0xa5` marker could hide partially unwritten outputs; all five outputs now start with a qNaN poison and every active element must change its sentinel bits and be finite. Final hostile follow-up found no remaining actionable P1–P3 findings. The full mac-dev build passes; the focused stage-6/stage-7/concurrent tests pass 3/3; mac-metal passes 57/57; mac-host passes 44/44 with the unavailable real-input case skipped; `test_map` and `git diff --check` pass. | Keep MTP runtime-storage composition, later stages, complete drafter behavior and model-backed draft/KV parity open; retain the reviewed dead-h2 placeholder lifetime contract |
+| REV-121 | Implement MTP drafter stage 8 key/value projection | Hostile review found no actionable P1–P3 findings. The stage-8 fixture originally allocated an oversized sink; it now models the named `bo` region at exactly 2560 floats and proves its largest active padded sink use (1536 floats) fits. The scalar oracle independently builds Q8_1 activations and Q8_0 key/value projections for T=1..8 and verifies padded NC rows. `mac-dev` builds; focused stage 6/7/8 and concurrent CTests pass 5/5; `mac-metal` passes 59/59; `mac-host` passes 44/44 with one unavailable real-input case skipped; `test_map` and `git diff --check` pass; the documented `.venv` Python suite passes 35/35 modules (two optional structured-schema tests skipped). | Verify the NC/T active-row contract and scratch lifetimes against model-backed MTP weights; stage 8 remains a typed standalone encoder without runtime-storage wiring |
 
 ### D-IMPL-313: Add a per-layer GDN write-through Window block
 
@@ -8301,3 +8302,35 @@ measuring L-15 remain open.
   runtime storage, all later MTP stages, complete drafter behavior and
   model-backed parity remain necessary before L11 is complete. Keep the
   caller-owned dead-h2 placeholder lifetime contract visible to future reviews.
+
+### D-IMPL-324: Implement MTP drafter stage 8 K/V projections
+
+- **Decision:** Add an isolated encoder for stage 8 that reads T from
+  `MtpParams`, quantizes the active `mixed` rows once to Q8_1, and then runs
+  the key and value Q8_0 matvecs in order with the smallest supported NC at
+  least T. Both matvecs use the same read-only T metadata and share one
+  caller-provided padded-column sink. Reject active parameter, input, weight,
+  activation, output and sink aliases that can change a later projection's
+  reads or overwrite the other projection's results.
+- **Reason:** The stage's specified operations already have validated
+  standalone Q8_1 and read-only Q8_0 matvec encoders and share the MTP bind
+  layout's `xq`, `kcur`, `vcur` and `bo` regions. A small ordered wrapper
+  reuses those primitives and their quantization/matvec arithmetic. It takes
+  typed views rather than resolving tensor names or bind regions, so it does
+  not imply that an MTP runtime pass or inference path is wired.
+- **Validation:** The dedicated Metal fixture checks T=1..8 against separate
+  scalar Q8_1, key-matvec and value-matvec oracles, including the selected NC,
+  padded sink values, active output bounds, guards and immutable inputs. It
+  also checks malformed T, short weights and sink, foreign Context ownership,
+  parameter/output and K/V output aliases, ordered-group rejection, and
+  caller-owned segment rollback after a later invalid stage-8 call. The build
+  passes; the focused stage 6/7/8 serial/concurrent matrix passes 5/5,
+  `mac-metal` passes 59/59, and `mac-host` passes 44/44 with one unavailable
+  real-input test skipped. `test_map`, the documented `.venv` Python suite
+  (35/35 modules; two optional structured-schema tests skipped), and
+  `git diff --check` pass. Hostile review found no actionable P1–P3 findings;
+  the review and fixture sizing follow-up are recorded in REV-121.
+- **Review required:** See REV-121. Confirm scratch and model-weight binding
+  against an inspected MTP model, then implement stage 9 (K norm/RoPE,
+  optional FWHT and K/V append) and validate the full stage 8→9 handoff.
+  Runtime-storage composition and model-backed draft/KV parity remain open.

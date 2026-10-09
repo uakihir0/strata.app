@@ -332,6 +332,14 @@
       "label": "metal",
       "origin": "09 9.1, 04 §5.11, D-IMPL-323, REV-120"
     },
+    "metal_mtp_kv_projection_test": {
+      "label": "metal",
+      "origin": "09 9.1, 04 §5.11, D-IMPL-324, REV-121"
+    },
+    "metal_mtp_kv_projection_test_concurrent": {
+      "label": "metal",
+      "origin": "09 9.1, 04 §5.11, D-IMPL-324, REV-121"
+    },
     "metal_mv_test": {
       "label": "metal",
       "origin": "09 9.1, D-IMPL-271, D-IMPL-299, REV-096, D-IMPL-305, REV-102, D-IMPL-306"

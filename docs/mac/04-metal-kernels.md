@@ -2757,8 +2757,8 @@ weights. Nine kernels are new; they follow the stage table.
 
 **Buffers.** The drafter has its own scratch region, carved once at bind for T = 8 and kept apart from the window
 arena (section 4.4). It is upstream's `arena_` (`mtp.cpp:252-286`) without the grouping buffers. Every named region
-starts on a 256-B boundary. `MtpBindLayout` exposes bounded views into this allocation. Stage 6 has a
-standalone encoder over typed buffer views, but no production MTP pass yet composes these runtime-storage views.
+starts on a 256-B boundary. `MtpBindLayout` exposes bounded views into this allocation. Stages 6–8 have
+standalone encoders over typed buffer views, but no production MTP pass yet composes these runtime-storage views.
 
 | Buffer | Shape | Written by |
 | --- | --- | --- |
@@ -2888,8 +2888,13 @@ of the Encoder form must propagate failure from their enclosing
 `Encoder::encode`. `encode_mtp_attention_read` composes stage 7's GR
 normalize/down/up read with `apply=false`, keeping `R` unchanged while writing
 `inj` and `mixed`; it rejects parameter aliases with any active GR view before
-delegating to the GR chain. Stages 6 and 7 have isolated validated encoders
-only; runtime-storage wiring, later MTP stages and the complete drafter remain
+delegating to the GR chain. `encode_mtp_attention_kv_projection` reads T from
+the same parameter block, quantizes `mixed` once to Q8_1, then encodes the
+ordered Q8_0 key and value projections to `kcur` and `vcur`. It selects the
+smallest supported NC at least T, shares the padded-column sink across those
+ordered dispatches, and rejects parameter, input, output and sink aliases that
+could corrupt later reads. These are isolated stage encoders only;
+runtime-storage wiring, stages 1–5 and 9–22, and the complete drafter remain
 open.
 
 **`strata_q_q8_0_scaled`**, grid ⌈n/4096⌉ × 128, one 32-value block per thread. Upstream
@@ -5303,6 +5308,8 @@ and foreign Context ownership.
 | `metal_mtp_test` | metal | `strata_mtp_add_streams` | MTP stage 6 T=1..8 matches the independent scalar addition oracle bit for bit; checks active output rows and guards, immutable inputs, read-only input overlap, malformed T, short/misaligned/foreign views, output/input aliases and caller-owned late-failure discard. The remaining MTP stages and full drafter parity are not covered |
 | `metal_mtp_gr_test` | metal | `strata_gr_norm`, `strata_gr_down`, `strata_gr_up` | MTP stage 7 composes the existing ordered GR read with `apply=false` for T=1..8 and matches the direct GR chain bit for bit; verifies finite populated outputs, residual and params preservation, active-row output bounds, malformed T, dead-h2 scratch size/alignment, foreign params, parameter/input and parameter/output alias rejection, and standalone/caller-owned rollback after late failures. This does not establish runtime-storage wiring or drafter parity |
 | `metal_mtp_gr_test_concurrent` | metal | Same GR kernels as `metal_mtp_gr_test` | Repeats the MTP stage-7 fixture with concurrent dispatch enabled and verifies that the ordered GR chain rejects an open concurrent group without changing any buffers |
+| `metal_mtp_kv_projection_test` | metal | `strata_q_q8_1`, `strata_mv_q8_0_n<NC>` | MTP stage 8 covers T=1..8, compares the quantized rows and both 2560→512 Q8_0 projections with independent scalar oracles, checks padded sink values, active output bounds and guards, immutable inputs, malformed T, short weights/sink, foreign weights, parameter/output aliases and overlapping K/V outputs, and verifies caller-owned rollback after a later invalid stage-8 call. This does not establish runtime-storage wiring or drafter parity |
+| `metal_mtp_kv_projection_test_concurrent` | metal | Same Q8_1 and Q8_0 matvec kernels as `metal_mtp_kv_projection_test` | Repeats the stage-8 fixture under concurrent dispatch and verifies rejection inside an open group without changing any buffers |
 | `metal_sampler_parity_test`, `metal_sampler_parity_test_concurrent` | metal | Section 5.12's greedy, split-part, split-merge, composite sampled, coupled-penalty and CPU-tail twin on random, edge and fixture inputs for T=1..8 and model/maximum vocabularies; standalone and shared Encoder paths match the scalar references; concurrent tests reject dependent merge/sample calls in an open group and verify segment discard, including discard of a prior split-part dispatch; shared coupled-penalty→sampled composition and 248,320/262,144 vocabulary merge scratch are checked in one Encoder segment; fixtures 16 and 17 are deterministic semantic ports, with host fixture 15 in `sampler_tail_test`; literal upstream fixtures 1-14 and 18 and production sampler integration remain open under REV-028 | Candidate IDs/logit bits and CPU-tail tokens/probabilities exact |
 | `metal_util_test` | metal | `strata_util_*` | B |
 | `metal_prefill_test` | metal | `strata_pf_gr_norm`, `strata_pf_gr_norm_lo`, `strata_embed_rows_{q3_k,iq3_s,iq4_xs,bf16}`, `strata_gr_broadcast` | Prefill GR normalization T=1/3/8 covers BF16X2 modes 0/1/2 and random, edge (including an order-sensitive reduction sentinel) and fixture data against a scalar oracle that reproduces 256-thread FMA accumulation and both XOR reduction stages. Scale is U(4), high BF16 is U(1), and the low remainder is bitwise checked from the GPU scale/high outputs. Standalone and shared Encoder forms check read-only inputs, guards, invalid mode/extent/alignment/alias/ownership, and late-failure discard. The embedding gather → GR broadcast → Prefill normalization chain runs in one segment; a concurrent-group fixture verifies rejection. |
