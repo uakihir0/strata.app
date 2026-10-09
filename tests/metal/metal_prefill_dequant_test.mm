@@ -235,17 +235,63 @@ struct FormatTraits<block_q4_K> {
 
     // The packed bytes are literal. Expected codes below are listed in output
     // order and do not reuse the decoder's byte/nibble address calculation.
-    static constexpr std::array<std::uint8_t, 16> packed_pattern_a{
-        0x10u, 0x32u, 0x54u, 0x76u, 0x98u, 0xbau, 0xdcu, 0xfeu,
-        0xefu, 0xcdu, 0xabu, 0x89u, 0x67u, 0x45u, 0x23u, 0x01u};
-    static constexpr std::array<std::uint8_t, 32> logical_low_codes{{
-        0u, 2u, 4u, 6u, 8u, 10u, 12u, 14u, 15u, 13u, 11u, 9u, 7u, 5u, 3u,
-        1u, 0u, 2u, 4u, 6u, 8u, 10u, 12u, 14u, 15u, 13u, 11u, 9u, 7u, 5u,
-        3u, 1u}};
-    static constexpr std::array<std::uint8_t, 32> logical_high_codes{{
-        1u, 3u, 5u, 7u, 9u, 11u, 13u, 15u, 14u, 12u, 10u, 8u, 6u, 4u, 2u,
-        0u, 1u, 3u, 5u, 7u, 9u, 11u, 13u, 15u, 14u, 12u, 10u, 8u, 6u, 4u,
-        2u, 0u}};
+    static constexpr std::array<std::array<std::uint8_t, 16>, 8>
+        packed_patterns{{
+            {{0x10u, 0x32u, 0x54u, 0x76u, 0x98u, 0xbau, 0xdcu, 0xfeu,
+              0xefu, 0xcdu, 0xabu, 0x89u, 0x67u, 0x45u, 0x23u, 0x01u}},
+            {{0xf0u, 0xe1u, 0xd2u, 0xc3u, 0xb4u, 0xa5u, 0x96u, 0x87u,
+              0x78u, 0x69u, 0x5au, 0x4bu, 0x3cu, 0x2du, 0x1eu, 0x0fu}},
+            {{0x0fu, 0x1eu, 0x2du, 0x3cu, 0x4bu, 0x5au, 0x69u, 0x78u,
+              0x87u, 0x96u, 0xa5u, 0xb4u, 0xc3u, 0xd2u, 0xe1u, 0xf0u}},
+            {{0x78u, 0xf0u, 0x3cu, 0xb4u, 0x5au, 0xd2u, 0x1eu, 0x96u,
+              0x69u, 0xe1u, 0x2du, 0xa5u, 0x4bu, 0xc3u, 0x0fu, 0x87u}},
+            {{0x01u, 0x23u, 0x45u, 0x67u, 0x89u, 0xabu, 0xcdu, 0xefu,
+              0xfeu, 0xdcu, 0xbau, 0x98u, 0x76u, 0x54u, 0x32u, 0x10u}},
+            {{0xe1u, 0xd2u, 0xc3u, 0xb4u, 0xa5u, 0x96u, 0x87u, 0x78u,
+              0x69u, 0x5au, 0x4bu, 0x3cu, 0x2du, 0x1eu, 0x0fu, 0xf0u}},
+            {{0xf0u, 0x78u, 0xe1u, 0x69u, 0xd2u, 0x5au, 0xc3u, 0x4bu,
+              0xb4u, 0x3cu, 0xa5u, 0x2du, 0x96u, 0x1eu, 0x87u, 0x0fu}},
+            {{0x87u, 0x0fu, 0xc3u, 0x4bu, 0xa5u, 0x2du, 0xe1u, 0x69u,
+              0x96u, 0x1eu, 0xd2u, 0x5au, 0xb4u, 0x3cu, 0xf0u, 0x78u}},
+        }};
+    static constexpr std::array<std::array<std::uint8_t, 16>, 8>
+        logical_low_codes{{
+            {{0u, 2u, 4u, 6u, 8u, 10u, 12u, 14u,
+              15u, 13u, 11u, 9u, 7u, 5u, 3u, 1u}},
+            {{0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u,
+              8u, 9u, 10u, 11u, 12u, 13u, 14u, 15u}},
+            {{15u, 14u, 13u, 12u, 11u, 10u, 9u, 8u,
+              7u, 6u, 5u, 4u, 3u, 2u, 1u, 0u}},
+            {{8u, 0u, 12u, 4u, 10u, 2u, 14u, 6u,
+              9u, 1u, 13u, 5u, 11u, 3u, 15u, 7u}},
+            {{1u, 3u, 5u, 7u, 9u, 11u, 13u, 15u,
+              14u, 12u, 10u, 8u, 6u, 4u, 2u, 0u}},
+            {{1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u,
+              9u, 10u, 11u, 12u, 13u, 14u, 15u, 0u}},
+            {{0u, 8u, 1u, 9u, 2u, 10u, 3u, 11u,
+              4u, 12u, 5u, 13u, 6u, 14u, 7u, 15u}},
+            {{7u, 15u, 3u, 11u, 5u, 13u, 1u, 9u,
+              6u, 14u, 2u, 10u, 4u, 12u, 0u, 8u}},
+        }};
+    static constexpr std::array<std::array<std::uint8_t, 16>, 8>
+        logical_high_codes{{
+            {{1u, 3u, 5u, 7u, 9u, 11u, 13u, 15u,
+              14u, 12u, 10u, 8u, 6u, 4u, 2u, 0u}},
+            {{15u, 14u, 13u, 12u, 11u, 10u, 9u, 8u,
+              7u, 6u, 5u, 4u, 3u, 2u, 1u, 0u}},
+            {{0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u,
+              8u, 9u, 10u, 11u, 12u, 13u, 14u, 15u}},
+            {{7u, 15u, 3u, 11u, 5u, 13u, 1u, 9u,
+              6u, 14u, 2u, 10u, 4u, 12u, 0u, 8u}},
+            {{0u, 2u, 4u, 6u, 8u, 10u, 12u, 14u,
+              15u, 13u, 11u, 9u, 7u, 5u, 3u, 1u}},
+            {{14u, 13u, 12u, 11u, 10u, 9u, 8u, 7u,
+              6u, 5u, 4u, 3u, 2u, 1u, 0u, 15u}},
+            {{15u, 7u, 14u, 6u, 13u, 5u, 12u, 4u,
+              11u, 3u, 10u, 2u, 9u, 1u, 8u, 0u}},
+            {{8u, 0u, 12u, 4u, 10u, 2u, 14u, 6u,
+              9u, 1u, 13u, 5u, 11u, 3u, 15u, 7u}},
+        }};
     static constexpr std::array<std::uint8_t, 12> packed_scales{
         0x85u, 0x4au, 0xcbu, 0x3eu, 0x75u, 0xdau,
         0x61u, 0xb6u, 0x9cu, 0xe2u, 0x5du, 0xa7u};
@@ -264,8 +310,9 @@ struct FormatTraits<block_q4_K> {
         const bool complement = ((column + block_index) & 1u) != 0u;
         for (std::uint32_t chunk = 0u; chunk < 4u; ++chunk) {
             for (std::uint32_t byte = 0u; byte < 32u; ++byte) {
+                const std::uint32_t pattern = chunk * 2u + byte / 16u;
                 const std::uint8_t packed =
-                    packed_pattern_a[byte % packed_pattern_a.size()];
+                    packed_patterns[pattern][byte % 16u];
                 block.qs[chunk * 32u + byte] = static_cast<strata_u8>(
                     complement ? packed ^ 0xffu : packed);
             }
@@ -275,10 +322,14 @@ struct FormatTraits<block_q4_K> {
     static std::uint32_t oracle_code(std::uint32_t column,
                                     std::uint32_t block_index,
                                     std::uint32_t value) {
+        const std::uint32_t qs_chunk = value / 64u;
         const std::uint32_t within_half = value % 64u;
+        const std::uint32_t pattern =
+            qs_chunk * 2u + (within_half % 32u) / 16u;
         const std::uint32_t code =
-            within_half < 32u ? logical_low_codes[within_half]
-                              : logical_high_codes[within_half - 32u];
+            within_half < 32u
+                ? logical_low_codes[pattern][within_half % 16u]
+                : logical_high_codes[pattern][(within_half - 32u) % 16u];
         const bool complement = ((column + block_index) & 1u) != 0u;
         return complement ? 15u - code : code;
     }
