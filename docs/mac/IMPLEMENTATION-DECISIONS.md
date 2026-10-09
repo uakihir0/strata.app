@@ -10564,3 +10564,49 @@ measuring L-15 remain open.
   2/2 afterwards. `mac-host` passed 44/45 with one unavailable-real-input
   test skipped, and `test_map`, the metallib/manifest check, `check_drift.py`
   and `git diff --check` passed.
+
+### D-IMPL-369: Add the Q5_K Prefill dequantizer
+
+- **Decision:** Add `strata_pf_dequant_q5_k` and caller-owned/standalone
+  `encode_prefill_dequant_q5_k` APIs. Read the native 256-value, 176-byte
+  block, combine each low/high nibble with its `qh` bit to form a five-bit
+  code, unpack the eight six-bit scale/min groups, compute `d1*q - m1` in
+  F32 and round once to F16 in K-major `[k][n_out]` scratch. Use the shared
+  checked dispatch with Q5_K's block extent.
+- **Reason:** Q5_K shares Q4_K's block length and scale/min encoding but adds
+  a separate high-bit plane. This provides another dense catalogue format
+  while exercising the existing per-format geometry and validation path.
+- **Review items:** Verify the 176-byte layout, qh bit/group indexing, qs
+  nibble order, all eight packed scale/min groups and F16 `dm` order against
+  the Q5_K layout and native decoder. Check independent packed and logical
+  fixtures, all five-bit codes and high-bit values, two consecutive blocks,
+  the N tail, F32 arithmetic and one-round F16 RNE; confirm extents,
+  alignment, ownership, aliases, immutable input, guards, rollback, manifest
+  and current-status documentation.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the build passed, the full `mac-metal` suite passed 90/90 before
+  the final fixture strengthening, and the rebuilt serial/concurrent dequant
+  tests passed 2/2 afterwards. `mac-host` passed 44/45 with one
+  unavailable-real-input test skipped; `test_map`, the 184-kernel
+  metallib/manifest check, upstream drift check and `git diff --check` passed.
+  Review findings and disposition are in REV-166.
+
+### REV-166: Hostile review of Q5_K Prefill dequantization
+
+- **Scope:** Q5_K's 256-value/176-byte block; five-bit code reconstruction
+  from `qs` and `qh`; eight packed scale/min groups; F16 `dm`, F32 arithmetic
+  and one-round F16 output; host validation, fixture independence, manifest
+  and documentation.
+- **Findings and fixes:** The first review found that repeated `qs` halves
+  could hide a wrong within-group byte offset. The fixture now uses distinct
+  literal bytes for both halves and all four 32-byte chunks, with an
+  independent logical-code formula.
+- **Follow-up:** The reviewer verified all 256 expected codes and simulated
+  both within-group and cross-chunk aliases; each produces mismatches. No
+  further actionable issue was found.
+- **Disposition:** No actionable findings remain. Q5_K is an isolated Prefill
+  dequantizer; production Prefill scheduling and model-backed inference
+  remain open.
+- **Validation:** The full `mac-metal` suite passed 90/90 before the final
+  fixture change. The rebuilt serial and concurrent dequant tests passed
+  2/2 afterwards; `git diff --check` passed.

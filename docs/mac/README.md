@@ -8,8 +8,9 @@ GR write/next-read normalization, low-rank SiLU, four-stream mix and GDN
 gate, tiled-convolution, convolution-history, q/k L2, recurrence and
 output-normalization encoders. Isolated F16 and BF16 MPP and SIMD GEMM
 components are implemented with validated host encoders, as are standalone
-IQ4_NL, Q2_0, Q4_0, Q4_K, Q5_0 and Q8_0 weight-to-K-major-F16 dequantizers.
-The other five dense formats and production `Prefill::run` integration remain open. MPP requires
+IQ4_NL, Q2_0, Q4_0, Q4_K, Q5_K, Q5_0 and Q8_0
+weight-to-K-major-F16 dequantizers. The other four dense formats and
+production `Prefill::run` integration remain open. MPP requires
 Apple10; the SIMD paths use F32 SIMD-group matrices and are intended for all
 Apple GPU families, but have only been exercised on the current Apple10 Mac.
 The GR/GDN transform fixture's serial and concurrent Prefill Metal tests pass
@@ -17,17 +18,21 @@ The GR/GDN transform fixture's serial and concurrent Prefill Metal tests pass
 normalization changes. Output normalization includes a four-partial-order
 sentinel with a regrouping negative control, exact F16 halfway ties-to-even
 bits, and unsaturated positive/negative overflow checks.
-The IQ4_NL, Q2_0, Q4_0, Q4_K, Q5_0 and Q8_0 dequant serial and concurrent tests pass 2/2,
-including exact F16 bits, K-major layout, Q4_K's 256-value groups and packed
-scale/min fields, input immutability, guards, extent and ownership rejection,
-partial-overlap rejection and transactional rollback.
+The IQ4_NL, Q2_0, Q4_0, Q4_K, Q5_K, Q5_0 and Q8_0 dequant serial and concurrent tests pass 2/2,
+including exact F16 bits, K-major layout, Q4_K/Q5_K's 256-value blocks and
+packed scale/min fields, Q5_K's fifth-bit plane, input immutability, guards,
+extent and ownership rejection, partial-overlap rejection and transactional
+rollback.
 REV-163 replaced Q2_0's initially coupled pack/unpack test fixture with literal
 packed bytes and a separate logical-code table; hostile follow-up review found
 no further issue. REV-164 reviewed the IQ4_NL codebook path and found no
 actionable issues. REV-165 found two Q4_K fixture patterns that could hide
 packed-byte index errors; distinct literal patterns and independent
 low/high-code tables now cover every 16-byte half, and follow-up review found
-no remaining actionable issue.
+no remaining actionable issue. REV-166 found a repeated Q5_K `qs` half that
+could hide a within-group byte offset error; the fixture now gives every
+16-byte half a distinct pattern, and follow-up review found no remaining
+actionable issue.
 The isolated F16/BF16 MPP and SIMD GEMM serial and concurrent tests pass 4/4
 on Apple10. The full `mac-metal` suite passed 90/90. `mac-host` ran 45 tests: 44
 passed and one real-input test was skipped because model inputs are
