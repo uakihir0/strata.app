@@ -4,10 +4,12 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/metal/context.hpp"
 #include "strata/metal/encoder.hpp"
+#include "strata/metal/gr_dispatch.hpp"
 #include "strata/metal/prefill_dispatch.hpp"
 #include "strata/metal/prefill_gr_mix_dispatch.hpp"
 #include "strata/metal/prefill_gr_norm_dispatch.hpp"
 #include "strata/metal/prefill_gr_silu_dispatch.hpp"
+#include "strata/metal/prefill_gr_write_norm_dispatch.hpp"
 #include "twin.hpp"
 
 #import <Metal/Metal.h>
@@ -1794,6 +1796,416 @@ bool test_gr_mix_open_concurrent_group_rejected(Context& context) {
     return rejected;
 }
 
+bool run_gr_write_norm_case(Context& context, std::uint32_t rows,
+                            PrefillBF16X2Mode mode, bool shared_encoder) {
+    const bool write_low = mode == PrefillBF16X2Mode::all_projections;
+    const std::string label =
+        "Prefill GR write-norm T=" + std::to_string(rows) +
+        " mode=" + std::to_string(static_cast<std::uint32_t>(mode)) +
+        (shared_encoder ? " shared" : " standalone");
+    const std::size_t stream_rows = static_cast<std::size_t>(rows) * kStreams;
+    const std::size_t residual_bytes =
+        stream_rows * kWidth * sizeof(float);
+    const std::size_t block_bytes =
+        static_cast<std::size_t>(rows) * kWidth * sizeof(float);
+    const std::size_t inject_bytes = stream_rows * sizeof(float);
+    const std::size_t norm_bytes =
+        static_cast<std::size_t>(kStreams) * kWidth * sizeof(float);
+    const std::size_t scale_bytes = stream_rows * sizeof(float);
+    const std::size_t output_bytes =
+        stream_rows * kWidth * sizeof(std::uint16_t);
+
+    std::mt19937 rng(0x4752574eu ^ rows ^
+                     static_cast<std::uint32_t>(mode));
+    std::uniform_real_distribution<float> residual_dist(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> block_dist(-0.5f, 0.5f);
+    std::uniform_real_distribution<float> inject_dist(-5.0f, 5.0f);
+    std::vector<float> initial_residual(stream_rows * kWidth);
+    std::vector<float> block_out(static_cast<std::size_t>(rows) * kWidth);
+    std::vector<float> inject(stream_rows);
+    std::vector<float> next_norm(kStreams * kWidth);
+    for (float& value : initial_residual) value = residual_dist(rng);
+    for (float& value : block_out) value = block_dist(rng);
+    for (float& value : inject) value = inject_dist(rng);
+    for (std::size_t index = 0u; index < next_norm.size(); ++index) {
+        const int centered = static_cast<int>((index * 19u + 7u) % 41u) - 20;
+        next_norm[index] =
+            0.875f + static_cast<float>(centered) * 0.015625f;
+    }
+
+    TestBuffer fused_residual, reference_residual, block_buffer, inject_buffer;
+    TestBuffer norm_buffer, fused_rs, reference_rs, fused_high, reference_high;
+    TestBuffer fused_low, reference_low;
+    std::string error;
+    bool allocated =
+        fused_residual.allocate(context, label + " fused residual",
+                                residual_bytes, error) &&
+        reference_residual.allocate(context, label + " reference residual",
+                                    residual_bytes, error) &&
+        block_buffer.allocate(context, label + " block output", block_bytes,
+                              error) &&
+        inject_buffer.allocate(context, label + " injection", inject_bytes,
+                               error) &&
+        norm_buffer.allocate(context, label + " next norm", norm_bytes,
+                             error) &&
+        fused_rs.allocate(context, label + " fused scale", scale_bytes,
+                          error) &&
+        reference_rs.allocate(context, label + " reference scale", scale_bytes,
+                              error) &&
+        fused_high.allocate(context, label + " fused high", output_bytes,
+                            error) &&
+        reference_high.allocate(context, label + " reference high",
+                                output_bytes, error);
+    if (write_low) {
+        allocated =
+            allocated &&
+            fused_low.allocate(context, label + " fused low", output_bytes,
+                               error) &&
+            reference_low.allocate(context, label + " reference low",
+                                   output_bytes, error);
+    }
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+
+    std::memcpy(fused_residual.payload().data(), initial_residual.data(),
+                residual_bytes);
+    std::memcpy(reference_residual.payload().data(), initial_residual.data(),
+                residual_bytes);
+    std::memcpy(block_buffer.payload().data(), block_out.data(), block_bytes);
+    std::memcpy(inject_buffer.payload().data(), inject.data(), inject_bytes);
+    std::memcpy(norm_buffer.payload().data(), next_norm.data(), norm_bytes);
+    const auto block_before = std::vector<std::uint8_t>(
+        block_buffer.allocation().begin(), block_buffer.allocation().end());
+    const auto inject_before = std::vector<std::uint8_t>(
+        inject_buffer.allocation().begin(), inject_buffer.allocation().end());
+    const auto norm_before = std::vector<std::uint8_t>(
+        norm_buffer.allocation().begin(), norm_buffer.allocation().end());
+
+    const PrefillGRWriteNormBuffers fused_buffers{
+        fused_residual.view(),
+        context.buffers().read_only(block_buffer.view()),
+        context.buffers().read_only(inject_buffer.view()),
+        context.buffers().read_only(norm_buffer.view()),
+        fused_rs.view(), fused_high.view(),
+        write_low ? fused_low.view() : BufferRef{}};
+    auto fused_command = context.make_command_buffer(label + " fused", error);
+    check(fused_command != nullptr, label + " fused command buffer", error);
+    if (!fused_command) return false;
+    const bool fused_encoded = shared_encoder
+        ? Encoder::encode(
+              context, *fused_command, "shared Prefill GR write-norm",
+              [&](Encoder& encoder, std::string& encode_error) {
+                  return encode_prefill_gr_write_norm(
+                      context, encoder, rows, mode, fused_buffers,
+                      encode_error);
+              },
+              error)
+        : encode_prefill_gr_write_norm(context, *fused_command, rows, mode,
+                                       fused_buffers, error);
+    check(fused_encoded, label + " production encode", error);
+    if (!fused_encoded) {
+        fused_command->discard();
+        return false;
+    }
+    if (!submit_and_wait(fused_command, label + " fused", error)) {
+        check(false, label + " fused Metal dispatch", error);
+        return false;
+    }
+
+    const PrefillGRNormBuffers reference_norm_buffers{
+        reference_residual.view(), norm_buffer.view(), reference_rs.view(),
+        reference_high.view(),
+        write_low ? reference_low.view() : BufferRef{}};
+    auto reference_command =
+        context.make_command_buffer(label + " reference chain", error);
+    check(reference_command != nullptr,
+          label + " reference command buffer", error);
+    if (!reference_command) return false;
+    const bool reference_encoded = Encoder::encode(
+        context, *reference_command, "GR post followed by Prefill GR norm",
+        [&](Encoder& encoder, std::string& encode_error) {
+            const GRPostBuffers post_buffers{
+                reference_residual.view(), block_buffer.view(),
+                inject_buffer.view(), reference_residual.view()};
+            return encode_gr_post(context, encoder, rows, post_buffers,
+                                  encode_error) &&
+                   encode_prefill_gr_norm(context, encoder, rows, mode,
+                                          reference_norm_buffers,
+                                          encode_error);
+        },
+        error);
+    check(reference_encoded, label + " reference encode", error);
+    if (!reference_encoded) {
+        reference_command->discard();
+        return false;
+    }
+    if (!submit_and_wait(reference_command, label + " reference", error)) {
+        check(false, label + " reference Metal dispatch", error);
+        return false;
+    }
+
+    const auto same_payload = [](const TestBuffer& left,
+                                 const TestBuffer& right) {
+        return std::equal(left.payload().begin(), left.payload().end(),
+                          right.payload().begin());
+    };
+    const bool residual_equal = same_payload(fused_residual, reference_residual);
+    const bool scale_equal = same_payload(fused_rs, reference_rs);
+    const bool high_equal = same_payload(fused_high, reference_high);
+    const bool low_equal =
+        !write_low || same_payload(fused_low, reference_low);
+    check(residual_equal, label + " residual matches GR post");
+    check(scale_equal, label + " scale matches separate normalization");
+    check(high_equal, label + " BF16 high matches separate normalization");
+    check(low_equal, label + " BF16 remainder matches separate normalization");
+    const bool inputs_unchanged =
+        std::equal(block_before.begin(), block_before.end(),
+                   block_buffer.allocation().begin()) &&
+        std::equal(inject_before.begin(), inject_before.end(),
+                   inject_buffer.allocation().begin()) &&
+        std::equal(norm_before.begin(), norm_before.end(),
+                   norm_buffer.allocation().begin());
+    check(inputs_unchanged, label + " inputs remain read-only");
+    const bool guards =
+        fused_residual.guards_intact() && reference_residual.guards_intact() &&
+        block_buffer.guards_intact() && inject_buffer.guards_intact() &&
+        norm_buffer.guards_intact() && fused_rs.guards_intact() &&
+        reference_rs.guards_intact() && fused_high.guards_intact() &&
+        reference_high.guards_intact() &&
+        (!write_low ||
+         (fused_low.guards_intact() && reference_low.guards_intact()));
+    check(guards, label + " guard regions");
+    return residual_equal && scale_equal && high_equal && low_equal &&
+           inputs_unchanged && guards;
+}
+
+bool reject_gr_write_norm_call(Context& context, std::uint32_t rows,
+                               PrefillBF16X2Mode mode,
+                               const PrefillGRWriteNormBuffers& buffers,
+                               std::string_view expected_error,
+                               const std::string& label) {
+    std::string error;
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, "rejected Prefill GR write-norm",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_gr_write_norm(context, encoder, rows, mode,
+                                                buffers, encode_error);
+        },
+        error);
+    const bool right_error =
+        !encoded && error.find(expected_error) != std::string::npos;
+    check(right_error, label, error);
+    return right_error;
+}
+
+bool test_gr_write_norm_validation(Context& context,
+                                  Context& foreign_context) {
+    const std::string label = "Prefill GR write-norm validation";
+    constexpr std::size_t residual_bytes =
+        kStreams * kWidth * sizeof(float);
+    constexpr std::size_t block_bytes = kWidth * sizeof(float);
+    constexpr std::size_t inject_bytes = kStreams * sizeof(float);
+    constexpr std::size_t norm_bytes =
+        kStreams * kWidth * sizeof(float);
+    constexpr std::size_t scale_bytes = kStreams * sizeof(float);
+    constexpr std::size_t output_bytes =
+        kStreams * kWidth * sizeof(std::uint16_t);
+    TestBuffer residual, block, inject, norm, rs, high, low, foreign;
+    std::string error;
+    const bool allocated =
+        residual.allocate(context, label + " residual", residual_bytes,
+                          error) &&
+        block.allocate(context, label + " block", block_bytes, error) &&
+        inject.allocate(context, label + " injection", inject_bytes, error) &&
+        norm.allocate(context, label + " norm", norm_bytes, error) &&
+        rs.allocate(context, label + " scale", scale_bytes, error) &&
+        high.allocate(context, label + " high", output_bytes, error) &&
+        low.allocate(context, label + " low", output_bytes, error) &&
+        foreign.allocate(foreign_context, label + " foreign", residual_bytes,
+                         error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    const ReadOnlyBufferRef block_ro =
+        context.buffers().read_only(block.view());
+    const ReadOnlyBufferRef inject_ro =
+        context.buffers().read_only(inject.view());
+    const ReadOnlyBufferRef norm_ro =
+        context.buffers().read_only(norm.view());
+    const PrefillGRWriteNormBuffers valid{
+        residual.view(), block_ro, inject_ro, norm_ro, rs.view(), high.view(),
+        low.view()};
+    bool passed = true;
+    passed &= reject_gr_write_norm_call(
+        context, 0u, PrefillBF16X2Mode::off, valid, "row count",
+        label + " rejects zero rows");
+    passed &= reject_gr_write_norm_call(
+        context, 1u, static_cast<PrefillBF16X2Mode>(3u),
+        {residual.view(), block_ro, inject_ro, norm_ro, rs.view(), high.view(),
+         {}},
+        "mode is invalid", label + " rejects unknown mode");
+    passed &= reject_gr_write_norm_call(
+        context, 1u, PrefillBF16X2Mode::all_projections,
+        {residual.view(), block_ro, inject_ro, norm_ro, rs.view(), high.view(),
+         {}},
+        "requires xn16_lo", label + " requires mode-1 remainder");
+    passed &= reject_gr_write_norm_call(
+        context, 1u, PrefillBF16X2Mode::off, valid,
+        "only valid in mode 1", label + " rejects unused remainder");
+    passed &= reject_gr_write_norm_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {residual.view(), block_ro.slice(0u, block_bytes - sizeof(float)),
+         inject_ro, norm_ro, rs.view(), high.view(), {}},
+        "undersized", label + " rejects short block output");
+    passed &= reject_gr_write_norm_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {residual.view(), block_ro, inject_ro.slice(0u, inject_bytes - 4u),
+         norm_ro, rs.view(), high.view(), {}},
+        "undersized", label + " rejects short injection");
+    passed &= reject_gr_write_norm_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {residual.view(), block_ro, inject_ro,
+         norm_ro.slice(0u, norm_bytes - sizeof(float)), rs.view(), high.view(),
+         {}},
+        "undersized", label + " rejects short next norm");
+    passed &= reject_gr_write_norm_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {residual.view(), context.buffers().read_only(residual.view()),
+         inject_ro, norm_ro, rs.view(), high.view(), {}},
+        "output overlaps a read-only input",
+        label + " rejects output/input overlap");
+    passed &= reject_gr_write_norm_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {residual.view(), block_ro, inject_ro, norm_ro, residual.view(),
+         high.view(), {}},
+        "output buffer views overlap",
+        label + " rejects output/output overlap");
+    passed &= reject_gr_write_norm_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {foreign.view(), block_ro, inject_ro, norm_ro, rs.view(), high.view(),
+         {}},
+        "not owned by this Context",
+        label + " rejects foreign Context view");
+    return passed;
+}
+
+bool test_gr_write_norm_failure_discards_prior_dispatch(Context& context) {
+    const std::string label =
+        "Prefill GR write-norm failure discards earlier dispatch";
+    constexpr std::size_t residual_bytes =
+        kStreams * kWidth * sizeof(float);
+    constexpr std::size_t norm_bytes =
+        kStreams * kWidth * sizeof(float);
+    constexpr std::size_t scale_bytes = kStreams * sizeof(float);
+    constexpr std::size_t output_bytes =
+        kStreams * kWidth * sizeof(std::uint16_t);
+    TestBuffer residual, norm, rs, high;
+    std::string error;
+    const bool allocated =
+        residual.allocate(context, label + " residual", residual_bytes,
+                          error) &&
+        norm.allocate(context, label + " norm", norm_bytes, error) &&
+        rs.allocate(context, label + " scale", scale_bytes, error) &&
+        high.allocate(context, label + " high", output_bytes, error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    const auto rs_before = std::vector<std::uint8_t>(
+        rs.allocation().begin(), rs.allocation().end());
+    const auto high_before = std::vector<std::uint8_t>(
+        high.allocation().begin(), high.allocation().end());
+    const PrefillGRNormBuffers norm_buffers{
+        residual.view(), norm.view(), rs.view(), high.view(), {}};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, "Prefill GR write-norm rollback fixture",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_prefill_gr_norm(context, encoder, 1u,
+                                        PrefillBF16X2Mode::off, norm_buffers,
+                                        encode_error)) {
+                return false;
+            }
+            return encode_prefill_gr_write_norm(
+                context, encoder, 0u, PrefillBF16X2Mode::off, {},
+                encode_error);
+        },
+        error);
+    const bool discarded = command->unsafe_native_handle() == nullptr;
+    const bool unchanged =
+        !encoded && discarded &&
+        error.find("row count") != std::string::npos &&
+        std::equal(rs_before.begin(), rs_before.end(),
+                   rs.allocation().begin()) &&
+        std::equal(high_before.begin(), high_before.end(),
+                   high.allocation().begin());
+    check(unchanged, label,
+          error + (discarded ? " (command buffer discarded)"
+                             : " (command buffer remained submit-capable)"));
+    return unchanged;
+}
+
+bool test_gr_write_norm_open_concurrent_group_rejected(Context& context) {
+    const char* const dispatch = std::getenv("STRATA_METAL_DISPATCH");
+    if (dispatch == nullptr || std::string_view(dispatch) != "concurrent") {
+        return true;
+    }
+    const std::string label =
+        "Prefill GR write-norm rejects open concurrent group";
+    constexpr std::size_t residual_bytes =
+        kStreams * kWidth * sizeof(float);
+    constexpr std::size_t block_bytes = kWidth * sizeof(float);
+    constexpr std::size_t inject_bytes = kStreams * sizeof(float);
+    constexpr std::size_t norm_bytes =
+        kStreams * kWidth * sizeof(float);
+    constexpr std::size_t scale_bytes = kStreams * sizeof(float);
+    constexpr std::size_t output_bytes =
+        kStreams * kWidth * sizeof(std::uint16_t);
+    TestBuffer residual, block, inject, norm, rs, high;
+    std::string error;
+    const bool allocated =
+        residual.allocate(context, label + " residual", residual_bytes,
+                          error) &&
+        block.allocate(context, label + " block", block_bytes, error) &&
+        inject.allocate(context, label + " injection", inject_bytes, error) &&
+        norm.allocate(context, label + " norm", norm_bytes, error) &&
+        rs.allocate(context, label + " scale", scale_bytes, error) &&
+        high.allocate(context, label + " high", output_bytes, error);
+    if (!allocated) {
+        check(false, label + " allocate buffers", error);
+        return false;
+    }
+    const PrefillGRWriteNormBuffers buffers{
+        residual.view(), context.buffers().read_only(block.view()),
+        context.buffers().read_only(inject.view()),
+        context.buffers().read_only(norm.view()), rs.view(), high.view(), {}};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, "open concurrent Prefill GR write-norm",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encoder.group_begin(encode_error)) return false;
+            return encode_prefill_gr_write_norm(
+                context, encoder, 1u, PrefillBF16X2Mode::off, buffers,
+                encode_error);
+        },
+        error);
+    const bool rejected =
+        !encoded && error.find("ordered concurrent-group boundary") !=
+                        std::string::npos;
+    check(rejected, label, error);
+    return rejected;
+}
+
 bool test_open_concurrent_group_rejected(Context& context) {
     const char* const dispatch = std::getenv("STRATA_METAL_DISPATCH");
     if (dispatch == nullptr || std::string_view(dispatch) != "concurrent") {
@@ -1872,6 +2284,7 @@ int main(int argc, char** argv) {
 
     bool passed = test_encoder_validation(*context, *foreign_context);
     passed &= test_silu_encoder_validation(*context, *foreign_context);
+    passed &= test_gr_write_norm_validation(*context, *foreign_context);
     const std::array<std::uint32_t, 3> rows{1u, 3u, 8u};
     const std::array<PrefillBF16X2Mode, 3> modes{
         PrefillBF16X2Mode::off,
@@ -1908,14 +2321,25 @@ int main(int argc, char** argv) {
     passed &= test_failure_discards_prior_prefill_dispatch(*context);
     passed &= test_silu_failure_discards_prior_dispatch(*context);
     passed &= test_gr_mix_failure_discards_prior_dispatch(*context);
+    passed &= test_gr_write_norm_failure_discards_prior_dispatch(*context);
     passed &= test_open_concurrent_group_rejected(*context);
     passed &= test_silu_open_concurrent_group_rejected(*context);
     passed &= test_gr_mix_open_concurrent_group_rejected(*context);
+    for (std::size_t mode_index = 0u; mode_index < modes.size();
+         ++mode_index) {
+        for (std::size_t row_index = 0u; row_index < rows.size();
+             ++row_index) {
+            const bool shared = row_index == 1u && mode_index == 1u;
+            passed &= run_gr_write_norm_case(
+                *context, rows[row_index], modes[mode_index], shared);
+        }
+    }
+    passed &= test_gr_write_norm_open_concurrent_group_rejected(*context);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d Prefill Metal test(s) failed\n", g_failures);
         return 1;
     }
     if (!passed) return 1;
-    std::puts("all Prefill GR normalization, SiLU and mix tests passed");
+    std::puts("all Prefill GR normalization, GR write-norm, SiLU and mix tests passed");
     return 0;
 }

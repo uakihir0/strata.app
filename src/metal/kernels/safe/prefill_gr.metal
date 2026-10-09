@@ -80,6 +80,87 @@ kernel void strata_pf_gr_norm_lo(device const float* residual [[buffer(0)]],
                     tid, lane, simdgroup, row);
 }
 
+static inline void prefill_gr_write_norm(
+    device float* residual, device const float* block_out,
+    device const float* inject, device const float* next_norm,
+    device float* rs_out, device ushort* xn16, device ushort* xn16_lo,
+    threadgroup float* partials, bool write_low_remainder,
+    uint tid, uint lane, uint simdgroup, uint row) {
+    constexpr uint kWidth = N_EMBD;
+    constexpr uint kValuesPerThread = kWidth / 256u;
+    const uint token = row / HC;
+    const uint stream = row % HC;
+    const ulong row_offset = ulong(row) * kWidth;
+    const ulong block_offset = ulong(token) * kWidth;
+    const float scaled_inject = fma(0.25f, inject[row], 0.0f);
+    const float scale = fma(2.0f, sigmoid_k(scaled_inject), 0.0f);
+
+    float values[kValuesPerThread];
+    float sum = 0.0f;
+    for (uint k = 0u, column = tid; column < kWidth;
+         ++k, column += 256u) {
+        const ulong index = row_offset + column;
+        const float value =
+            fma(block_out[block_offset + column], scale, residual[index]);
+        residual[index] = value;
+        values[k] = value;
+        sum = fma(value, value, sum);
+    }
+    sum = prefill_block_sum(sum, partials, lane, simdgroup);
+    const float norm_scale = rsqrt(sum / float(kWidth) + 1.0e-6f);
+    if (tid == 0u) rs_out[row] = norm_scale;
+
+    const ulong norm_offset = ulong(stream) * kWidth;
+    for (uint k = 0u, column = tid; column < kWidth;
+         ++k, column += 256u) {
+        const float value =
+            (values[k] * norm_scale) * next_norm[norm_offset + column];
+        const ushort high = f32_to_bf16_rne(value);
+        xn16[row_offset + column] = high;
+        if (write_low_remainder) {
+            xn16_lo[row_offset + column] =
+                f32_to_bf16_rne(value - bf16_to_f32(high));
+        }
+    }
+}
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void strata_pf_gr_write_norm(
+    device float* residual [[buffer(0)]],
+    device const float* block_out [[buffer(1)]],
+    device const float* inject [[buffer(2)]],
+    device const float* next_norm [[buffer(3)]],
+    device float* rs_out [[buffer(4)]],
+    device ushort* xn16 [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]]) {
+    threadgroup float partials[8];
+    prefill_gr_write_norm(residual, block_out, inject, next_norm, rs_out,
+                          xn16, nullptr, partials, false, tid, lane, simdgroup,
+                          row);
+}
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void strata_pf_gr_write_norm_lo(
+    device float* residual [[buffer(0)]],
+    device const float* block_out [[buffer(1)]],
+    device const float* inject [[buffer(2)]],
+    device const float* next_norm [[buffer(3)]],
+    device float* rs_out [[buffer(4)]],
+    device ushort* xn16 [[buffer(5)]],
+    device ushort* xn16_lo [[buffer(6)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]]) {
+    threadgroup float partials[8];
+    prefill_gr_write_norm(residual, block_out, inject, next_norm, rs_out,
+                          xn16, xn16_lo, partials, true, tid, lane, simdgroup,
+                          row);
+}
+
 static inline void prefill_gr_silu(device const float* low_rank,
                                    device ushort* high_bf16,
                                    device ushort* low_bf16,
