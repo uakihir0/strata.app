@@ -79,6 +79,11 @@ public:
                                const MtpInputProjectionSources& sources,
                                MtpInputProjectionBuffers& buffers,
                                std::string& error) const;
+    /// Resolve the MTP parameter and scratch views for stage 6. The encoder
+    /// validates active extents and aliases before dispatch.
+    bool bind_add_streams(Context& context, std::uint32_t params_slot,
+                          MtpAddStreamsBuffers& buffers,
+                          std::string& error) const;
     /// Borrowed main RoPE view, or empty when unbound or this owner is invalid.
     BufferRef shared_rope() const noexcept;
     bool kv_views(MtpKvViews& views, std::string& error) const;

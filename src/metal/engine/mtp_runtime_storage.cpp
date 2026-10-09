@@ -484,6 +484,38 @@ bool MtpRuntimeStorage::bind_input_projection(
     return true;
 }
 
+bool MtpRuntimeStorage::bind_add_streams(
+    Context& context, std::uint32_t params_slot_index,
+    MtpAddStreamsBuffers& buffers, std::string& error) const {
+    error.clear();
+    buffers = {};
+    if (!is_valid() || impl_->buffers != &context.buffers()) {
+        error = "MTP add-streams binding needs live runtime storage from this Context";
+        return false;
+    }
+
+    const BufferRef params_slot = mtp_params_slot(params_slot_index);
+    if (!params_slot || params_slot.length < sizeof(MtpParams) ||
+        params_slot.contents == nullptr) {
+        error = "MTP add-streams parameter slot is unavailable";
+        return false;
+    }
+    const ReadOnlyBufferRef params =
+        context.buffers().read_only(params_slot);
+    const ReadOnlyBufferRef h2 =
+        context.buffers().read_only(bind_region(MtpBindRegionId::h2));
+    const ReadOnlyBufferRef e2 =
+        context.buffers().read_only(bind_region(MtpBindRegionId::e2));
+    const BufferRef output = bind_region(MtpBindRegionId::mtp_rin);
+    if (!params || !h2 || !e2 || !output) {
+        error = "MTP add-streams runtime parameter or scratch view is unavailable";
+        return false;
+    }
+    buffers = {params, h2, e2, output};
+    error.clear();
+    return true;
+}
+
 BufferRef MtpRuntimeStorage::shared_rope() const noexcept {
     if (impl_ == nullptr || impl_->buffers == nullptr ||
         !impl_->shared_rope_bound ||
