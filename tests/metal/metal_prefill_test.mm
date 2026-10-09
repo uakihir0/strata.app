@@ -15,6 +15,7 @@
 #include "strata/metal/prefill_gr_silu_dispatch.hpp"
 #include "strata/metal/prefill_gdn_gates_dispatch.hpp"
 #include "strata/metal/prefill_gdn_conv_dispatch.hpp"
+#include "strata/metal/prefill_gdn_dispatch.hpp"
 #include "strata/metal/prefill_gdn_l2_dispatch.hpp"
 #include "strata/metal/prefill_gdn_out_norm_dispatch.hpp"
 #include "strata/metal/prefill_gdn_rec_dispatch.hpp"
@@ -6497,6 +6498,463 @@ bool test_open_concurrent_group_rejected(Context& context) {
     return rejected;
 }
 
+struct GDNTransformTestOutputs;
+
+struct GDNTransformTestInputs {
+    TestBuffer alpha_beta;
+    TestBuffer dt_bias;
+    TestBuffer a;
+    TestBuffer qkv;
+    TestBuffer conv_weights;
+    TestBuffer z;
+    TestBuffer gamma;
+
+    bool allocate(Context& context, std::uint32_t rows,
+                  const std::string& label, std::string& error) {
+        return alpha_beta.allocate(
+                   context, label + " alpha beta",
+                   static_cast<std::size_t>(rows) * 2u * kGdnHeads *
+                       sizeof(float),
+                   error) &&
+               dt_bias.allocate(context, label + " dt bias",
+                                kGdnHeads * sizeof(float), error) &&
+               a.allocate(context, label + " A",
+                          kGdnHeads * sizeof(float), error) &&
+               qkv.allocate(context, label + " qkv",
+                             static_cast<std::size_t>(rows) *
+                                 kGdnConvChannels * sizeof(float),
+                             error) &&
+               conv_weights.allocate(
+                   context, label + " conv weights",
+                   static_cast<std::size_t>(kGdnConvChannels) *
+                       kGdnConvKernel * sizeof(float),
+                   error) &&
+               z.allocate(context, label + " z",
+                          static_cast<std::size_t>(rows) * kGdnValueDim *
+                              sizeof(float),
+                          error) &&
+               gamma.allocate(context, label + " gamma",
+                              kGdnHeadDim * sizeof(float), error);
+    }
+
+    PrefillGDNTransformBuffers bind(Context& context,
+                                    GDNTransformTestOutputs& outputs);
+};
+
+struct GDNTransformTestOutputs {
+    TestBuffer history;
+    TestBuffer gate;
+    TestBuffer beta;
+    TestBuffer h;
+    TestBuffer state;
+    TestBuffer oc;
+    TestBuffer y_h;
+
+    bool allocate(Context& context, std::uint32_t rows,
+                  const std::string& label, std::string& error) {
+        const std::size_t head_rows_bytes =
+            static_cast<std::size_t>(rows) * kGdnHeads * sizeof(float);
+        const std::size_t row_bytes =
+            static_cast<std::size_t>(rows) * kGdnConvChannels * sizeof(float);
+        const std::size_t value_bytes =
+            static_cast<std::size_t>(rows) * kGdnValueDim * sizeof(float);
+        return history.allocate(
+                   context, label + " history",
+                   static_cast<std::size_t>(kGdnConvChannels) *
+                       (kGdnConvKernel - 1u) * sizeof(float),
+                   error) &&
+               gate.allocate(context, label + " gate", head_rows_bytes,
+                             error) &&
+               beta.allocate(context, label + " beta", head_rows_bytes,
+                             error) &&
+               h.allocate(context, label + " h", row_bytes, error) &&
+               state.allocate(context, label + " state",
+                              static_cast<std::size_t>(kGdnStateElements) *
+                                  sizeof(float),
+                              error) &&
+               oc.allocate(context, label + " oc", value_bytes, error) &&
+               y_h.allocate(
+                   context, label + " y_h",
+                   static_cast<std::size_t>(rows) * kGdnValueDim *
+                       sizeof(std::uint16_t),
+                   error);
+    }
+};
+
+PrefillGDNTransformBuffers GDNTransformTestInputs::bind(
+    Context& context, GDNTransformTestOutputs& outputs) {
+    return {context.buffers().read_only(alpha_beta.view()),
+            context.buffers().read_only(dt_bias.view()),
+            context.buffers().read_only(a.view()),
+            outputs.history.view(),
+            context.buffers().read_only(qkv.view()),
+            context.buffers().read_only(conv_weights.view()),
+            outputs.gate.view(),
+            outputs.beta.view(),
+            outputs.h.view(),
+            outputs.state.view(),
+            outputs.oc.view(),
+            context.buffers().read_only(z.view()),
+            context.buffers().read_only(gamma.view()),
+            outputs.y_h.view()};
+}
+
+void initialize_gdn_transform_inputs(GDNTransformTestInputs& inputs,
+                                     std::uint32_t rows) {
+    auto* alpha_beta =
+        reinterpret_cast<float*>(inputs.alpha_beta.payload().data());
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        for (std::uint32_t head = 0u; head < kGdnHeads; ++head) {
+            const std::size_t base =
+                static_cast<std::size_t>(row) * 2u * kGdnHeads;
+            const int alpha =
+                static_cast<int>((row * 19u + head * 31u + 7u) % 101u) - 50;
+            const int beta =
+                static_cast<int>((row * 37u + head * 11u + 3u) % 97u) - 48;
+            alpha_beta[base + head] = static_cast<float>(alpha) * 0.035f;
+            alpha_beta[base + kGdnHeads + head] =
+                static_cast<float>(beta) * 0.04f;
+        }
+    }
+    auto* dt = reinterpret_cast<float*>(inputs.dt_bias.payload().data());
+    auto* a_values = reinterpret_cast<float*>(inputs.a.payload().data());
+    for (std::uint32_t head = 0u; head < kGdnHeads; ++head) {
+        dt[head] = static_cast<float>(static_cast<int>(head % 17u) - 8) *
+                   0.025f;
+        a_values[head] = 0.35f + static_cast<float>(head % 9u) * 0.04f;
+    }
+
+    auto* qkv = reinterpret_cast<float*>(inputs.qkv.payload().data());
+    const std::size_t qkv_values =
+        static_cast<std::size_t>(rows) * kGdnConvChannels;
+    for (std::size_t i = 0u; i < qkv_values; ++i) {
+        const int centered = static_cast<int>((i * 23u + 5u) % 127u) - 63;
+        qkv[i] = static_cast<float>(centered) * 0.0008f;
+    }
+    auto* conv_weights =
+        reinterpret_cast<float*>(inputs.conv_weights.payload().data());
+    const std::size_t weight_values =
+        static_cast<std::size_t>(kGdnConvChannels) * kGdnConvKernel;
+    for (std::size_t i = 0u; i < weight_values; ++i) {
+        const int centered = static_cast<int>((i * 13u + 3u) % 53u) - 26;
+        conv_weights[i] = static_cast<float>(centered) * 0.0015f;
+    }
+    auto* z = reinterpret_cast<float*>(inputs.z.payload().data());
+    const std::size_t value_values =
+        static_cast<std::size_t>(rows) * kGdnValueDim;
+    for (std::size_t i = 0u; i < value_values; ++i) {
+        const int centered = static_cast<int>((i * 17u + 29u) % 103u) - 51;
+        z[i] = static_cast<float>(centered) * 0.03f;
+    }
+    auto* gamma = reinterpret_cast<float*>(inputs.gamma.payload().data());
+    for (std::uint32_t i = 0u; i < kGdnHeadDim; ++i) {
+        gamma[i] = 0.75f + static_cast<float>((i * 7u + 5u) % 31u) * 0.0125f;
+    }
+}
+
+void initialize_gdn_transform_outputs(GDNTransformTestOutputs& outputs) {
+    auto* history = reinterpret_cast<float*>(outputs.history.payload().data());
+    const std::size_t history_values =
+        static_cast<std::size_t>(kGdnConvChannels) * (kGdnConvKernel - 1u);
+    for (std::size_t i = 0u; i < history_values; ++i) {
+        const int centered = static_cast<int>((i * 11u + 7u) % 61u) - 30;
+        history[i] = static_cast<float>(centered) * 0.0007f;
+    }
+    auto* state = reinterpret_cast<float*>(outputs.state.payload().data());
+    for (std::size_t i = 0u; i < kGdnStateElements; ++i) {
+        const int centered = static_cast<int>((i * 29u + 17u) % 101u) - 50;
+        state[i] = static_cast<float>(centered) * 0.00012f;
+    }
+}
+
+bool run_prefill_gdn_transforms_case(Context& context, std::uint32_t rows,
+                                     bool standalone_api) {
+    const std::string label =
+        "Prefill GDN transforms T=" + std::to_string(rows) +
+        (standalone_api ? " standalone" : " caller-owned");
+    GDNTransformTestInputs inputs;
+    GDNTransformTestOutputs composed, direct;
+    std::string error;
+    const bool allocated =
+        inputs.allocate(context, rows, label + " inputs", error) &&
+        composed.allocate(context, rows, label + " composed", error) &&
+        direct.allocate(context, rows, label + " direct", error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+
+    initialize_gdn_transform_inputs(inputs, rows);
+    initialize_gdn_transform_outputs(composed);
+    initialize_gdn_transform_outputs(direct);
+    std::memcpy(direct.history.payload().data(),
+                composed.history.payload().data(),
+                composed.history.payload().size());
+    std::memcpy(direct.state.payload().data(),
+                composed.state.payload().data(),
+                composed.state.payload().size());
+
+    const std::array<TestBuffer*, 7u> read_only_inputs{
+        &inputs.alpha_beta, &inputs.dt_bias, &inputs.a, &inputs.qkv,
+        &inputs.conv_weights, &inputs.z, &inputs.gamma};
+    std::array<std::vector<std::uint8_t>, 7u> input_snapshots;
+    for (std::size_t i = 0u; i < read_only_inputs.size(); ++i) {
+        const auto payload = read_only_inputs[i]->payload();
+        input_snapshots[i].assign(payload.begin(), payload.end());
+    }
+    const PrefillGDNTransformBuffers composed_buffers =
+        inputs.bind(context, composed);
+
+    auto composed_command =
+        context.make_command_buffer(label + " composed command", error);
+    check(composed_command != nullptr, label + " composed command buffer",
+          error);
+    if (!composed_command) return false;
+    const bool composed_encoded =
+        standalone_api
+            ? encode_prefill_gdn_transforms(context, *composed_command, rows,
+                                            composed_buffers, error)
+            : Encoder::encode(
+                  context, *composed_command, label + " caller-owned",
+                  [&](Encoder& encoder, std::string& encode_error) {
+                      return encode_prefill_gdn_transforms(
+                          context, encoder, rows, composed_buffers,
+                          encode_error);
+                  },
+                  error);
+    check(composed_encoded, label + " composed encode", error);
+    if (!composed_encoded) {
+        composed_command->discard();
+        return false;
+    }
+    if (!submit_and_wait(composed_command, label + " composed", error)) {
+        check(false, label + " composed dispatch", error);
+        return false;
+    }
+
+    const PrefillGDNTransformBuffers direct_buffers =
+        inputs.bind(context, direct);
+    auto direct_command =
+        context.make_command_buffer(label + " direct command", error);
+    check(direct_command != nullptr, label + " direct command buffer", error);
+    if (!direct_command) return false;
+    const bool direct_encoded = Encoder::encode(
+        context, *direct_command, label + " direct component sequence",
+        [&](Encoder& encoder, std::string& encode_error) {
+            const PrefillGDNGatesBuffers gates{
+                direct_buffers.alpha_beta, direct_buffers.dt_bias,
+                direct_buffers.a, direct_buffers.gate, direct_buffers.beta};
+            const PrefillGDNConvTiledBuffers conv{
+                context.buffers().read_only(direct_buffers.history),
+                direct_buffers.qkv, direct_buffers.conv_weights,
+                direct_buffers.h};
+            const PrefillGDNConvHistoryBuffers history{
+                direct_buffers.history, direct_buffers.qkv};
+            const PrefillGDNRecBuffers rec{
+                direct_buffers.state,
+                context.buffers().read_only(direct_buffers.h),
+                context.buffers().read_only(direct_buffers.gate),
+                context.buffers().read_only(direct_buffers.beta),
+                direct_buffers.oc};
+            const PrefillGDNOutNormBuffers out_norm{
+                context.buffers().read_only(direct_buffers.oc), direct_buffers.z,
+                direct_buffers.gamma, direct_buffers.y_h};
+            return encode_prefill_gdn_gates(context, encoder, rows, gates,
+                                             encode_error) &&
+                   encode_prefill_gdn_conv_tiled(context, encoder, rows, conv,
+                                                 encode_error) &&
+                   encode_prefill_gdn_conv_history(context, encoder, rows,
+                                                   history, encode_error) &&
+                   encode_prefill_gdn_l2(context, encoder, rows,
+                                         direct_buffers.h, encode_error) &&
+                   encode_prefill_gdn_rec(context, encoder, rows, rec,
+                                          encode_error) &&
+                   encode_prefill_gdn_out_norm(context, encoder, rows,
+                                               out_norm, encode_error);
+        },
+        error);
+    check(direct_encoded, label + " direct component encode", error);
+    if (!direct_encoded) {
+        direct_command->discard();
+        return false;
+    }
+    if (!submit_and_wait(direct_command, label + " direct", error)) {
+        check(false, label + " direct dispatch", error);
+        return false;
+    }
+
+    const std::array<TestBuffer*, 7u> composed_outputs{
+        &composed.history, &composed.gate, &composed.beta, &composed.h,
+        &composed.state, &composed.oc, &composed.y_h};
+    const std::array<TestBuffer*, 7u> direct_outputs{
+        &direct.history, &direct.gate, &direct.beta, &direct.h, &direct.state,
+        &direct.oc, &direct.y_h};
+    const std::array<std::string_view, 7u> output_names{
+        "history update", "gate", "beta", "convolution and q/k h",
+        "recurrent state", "oc", "F16 y_h"};
+    bool outputs_match = true;
+    for (std::size_t i = 0u; i < composed_outputs.size(); ++i) {
+        const auto left = composed_outputs[i]->payload();
+        const auto right = direct_outputs[i]->payload();
+        const bool match =
+            left.size() == right.size() &&
+            std::equal(left.begin(), left.end(), right.begin());
+        check(match, label + " matches direct " + std::string(output_names[i]));
+        outputs_match &= match;
+    }
+    bool inputs_unchanged = true;
+    for (std::size_t i = 0u; i < read_only_inputs.size(); ++i) {
+        const auto payload = read_only_inputs[i]->payload();
+        inputs_unchanged &=
+            std::equal(input_snapshots[i].begin(), input_snapshots[i].end(),
+                       payload.begin());
+    }
+    check(inputs_unchanged, label + " read-only projections remain unchanged");
+    bool guards = true;
+    for (TestBuffer* buffer : read_only_inputs) {
+        guards &= buffer->guards_intact();
+    }
+    for (TestBuffer* buffer : composed_outputs) {
+        guards &= buffer->guards_intact();
+    }
+    for (TestBuffer* buffer : direct_outputs) {
+        guards &= buffer->guards_intact();
+    }
+    check(guards, label + " guard regions");
+
+    const std::size_t value_bytes =
+        static_cast<std::size_t>(rows) * kGdnValueDim * sizeof(float);
+    PrefillGDNTransformBuffers late_alias = inputs.bind(context, composed);
+    late_alias.oc = composed.h.view().slice(0u, value_bytes);
+    auto alias_command =
+        context.make_command_buffer(label + " late alias", error);
+    if (!alias_command) {
+        check(false, label + " late alias command buffer", error);
+        return false;
+    }
+    const bool alias_encoded =
+        standalone_api
+            ? encode_prefill_gdn_transforms(context, *alias_command, rows,
+                                            late_alias, error)
+            : Encoder::encode(
+                  context, *alias_command, label + " caller-owned alias",
+                  [&](Encoder& encoder, std::string& encode_error) {
+                      return encode_prefill_gdn_transforms(
+                          context, encoder, rows, late_alias, encode_error);
+                  },
+                  error);
+    const bool alias_rejected =
+        !alias_encoded && alias_command->unsafe_native_handle() == nullptr &&
+        error.find("writable stages overlap") != std::string::npos &&
+        error.find("h and oc") != std::string::npos;
+    check(alias_rejected, label + " rejects late cross-stage h/oc alias",
+          error);
+
+    const std::size_t y_h_bytes =
+        static_cast<std::size_t>(rows) * kGdnValueDim *
+        sizeof(std::uint16_t);
+    PrefillGDNTransformBuffers short_final = inputs.bind(context, composed);
+    short_final.y_h = composed.y_h.view().slice(0u, y_h_bytes - 2u);
+    auto short_command =
+        context.make_command_buffer(label + " short y_h", error);
+    if (!short_command) {
+        check(false, label + " short y_h command buffer", error);
+        return false;
+    }
+    const bool short_encoded =
+        standalone_api
+            ? encode_prefill_gdn_transforms(context, *short_command, rows,
+                                            short_final, error)
+            : Encoder::encode(
+                  context, *short_command, label + " caller-owned short y_h",
+                  [&](Encoder& encoder, std::string& encode_error) {
+                      return encode_prefill_gdn_transforms(
+                          context, encoder, rows, short_final, encode_error);
+                  },
+                  error);
+    const bool short_rejected =
+        !short_encoded && short_command->unsafe_native_handle() == nullptr &&
+        error.find("y_h buffer is undersized") != std::string::npos;
+    check(short_rejected, label + " rejects short final output before dispatch",
+          error);
+
+    const std::size_t history_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) *
+        (kGdnConvKernel - 1u) * sizeof(float);
+    const std::size_t qkv_bytes =
+        static_cast<std::size_t>(rows) * kGdnConvChannels * sizeof(float);
+    TestBuffer shared_history_qkv;
+    std::string shared_error;
+    const bool arena_allocated = shared_history_qkv.allocate(
+        context, label + " shared history/qkv arena",
+        history_bytes + qkv_bytes, shared_error);
+    check(arena_allocated, label + " allocate shared history/qkv arena",
+          shared_error);
+    if (!arena_allocated) return false;
+    PrefillGDNTransformBuffers shared_ranges =
+        inputs.bind(context, composed);
+    shared_ranges.history =
+        shared_history_qkv.view().slice(0u, history_bytes + qkv_bytes);
+    shared_ranges.qkv = context.buffers().read_only(
+        shared_history_qkv.view().slice(history_bytes, qkv_bytes));
+    auto shared_command =
+        context.make_command_buffer(label + " disjoint arena ranges",
+                                    shared_error);
+    check(shared_command != nullptr,
+          label + " disjoint arena command buffer", shared_error);
+    if (!shared_command) return false;
+    const bool shared_encoded =
+        standalone_api
+            ? encode_prefill_gdn_transforms(context, *shared_command, rows,
+                                            shared_ranges, shared_error)
+            : Encoder::encode(
+                  context, *shared_command,
+                  label + " disjoint arena caller-owned",
+                  [&](Encoder& encoder, std::string& encode_error) {
+                      return encode_prefill_gdn_transforms(
+                          context, encoder, rows, shared_ranges, encode_error);
+                  },
+                  shared_error);
+    const bool shared_ranges_accepted =
+        shared_encoded && shared_command->unsafe_native_handle() != nullptr;
+    shared_command->discard();
+    check(shared_ranges_accepted,
+          label + " accepts disjoint active ranges in shared arena",
+          shared_error);
+    check(shared_history_qkv.guards_intact(),
+          label + " shared arena guard regions");
+    return outputs_match && inputs_unchanged && guards && alias_rejected &&
+           short_rejected && shared_ranges_accepted &&
+           shared_history_qkv.guards_intact();
+}
+
+bool test_prefill_gdn_transforms_open_concurrent_group_rejected(
+    Context& context) {
+    const char* const dispatch = std::getenv("STRATA_METAL_DISPATCH");
+    if (dispatch == nullptr || std::string_view(dispatch) != "concurrent") {
+        return true;
+    }
+    const std::string label =
+        "Prefill GDN transforms reject open concurrent group";
+    std::string error;
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, label,
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encoder.group_begin(encode_error)) return false;
+            return encode_prefill_gdn_transforms(context, encoder, 1u, {},
+                                                 encode_error);
+        },
+        error);
+    const bool rejected =
+        !encoded && error.find("ordered concurrent-group boundary") !=
+                        std::string::npos;
+    check(rejected, label, error);
+    return rejected;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -6597,6 +7055,8 @@ int main(int argc, char** argv) {
         test_prefill_gdn_rec_failure_discards_prior_dispatch(*context);
     passed &=
         test_prefill_gdn_out_norm_failure_discards_prior_dispatch(*context);
+    passed &= test_prefill_gdn_transforms_open_concurrent_group_rejected(
+        *context);
     passed &= test_open_concurrent_group_rejected(*context);
     passed &= test_silu_open_concurrent_group_rejected(*context);
     passed &= test_gr_mix_open_concurrent_group_rejected(*context);
@@ -6674,6 +7134,9 @@ int main(int argc, char** argv) {
             run_prefill_gdn_out_norm_case(*context, composed_rows, true,
                                           true);
     }
+    passed &= run_prefill_gdn_transforms_case(*context, 1u, true);
+    passed &= run_prefill_gdn_transforms_case(*context, 3u, false);
+    passed &= run_prefill_gdn_transforms_case(*context, 65u, true);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d Prefill Metal test(s) failed\n", g_failures);
         return 1;
