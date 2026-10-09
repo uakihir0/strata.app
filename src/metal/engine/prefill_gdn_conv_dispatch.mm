@@ -123,6 +123,42 @@ bool validate_dispatch(Context& context, std::uint32_t rows,
     return true;
 }
 
+bool validate_history_dispatch(
+    Context& context, std::uint32_t rows,
+    const PrefillGDNConvHistoryBuffers& buffers,
+    std::size_t& history_bytes, std::size_t& row_bytes,
+    std::string& error) {
+    if (rows == 0u || rows > kPrefillMaxShaderRows) {
+        error = "Prefill GDN convolution history row count exceeds the "
+                "shader-safe range";
+        return false;
+    }
+    if (!checked_float_bytes(kKernelWidth - 1u, kChannels, history_bytes) ||
+        !checked_float_bytes(rows, kChannels, row_bytes)) {
+        error = "Prefill GDN convolution history buffer size overflows size_t";
+        return false;
+    }
+    if (!buffers.history || !context.buffers().owns(buffers.history)) {
+        error = "Prefill GDN convolution history buffer is not owned by this "
+                "Context";
+        return false;
+    }
+    if (buffers.history.length < history_bytes ||
+        buffers.history.offset % kFloatBytes != 0u) {
+        error = "Prefill GDN convolution history buffer is undersized or "
+                "misaligned";
+        return false;
+    }
+    if (!validate_read_view(context, buffers.qkv, row_bytes, "QKV", error)) {
+        return false;
+    }
+    if (overlaps(buffers.qkv, buffers.history)) {
+        error = "Prefill GDN convolution history overlaps QKV";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 bool encode_prefill_gdn_conv_tiled(
@@ -170,6 +206,51 @@ bool encode_prefill_gdn_conv_tiled(
         context, command_buffer, "Prefill GDN tiled convolution",
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_prefill_gdn_conv_tiled(
+                context, encoder, rows, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_prefill_gdn_conv_history(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    const PrefillGDNConvHistoryBuffers& buffers, std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "Prefill GDN convolution history requires an ordered "
+                "concurrent-group boundary";
+        return false;
+    }
+
+    std::size_t history_bytes = 0u;
+    std::size_t row_bytes = 0u;
+    if (!validate_history_dispatch(context, rows, buffers, history_bytes,
+                                   row_bytes, error)) {
+        return false;
+    }
+
+    const EncoderBufferBinding outputs[] = {
+        {buffers.history, 0u, history_bytes, kFloatBytes},
+    };
+    const EncoderReadOnlyBufferBinding inputs[] = {
+        {buffers.qkv, 1u, row_bytes, kFloatBytes},
+    };
+    const EncoderBytesBinding row_binding{&rows, sizeof(rows), 2u};
+    const EncoderThreadgroupMemory no_threadgroup_memory{};
+    return encoder.dispatch(
+        "strata_pf_gdn_conv_hist", {kChannels / kThreads, 1u, 1u},
+        {kThreads, 1u, 1u}, outputs, inputs,
+        std::span<const EncoderBytesBinding>(&row_binding, 1u),
+        std::span<const EncoderThreadgroupMemory>(&no_threadgroup_memory, 0u),
+        error);
+}
+
+bool encode_prefill_gdn_conv_history(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    const PrefillGDNConvHistoryBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Prefill GDN convolution history",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_gdn_conv_history(
                 context, encoder, rows, buffers, encode_error);
         },
         error);

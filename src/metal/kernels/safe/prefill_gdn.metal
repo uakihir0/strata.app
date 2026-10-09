@@ -70,6 +70,29 @@ kernel void strata_pf_gdn_conv_tiled(
     }
 }
 
+[[max_total_threads_per_threadgroup(128)]]
+kernel void strata_pf_gdn_conv_hist(
+    device float* history [[buffer(0)]],
+    device const float* qkv [[buffer(1)]],
+    constant uint& rows [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint group [[threadgroup_position_in_grid]]) {
+    const uint channel = 128u * group + tid;
+    const ulong history_base = ulong(channel) * (GDN_CONV_KERNEL - 1u);
+    float next[GDN_CONV_KERNEL - 1u];
+    for (uint k = 0u; k < GDN_CONV_KERNEL - 1u; ++k) {
+        const uint source = rows + k;
+        next[k] = source < GDN_CONV_KERNEL - 1u
+            ? history[history_base + source]
+            : qkv[ulong(source - (GDN_CONV_KERNEL - 1u)) *
+                      GDN_CONV_CHANNELS +
+                  channel];
+    }
+    for (uint k = 0u; k < GDN_CONV_KERNEL - 1u; ++k) {
+        history[history_base + k] = next[k];
+    }
+}
+
 [[max_total_threads_per_threadgroup(256)]]
 kernel void strata_pf_gdn_gates(
     device const float* alpha_beta [[buffer(0)]],
