@@ -45,6 +45,16 @@ bool encode_prefill_dequant_q2_0(Context& context,
                                  const PrefillDequantBuffers& buffers,
                                  std::string& error);
 
+/// Expand row-major IQ4_NL blocks to F16 K-major scratch `[k][n_out]`.
+bool encode_prefill_dequant_iq4_nl(Context& context, Encoder& encoder,
+                                   const PrefillDequantParams& params,
+                                   const PrefillDequantBuffers& buffers,
+                                   std::string& error);
+bool encode_prefill_dequant_iq4_nl(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillDequantParams& params, const PrefillDequantBuffers& buffers,
+    std::string& error);
+
 /// Expand row-major Q4_0 blocks to F16 K-major scratch `[k][n_out]`.
 bool encode_prefill_dequant_q4_0(Context& context, Encoder& encoder,
                                  const PrefillDequantParams& params,

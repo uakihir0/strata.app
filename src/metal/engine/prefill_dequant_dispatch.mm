@@ -16,12 +16,13 @@ namespace strata::metal {
 namespace {
 
 constexpr std::uint32_t kValuesPerQ2Block = 64u;
-constexpr std::uint32_t kValuesPerQ4Q5Q8Block = 32u;
+constexpr std::uint32_t kValuesPer32ValueBlock = 32u;
 constexpr std::uint32_t kThreads = 256u;
 constexpr std::size_t kHalfBytes = sizeof(std::uint16_t);
 constexpr std::uint32_t kMaxSignedExtent =
     static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max());
 static_assert(sizeof(block_q2_0) == 18u);
+static_assert(sizeof(block_iq4_nl) == 18u);
 static_assert(sizeof(block_q4_0) == 18u);
 static_assert(sizeof(block_q5_0) == 22u);
 static_assert(sizeof(block_q8_0) == 34u);
@@ -180,7 +181,7 @@ bool encode_prefill_dequant_q8_0(Context& context, Encoder& encoder,
                                  std::string& error) {
     return encode_dequant_dispatch<block_q8_0>(
         context, encoder, params, buffers, "Q8_0",
-        "strata_pf_dequant_q8_0", kValuesPerQ4Q5Q8Block, error);
+        "strata_pf_dequant_q8_0", kValuesPer32ValueBlock, error);
 }
 
 bool encode_prefill_dequant_q8_0(Context& context,
@@ -197,13 +198,35 @@ bool encode_prefill_dequant_q8_0(Context& context,
         error);
 }
 
+bool encode_prefill_dequant_iq4_nl(Context& context, Encoder& encoder,
+                                   const PrefillDequantParams& params,
+                                   const PrefillDequantBuffers& buffers,
+                                   std::string& error) {
+    return encode_dequant_dispatch<block_iq4_nl>(
+        context, encoder, params, buffers, "IQ4_NL",
+        "strata_pf_dequant_iq4_nl", kValuesPer32ValueBlock, error);
+}
+
+bool encode_prefill_dequant_iq4_nl(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillDequantParams& params, const PrefillDequantBuffers& buffers,
+    std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Prefill IQ4_NL dequantization",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_dequant_iq4_nl(
+                context, encoder, params, buffers, encode_error);
+        },
+        error);
+}
+
 bool encode_prefill_dequant_q4_0(Context& context, Encoder& encoder,
                                  const PrefillDequantParams& params,
                                  const PrefillDequantBuffers& buffers,
                                  std::string& error) {
     return encode_dequant_dispatch<block_q4_0>(
         context, encoder, params, buffers, "Q4_0",
-        "strata_pf_dequant_q4_0", kValuesPerQ4Q5Q8Block, error);
+        "strata_pf_dequant_q4_0", kValuesPer32ValueBlock, error);
 }
 
 bool encode_prefill_dequant_q4_0(Context& context,
@@ -226,7 +249,7 @@ bool encode_prefill_dequant_q5_0(Context& context, Encoder& encoder,
                                  std::string& error) {
     return encode_dequant_dispatch<block_q5_0>(
         context, encoder, params, buffers, "Q5_0",
-        "strata_pf_dequant_q5_0", kValuesPerQ4Q5Q8Block, error);
+        "strata_pf_dequant_q5_0", kValuesPer32ValueBlock, error);
 }
 
 bool encode_prefill_dequant_q5_0(Context& context,
