@@ -2,6 +2,7 @@
 #pragma once
 
 #include "strata/metal/context.hpp"
+#include "strata/metal/mtp_kv.hpp"
 
 #include <string>
 
@@ -57,6 +58,29 @@ struct MtpAttentionKvProjectionBuffers {
     BufferRef sink;
 };
 
+/// Inputs and caller-owned cache views for MTP stage 9. K is normalized with
+/// the MTP K norm and the shared RoPE table in place; when `kv_rot` is set,
+/// both current K and V are also FWHT-rotated in place before append. The KV
+/// layout must be the canonical layout returned by make_mtp_kv_layout, and
+/// its views must come from that layout. K8v4 requests use the drafter's
+/// documented int8 storage mapping.
+///
+/// Keep every view alive until command-buffer completion. The caller must
+/// keep `params` and its active StepRows, `kcur`, `vcur`, `k_norm`, and `rope`
+/// unchanged until completion. `params` and its StepRows are CPU-validated
+/// before the GPU reads them. The encoder overwrites K in place, overwrites V
+/// when `kv_rot` is set, and appends rows to the cache views.
+struct MtpAttentionKvAppendBuffers {
+    BufferRef params;
+    BufferRef kcur;
+    BufferRef vcur;
+    BufferRef k_norm;
+    BufferRef rope;
+    MtpKvLayout kv_layout;
+    MtpKvViews kv_views;
+    bool kv_rot = false;
+};
+
 /// Add MTP hidden and embedding streams to the caller-owned Encoder segment.
 /// On failure, the enclosing Encoder::encode body must return false so prior
 /// work in that segment is discarded.
@@ -93,5 +117,18 @@ bool encode_mtp_attention_kv_projection(
 bool encode_mtp_attention_kv_projection(
     Context& context, CommandBuffer& command_buffer,
     const MtpAttentionKvProjectionBuffers& buffers, std::string& error);
+
+/// Encode MTP stage 9: normalize/RoPE the two K heads, optionally rotate K/V
+/// according to the selected KV mode, and append both heads at MtpParams
+/// StepRow positions. This requires an ordered concurrent-group boundary.
+/// Current K (and V when rotated) are modified in place. The standalone
+/// command-buffer form is transactional; the caller-owned form must propagate
+/// failure from its enclosing Encoder::encode body.
+bool encode_mtp_attention_kv_append(
+    Context& context, Encoder& encoder,
+    const MtpAttentionKvAppendBuffers& buffers, std::string& error);
+bool encode_mtp_attention_kv_append(
+    Context& context, CommandBuffer& command_buffer,
+    const MtpAttentionKvAppendBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal

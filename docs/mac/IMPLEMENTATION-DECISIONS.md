@@ -7740,6 +7740,7 @@ measuring L-15 remain open.
 | REV-119 | Implement MTP drafter stage 6 | Initial hostile review found a P2 oracle gap: the original input values could not distinguish FP32 addition from binary16 rounding. The fixture now sets `h2[0]=1024.0f` and `e2[0]=0.25f`, whose required FP32 result is exactly 1024.25 while binary16 addition rounds to 1024.0, and checks that witness for every T=1..8 case. The review also found a missing review-ledger row and stale docs claiming no MTP kernel consumed runtime views; REV-119 and the 04/06 descriptions now record that stage 6 is standalone while production runtime-view composition and the other stages remain open. Final hostile follow-up found no remaining actionable findings. The focused `metal_mtp_test` passes 1/1; the full `mac-metal` suite passes 55/55; `mac-host` passes 44/44 with the unavailable real-input case skipped. The full `mac-dev` build, `test_map` CTest and `git diff --check` pass. | Preserve the exact FP32 witness and active-row alias/rollback coverage. Wire all MTP stages through `MtpRuntimeStorage`, then establish replay parity for draft IDs, probabilities and K/V before claiming L11 or production inference |
 | REV-120 | Compose the MTP stage-7 attention GR read | Initial hostile review found a P2 gap: MTP parameters could alias a GR writable output and be overwritten; stage 7 now rejects overlap between `MtpParams` and all 11 active GR views before delegation. Regressions alias the params with both the normalized output and norm input, and prove that an enclosing caller-owned segment discards an already encoded stage 6 after a late stage-7 alias rejection. Review also found P3 stale stage-6-only documentation and the missing REV-120 ledger row; the stage-6/7 descriptions, plan, test inventory and this record are synchronized. A follow-up found that the original finite `0xa5` marker could hide partially unwritten outputs; all five outputs now start with a qNaN poison and every active element must change its sentinel bits and be finite. Final hostile follow-up found no remaining actionable P1–P3 findings. The full mac-dev build passes; the focused stage-6/stage-7/concurrent tests pass 3/3; mac-metal passes 57/57; mac-host passes 44/44 with the unavailable real-input case skipped; `test_map` and `git diff --check` pass. | Keep MTP runtime-storage composition, later stages, complete drafter behavior and model-backed draft/KV parity open; retain the reviewed dead-h2 placeholder lifetime contract |
 | REV-121 | Implement MTP drafter stage 8 key/value projection | Hostile review found no actionable P1–P3 findings. The stage-8 fixture originally allocated an oversized sink; it now models the named `bo` region at exactly 2560 floats and proves its largest active padded sink use (1536 floats) fits. The scalar oracle independently builds Q8_1 activations and Q8_0 key/value projections for T=1..8 and verifies padded NC rows. `mac-dev` builds; focused stage 6/7/8 and concurrent CTests pass 5/5; `mac-metal` passes 59/59; `mac-host` passes 44/44 with one unavailable real-input case skipped; `test_map` and `git diff --check` pass; the documented `.venv` Python suite passes 35/35 modules (two optional structured-schema tests skipped). | Verify the NC/T active-row contract and scratch lifetimes against model-backed MTP weights; stage 8 remains a typed standalone encoder without runtime-storage wiring |
+| REV-122 | Compose MTP stage 9 K normalization, RoPE, optional rotation and KV append | Hostile review found two P2 lifetime-contract gaps: the API had to require CPU-validated `MtpParams`/StepRows to stay alive and unchanged while GPU dispatches read them, then also name K norm and RoPE as asynchronous read inputs that must remain unchanged through completion. The public contract and both engine/kernel guides now distinguish stable caller inputs from the stage's in-place K, optional V and cache writes. Final hostile re-review found no remaining actionable P1–P3 findings. The `mac-dev` build passes; the focused stage-9 serial/concurrent pair passes 2/2; `mac-metal` passes 61/61; `mac-host` passes 44/44 with one unavailable real-input test skipped; the documented `.venv` Python suite passes 35/35 modules; `test_map` and `git diff --check` pass. | Verify `kv_rot` against the selected runtime KV configuration and establish stage-8→9 parity through `MtpRuntimeStorage` and an inspected model |
 
 ### D-IMPL-313: Add a per-layer GDN write-through Window block
 
@@ -8330,7 +8331,43 @@ measuring L-15 remain open.
   (35/35 modules; two optional structured-schema tests skipped), and
   `git diff --check` pass. Hostile review found no actionable P1–P3 findings;
   the review and fixture sizing follow-up are recorded in REV-121.
-- **Review required:** See REV-121. Confirm scratch and model-weight binding
-  against an inspected MTP model, then implement stage 9 (K norm/RoPE,
-  optional FWHT and K/V append) and validate the full stage 8→9 handoff.
-  Runtime-storage composition and model-backed draft/KV parity remain open.
+- **Review required:** See REV-121 and D-IMPL-325/REV-122. Confirm scratch and
+  model-weight binding against an inspected MTP model and validate the full
+  stage 8→9 handoff. Runtime-storage composition and model-backed draft/KV
+  parity remain open.
+
+### D-IMPL-325: Compose MTP drafter stage 9 K/V append
+
+- **Decision:** Add a typed stage-9 encoder that reads T and StepRows from the
+  live `MtpParams` slot, normalizes and applies RoPE to the two K heads in
+  place, optionally FWHT-rotates K and V, then appends to the caller's
+  canonical MTP K/V layout. Validate the layout against
+  `make_mtp_kv_layout`, require all K/V/cache views to match its one-allocation
+  geometry, and reject duplicate or out-of-capacity positions and unsafe
+  active-view aliases before dispatch. Require params/StepRows, current K/V,
+  K norm and RoPE inputs to remain stable through GPU completion. Q4_0 requires
+  rotation; fp16 forbids it; int8 accepts the explicit rotation choice.
+  K8v4 requests use the existing MTP-to-int8 storage mapping.
+- **Reason:** Section 5.11 defines stage 9 as QSA key normalization/RoPE,
+  format-dependent optional FWHT, and the existing per-format QSA cache
+  append at `StepRow::pos`. The repository already has validated encoders for
+  each operation and a canonical single-allocation MTP cache owner. The
+  wrapper fixes their order and checks the handoff without resolving model
+  tensor names, inferring configuration from the environment, or claiming
+  production MTP scheduling.
+- **Validation:** A dedicated Metal twin covers T=1..8 in fp16, int8 with and
+  without rotation, rotated q4_0, and K8v4-requested int8 storage. It checks
+  K norm/RoPE and optional FWHT against scalar oracles, compares all cache
+  bytes with scalar append oracles, and exercises malformed parameters,
+  positions, layouts, cache views, foreign ownership, rotation constraints,
+  caller-owned rollback and concurrent-group rejection. The `mac-dev` build,
+  focused 2/2 serial/concurrent CTests, full `mac-metal` 61/61,
+  `mac-host` 44/44 (one unavailable real-input test skipped), documented
+  `.venv` Python suite (35/35 modules), `test_map` and `git diff --check` pass.
+  Hostile review found and closed two P2 lifetime-contract gaps; final
+  re-review found no actionable P1–P3 findings. Details are in REV-122.
+- **Review required:** Confirm the `kv_rot` choice is bound to the exact
+  production KV configuration, then compose stages 6–9 through
+  `MtpRuntimeStorage` and compare a recorded drafter round with an inspected
+  model. The remaining drafter stages and production proposal/acceptance
+  scheduler stay open.
