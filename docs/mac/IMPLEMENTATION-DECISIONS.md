@@ -9753,3 +9753,63 @@ measuring L-15 remain open.
   the full Metal suite passed 80/80 and the host suite passed with only the
   unavailable-model-input case skipped. Synthetic fixtures do not demonstrate
   production Prefill integration or model-backed inference.
+
+### D-IMPL-353: Implement Prefill GDN q/k L2 normalization
+
+- **Decision:** Add the isolated `strata_pf_gdn_l2` kernel and validated
+  standalone and caller-owned `encode_prefill_gdn_l2` APIs. Use a 128-thread
+  group per head and row, normalize q and k heads in place, and leave all v
+  heads unchanged. Preserve the four-simdgroup butterfly partials and the
+  specified `((p0 + p1) + p2) + p3` addition order, then add
+  `RMS_EPSILON` before `rsqrt`. Reject unsafe row counts, undersized or
+  misaligned views, foreign Context buffers and an open concurrent group.
+  Keep the stage ordered after convolution as a separately callable component;
+  Prefill GEMM and chunk-loop integration remain pending.
+- **Reason:** The exact reduction order and epsilon are part of the §6.4
+  numerical contract. An in-place q/k-only stage makes the documented
+  convolution→normalization ordering explicit while preserving v data for
+  later recurrence. The production Prefill path is still unwired, so this
+  component does not claim end-to-end behavior.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the full `mac-dev` build succeeded. Focused serial and concurrent
+  Prefill CTests passed 2/2 after adding the reduction-order and epsilon
+  sentinels. The fresh `mac-metal` suite passed 80/80, and `mac-host` passed
+  43 tests with one unavailable-model-input case skipped. `test_map.py`
+  reported all checks passed, with notes for planned tests and requirements;
+  `check_drift.py` found no upstream changes and valid golden files, and
+  `git diff --check` passed. The pinned Python runner passed 35/35 modules
+  after the implementation changes. The fixtures verify
+  ordered-versus-regrouped reduction sensitivity, rejection of omitted
+  epsilon, unchanged v heads, convolution→L2 composition, guards, validation
+  and rollback. The current fixtures are synthetic and do not establish
+  production Prefill or model parity. Review findings and disposition are
+  recorded in REV-150.
+
+### REV-150: Hostile review of Prefill GDN q/k L2 normalization
+
+- **Scope:** `strata_pf_gdn_l2`, its standalone and caller-owned Encoder APIs,
+  four-simdgroup reduction order, epsilon, q/k-only mutation, dispatch
+  validation, rollback, concurrent-group rejection, regression fixtures and
+  test inventories.
+- **Findings:** The first read-only review found no implementation defect but
+  identified two P2 gaps: the original fixtures did not distinguish a
+  regrouped reduction, and did not show that omitting `RMS_EPSILON` changes
+  the result beyond the oracle tolerance. It also found that the kernel and
+  test inventories omitted the new stage. The follow-up review confirmed that
+  the new reduction sentinel produces a distinct regrouped result, the
+  epsilon sentinel strongly separates the omitted-epsilon result, and the
+  inventories name the stage. It found no further code issue; its only
+  remaining finding was that this decision/review record had not yet been
+  added.
+- **Disposition:** Added the order-sensitive fixture and regrouping negative
+  control, an epsilon-sensitive input and omitted-epsilon negative control,
+  and synchronized the §10.5 and §9.1 test descriptions plus `test_map.json`.
+  Added this decision and review record to resolve the dangling references.
+  The final read-only review found no remaining concrete P1–P3 issue. On
+  Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a), the full build
+  succeeded, focused Prefill serial/concurrent tests passed 2/2 after the
+  sentinels, `mac-metal` passed 80/80 and `mac-host` passed 43 tests with one
+  unavailable-model-input case skipped. `test_map.py`, `check_drift.py` and
+  `git diff --check` passed; the pinned Python runner passed 35/35 modules.
+  The synthetic tests do not establish production Prefill integration or
+  model-backed inference.
