@@ -26,9 +26,9 @@ Synthetic tests cover the component chain and rollback; production
 `Prefill::run` still does not call it.
 
 One Prefill GR read half now composes normalization, down projection, SiLU,
-up projection and injection. Serial and concurrent synthetic tests cover all
-BF16X2 modes; the remaining mixer/MoE layers and production chunk execution
-are still unimplemented.
+up projection, injection and four-stream mixing. Serial and concurrent
+synthetic tests cover all BF16X2 modes; layer scheduling, MoE integration and
+production chunk execution are still unimplemented.
 
 ## Build and test entry points
 

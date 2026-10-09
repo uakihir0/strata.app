@@ -10882,3 +10882,53 @@ measuring L-15 remain open.
   Prefill GR serial/concurrent tests passed 2/2. The full `mac-metal` suite
   passed 90/90 before the final oracle threshold/input corrections; the
   focused Prefill GR serial/concurrent cases are rerun after those corrections.
+
+### D-IMPL-376: Compose the complete isolated Prefill GR read half
+
+- **Decision:** Add `encode_prefill_gr_read_mix` to run the five-stage GR read
+  coordinator followed by the four-stream BF16/F16 mixer in the same ordered
+  segment. Mode 1 keeps the GR normalization/SiLU/projection remainders and
+  the mixer remainder; mode 2 omits GR projection remainders but still writes
+  the mixer remainder; mode 0 writes neither. Validate mixer output sizes and
+  ownership, disjointness from active read-stage outputs, and aliases with
+  residual, norm and model weights before encoding the first stage. Preserve
+  both caller-owned `Encoder` and transactional `CommandBuffer` forms.
+- **Reason:** GR mix is step 6 of docs/mac/04 §6.3 and already has its own
+  validated encoder and scalar-oracle tests. Composing it with the read
+  coordinator completes a well-bounded, independently testable GR read half
+  while leaving layer scheduling, MoE, arena allocation and production
+  `Prefill::run` as separate work.
+- **Review required:** Verify the different mode-1 and mode-2 remainder
+  contracts, buffer shapes and active-range aliases across GR read outputs,
+  residual/norm/model weights, ordering and rollback through both APIs.
+  Confirm that tests exercise the integrated sequence and still distinguish
+  this isolated half from production Prefill inference.
+- **Validation:** After the final alias matrix, the rebuilt `mac-dev` target,
+  focused serial/concurrent Prefill tests (2/2), `test_map` (1/1), and full
+  `mac-metal` suite (90/90) all passed.
+
+### REV-173: Hostile review of Prefill GR read/mix composition
+
+- **Scope:** GR/mixer mode-specific remainders, validated input/output
+  extents, cross-stage alias ranges, read→mix ordering, serial/concurrent
+  behavior, and failure rollback.
+- **Findings and fixes:** Chandrasekhar and Hegel independently found that
+  the original alias negatives covered only mode 0 and a subset of inputs.
+  Hegel's follow-up identified remaining mode gaps for the primary mixer
+  outputs and the second mode-1 GR remainder. The matrix now checks every
+  active mixer output against residual, norm and all three model-weight inputs
+  in every applicable mode; it also checks both active mode-1 read remainders
+  and the mode-2 read output against `mixed_bf_lo`. Chandrasekhar found that
+  the original invalid-GEMM rollback stopped at the first down projection. A
+  separate case now encodes the complete read prefix, then triggers the
+  mixer's conservative full-view overlap validation while the active mixer
+  output spans remain disjoint. Both standalone and caller-owned forms must
+  discard that prefix and preserve the read and mixer allocations.
+- **Disposition:** No dispatch implementation defect was reported. All
+  coverage findings were addressed. Chandrasekhar and Hegel independently
+  verified the final mode/input/output alias matrix and the post-read rollback
+  case; neither found a remaining gap.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the final rebuilt `mac-dev` target and focused serial/concurrent
+  Prefill tests passed 2/2; `test_map` passed 1/1 and the full `mac-metal`
+  suite passed 90/90 after the final test expansion.
