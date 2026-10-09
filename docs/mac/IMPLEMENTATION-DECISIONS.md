@@ -9051,6 +9051,64 @@ measuring L-15 remain open.
   `metal_mtp_test` and `metal_mtp_test_concurrent` passed 3/3. The storage
   fixture verifies binding and ordered dispatch, not inspected-model parity.
 
+### D-IMPL-341: Bind MTP attention runtime views for stages 7–8
+
+- **Decision:** Add runtime-storage adapters for stage 7's attention read and
+  stage 8's K/V projections. Resolve the shared MTP parameter slot and named
+  dense weights/scratch through `MtpRuntimeStorage`; keep active-extent,
+  alignment, ownership and alias validation in each stage encoder. Stage 7
+  reuses `h2` as the two distinct unused GR ABI views after stage 6 has
+  consumed its active rows. Stage 8 uses the full `bo` region as its shared
+  padded-column sink; later ordered stages may reuse `bo[0]` at stage 10 and
+  write the meaningful output at stage 14.
+- **Reason:** The existing bind layout already provides each stage's
+  persistent and temporary views. Reusing those planned regions preserves the
+  allocation plan while making the stage-6→7→8 producer/consumer lifetime
+  explicit. The encoder remains the single authority for active `T` ranges
+  and writable alias checks.
+- **Validation:** `metal_mtp_storage_test` checks the weight and scratch
+  mappings, including exact named-region offsets, and dispatches the full
+  stages 1–8 chain at T=1, T=5 and T=8 in ordered Encoder segments. T=5
+  exercises the padded `bo` sink; T=8 covers maximum active extents. The T=1
+  chain starts with a GPU-produced selected token. Independent
+  `metal_mtp_gr_test` and
+  `metal_mtp_kv_projection_test` fixtures provide the numerical stage oracles.
+  The runtime-storage cases are synthetic binding/dispatch smoke tests and do
+  not establish inspected-model numerical parity or scheduler integration.
+- **Build and tests:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `cmake --build --preset mac-dev` succeeded, the focused stage 7,
+  stage 8 and runtime-storage matrix passed 5/5, the complete `mac-metal`
+  suite passed 80/80, and `mac-host` passed with its unavailable real-input
+  test skipped.
+- **Review required:** Keep stage 7 after stage 6 so its `h2` placeholders
+  are dead, preserve stage 7→8 ordering, and ensure `bo` remains scratch until
+  stage 14 writes its meaningful result. These adapters do not wire a
+  production drafter scheduler; stages 9–22 runtime bindings and inspected
+  model parity remain open.
+
+### REV-138: Hostile review of MTP stage-7/8 runtime binding
+
+- **Scope:** `bind_attention_read`, `bind_attention_kv_projection`, their
+  named bind-region and dense-weight mappings, ordered T=5/T=1 tests, scratch
+  lifetimes and current documentation.
+- **Findings and disposition:** The first hostile review found two P2 test
+  gaps: runtime scratch assertions checked handles but not named-region
+  offsets, and the integrated runtime chain did not cover T=8. The storage
+  fixture now compares full view identity (handle, offset, extent, CPU pointer
+  and GPU address) with each intended bind region and dispatches stages 1–8
+  at T=8. It also found a P3 stale API-table statement that stages 7–22
+  runtime binding remained open; the documented remaining range is now
+  stages 9–22. The hostile follow-up verified all three fixes and found no
+  further actionable implementation, test or documentation issues.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a),
+  the `mac-dev` build succeeded, the focused stage-7, stage-8 and
+  runtime-storage matrix passed 5/5, and the full `mac-metal` suite passed
+  80/80. `mac-host` passed with the unavailable real-input test skipped.
+  `test_map.py` passed with existing planned-work/missing-check diagnostics;
+  `check_drift.py` found no upstream changes and a valid golden set;
+  `git diff --check` passed. The storage fixture verifies binding and
+  dispatch, not inspected-model parity.
+
 ### D-IMPL-338: Compose MTP drafter stages 1–5
 
 - **Decision:** Add `encode_mtp_input_projection` as the ordered stages 1–5
