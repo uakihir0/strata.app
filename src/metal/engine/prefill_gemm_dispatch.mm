@@ -1,4 +1,4 @@
-// Validated encoder for the isolated Prefill BF16 MPP GEMM component.
+// Validated encoders for isolated Prefill F16/BF16 MPP GEMM components.
 #include "strata/metal/prefill_gemm_dispatch.hpp"
 
 #include "strata/metal/encoder.hpp"
@@ -18,7 +18,7 @@ namespace {
 
 constexpr std::uint32_t kTile = 64u;
 constexpr std::uint32_t kThreads = 128u;
-constexpr std::size_t kBF16Bytes = 2u;
+constexpr std::size_t kHalfBytes = 2u;
 constexpr std::size_t kFloatBytes = 4u;
 constexpr std::uint32_t kMaxSignedExtent =
     static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max());
@@ -75,15 +75,14 @@ bool overlaps(ReadOnlyBufferRef input, BufferRef output,
 
 bool validate_read_view(Context& context, ReadOnlyBufferRef view,
                         std::size_t required_bytes, std::string_view name,
-                        std::string& error) {
+                        std::string_view component, std::string& error) {
     if (!view || !context.buffers().owns(view)) {
-        error = "Prefill BF16 MPP GEMM " + std::string(name) +
+        error = std::string(component) + " " + std::string(name) +
                 " buffer is not owned by this Context";
         return false;
     }
-    if (view.length() < required_bytes ||
-        view.offset() % kBF16Bytes != 0u) {
-        error = "Prefill BF16 MPP GEMM " + std::string(name) +
+    if (view.length() < required_bytes || view.offset() % kHalfBytes != 0u) {
+        error = std::string(component) + " " + std::string(name) +
                 " buffer is undersized or misaligned";
         return false;
     }
@@ -91,34 +90,40 @@ bool validate_read_view(Context& context, ReadOnlyBufferRef view,
 }
 
 bool validate_write_view(Context& context, BufferRef view,
-                         std::size_t required_bytes, std::string& error) {
+                         std::size_t required_bytes,
+                         std::string_view component, std::string& error) {
     if (!view || !context.buffers().owns(view)) {
-        error = "Prefill BF16 MPP GEMM y buffer is not owned by this Context";
+        error = std::string(component) +
+                " y buffer is not owned by this Context";
         return false;
     }
     if (view.length < required_bytes || view.offset % kFloatBytes != 0u) {
-        error = "Prefill BF16 MPP GEMM y buffer is undersized or misaligned";
+        error = std::string(component) +
+                " y buffer is undersized or misaligned";
         return false;
     }
     return true;
 }
 
 bool validate_dispatch(Context& context,
-                       const PrefillGemmBF16MPPParams& params,
-                       const PrefillGemmBF16MPPBuffers& buffers,
+                       const PrefillGemmMPPParams& params,
+                       const PrefillGemmMPPBuffers& buffers,
+                       std::string_view component,
+                       std::size_t input_element_bytes,
                        std::size_t& x_bytes, std::size_t& w_bytes,
                        std::size_t& y_bytes, std::string& error) {
     if (!supports_apple10(context)) {
-        error = "Prefill BF16 MPP GEMM requires an Apple10 GPU";
+        error = std::string(component) + " requires an Apple10 GPU";
         return false;
     }
     if (params.rows == 0u || params.rows > kPrefillMaxShaderRows) {
-        error = "Prefill BF16 MPP GEMM row count exceeds the shader-safe "
-                "range";
+        error = std::string(component) +
+                " row count exceeds the shader-safe range";
         return false;
     }
     if (params.n == 0u || params.k < 32u || params.k % 32u != 0u) {
-        error = "Prefill BF16 MPP GEMM requires n > 0 and K divisible by 32";
+        error = std::string(component) +
+                " requires n > 0 and K divisible by 32";
         return false;
     }
     const std::uint64_t output_column_end =
@@ -127,12 +132,15 @@ bool validate_dispatch(Context& context,
         params.ldy > kMaxSignedExtent ||
         output_column_end > kMaxSignedExtent ||
         params.ldy < output_column_end) {
-        error = "Prefill BF16 MPP GEMM output extent or stride is invalid";
+        error = std::string(component) + " output extent or stride is invalid";
         return false;
     }
-    if (!checked_matrix_bytes(params.rows, params.k, kBF16Bytes, x_bytes) ||
-        !checked_matrix_bytes(params.n, params.k, kBF16Bytes, w_bytes)) {
-        error = "Prefill BF16 MPP GEMM input buffer size overflows size_t";
+    if (!checked_matrix_bytes(params.rows, params.k, input_element_bytes,
+                              x_bytes) ||
+        !checked_matrix_bytes(params.n, params.k, input_element_bytes,
+                              w_bytes)) {
+        error = std::string(component) +
+                " input buffer size overflows size_t";
         return false;
     }
     std::size_t last_row_offset = 0u;
@@ -144,47 +152,50 @@ bool validate_dispatch(Context& context,
         !checked_multiply(
             last_row_offset + static_cast<std::size_t>(output_column_end),
             kFloatBytes, y_bytes)) {
-        error = "Prefill BF16 MPP GEMM output buffer size overflows size_t";
+        error = std::string(component) +
+                " output buffer size overflows size_t";
         return false;
     }
-    if (!validate_read_view(context, buffers.x, x_bytes, "X", error) ||
-        !validate_read_view(context, buffers.w, w_bytes, "W", error) ||
-        !validate_write_view(context, buffers.y, y_bytes, error)) {
+    if (!validate_read_view(context, buffers.x, x_bytes, "X", component,
+                            error) ||
+        !validate_read_view(context, buffers.w, w_bytes, "W", component,
+                            error) ||
+        !validate_write_view(context, buffers.y, y_bytes, component, error)) {
         return false;
     }
     if (overlaps(buffers.x, buffers.y, x_bytes, y_bytes) ||
         overlaps(buffers.w, buffers.y, w_bytes, y_bytes)) {
-        error = "Prefill BF16 MPP GEMM y overlaps a read-only input";
+        error = std::string(component) + " y overlaps a read-only input";
         return false;
     }
     return true;
 }
 
-}  // namespace
-
-bool encode_prefill_gemm_bf16_mpp(
+bool encode_prefill_gemm_mpp(
     Context& context, Encoder& encoder,
-    const PrefillGemmBF16MPPParams& params,
-    const PrefillGemmBF16MPPBuffers& buffers, std::string& error) {
-    error.clear();
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, std::string_view component,
+    std::string_view pipeline, std::size_t input_element_bytes,
+    std::string& error) {
     if (encoder.concurrent_group_open()) {
-        error = "Prefill BF16 MPP GEMM requires an ordered concurrent-group "
-                "boundary";
+        error = std::string(component) +
+                " requires an ordered concurrent-group boundary";
         return false;
     }
 
     std::size_t x_bytes = 0u;
     std::size_t w_bytes = 0u;
     std::size_t y_bytes = 0u;
-    if (!validate_dispatch(context, params, buffers, x_bytes, w_bytes, y_bytes,
+    if (!validate_dispatch(context, params, buffers, component,
+                           input_element_bytes, x_bytes, w_bytes, y_bytes,
                            error)) {
         return false;
     }
 
     const EncoderBufferBinding output{buffers.y, 2u, y_bytes, kFloatBytes};
     const EncoderReadOnlyBufferBinding inputs[] = {
-        {buffers.x, 0u, x_bytes, kBF16Bytes},
-        {buffers.w, 1u, w_bytes, kBF16Bytes},
+        {buffers.x, 0u, x_bytes, input_element_bytes},
+        {buffers.w, 1u, w_bytes, input_element_bytes},
     };
     const std::array<std::uint32_t, 6u> scalar_values{
         params.rows, params.n, params.k, params.ldy, params.col0,
@@ -201,22 +212,68 @@ bool encode_prefill_gemm_bf16_mpp(
         params.rows / kTile +
         static_cast<std::size_t>(params.rows % kTile != 0u);
     return encoder.dispatch(
-        "strata_pf_gemm_bf16_mpp", {grid_x, grid_y, 1u},
-        {kThreads, 1u, 1u}, std::span<const EncoderBufferBinding>(&output, 1u),
-        inputs, scalar_bindings, {}, error);
+        pipeline, {grid_x, grid_y, 1u}, {kThreads, 1u, 1u},
+        std::span<const EncoderBufferBinding>(&output, 1u), inputs,
+        scalar_bindings, {}, error);
+}
+
+bool encode_prefill_gemm_mpp(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, std::string_view component,
+    std::string_view pipeline, std::size_t input_element_bytes,
+    std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, component,
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_gemm_mpp(
+                context, encoder, params, buffers, component, pipeline,
+                input_element_bytes, encode_error);
+        },
+        error);
+}
+
+}  // namespace
+
+bool encode_prefill_gemm_bf16_mpp(
+    Context& context, Encoder& encoder,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, std::string& error) {
+    error.clear();
+    return encode_prefill_gemm_mpp(
+        context, encoder, params, buffers, "Prefill BF16 MPP GEMM",
+        "strata_pf_gemm_bf16_mpp", kHalfBytes, error);
 }
 
 bool encode_prefill_gemm_bf16_mpp(
     Context& context, CommandBuffer& command_buffer,
-    const PrefillGemmBF16MPPParams& params,
-    const PrefillGemmBF16MPPBuffers& buffers, std::string& error) {
-    return Encoder::encode(
-        context, command_buffer, "Prefill BF16 MPP GEMM",
-        [&](Encoder& encoder, std::string& encode_error) {
-            return encode_prefill_gemm_bf16_mpp(
-                context, encoder, params, buffers, encode_error);
-        },
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, std::string& error) {
+    error.clear();
+    return encode_prefill_gemm_mpp(
+        context, command_buffer, params, buffers,
+        "Prefill BF16 MPP GEMM", "strata_pf_gemm_bf16_mpp", kHalfBytes,
         error);
+}
+
+bool encode_prefill_gemm_f16_mpp(
+    Context& context, Encoder& encoder,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, std::string& error) {
+    error.clear();
+    return encode_prefill_gemm_mpp(
+        context, encoder, params, buffers, "Prefill F16 MPP GEMM",
+        "strata_pf_gemm_f16_mpp", kHalfBytes, error);
+}
+
+bool encode_prefill_gemm_f16_mpp(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, std::string& error) {
+    error.clear();
+    return encode_prefill_gemm_mpp(
+        context, command_buffer, params, buffers, "Prefill F16 MPP GEMM",
+        "strata_pf_gemm_f16_mpp", kHalfBytes, error);
 }
 
 }  // namespace strata::metal
