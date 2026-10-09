@@ -12489,6 +12489,12 @@ bool run_indexed_head_engine_case(
         sink_buffer.view(), active_rows_buffer.view()};
     const IndexedHeadMatVecBuffers buffers{matvec_buffers,
                                            row_map_buffer.view()};
+    const ReadOnlyIndexedHeadMatVecBuffers read_only_buffers{
+        context.buffers().read_only(activation_buffer.view()),
+        context.buffers().read_only(weight_buffer.view()),
+        context.buffers().read_only(active_rows_buffer.view()),
+        output_buffer.view(), sink_buffer.view(),
+        context.buffers().read_only(row_map_buffer.view())};
     bool passed = true;
     if (test_rejections) {
         const auto expect_rejected = [&](const std::string& case_label,
@@ -12504,6 +12510,33 @@ bool run_indexed_head_engine_case(
             check(rejected, case_label, error);
             passed &= rejected;
         };
+        const auto expect_read_only_rejected =
+            [&](const std::string& case_label,
+                const ReadOnlyIndexedHeadMatVecBuffers& test_buffers,
+                const std::string& expected_error) {
+                auto rejected_command =
+                    context.make_command_buffer(case_label, error);
+                check(rejected_command != nullptr,
+                      case_label + " command-buffer allocation", error);
+                if (!rejected_command) {
+                    passed = false;
+                    return;
+                }
+                const bool accepted = Encoder::encode(
+                    context, *rejected_command, case_label,
+                    [&](Encoder& encoder, std::string& encode_error) {
+                        return encode_indexed_head_matvec(
+                            context, encoder, format, n_in, weight_rows,
+                            output_rows, test_buffers, encode_error);
+                    },
+                    error);
+                const bool rejected =
+                    !accepted &&
+                    rejected_command->unsafe_native_handle() == nullptr &&
+                    error.find(expected_error) != std::string::npos;
+                check(rejected, case_label, error);
+                passed &= rejected;
+            };
 
         std::int32_t invalid_index = -1;
         std::memcpy(row_map_buffer.payload().data(), &invalid_index,
@@ -12511,6 +12544,9 @@ bool run_indexed_head_engine_case(
         expect_rejected(label + " rejects negative row index", weight_rows,
                         output_rows, buffers,
                         "row map contains an index outside");
+        expect_read_only_rejected(
+            label + " read-only Encoder rejects negative row index",
+            read_only_buffers, "row map contains an index outside");
         invalid_index = static_cast<std::int32_t>(weight_rows);
         std::memcpy(row_map_buffer.payload().data(), &invalid_index,
                     sizeof(invalid_index));
@@ -12546,6 +12582,12 @@ bool run_indexed_head_engine_case(
                 "mat-vec active-row buffer does not match active_columns";
         check(rejects_live_rows, label + " requires one live column", error);
         passed &= rejects_live_rows;
+        std::memcpy(active_rows_buffer.payload().data(), &wrong_active_columns,
+                    sizeof(wrong_active_columns));
+        expect_read_only_rejected(
+            label + " read-only Encoder requires one live column",
+            read_only_buffers,
+            "active-row buffer does not match active_columns");
         std::memcpy(active_rows_buffer.payload().data(), &active_columns,
                     sizeof(active_columns));
 
@@ -12562,6 +12604,14 @@ bool run_indexed_head_engine_case(
         expect_rejected(label + " rejects output/row-map overlap",
                         weight_rows, output_rows, output_map_alias,
                         "outputs must not overlap an input");
+        ReadOnlyIndexedHeadMatVecBuffers read_only_output_map_alias =
+            read_only_buffers;
+        read_only_output_map_alias.output = alias_buffer.view();
+        read_only_output_map_alias.row_map =
+            context.buffers().read_only(alias_buffer.view());
+        expect_read_only_rejected(
+            label + " read-only Encoder rejects output/row-map overlap",
+            read_only_output_map_alias, "outputs must not overlap an input");
 
         IndexedHeadMatVecBuffers sink_map_alias = buffers;
         sink_map_alias.matvec.sink =
@@ -12570,6 +12620,19 @@ bool run_indexed_head_engine_case(
         expect_rejected(label + " rejects sink/row-map overlap", weight_rows,
                         output_rows, sink_map_alias,
                         "outputs must not overlap an input");
+
+        const BufferRef foreign_activation = foreign_context.buffers().allocate(
+            label + " foreign read-only activation", activation_bytes, error);
+        check(static_cast<bool>(foreign_activation),
+              label + " foreign read-only activation allocation", error);
+        if (!foreign_activation) return false;
+        ReadOnlyIndexedHeadMatVecBuffers foreign_read_only =
+            read_only_buffers;
+        foreign_read_only.activations =
+            foreign_context.buffers().read_only(foreign_activation);
+        expect_read_only_rejected(
+            label + " read-only Encoder rejects foreign Context input",
+            foreign_read_only, "not owned by this Context");
 
         twin::GuardedBuffer short_map_buffer;
         check(short_map_buffer.allocate(
@@ -12754,6 +12817,45 @@ bool run_indexed_head_engine_case(
     const bool nonzero = std::any_of(
         expected.begin(), expected.end(), [](float value) { return value != 0.0f; });
     check(nonzero, label + " produces nonzero output");
+
+    std::memset(output_buffer.payload().data(), 0xa5, output_bytes);
+    std::memset(sink_buffer.payload().data(), 0xa5, sink_bytes);
+    activation_buffer.capture_before_dispatch();
+    output_buffer.capture_before_dispatch();
+    sink_buffer.capture_before_dispatch();
+    auto read_only_command =
+        context.make_command_buffer(label + " read-only Encoder", error);
+    check(read_only_command != nullptr,
+          label + " read-only command-buffer allocation", error);
+    if (!read_only_command) return false;
+    const bool read_only_encoded = Encoder::encode(
+        context, *read_only_command, label + " read-only Encoder segment",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_q8_1(context, encoder, 1u, n_in,
+                             {input_buffer.view(), activation_buffer.view()},
+                             encode_error)) {
+                return false;
+            }
+            return encode_indexed_head_matvec(
+                context, encoder, format, n_in, weight_rows, output_rows,
+                read_only_buffers, encode_error);
+        },
+        error);
+    check(read_only_encoded, label + " read-only Encoder production path",
+          error);
+    if (!read_only_encoded) return false;
+    const bool read_only_completed = wait_for_engine_command(
+        *read_only_command, label + " read-only Encoder", error);
+    check(read_only_completed,
+          label + " read-only Encoder command completes", error);
+    if (!read_only_completed) return false;
+    const auto read_only_output_mismatch =
+        twin::compare_bytes(output_buffer.payload(), expected_bytes);
+    check(!read_only_output_mismatch,
+          label + " read-only Encoder output matches scalar oracle",
+          read_only_output_mismatch ? read_only_output_mismatch->reason
+                                    : std::string{});
+
     check(!input_buffer.first_unwritten_change({}),
           label + " leaves F32 input unchanged");
     check(!weight_buffer.first_unwritten_change({}),
@@ -12764,15 +12866,16 @@ bool run_indexed_head_engine_case(
           label + " leaves row map unchanged");
     check(!sink_buffer.first_unwritten_change({}),
           label + " leaves unused sink unchanged");
-    const std::array<twin::ByteRange, 1> activation_written =
-        {{{0u, activation_bytes}}};
-    check(!activation_buffer.first_unwritten_change(activation_written),
-          label + " Q8_1 activation guards remain unchanged");
+    check(!activation_buffer.first_unwritten_change({}),
+          label + " Q8_1 activation remains unchanged in read-only dispatch");
     const std::array<twin::ByteRange, 1> output_written =
         {{{0u, output_bytes}}};
     check(!output_buffer.first_unwritten_change(output_written),
           label + " output guards remain unchanged");
-    return passed && !output_mismatch && nonzero;
+    check(!sink_buffer.first_unwritten_change({}),
+          label + " read-only Encoder leaves sink guards unchanged");
+    return passed && !output_mismatch && !read_only_output_mismatch &&
+           nonzero;
 }
 
 bool run_indexed_head_engine_encoders(Context& context) {

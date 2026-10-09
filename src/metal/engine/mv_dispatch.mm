@@ -1104,6 +1104,173 @@ bool encode_matvec_impl(Context& context, void* command_handle,
     return true;
 }
 
+bool encode_read_only_indexed_head_matvec_impl(
+    Context& context, Encoder& encoder, MatVecWeightFormat format,
+    std::uint32_t n_in, std::uint32_t weight_rows,
+    std::uint32_t output_rows,
+    const ReadOnlyIndexedHeadMatVecBuffers& buffers, std::string& error) {
+    constexpr std::string_view operation = "indexed head mat-vec";
+    error.clear();
+
+    FormatInfo info;
+    if (!format_info(format, info)) {
+        error = std::string(operation) + " weight format is unsupported";
+        return false;
+    }
+    if (format != MatVecWeightFormat::q5_k &&
+        format != MatVecWeightFormat::q6_k &&
+        format != MatVecWeightFormat::iq4_xs) {
+        error = "indexed head format must be Q5_K, Q6_K or IQ4_XS";
+        return false;
+    }
+    if (n_in == 0u || n_in > kMaxMatVecWidth || output_rows == 0u) {
+        error = std::string(operation) +
+                " dimensions must have n_in in 1..16640 and positive output_rows";
+        return false;
+    }
+    if (weight_rows == 0u || output_rows > weight_rows ||
+        static_cast<std::uint64_t>(weight_rows) >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::int32_t>::max()) +
+                1u) {
+        error = "indexed head row counts must fit signed indices and output rows";
+        return false;
+    }
+    if (n_in % info.block_values != 0u) {
+        error = std::string(operation) +
+                " n_in is not divisible by the weight block width";
+        return false;
+    }
+
+    constexpr std::uint32_t active_columns = 1u;
+    constexpr std::uint32_t compiled_columns = 1u;
+    const std::uint64_t blocks_per_row = n_in / info.block_values;
+    const std::uint64_t row_bytes = blocks_per_row * info.block_bytes;
+    std::uint64_t weight_count = 0u;
+    std::uint64_t weight_byte_count = 0u;
+    if (!checked_mul(weight_rows, blocks_per_row, weight_count) ||
+        !checked_mul(weight_rows, row_bytes, weight_byte_count) ||
+        weight_count > kShaderIndexCapacity ||
+        static_cast<std::uint64_t>(compiled_columns) * output_rows >
+            kShaderIndexCapacity) {
+        error = std::string(operation) +
+                " flattened index exceeds the 32-bit shader range";
+        return false;
+    }
+
+    std::size_t activation_bytes = 0u;
+    std::size_t weight_bytes = 0u;
+    std::size_t output_bytes = 0u;
+    std::size_t sink_bytes = 0u;
+    std::size_t row_map_bytes = 0u;
+    const std::uint64_t input_count =
+        static_cast<std::uint64_t>(n_in) / kQ8_1BlockValues;
+    if (input_count > kShaderIndexCapacity ||
+        !checked_bytes(input_count, kQ8_1BlockBytes, activation_bytes) ||
+        !checked_bytes(weight_byte_count, 1u, weight_bytes) ||
+        !checked_bytes(output_rows, sizeof(float), output_bytes) ||
+        !checked_bytes(1u, sizeof(float), sink_bytes) ||
+        !checked_bytes(output_rows, sizeof(std::int32_t), row_map_bytes)) {
+        error = std::string(operation) +
+                " buffer size overflows the host byte range";
+        return false;
+    }
+
+    std::uint32_t rows_per_group = 1u;
+    if (blocks_per_row < info.small_k_threshold) rows_per_group = 4u;
+    const std::string kernel_name =
+        std::string("strata_mv_") + info.name + "_n1_x";
+    id<MTLComputePipelineState> pipeline = nil;
+    if (!validate_pipeline(context, kernel_name.c_str(), kMatVecThreadsX,
+                           kMatVecThreadsY, operation, pipeline, error)) {
+        return false;
+    }
+
+    if (!validate_read_only_buffer(
+            context, buffers.activations, activation_bytes, 256u,
+            "activations", operation, error) ||
+        !validate_read_only_buffer(
+            context, buffers.weights, weight_bytes, alignof(std::uint16_t),
+            "weights", operation, error) ||
+        !validate_read_only_buffer(
+            context, buffers.active_rows, sizeof(std::uint32_t),
+            alignof(std::uint32_t), "active-row count", operation, error) ||
+        !validate_read_only_buffer(
+            context, buffers.row_map, row_map_bytes, alignof(std::int32_t),
+            "row map", operation, error) ||
+        !validate_buffer(context, buffers.output, output_bytes,
+                         alignof(float), "output", error) ||
+        !validate_buffer(context, buffers.sink, sink_bytes,
+                         alignof(float), "sink", error)) {
+        return false;
+    }
+
+    std::uint32_t live_rows = 0u;
+    std::memcpy(&live_rows, buffers.active_rows.contents(), sizeof(live_rows));
+    if (live_rows != active_columns) {
+        error = "mat-vec active-row buffer does not match active_columns";
+        return false;
+    }
+    const auto* const indices =
+        static_cast<const std::int32_t*>(buffers.row_map.contents());
+    for (std::uint32_t output_row = 0u; output_row < output_rows;
+         ++output_row) {
+        if (indices[output_row] < 0 ||
+            static_cast<std::uint32_t>(indices[output_row]) >= weight_rows) {
+            error = "mat-vec row map contains an index outside the full head";
+            return false;
+        }
+    }
+
+    const auto output_overlaps_input = [&](BufferRef output,
+                                           std::size_t bytes) {
+        return read_only_buffer_ranges_overlap(
+                   buffers.activations, activation_bytes, output, bytes) ||
+               read_only_buffer_ranges_overlap(
+                   buffers.weights, weight_bytes, output, bytes) ||
+               read_only_buffer_ranges_overlap(
+                   buffers.active_rows, sizeof(std::uint32_t), output, bytes) ||
+               read_only_buffer_ranges_overlap(
+                   buffers.row_map, row_map_bytes, output, bytes);
+    };
+    if (output_overlaps_input(buffers.output, output_bytes) ||
+        output_overlaps_input(buffers.sink, sink_bytes) ||
+        buffer_ranges_overlap(buffers.output, output_bytes,
+                              buffers.sink, sink_bytes)) {
+        error = std::string(operation) +
+                " outputs must not overlap an input or each other";
+        return false;
+    }
+
+    const MatVecParams params{n_in, output_rows};
+    const std::array writable_bindings{
+        EncoderBufferBinding{buffers.output, 2u, output_bytes,
+                             alignof(float)},
+        EncoderBufferBinding{buffers.sink, 3u, sink_bytes, alignof(float)},
+    };
+    const std::array read_only_bindings{
+        EncoderReadOnlyBufferBinding{buffers.activations, 0u,
+                                     activation_bytes, 256u},
+        EncoderReadOnlyBufferBinding{buffers.weights, 1u, weight_bytes,
+                                     alignof(std::uint16_t)},
+        EncoderReadOnlyBufferBinding{buffers.active_rows, 4u,
+                                     sizeof(std::uint32_t),
+                                     alignof(std::uint32_t)},
+        EncoderReadOnlyBufferBinding{buffers.row_map, 6u, row_map_bytes,
+                                     alignof(std::int32_t)},
+    };
+    const std::array inline_bytes{
+        EncoderBytesBinding{&params, sizeof(params), 5u},
+    };
+    const std::uint32_t grid_x = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(output_rows) + rows_per_group - 1u) /
+        rows_per_group);
+    return encoder.dispatch(
+        kernel_name, {grid_x, 1u, 1u},
+        {kMatVecThreadsX, kMatVecThreadsY, 1u}, writable_bindings,
+        read_only_bindings, inline_bytes, {}, error);
+}
+
 bool encode_read_only_matvec_impl(
     Context& context, Encoder& encoder, MatVecWeightFormat format,
     std::uint32_t n_in, std::uint32_t n_out,
@@ -1460,6 +1627,16 @@ bool encode_indexed_head_matvec(
                 n_in, output_rows, 1u, 1u, buffers.matvec,
                 &buffers.row_map, weight_rows, encode_error);
         },
+        error);
+}
+
+bool encode_indexed_head_matvec(
+    Context& context, Encoder& encoder, MatVecWeightFormat format,
+    std::uint32_t n_in, std::uint32_t weight_rows,
+    std::uint32_t output_rows,
+    const ReadOnlyIndexedHeadMatVecBuffers& buffers, std::string& error) {
+    return encode_read_only_indexed_head_matvec_impl(
+        context, encoder, format, n_in, weight_rows, output_rows, buffers,
         error);
 }
 

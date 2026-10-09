@@ -106,6 +106,19 @@ struct IndexedHeadMatVecBuffers {
     BufferRef row_map;
 };
 
+struct ReadOnlyIndexedHeadMatVecBuffers {
+    // Q8_1 activation row and packed head weights are MSL const inputs.
+    ReadOnlyBufferRef activations;
+    ReadOnlyBufferRef weights;
+    // Host-visible uint32 value equal to one.
+    ReadOnlyBufferRef active_rows;
+    // Receives indexed output rows; sink is required to hold at least one float.
+    BufferRef output;
+    BufferRef sink;
+    // Host-visible int32 row indices: output row -> full-head weight row.
+    ReadOnlyBufferRef row_map;
+};
+
 /// Encode one dense projection with a compiled NC width of 1, 2, 4 or 8.
 /// `active_columns` may be smaller than `compiled_columns`; the unused outputs
 /// are written to `sink`. Non-indexed dense/head variants are supported.
@@ -221,5 +234,23 @@ bool encode_indexed_head_matvec(
     MatVecWeightFormat format, std::uint32_t n_in,
     std::uint32_t weight_rows, std::uint32_t output_rows,
     const IndexedHeadMatVecBuffers& buffers, std::string& error);
+
+/// Add the indexed draft-vocabulary head dispatch to a caller-owned compute
+/// segment for Q5_K, Q6_K or IQ4_XS. `weight_rows` is the full head row count;
+/// `output_rows` is the row-map length and must not exceed it. This path uses
+/// one active and compiled column, and validates each signed row-map index
+/// against the full head.
+///
+/// All views must belong to `context`. Read-only inputs may alias each other;
+/// output and sink must not overlap any input or each other. Keep every
+/// read-only input, including `row_map` and `active_rows`, alive and unchanged
+/// until command completion. Propagate false from the enclosing
+/// `Encoder::encode` body so earlier dispatches in its unsubmitted segment are
+/// discarded.
+bool encode_indexed_head_matvec(
+    Context& context, Encoder& encoder, MatVecWeightFormat format,
+    std::uint32_t n_in, std::uint32_t weight_rows,
+    std::uint32_t output_rows,
+    const ReadOnlyIndexedHeadMatVecBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal
