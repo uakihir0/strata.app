@@ -10658,3 +10658,32 @@ measuring L-15 remain open.
   one unavailable-real-input test skipped; the Python runner passed 35/35
   modules with declared skips. Manifest and `test_map` checks passed, and
   `git diff --check` passed.
+
+### D-IMPL-371: Add the Q3_K Prefill dequantizer
+
+- **Decision:** Add `strata_pf_dequant_q3_k` and caller-owned/standalone
+  `encode_prefill_dequant_q3_k` APIs. Decode the native 256-value, 110-byte
+  block from four two-bit `qs` groups, the corresponding `hmask` bit and 16
+  packed six-bit scales biased by 32. Evaluate `(d * (scale - 32)) * q` in
+  F32, round once to F16 and write K-major `[k][n_out]` scratch. Use the
+  shared checked dispatch with Q3_K-specific block geometry.
+- **Reason:** Q3_K is used by the Phase-1 model catalogue, native mat-vec and
+  Q3_K embedding decoder. Reusing the documented scale/bitplane layout adds
+  another dense format without claiming production Prefill scheduling.
+- **Review and fixes:** The hostile review cross-checked all four packed-scale
+  reconstruction cases, `qs`/`hmask` decoding, signed codes, block geometry,
+  K-major output and F32-to-F16 arithmetic against the embedding decoder,
+  CUDA `group32` path and scalar oracle. It found that the two literal 32-byte
+  `qs` halves repeated, allowing a missing second-half offset to pass. The
+  fixture now toggles each low q bit in the second half and the separate
+  logical oracle models that pattern. A negative-control build with the
+  kernel's 32-byte half offset removed fails the Q3_K expansion assertion;
+  restoring the offset makes serial and concurrent tests pass.
+- **Disposition:** The reviewer found no decoder, host validation, arithmetic
+  or manifest defect. The fixture blind spot is corrected; follow-up hostile
+  review of that correction is pending.
+- **Validation:** The mac-dev build succeeded and the focused serial and
+  concurrent dequant tests passed 2/2 after the fix. Before the fixture repair,
+  the complete mac-metal suite passed 90/90, mac-host passed 44 tests with one
+  unavailable-input test skipped, and the Python runner passed 35/35 modules
+  with declared skips. `git diff --check` passes.

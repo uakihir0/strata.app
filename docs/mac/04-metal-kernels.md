@@ -303,7 +303,7 @@ column points to the specification. "Threads" is the manifest value.
 | `strata_pf_gdn_gates`, `strata_pf_gdn_conv_tiled`, `strata_pf_gdn_conv_hist`, `strata_pf_gdn_l2`, `strata_pf_gdn_rec`, `strata_pf_gdn_out_norm` | | 6.4 |
 | `strata_pf_gate_attn` | | 6.5 |
 | `strata_idx_append_first`, `strata_idx_append_blocks`, `strata_idx_append_tail` | | 6.5 |
-| `strata_pf_dequant_{iq4_nl,q2_0,q4_0,q4_k,q5_k,q5_0,q6_k,q8_0}` | these eight of the 11 dense formats; the other three are planned | 6.2 |
+| `strata_pf_dequant_{iq4_nl,q2_0,q3_k,q4_0,q4_k,q5_k,q5_0,q6_k,q8_0}` | these nine of the 11 dense formats; the other two are planned | 6.2 |
 | `strata_pf_gemm_f16` | `mpp`, `simd` | 6.2 |
 | `strata_pf_gemm_bf16` | `mpp`, `simd` | 6.2 |
 | `strata_pf_gemm_bf16_mpp` | isolated Apple10 MPP component; not the production selector | 6.2 |
@@ -3879,13 +3879,15 @@ Mac runs its own tiles. The projections:
   upstream does, this happens again for every layer of every chunk.
 - **The routed experts** do not use these kernels. They dequantise inside their own tiles (section 6.6).
 
-The repository implements standalone IQ4_NL, Q2_0, Q4_0, Q4_K, Q5_K, Q5_0,
-Q6_K and Q8_0 variants as
-`strata_pf_dequant_{iq4_nl,q2_0,q4_0,q4_k,q5_k,q5_0,q6_k,q8_0}`,
+The repository implements standalone IQ4_NL, Q2_0, Q3_K, Q4_0, Q4_K, Q5_K,
+Q5_0, Q6_K and Q8_0 variants as
+`strata_pf_dequant_{iq4_nl,q2_0,q3_k,q4_0,q4_k,q5_k,q5_0,q6_k,q8_0}`,
 exposed by matching `encode_prefill_dequant_*` functions. IQ4_NL maps
 low/high nibbles through the 16-entry nonlinear codebook; Q2_0 expands
 64-value blocks by extracting four two-bit codes per byte and subtracting
-one; Q4_0 extracts low/high nibbles from each 16-byte code array; Q4_K
+one; Q3_K expands 256-value blocks from packed two-bit codes and a per-value
+high-bit mask, then applies packed six-bit scales for each 16-value group;
+Q4_0 extracts low/high nibbles from each 16-byte code array; Q4_K
 expands 256-value blocks using eight packed six-bit scale/min groups and
 low/high nibbles; Q5_K expands 256-value blocks by combining each nibble
 with the matching bit from its 5-bit `qh` plane and applying the packed
@@ -3896,14 +3898,14 @@ Q8_0 reads signed bytes. Each applies its format's F32 dequantization
 expression, converts once to F16, and writes K-major scratch. The serial and
 concurrent GPU tests compare exact F16 bits from logical codes independent of
 the packed-block decoder, preserve the source, and check guards, invalid
-extents, aliases, Context ownership and transactional discard. The other three
+extents, aliases, Context ownership and transactional discard. The other two
 format pipelines and all production `Prefill::run` wiring remain open; these
 component tests do not establish end-to-end prefill or model inference.
 
 **`strata_pf_dequant_<fmt>`**, one pipeline per implemented format of section
 5.8. Grid (⌈n_out / 256⌉, K / values_per_block) × 256: thread n = 256·tg.x +
-tid decodes block g = tg.y of row n; Q2_0 uses 64 values per block, Q4_K,
-Q5_K and Q6_K use 256, and the other implemented formats use 32.
+tid decodes block g = tg.y of row n; Q2_0 uses 64 values per block, Q3_K,
+Q4_K, Q5_K and Q6_K use 256, and the other implemented formats use 32.
 
 ```c++
 n = 256*tg.x + tid;  g = tg.y;
@@ -3915,7 +3917,9 @@ for (j = 0; j < values_per_block; ++j)
 ```
 
 - `value_<fmt>` is upstream's `group32` expression for the format, written per value:
-  - Q3_K, IQ3_S and IQ4_XS use the decodes of section 5.2;
+  - Q3_K: `(d · float(sc)) · float(q2 − (hmask ? 0 : 4))`, with its packed
+    scale decoded from section 5.2;
+  - IQ3_S and IQ4_XS use the decodes of section 5.2;
   - Q2_0: `float(q − 1) · d`;
   - Q4_0, Q5_0 and Q8_0: `float(q − 8)`, `float(q − 16)` and `float(q)`, each times `d`;
   - IQ4_NL: `d · float(kvalues_iq4nl[nib])`;
