@@ -9972,3 +9972,55 @@ measuring L-15 remain open.
   changes; the full `mac-metal` suite passed 82/82 and `mac-host` passed 43
   tests with one unavailable-model-input test skipped. No implementation
   correction was required by review.
+
+### D-IMPL-357: Implement an isolated Apple10 F16 MPP GEMM
+
+- **Decision:** Add `strata_pf_gemm_f16_mpp` and validated standalone and
+  caller-owned Encoder APIs beside the isolated BF16 MPP GEMM. Read F16 X as
+  row-major `[rows][k]`, read F16 W from the K-major `[k][n]` dequantization
+  scratch, and write F32 Y with caller-selected `col0` and `ldy`. Keep
+  overwrite and accumulate modes, Apple10 restriction, shader-safe row and
+  signed-extent checks, checked input/output byte ranges, alignment and
+  Context ownership checks, read-only input/output disjointness, and ordered
+  concurrent-group boundaries shared with the BF16 dispatch. The shader
+  exposes const F16 inputs at its ABI; it removes const qualification only to
+  form MPP tensor wrappers, and passes those wrappers solely to the read-only
+  matrix operation. Keep SIMD fallbacks, BF16X2 remainder GEMM, the production
+  selector and Prefill scheduling/chunk integration open.
+- **Reason:** Section 6.2 defines the F16 MPP tile and K-major dequantization
+  scratch as the Apple10 prompt-projection path. Implementing this as an
+  independently validated component follows that layout and advances the
+  documented plan while preserving the distinction between a tested kernel
+  and production Prefill.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the `mac-dev` build succeeded. The serial and concurrent
+  F16/BF16 GEMM CTests pass 2/2 after the test oracle was corrected to use
+  K-major weights for F16. The cases compare T,n=1/63/65 at K=32 and
+  65×65×2560 in overwrite and accumulate modes with an FP64 oracle under
+  U(2K) and R(2^-16), and check padding, immutability, guards, validation,
+  alias rejection and rollback. The full `mac-metal` suite passed 82/82;
+  `mac-host` passed 43 tests and skipped the single test that needs unavailable
+  model inputs. `test_map.py`, `check_drift.py` and `git diff --check` pass. These isolated
+  tests do not establish cross-family MPP support, the SIMD path, production
+  Prefill integration or model-backed inference.
+
+### REV-154: Hostile review of the isolated Prefill F16 MPP GEMM
+
+- **Scope:** F16 and BF16 MPP layouts and descriptors, tensor slices,
+  edge-tile safety, shared host validation and transaction behavior, input
+  immutability, alias tests, GPU oracle coverage and synchronized status
+  documentation.
+- **Findings:** The first review found no concrete runtime defect in the F16
+  path or BF16 regression. It identified stale documentation that called
+  isolated F16 MPP unimplemented and missing direct coverage of W/Y overlap.
+  The follow-up review then reported the W/Y fixture's backing range as
+  undersized. The current fixture uses a 160-byte view, with W spanning
+  `[0,128)` and Y spanning `[120,132)`, so the views are valid and overlap by
+  eight bytes; a final source review confirmed the finding is resolved and
+  the fixture runs for F16 and BF16.
+- **Disposition:** Updated the kernel, engine and test documentation to list
+  isolated F16 MPP while keeping SIMD and production integration pending.
+  Added the W/Y partial-overlap regression for both input formats. The
+  focused serial/concurrent CTests passed 2/2 after these fixes, and the full
+  `mac-metal` suite passed 82/82. No implementation defect remains from
+  review.

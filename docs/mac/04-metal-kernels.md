@@ -3945,16 +3945,17 @@ op.run(tX.slice(0, 64*tg.y), tW.slice(64*tg.x, 0), tY.slice(64*tg.x, 64*tg.y));
   write only live elements; that `multiply_accumulate` adds to Y; and whether the result is independent of the chunk
   size (`prefill_chunk_independent` under `mpp`). If any check fails, that family defaults to `simd`.
 
-The repository currently implements `strata_pf_gemm_bf16_mpp` as an isolated
-Apple10 component with validated standalone and caller-owned Encoder APIs.
-It covers BF16 X/W, F32 strided Y, overwrite and accumulate modes, and edge
-slices; its Metal tests exercise T and n at 1/63/65 and K=32/2560 against the
-U(2K) and R(2^-16) contracts. Context skips `_mpp` pipelines on other GPU
-families, and the encoder rejects dispatch there. This component does not
-implement the F16 MPP path, either SIMD fallback, BF16X2 activation remainder,
-the production `STRATA_METAL_GEMM` selector, GEMM scheduling or Prefill chunk
-integration. L-6, testing on the other GPU families, and the production
-Prefill path remain open.
+The repository currently implements `strata_pf_gemm_f16_mpp` and
+`strata_pf_gemm_bf16_mpp` as isolated Apple10 components with validated
+standalone and caller-owned Encoder APIs. They cover F16/BF16 inputs, F32
+strided Y, overwrite and accumulate modes, and edge slices; the F16 weight
+fixture uses the documented K-major scratch layout. Their Metal tests exercise
+T and n at 1/63/65 and K=32/2560 against the U(2K) and R(2^-16) contracts.
+Context skips `_mpp` pipelines on other GPU families, and the encoders reject
+dispatch there. These components do not implement either SIMD fallback,
+BF16X2 activation remainder, the production `STRATA_METAL_GEMM` selector,
+GEMM scheduling or Prefill chunk integration. L-6, testing on the other GPU
+families, and the production Prefill path remain open.
 
 **`simd`** (`simdgroup_matrix`, every family). Grid (⌈n / 64⌉, ⌈T / 32⌉) × 128. The output tile is 32 rows × 64
 columns. Simdgroup sg computes rows `16·(sg / 2)` .. +15 and columns `32·(sg % 2)` .. +31 of it, as 2 × 4 blocks of
