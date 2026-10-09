@@ -28,6 +28,8 @@ constexpr std::uint32_t kMtpQueryProjectionWidth =
     N_HEAD_Q * 2u * HEAD_DIM;
 constexpr std::uint32_t kMtpQueryHeadWidth =
     N_HEAD_Q * HEAD_DIM;
+constexpr std::uint32_t kMtpOutputProjectionInputWidth =
+    N_HEAD_Q * HEAD_DIM;
 constexpr std::uint32_t kMtpQ8BlockValues = 32u;
 constexpr std::uint32_t kMtpQ81BlockBytes = 36u;
 constexpr std::uint32_t kMtpAddStreamsThreads = 256u;
@@ -49,6 +51,7 @@ static_assert(offsetof(MtpParams, T) == 0u);
 static_assert(sizeof(Q81) == kMtpQ81BlockBytes);
 static_assert(kMtpQueryProjectionWidth == 12'288u);
 static_assert(kMtpQueryHeadWidth == 6'144u);
+static_assert(kMtpOutputProjectionInputWidth == 6'144u);
 static_assert(kMtpWindowIdsStride == 2'048u);
 
 template <class Address>
@@ -1046,6 +1049,124 @@ bool validate_mtp_attention(Context& context,
     return true;
 }
 
+bool validate_mtp_attention_output_projection(
+    Context& context, const MtpAttentionOutputProjectionBuffers& buffers,
+    ReadOnlyBufferRef& active_rows, std::string& error) {
+    constexpr char operation[] = "MTP attention output projection";
+    std::uint32_t rows = 0u;
+    if (!read_mtp_rows(context, buffers.params, operation, rows, error)) {
+        return false;
+    }
+    if (rows != 1u) {
+        error = std::string(operation) +
+                " requires T=1 for the full-layer pass";
+        return false;
+    }
+
+    constexpr std::size_t attention_bytes =
+        static_cast<std::size_t>(kMtpOutputProjectionInputWidth) *
+        sizeof(float);
+    constexpr std::size_t q_full_bytes =
+        static_cast<std::size_t>(kMtpQueryProjectionWidth) * sizeof(float);
+    constexpr std::size_t output_bytes =
+        static_cast<std::size_t>(N_EMBD) * sizeof(float);
+    constexpr std::size_t sink_bytes = sizeof(float);
+    constexpr std::size_t activation_bytes =
+        (static_cast<std::size_t>(kMtpOutputProjectionInputWidth) /
+         kMtpQ8BlockValues) *
+        kMtpQ81BlockBytes;
+    constexpr std::size_t weight_blocks =
+        static_cast<std::size_t>(N_EMBD) *
+        (kMtpOutputProjectionInputWidth / kMtpQ8BlockValues);
+    constexpr std::size_t weight_bytes =
+        weight_blocks * sizeof(block_q8_0);
+
+    if (!validate_read_only_buffer(context, buffers.params,
+                                   sizeof(MtpParams), alignof(MtpParams),
+                                   "params", operation, error) ||
+        !validate_read_only_buffer(
+            context, context.buffers().read_only(buffers.attn),
+            attention_bytes, alignof(float), "attn", operation, error) ||
+        !validate_read_only_buffer(
+            context, context.buffers().read_only(buffers.q_full),
+            q_full_bytes, alignof(float), "q_full", operation, error) ||
+        !validate_buffer_view(context, buffers.attn32, attention_bytes,
+                              256u, operation, "attn32", error) ||
+        !validate_buffer_view(context, buffers.xq, activation_bytes, 256u,
+                              operation, "stage-14 xq", error) ||
+        !validate_read_only_buffer(context, buffers.o_weights, weight_bytes,
+                                   alignof(block_q8_0), "o_proj weights",
+                                   operation, error) ||
+        !validate_buffer_view(context, buffers.bo, output_bytes,
+                              alignof(float), operation, "bo", error) ||
+        !validate_buffer_view(context, buffers.sink, sink_bytes,
+                              alignof(float), operation, "sink", error)) {
+        return false;
+    }
+
+    active_rows =
+        buffers.params.slice(offsetof(MtpParams, T), sizeof(std::uint32_t));
+    if (!active_rows) {
+        error = std::string(operation) +
+                " cannot form its active-row metadata view";
+        return false;
+    }
+
+    struct InputView {
+        const char* name;
+        ReadOnlyBufferRef view;
+        std::size_t bytes;
+    };
+    const std::array<InputView, 4> inputs{{
+        {"params", buffers.params, sizeof(MtpParams)},
+        {"attn", context.buffers().read_only(buffers.attn), attention_bytes},
+        {"q_full", context.buffers().read_only(buffers.q_full), q_full_bytes},
+        {"o_proj weights", buffers.o_weights, weight_bytes},
+    }};
+    struct OutputView {
+        const char* name;
+        BufferRef view;
+        std::size_t bytes;
+    };
+    const std::array<OutputView, 4> outputs{{
+        {"attn32", buffers.attn32, attention_bytes},
+        {"stage-14 xq", buffers.xq, activation_bytes},
+        {"bo", buffers.bo, output_bytes},
+        {"sink", buffers.sink, sink_bytes},
+    }};
+    for (const auto& output : outputs) {
+        for (const auto& input : inputs) {
+            if (overlaps(input.view, input.bytes, output.view,
+                         output.bytes)) {
+                error = std::string(operation) + " " + output.name +
+                        " overlaps input " + input.name;
+                return false;
+            }
+        }
+    }
+    for (std::size_t input = 1u; input < inputs.size(); ++input) {
+        if (overlaps(inputs[0].view, inputs[0].bytes, inputs[input].view,
+                     inputs[input].bytes)) {
+            error = std::string(operation) +
+                    " parameter block overlaps input " + inputs[input].name;
+            return false;
+        }
+    }
+    for (std::size_t left = 0u; left < outputs.size(); ++left) {
+        for (std::size_t right = left + 1u; right < outputs.size(); ++right) {
+            if (overlaps(outputs[left].view, outputs[left].bytes,
+                         outputs[right].view, outputs[right].bytes)) {
+                error = std::string(operation) + " outputs " +
+                        outputs[left].name + " and " + outputs[right].name +
+                        " overlap";
+                return false;
+            }
+        }
+    }
+    error.clear();
+    return true;
+}
+
 }  // namespace
 
 bool encode_mtp_add_streams(Context& context, Encoder& encoder,
@@ -1516,6 +1637,53 @@ bool encode_mtp_attention(Context& context, CommandBuffer& command_buffer,
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_mtp_attention(context, encoder, buffers,
                                         encode_error);
+        },
+        error);
+}
+
+bool encode_mtp_attention_output_projection(
+    Context& context, Encoder& encoder,
+    const MtpAttentionOutputProjectionBuffers& buffers,
+    std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "MTP attention output projection requires an ordered "
+                "concurrent-group boundary";
+        return false;
+    }
+
+    ReadOnlyBufferRef active_rows;
+    if (!validate_mtp_attention_output_projection(
+            context, buffers, active_rows, error)) {
+        return false;
+    }
+
+    if (!encode_qsa_gate(
+            context, encoder, 1u,
+            {buffers.attn, buffers.q_full, buffers.attn32}, error) ||
+        !encode_q8_1(
+            context, encoder, 1u, kMtpOutputProjectionInputWidth,
+            {buffers.attn32, buffers.xq}, error)) {
+        return false;
+    }
+    const ReadOnlyBufferRef activations =
+        context.buffers().read_only(buffers.xq);
+    return encode_q8_0_matvec(
+        context, encoder, kMtpOutputProjectionInputWidth, N_EMBD, 1u, 1u,
+        {activations, buffers.o_weights, active_rows, buffers.bo,
+         buffers.sink},
+        error);
+}
+
+bool encode_mtp_attention_output_projection(
+    Context& context, CommandBuffer& command_buffer,
+    const MtpAttentionOutputProjectionBuffers& buffers,
+    std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "MTP attention output projection",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_mtp_attention_output_projection(
+                context, encoder, buffers, encode_error);
         },
         error);
 }

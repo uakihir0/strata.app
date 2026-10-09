@@ -142,6 +142,23 @@ struct MtpAttentionBuffers {
     bool kv_rot = false;
 };
 
+/// Inputs and outputs for MTP stage 14's attention gate and O projection.
+/// The stage consumes stage 13's 24×256 attention values and stage 10's
+/// q_full, gates the attention values, quantizes the 6144-wide row to Q8_1,
+/// then projects through the read-only Q8_0 o_proj matrix into `bo`. Keep all
+/// views alive through GPU completion, and keep params, inputs and weights
+/// unchanged until the encoder has consumed them.
+struct MtpAttentionOutputProjectionBuffers {
+    ReadOnlyBufferRef params;
+    BufferRef attn;
+    BufferRef q_full;
+    BufferRef attn32;
+    BufferRef xq;
+    ReadOnlyBufferRef o_weights;
+    BufferRef bo;
+    BufferRef sink;
+};
+
 /// Add MTP hidden and embedding streams to the caller-owned Encoder segment.
 /// On failure, the enclosing Encoder::encode body must return false so prior
 /// work in that segment is discarded.
@@ -237,5 +254,18 @@ bool encode_mtp_attention(Context& context,
                           CommandBuffer& command_buffer,
                           const MtpAttentionBuffers& buffers,
                           std::string& error);
+
+/// Encode MTP stage 14: apply the QSA gate, quantize its 6144-wide result to
+/// Q8_1, then run the T=1 Q8_0 O projection. The standalone form is
+/// transactional; callers of the Encoder form must propagate failure from
+/// their enclosing `Encoder::encode` body.
+bool encode_mtp_attention_output_projection(
+    Context& context, Encoder& encoder,
+    const MtpAttentionOutputProjectionBuffers& buffers,
+    std::string& error);
+bool encode_mtp_attention_output_projection(
+    Context& context, CommandBuffer& command_buffer,
+    const MtpAttentionOutputProjectionBuffers& buffers,
+    std::string& error);
 
 }  // namespace strata::metal
