@@ -7,7 +7,9 @@
 #include "strata/metal/mtp_kv.hpp"
 #include "strata/metal/window_head_mixer.hpp"
 
+#include <cstdint>
 #include <string>
+#include <utility>
 
 namespace strata::metal {
 
@@ -440,8 +442,48 @@ bool encode_mtp_final_mixer(Context& context, CommandBuffer& command_buffer,
                             const MtpFinalMixerBuffers& buffers,
                             std::string& error);
 
+/// An immutable subset-to-full-head row map validated once on the host. Keep
+/// the underlying storage alive and unchanged for as long as this token is
+/// reused by stage 21/22.
+class MtpDraftVocabularyMap {
+public:
+    MtpDraftVocabularyMap() = default;
+
+    explicit operator bool() const noexcept {
+        return static_cast<bool>(rows_) && row_count_ != 0u &&
+               full_head_size_ != 0u;
+    }
+    ReadOnlyBufferRef rows() const noexcept { return rows_; }
+    std::uint32_t row_count() const noexcept { return row_count_; }
+    std::uint32_t full_head_size() const noexcept { return full_head_size_; }
+
+private:
+    MtpDraftVocabularyMap(ReadOnlyBufferRef rows, std::uint32_t row_count,
+                          std::uint32_t full_head_size)
+        : rows_(std::move(rows)),
+          row_count_(row_count),
+          full_head_size_(full_head_size) {}
+
+    ReadOnlyBufferRef rows_;
+    std::uint32_t row_count_ = 0u;
+    std::uint32_t full_head_size_ = 0u;
+
+    friend bool make_mtp_draft_vocabulary_map(
+        Context&, ReadOnlyBufferRef, std::uint32_t,
+        MtpDraftVocabularyMap&, std::string&);
+};
+
+/// Validate an immutable row map once and retain the resulting token across
+/// draft steps. This keeps duplicate/range validation out of the per-token
+/// GPU encoding path.
+bool make_mtp_draft_vocabulary_map(Context& context,
+                                   ReadOnlyBufferRef row_map,
+                                   std::uint32_t full_head_size,
+                                   MtpDraftVocabularyMap& result,
+                                   std::string& error);
+
 /// Inputs and outputs for MTP stage 21's draft head. An empty
-/// `draft_vocab_ids` selects every row in the full head; otherwise it maps
+/// `draft_vocabulary` selects every row in the full head; otherwise it maps
 /// subset output rows to full-head rows. `head_vocab_size` is the number of
 /// rows in `weights`. T must be 1. The caller keeps all views alive, leaves
 /// inputs unchanged and avoids CPU access or reuse until GPU completion.
@@ -449,7 +491,7 @@ struct MtpDraftHeadBuffers {
     ReadOnlyBufferRef params;
     BufferRef sample;
     ReadOnlyBufferRef weights;
-    ReadOnlyBufferRef draft_vocab_ids;
+    MtpDraftVocabularyMap draft_vocabulary;
     BufferRef activations_q8_1;
     BufferRef logits;
     BufferRef matvec_sink;
@@ -470,5 +512,33 @@ bool encode_mtp_draft_head(Context& context,
                            std::uint32_t head_vocab_size,
                            const MtpDraftHeadBuffers& buffers,
                            std::string& error);
+
+/// Stage 22's greedy sampler consumes stage-21 logits. `params.samp` must
+/// select greedy sampling with an empty, zero-offset history. The optional
+/// vocabulary map is the same once-validated token used by stage 21. Keep all
+/// views alive and unchanged until GPU completion.
+struct MtpDraftSamplingBuffers {
+    BufferRef params;
+    BufferRef logits;
+    MtpDraftVocabularyMap draft_vocabulary;
+    BufferRef output_ids;
+    BufferRef probabilities;
+};
+
+/// Encode MTP stage 22's greedy path: select the argmax, compute its softmax
+/// probability over the active head rows, then map the subset index to the
+/// full token ID when a draft vocabulary is present. Probabilities are
+/// computed before the optional mapping. The standalone form is transactional;
+/// the caller-owned form requires an ordered concurrent-group boundary and
+/// failure propagation.
+bool encode_mtp_draft_sampling(Context& context, Encoder& encoder,
+                               std::uint32_t head_vocab_size,
+                               const MtpDraftSamplingBuffers& buffers,
+                               std::string& error);
+bool encode_mtp_draft_sampling(Context& context,
+                               CommandBuffer& command_buffer,
+                               std::uint32_t head_vocab_size,
+                               const MtpDraftSamplingBuffers& buffers,
+                               std::string& error);
 
 }  // namespace strata::metal

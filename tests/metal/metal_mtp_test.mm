@@ -3,6 +3,7 @@
 #include "strata/metal/context.hpp"
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/mtp_dispatch.hpp"
+#include "strata/metal/sampler_dispatch.hpp"
 #include "oracles/iq4_xs_mv.hpp"
 #include "oracles/q5_k_mv.hpp"
 #include "oracles/q6_k_mv.hpp"
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -450,6 +452,14 @@ bool execute_draft_head_case(
         std::memcpy(row_map_buffer.payload().data(), row_map.data(),
                     row_map.size_bytes());
     }
+    MtpDraftVocabularyMap validated_row_map;
+    if (!row_map.empty()) {
+        const bool map_valid = make_mtp_draft_vocabulary_map(
+            context, context.buffers().read_only(row_map_buffer.view()),
+            head_rows, validated_row_map, error);
+        check(map_valid, label + " row-map validation", error);
+        if (!map_valid) return false;
+    }
     std::fill(q8.payload().begin(), q8.payload().end(), 0xa5u);
     std::fill(logits.payload().begin(), logits.payload().end(), 0x5au);
     std::fill(sink.payload().begin(), sink.payload().end(), 0x3cu);
@@ -466,9 +476,7 @@ bool execute_draft_head_case(
         context.buffers().read_only(params.view()),
         sample.view(),
         context.buffers().read_only(weights.view()),
-        row_map.empty()
-            ? ReadOnlyBufferRef{}
-            : context.buffers().read_only(row_map_buffer.view()),
+        validated_row_map,
         q8.view(),
         logits.view(),
         sink.view(),
@@ -619,6 +627,18 @@ bool test_mtp_draft_head(Context& context) {
             }
             weight.d = strata::kernels::f16_from_f32(0.1875f);
         }
+        std::vector<float> expected_full_logits;
+        check(twin::q6_k_matvec_reference(
+                  weights, expected_q8, N_EMBD, head_rows, 1u, 1u,
+                  expected_full_logits, error),
+              "MTP stage 21 full Q6_K CPU oracle", error);
+        passed &= execute_draft_head_case(
+            context, "MTP stage 21 full Q6_K head",
+            MatVecWeightFormat::q6_k, head_rows,
+            {reinterpret_cast<const std::uint8_t*>(weights.data()),
+             weights.size() * sizeof(block_q6_K)},
+            sample_values, {}, expected_q8, expected_full_logits, false);
+
         std::vector<block_q6_K> selected;
         selected.reserve(draft_rows.size() * blocks_per_row);
         for (const std::int32_t row : draft_rows) {
@@ -659,6 +679,18 @@ bool test_mtp_draft_head(Context& context) {
                     static_cast<std::uint8_t>(block * 17u + index * 29u);
             }
         }
+        std::vector<float> expected_full_logits;
+        check(twin::iq4_xs_matvec_reference(
+                  weights, expected_q8, N_EMBD, head_rows, 1u, 1u,
+                  expected_full_logits, error),
+              "MTP stage 21 full IQ4_XS CPU oracle", error);
+        passed &= execute_draft_head_case(
+            context, "MTP stage 21 full IQ4_XS head",
+            MatVecWeightFormat::iq4_xs, head_rows,
+            {reinterpret_cast<const std::uint8_t*>(weights.data()),
+             weights.size() * sizeof(block_iq4_xs)},
+            sample_values, {}, expected_q8, expected_full_logits, false);
+
         std::vector<block_iq4_xs> selected;
         selected.reserve(draft_rows.size() * blocks_per_row);
         for (const std::int32_t row : draft_rows) {
@@ -740,11 +772,17 @@ bool test_mtp_draft_head_validation(Context& context,
     std::fill(logits.payload().begin(), logits.payload().end(), 0x7cu);
     std::fill(sink.payload().begin(), sink.payload().end(), 0x8du);
 
+    MtpDraftVocabularyMap validated_map;
+    check(make_mtp_draft_vocabulary_map(
+              context, context.buffers().read_only(map.view()), head_rows,
+              validated_map, error),
+          "validate MTP draft row map once", error);
+    if (!validated_map) return false;
     MtpDraftHeadBuffers valid{
         context.buffers().read_only(params.view()),
         sample.view(),
         context.buffers().read_only(weights.view()),
-        context.buffers().read_only(map.view()),
+        validated_map,
         q8.view(),
         logits.view(),
         sink.view(),
@@ -792,21 +830,35 @@ bool test_mtp_draft_head_validation(Context& context,
     set_params(params, 1u);
     valid.params = context.buffers().read_only(params.view());
 
-    const std::array<std::int32_t, 2> invalid_map{-1, 0};
-    std::memcpy(map.payload().data(), invalid_map.data(), sizeof(invalid_map));
-    valid.draft_vocab_ids = context.buffers().read_only(map.view());
-    passed &= expect_rejected(
-        valid, MatVecWeightFormat::q5_k, head_rows,
+    auto expect_map_rejected = [&](const std::array<std::int32_t, 2>& ids,
+                                   const std::string& label,
+                                   const std::string& expected_error) {
+        std::memcpy(map.payload().data(), ids.data(), sizeof(ids));
+        map.capture_before_dispatch();
+        MtpDraftVocabularyMap rejected_map;
+        const bool accepted = make_mtp_draft_vocabulary_map(
+            context, context.buffers().read_only(map.view()), head_rows,
+            rejected_map, error);
+        const bool expected = !accepted &&
+                              error.find(expected_error) != std::string::npos;
+        const bool unchanged = !map.first_unwritten_change({});
+        check(expected, label, error);
+        check(unchanged, label + " does not mutate the source map");
+        return expected && unchanged;
+    };
+    passed &= expect_map_rejected(
+        std::array<std::int32_t, 2>{-1, 0},
         "reject negative MTP draft row id", "outside the full head");
-    const std::array<std::int32_t, 2> duplicate_map{1, 1};
-    std::memcpy(map.payload().data(), duplicate_map.data(),
-                sizeof(duplicate_map));
-    valid.draft_vocab_ids = context.buffers().read_only(map.view());
-    passed &= expect_rejected(
-        valid, MatVecWeightFormat::q5_k, head_rows,
+    passed &= expect_map_rejected(
+        std::array<std::int32_t, 2>{1, 1},
         "reject duplicate MTP draft row id", "duplicate head rows");
     std::memcpy(map.payload().data(), valid_map.data(), sizeof(valid_map));
-    valid.draft_vocab_ids = context.buffers().read_only(map.view());
+    map.capture_before_dispatch();
+    check(make_mtp_draft_vocabulary_map(
+              context, context.buffers().read_only(map.view()), head_rows,
+              validated_map, error),
+          "revalidate restored MTP draft map", error);
+    valid.draft_vocabulary = validated_map;
 
     passed &= expect_rejected(
         valid, MatVecWeightFormat::q8_0, head_rows,
@@ -820,7 +872,7 @@ bool test_mtp_draft_head_validation(Context& context,
         short_q8, MatVecWeightFormat::q5_k, head_rows,
         "reject short MTP draft Q8_1 scratch", "undersized or misaligned");
     auto output_alias = valid;
-    output_alias.draft_vocab_ids = {};
+    output_alias.draft_vocabulary = {};
     output_alias.logits = sample.view().slice(0u, sizeof(float));
     passed &= expect_rejected(
         output_alias, MatVecWeightFormat::q5_k, 1u,
@@ -932,6 +984,316 @@ bool test_mtp_draft_head_validation(Context& context,
     return passed;
 }
 
+bool test_mtp_draft_sampling(Context& context) {
+    constexpr std::uint32_t output_rows = 7u;
+    constexpr std::uint32_t full_head_size = output_rows;
+    constexpr std::uint32_t draft_row_count = 4u;
+    constexpr std::size_t logits_bytes =
+        static_cast<std::size_t>(output_rows) * sizeof(float);
+    constexpr std::array<float, output_rows> logits_values{
+        -1.0f, 0.25f, 3.25f, 2.5f, -3.0f, 1.75f, 3.0f,
+    };
+    constexpr std::array<std::int32_t, draft_row_count> draft_ids{
+        6, 2, 5, 3,
+    };
+    constexpr std::uint32_t expected_subset_id = 2u;
+    constexpr std::int32_t expected_full_id = 5;
+
+    std::string error;
+    twin::GuardedBuffer params;
+    twin::GuardedBuffer logits;
+    twin::GuardedBuffer map;
+    twin::GuardedBuffer output_ids;
+    twin::GuardedBuffer probabilities;
+    const bool allocated =
+        params.allocate(context, "MTP draft sampling params", 256u, error) &&
+        logits.allocate(context, "MTP draft sampling logits", logits_bytes,
+                        error) &&
+        map.allocate(context, "MTP draft sampling map",
+                     sizeof(draft_ids), error) &&
+        output_ids.allocate(context, "MTP draft sampling output ID",
+                            sizeof(std::int32_t), error) &&
+        probabilities.allocate(context, "MTP draft sampling probability",
+                               sizeof(float), error);
+    check(allocated, "MTP stage 22 allocations", error);
+    if (!allocated) return false;
+
+    MtpParams params_value{};
+    params_value.T = 1u;
+    params_value.samp.greedy = 1;
+    std::memcpy(params.payload().data(), &params_value, sizeof(params_value));
+    std::memcpy(logits.payload().data(), logits_values.data(), logits_bytes);
+    std::memcpy(map.payload().data(), draft_ids.data(), sizeof(draft_ids));
+    auto expected_argmax_probability = [&](std::uint32_t active_rows) {
+        const float maximum = logits_values[expected_subset_id];
+        double exponential_sum = 0.0;
+        for (std::uint32_t row = 0u; row < active_rows; ++row) {
+            exponential_sum += std::exp(static_cast<double>(
+                logits_values[row] - maximum));
+        }
+        return static_cast<float>(1.0 / exponential_sum);
+    };
+    const float expected_full_probability =
+        expected_argmax_probability(output_rows);
+    const float expected_draft_probability =
+        expected_argmax_probability(draft_row_count);
+
+    MtpDraftVocabularyMap validated_map;
+    const bool valid_map = make_mtp_draft_vocabulary_map(
+        context, context.buffers().read_only(map.view()), full_head_size,
+        validated_map, error);
+    check(valid_map, "MTP stage 22 map validation", error);
+    if (!valid_map) return false;
+
+    auto run_valid_case = [&](const std::string& label,
+                              MtpDraftVocabularyMap vocabulary,
+                              std::int32_t expected_id,
+                              float expected_probability,
+                              float& actual_probability) {
+        std::fill(output_ids.payload().begin(), output_ids.payload().end(),
+                  0xa5u);
+        std::fill(probabilities.payload().begin(),
+                  probabilities.payload().end(), 0x5au);
+        params.capture_before_dispatch();
+        logits.capture_before_dispatch();
+        map.capture_before_dispatch();
+        output_ids.capture_before_dispatch();
+        probabilities.capture_before_dispatch();
+        const MtpDraftSamplingBuffers buffers{
+            params.view(), logits.view(), vocabulary, output_ids.view(),
+            probabilities.view(),
+        };
+        auto command = context.make_command_buffer(label, error);
+        check(command != nullptr, label + " command buffer", error);
+        if (!command) return false;
+        const bool encoded = encode_mtp_draft_sampling(
+            context, *command, full_head_size, buffers, error);
+        check(encoded, label + " encode", error);
+        if (!encoded) return false;
+        const bool completed = submit_and_wait(command, label, error);
+        check(completed, label + " GPU completion", error);
+        if (!completed) return false;
+
+        std::int32_t actual_id = -1;
+        std::memcpy(&actual_id, output_ids.payload().data(),
+                    sizeof(actual_id));
+        std::memcpy(&actual_probability, probabilities.payload().data(),
+                    sizeof(actual_probability));
+        check(actual_id == expected_id, label + " selected token ID");
+        const bool probability_matches =
+            std::isfinite(actual_probability) &&
+            std::abs(actual_probability - expected_probability) < 1.0e-6f;
+        check(probability_matches,
+              label + " argmax softmax probability",
+              "expected " + std::to_string(expected_probability) +
+                  ", got " + std::to_string(actual_probability));
+        const std::array<twin::ByteRange, 1> id_written{{
+            {0u, sizeof(std::int32_t)},
+        }};
+        const std::array<twin::ByteRange, 1> probability_written{{
+            {0u, sizeof(float)},
+        }};
+        const bool guards =
+            !output_ids.first_unwritten_change(id_written) &&
+            !probabilities.first_unwritten_change(probability_written) &&
+            !params.first_unwritten_change({}) &&
+            !logits.first_unwritten_change({}) &&
+            !map.first_unwritten_change({});
+        check(guards, label + " guards and immutable inputs");
+        return actual_id == expected_id && probability_matches && guards;
+    };
+
+    float full_probability = 0.0f;
+    const bool full_passed = run_valid_case(
+        "MTP stage 22 full vocabulary", {}, expected_subset_id,
+        expected_full_probability,
+        full_probability);
+    float mapped_probability = 0.0f;
+    const bool mapped_passed = run_valid_case(
+        "MTP stage 22 draft vocabulary", validated_map, expected_full_id,
+        expected_draft_probability,
+        mapped_probability);
+    const bool subset_probability_differs =
+        std::abs(full_probability - mapped_probability) > 1.0e-3f;
+    check(subset_probability_differs,
+          "MTP stage 22 probability uses only active draft rows");
+
+    auto expect_rejected = [&](const MtpDraftSamplingBuffers& candidate,
+                               std::uint32_t vocabulary,
+                               const std::string& label,
+                               const std::string& expected_error) {
+        params.capture_before_dispatch();
+        logits.capture_before_dispatch();
+        map.capture_before_dispatch();
+        output_ids.capture_before_dispatch();
+        probabilities.capture_before_dispatch();
+        auto command = context.make_command_buffer(label, error);
+        check(command != nullptr, label + " command buffer", error);
+        if (!command) return false;
+        const bool rejected = !encode_mtp_draft_sampling(
+            context, *command, vocabulary, candidate, error);
+        const bool expected =
+            rejected && error.find(expected_error) != std::string::npos;
+        const bool unchanged =
+            !params.first_unwritten_change({}) &&
+            !logits.first_unwritten_change({}) &&
+            !map.first_unwritten_change({}) &&
+            !output_ids.first_unwritten_change({}) &&
+            !probabilities.first_unwritten_change({});
+        check(expected, label, error);
+        check(unchanged, label + " preserves buffers");
+        command->discard();
+        return expected && unchanged;
+    };
+
+    bool passed =
+        full_passed && mapped_passed && subset_probability_differs;
+    auto valid_buffers = MtpDraftSamplingBuffers{
+        params.view(), logits.view(), validated_map, output_ids.view(),
+        probabilities.view(),
+    };
+    params_value.T = 2u;
+    std::memcpy(params.payload().data(), &params_value, sizeof(params_value));
+    passed &= expect_rejected(valid_buffers, full_head_size,
+                              "reject MTP stage 22 T=2", "requires T=1");
+    params_value.T = 1u;
+    params_value.samp.greedy = 0;
+    std::memcpy(params.payload().data(), &params_value, sizeof(params_value));
+    passed &= expect_rejected(
+        valid_buffers, full_head_size, "reject non-greedy MTP stage 22",
+        "requires greedy=1");
+    params_value.samp.greedy = 1;
+    params_value.samp.hist_off = 1u;
+    params_value.samp.hist_len = 1u;
+    std::memcpy(params.payload().data(), &params_value, sizeof(params_value));
+    passed &= expect_rejected(
+        valid_buffers, full_head_size, "reject MTP stage 22 history",
+        "empty zero-offset history");
+    params_value.samp.hist_off = 0u;
+    params_value.samp.hist_len = 0u;
+    std::memcpy(params.payload().data(), &params_value, sizeof(params_value));
+
+    auto short_logits = valid_buffers;
+    short_logits.logits = logits.view().slice(
+        0u, static_cast<std::size_t>(draft_row_count) * sizeof(float) - 1u);
+    passed &= expect_rejected(
+        short_logits, full_head_size, "reject short MTP stage 22 logits",
+        "undersized or misaligned");
+    auto output_alias = valid_buffers;
+    output_alias.probabilities =
+        output_ids.view().slice(0u, sizeof(float));
+    passed &= expect_rejected(
+        output_alias, full_head_size, "reject MTP stage 22 output alias",
+        "overlap");
+    passed &= expect_rejected(
+        valid_buffers, 0u, "reject empty MTP stage 22 head",
+        "must be in 1..248320");
+
+    // The valid greedy dispatch is discarded when the later MTP wrapper
+    // rejects malformed T in the same caller-owned encoder segment.
+    std::fill(output_ids.payload().begin(), output_ids.payload().end(), 0x61u);
+    std::fill(probabilities.payload().begin(), probabilities.payload().end(),
+              0x72u);
+    output_ids.capture_before_dispatch();
+    probabilities.capture_before_dispatch();
+    auto rollback_command =
+        context.make_command_buffer("MTP stage 22 late rollback", error);
+    check(rollback_command != nullptr,
+          "MTP stage 22 rollback command buffer", error);
+    if (!rollback_command) return false;
+    bool first_dispatch_encoded = false;
+    bool expected_late_rejection = false;
+    const bool transaction_succeeded = Encoder::encode(
+        context, *rollback_command, "MTP stage 22 rollback segment",
+        [&](Encoder& encoder, std::string& encode_error) {
+            const SamplerBuffers greedy_buffers{
+                logits.view(),
+                params.view().slice(offsetof(MtpParams, T),
+                                    sizeof(std::uint32_t)),
+                params.view().slice(offsetof(MtpParams, samp),
+                                    sizeof(SampRow)),
+                {},
+                {},
+                output_ids.view(),
+            };
+            first_dispatch_encoded = encode_sampler_greedy(
+                context, encoder, 1u, output_rows, greedy_buffers,
+                encode_error);
+            if (!first_dispatch_encoded) return false;
+            MtpParams invalid_value = params_value;
+            invalid_value.T = 2u;
+            twin::GuardedBuffer invalid_params;
+            if (!invalid_params.allocate(
+                    context, "late-invalid MTP sampling params", 256u,
+                    encode_error)) {
+                return false;
+            }
+            std::memcpy(invalid_params.payload().data(), &invalid_value,
+                        sizeof(invalid_value));
+            auto invalid = valid_buffers;
+            invalid.params = invalid_params.view();
+            const bool second_stage_encoded = encode_mtp_draft_sampling(
+                context, encoder, full_head_size, invalid, encode_error);
+            expected_late_rejection =
+                !second_stage_encoded &&
+                encode_error.find("requires T=1") != std::string::npos;
+            return second_stage_encoded;
+        },
+        error);
+    const bool discarded = first_dispatch_encoded &&
+                           expected_late_rejection &&
+                           !transaction_succeeded &&
+                           rollback_command->unsafe_native_handle() == nullptr;
+    const bool rollback_unchanged =
+        !output_ids.first_unwritten_change({}) &&
+        !probabilities.first_unwritten_change({});
+    check(discarded, "MTP stage 22 caller-owned late rollback", error);
+    check(rollback_unchanged,
+          "MTP stage 22 rollback preserves output IDs and probability");
+    passed &= discarded && rollback_unchanged;
+    rollback_command->discard();
+
+    const char* dispatch_mode = std::getenv("STRATA_METAL_DISPATCH");
+    if (dispatch_mode != nullptr &&
+        std::string_view(dispatch_mode) == "concurrent") {
+        output_ids.capture_before_dispatch();
+        probabilities.capture_before_dispatch();
+        auto group_command =
+            context.make_command_buffer("MTP stage 22 group boundary", error);
+        check(group_command != nullptr,
+              "MTP stage 22 group-boundary command buffer", error);
+        if (!group_command) return false;
+        const bool group_rejected = Encoder::encode(
+            context, *group_command, "MTP stage 22 group validation",
+            [&](Encoder& encoder, std::string& encode_error) {
+                if (!encoder.group_begin(encode_error)) return false;
+                std::string stage_error;
+                const bool rejected = !encode_mtp_draft_sampling(
+                    context, encoder, full_head_size, valid_buffers,
+                    stage_error);
+                if (!encoder.group_end(encode_error)) return false;
+                if (!rejected ||
+                    stage_error.find("ordered concurrent-group boundary") ==
+                        std::string::npos) {
+                    encode_error = "MTP stage 22 accepted an open group";
+                    return false;
+                }
+                return true;
+            },
+            error);
+        const bool unchanged =
+            !output_ids.first_unwritten_change({}) &&
+            !probabilities.first_unwritten_change({});
+        check(group_rejected,
+              "MTP stage 22 rejects open concurrent group", error);
+        check(unchanged,
+              "MTP stage 22 open-group rejection preserves outputs");
+        passed &= group_rejected && unchanged;
+        group_command->discard();
+    }
+    return passed;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -986,11 +1348,12 @@ int main(int argc, char** argv) {
     passed &= test_caller_owned_rollback(*context, params, h2, e2, output);
     passed &= test_mtp_draft_head(*context);
     passed &= test_mtp_draft_head_validation(*context, *foreign_context);
+    passed &= test_mtp_draft_sampling(*context);
 
     if (g_failures != 0 || !passed) {
         std::fprintf(stderr, "metal_mtp_test: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::puts("metal_mtp_test: MTP stages 6 and 21 OK");
+    std::puts("metal_mtp_test: MTP stages 6, 21 and 22 OK");
     return 0;
 }
