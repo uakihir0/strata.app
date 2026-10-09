@@ -7738,6 +7738,7 @@ measuring L-15 remain open.
 | REV-117 | Compose speculative input preparation with the FullMode producer and consumer | Initial hostile review found four gaps. A P2 contract gap overstated rollback for caller-owned Encoder use: the docs now require the enclosing `Encoder::encode` body to propagate false, and a late PLE failure test verifies the command is discarded and embedding, pending output, residual, usage, PLE outputs and history remain unchanged. A P3 T=8 test weakness used only repeated rows without an independent result; it now compares gather and broadcast with direct row-wise encoders, asserts nonzero finite embedding data and protects padded tails. A P3 stale T=1 integration claim now distinguishes the legacy token step from the speculative T=1..8 coordinator. A P3 test-map attribution was moved from the base storage CTest to the three dedicated PLE handoff CTests that execute D320 coverage. Follow-up review found one additional stale T=1-only phrase in the consumer-selector row; that now labels only the legacy path as T=1. Final hostile re-review found no remaining actionable issues. The affected five-Ctest matrix passes 5/5; mac-metal passes 54/54; mac-host passes 44/44 with the unavailable model-input test skipped. `test_map.py` and `git diff --check` pass with existing planned-work and missing-check diagnostics. | Keep proposal generation, multirow PLE row scheduling, accepted-prefix commit, production `Window::run`, tiered expert readiness and shipped-model parity open |
 | REV-118 | Prepare speculative Window inputs for T=1..8 | Hostile review found a P2 input-lifetime issue: PLE staging could overwrite caller token or sampler spans if they were backed by the same scratch region, before those values were copied to `WindowParams`. The implementation now snapshots both spans before any staging, and a T=3 regression sources both arrays from the PLE scratch being overwritten and verifies the published token and sampler values. Review also found that D321/test-map references preceded this audit entry; this record resolves the missing attribution. Final hostile follow-up found no remaining actionable issues. The affected four-Ctest matrix passes 4/4; mac-metal passes 54/54; mac-host passes 44/44 with one unavailable-input test skipped; the Python suite passes 35/35 modules in the isolated pinned-requirements environment. `test_map.py` and `git diff --check` pass with existing planned-work and missing-check diagnostics. | Preserve input rows when they alias staging scratch; retain caller-owned scratch/ring quiescence and keep proposal generation, accepted-prefix scheduling, production `Window::run` and model parity open |
 | REV-119 | Implement MTP drafter stage 6 | Initial hostile review found a P2 oracle gap: the original input values could not distinguish FP32 addition from binary16 rounding. The fixture now sets `h2[0]=1024.0f` and `e2[0]=0.25f`, whose required FP32 result is exactly 1024.25 while binary16 addition rounds to 1024.0, and checks that witness for every T=1..8 case. The review also found a missing review-ledger row and stale docs claiming no MTP kernel consumed runtime views; REV-119 and the 04/06 descriptions now record that stage 6 is standalone while production runtime-view composition and the other stages remain open. Final hostile follow-up found no remaining actionable findings. The focused `metal_mtp_test` passes 1/1; the full `mac-metal` suite passes 55/55; `mac-host` passes 44/44 with the unavailable real-input case skipped. The full `mac-dev` build, `test_map` CTest and `git diff --check` pass. | Preserve the exact FP32 witness and active-row alias/rollback coverage. Wire all MTP stages through `MtpRuntimeStorage`, then establish replay parity for draft IDs, probabilities and K/V before claiming L11 or production inference |
+| REV-120 | Compose the MTP stage-7 attention GR read | Initial hostile review found a P2 gap: MTP parameters could alias a GR writable output and be overwritten; stage 7 now rejects overlap between `MtpParams` and all 11 active GR views before delegation. Regressions alias the params with both the normalized output and norm input, and prove that an enclosing caller-owned segment discards an already encoded stage 6 after a late stage-7 alias rejection. Review also found P3 stale stage-6-only documentation and the missing REV-120 ledger row; the stage-6/7 descriptions, plan, test inventory and this record are synchronized. A follow-up found that the original finite `0xa5` marker could hide partially unwritten outputs; all five outputs now start with a qNaN poison and every active element must change its sentinel bits and be finite. Final hostile follow-up found no remaining actionable P1–P3 findings. The full mac-dev build passes; the focused stage-6/stage-7/concurrent tests pass 3/3; mac-metal passes 57/57; mac-host passes 44/44 with the unavailable real-input case skipped; `test_map` and `git diff --check` pass. | Keep MTP runtime-storage composition, later stages, complete drafter behavior and model-backed draft/KV parity open; retain the reviewed dead-h2 placeholder lifetime contract |
 
 ### D-IMPL-313: Add a per-layer GDN write-through Window block
 
@@ -8271,3 +8272,32 @@ measuring L-15 remain open.
   and MTP host chain; validate against recorded model-backed draft IDs,
   probabilities and drafter K/V before treating L11 as complete. MTP is not
   wired into production inference.
+
+### D-IMPL-323: Compose the MTP stage-7 attention GR read
+
+- **Decision:** Add standalone and caller-owned Encoder overloads for
+  `encode_mtp_attention_read`. Read and validate `T` from the shared MTP
+  parameter block, then reuse `encode_gr_read` in ordered `apply=false` mode.
+  Supply its required but semantically unused `block_out` and `inject_prev`
+  views as disjoint slices of the MTP `h2` allocation, after stage 6 has
+  consumed the active hidden rows.
+- **Reason:** The stage-7 operation is the existing GR normalize/down/up
+  sequence with `R` read-only and `inj`/`mixed` outputs. A small typed wrapper
+  preserves the GR pipeline's validation and ordering while avoiding a second
+  copy of its implementation. The placeholder views are sourced from dead
+  stage-6 scratch because the generic GR ABI requires distinct writable views
+  even when `apply=false`; bounded slices preserve its normal overlap checks.
+- **Validation:** The dedicated fixture compares the wrapper bit for bit with
+  the direct GR chain for T=1..8 and checks active bounds, unchanged R/params,
+  every active output overwritten from a qNaN poison, invalid dimensions,
+  parameter/input and parameter/output alias rejection and
+  standalone/caller-owned rollback. A concurrent-mode CTest also checks
+  rejection inside an open group. The full mac-dev build passes; the three
+  focused MTP tests, mac-metal 57/57 and mac-host 44/44 pass (one unavailable
+  real-input skip); `test_map` passes. Initial and follow-up hostile findings
+  and their repairs, with no remaining actionable P1–P3 findings, are recorded
+  in REV-120.
+- **Review required:** See REV-120. This is an isolated encoder only; wiring
+  runtime storage, all later MTP stages, complete drafter behavior and
+  model-backed parity remain necessary before L11 is complete. Keep the
+  caller-owned dead-h2 placeholder lifetime contract visible to future reviews.
