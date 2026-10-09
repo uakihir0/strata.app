@@ -161,8 +161,18 @@ bool build_pipelines(Context::Impl& im, const std::string& metallib_sha256, std:
     std::vector<MTLComputePipelineDescriptor*> descs(n);
     std::vector<id<MTLComputePipelineState>> made(n);
     std::vector<MTLComputePipelineReflection*> reflections(n);
+    std::vector<bool> enabled(n, true);
     std::vector<std::size_t> misses;
     for (std::size_t i = 0; i < n; ++i) {
+        const std::size_t name_length = std::strlen(k[i].name);
+        const bool requires_apple10 =
+            name_length >= 4u &&
+            std::strcmp(k[i].name + name_length - 4u, "_mpp") == 0;
+        if (requires_apple10 &&
+            ![im.device supportsFamily:MTLGPUFamilyApple10]) {
+            enabled[i] = false;
+            continue;
+        }
         id<MTLFunction> f = [im.library newFunctionWithName:@(k[i].name)];
         if (f == nil) { err = std::string("strata.metallib has no kernel ") + k[i].name; return false; }
         MTLComputePipelineDescriptor* d = [MTLComputePipelineDescriptor new];
@@ -222,6 +232,7 @@ bool build_pipelines(Context::Impl& im, const std::string& metallib_sha256, std:
     }
     if (!path.empty()) prune_pipeline_archives(path);
     for (std::size_t i = 0; i < n; ++i) {
+        if (!enabled[i]) continue;
         if (made[i].threadExecutionWidth != 32) {
             err = std::string("kernel ") + k[i].name + " has SIMD width " + std::to_string(made[i].threadExecutionWidth) +
                   ", Strata's kernels need 32";
