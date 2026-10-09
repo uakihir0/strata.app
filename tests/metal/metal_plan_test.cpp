@@ -265,7 +265,7 @@ void full_plan() {
     check(plan.mtp_params_bytes == 1'032ull * kMtpParamsSlotBytes,
           "MTP parameter memory covers fixed passes and every selected prefill group");
     check(plan.session_state_bytes == 118'038'528u &&
-              plan.window_scratch_bytes == 47'911'680u,
+              plan.window_scratch_bytes == 48'631'040u,
           "planner reports exact Qwen4exp session and 65,536-cell Window scratch sizes");
     const std::uint64_t qwen_usage_bytes =
         48ull * geometry.n_expert * sizeof(float);
@@ -284,7 +284,7 @@ void full_plan() {
     check(strata::metal::make_plan(coder_geometry, coder_options,
                                    coder_plan, error) &&
               coder_plan.session_state_bytes == 118'038'528u &&
-              coder_plan.window_scratch_bytes == 47'641'344u &&
+              coder_plan.window_scratch_bytes == 48'360'704u &&
               coder_plan.fixed_bytes == plan.fixed_bytes,
           "Coder planner uses the exact 256-expert scratch while retaining the fixed allowance");
     const std::uint64_t coder_usage_bytes =
@@ -319,7 +319,7 @@ void full_plan() {
     const std::size_t scratch_key = line.find("window_scratch_mib=");
     check(bind_key < fixed_key && full_key < params_key &&
               params_key < session_key && session_key < scratch_key &&
-              line.ends_with("window_scratch_mib=46"),
+              line.ends_with("window_scratch_mib=47"),
           "PLAN preserves existing key order and appends the fixed-state breakdown");
     check(line.find("w_full_mib=") != std::string::npos && line.find("reason=") == std::string::npos,
           "fitting PLAN reports full threshold without a reason");

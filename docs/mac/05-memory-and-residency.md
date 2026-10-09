@@ -221,8 +221,8 @@ buffers stay fixed because the arena is allocated for T = 8 even when `--mtp-max
 `n_out`, so its extent grows to the full model vocabulary when `draft_vocab.bin` is absent.
 
 The current exact GDN and PLE session-state allocation is 118,038,528 B (112.57 MiB). Together with the T=8
-Window scratch at 262,144 cells, the two layouts total 167,514,880 B (159.75 MiB) for 256 experts and
-167,523,072 B (159.76 MiB) for 512 experts, below the 256 MiB allowance. The planner reports
+Window scratch at 262,144 cells, the two layouts total 168,234,240 B (160.45 MiB) for 256 experts and
+168,242,432 B (160.45 MiB) for 512 experts, below the 256 MiB allowance. The planner reports
 `session_state_bytes` and `window_scratch_bytes` from these exact layouts and checks their subtotal together with
 `48 × n_expert × sizeof(float)` for the persistent MoE usage table against `F_fixed`; `ModelStorage` recomputes the
 same total and opens its buffers inside the outer allocation transaction. Session state remains owned by the session
@@ -390,7 +390,7 @@ PLAN fits=1 mode=full|tiered gpu=Apple_M5_Pro w_mib=53084 reserve_mib=700 ram_mi
  kv=fp16 context=65536 prefill_chunk=8192 prefill_mib=2194 experts_total=24576 experts_total_mib=32400
  experts_resident=24576 experts_resident_mib=32400 slots=0 slot_mib=0 ssd_experts=0
  total_mib=40904 free_mib=11480 ram_warning=0
- w_full_mib=... mtp_params_mib=1 session_state_mib=113 window_scratch_mib=46
+ w_full_mib=... mtp_params_mib=1 session_state_mib=113 window_scratch_mib=47
 ```
 
 The line wraps here only for readability; the real output is one line. The `mib` values are rounded up. The example
