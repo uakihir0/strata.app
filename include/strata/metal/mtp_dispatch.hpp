@@ -180,6 +180,17 @@ struct MtpFeedForwardReadBuffers {
     BufferRef mixed;
 };
 
+/// Inputs and outputs for MTP stage 16's dense router and top-10 route.
+struct MtpRouterBuffers {
+    ReadOnlyBufferRef params;
+    ReadOnlyBufferRef mixed;
+    ReadOnlyBufferRef router_weights;
+    BufferRef logits_r;
+    BufferRef ids;
+    BufferRef weights;
+    BufferRef matvec_sink;
+};
+
 /// Add MTP hidden and embedding streams to the caller-owned Encoder segment.
 /// On failure, the enclosing Encoder::encode body must return false so prior
 /// work in that segment is discarded.
@@ -299,5 +310,16 @@ bool encode_mtp_feed_forward_read(Context& context, Encoder& encoder,
 bool encode_mtp_feed_forward_read(
     Context& context, CommandBuffer& command_buffer,
     const MtpFeedForwardReadBuffers& buffers, std::string& error);
+
+/// Encode MTP stage 16: project the T=1 mixed row to 512 expert logits and
+/// select the top ten routes. The standalone form is transactional, and the
+/// caller-owned form must propagate failure from its enclosing
+/// `Encoder::encode` body.
+bool encode_mtp_router(Context& context, Encoder& encoder,
+                       const MtpRouterBuffers& buffers,
+                       std::string& error);
+bool encode_mtp_router(Context& context, CommandBuffer& command_buffer,
+                       const MtpRouterBuffers& buffers,
+                       std::string& error);
 
 }  // namespace strata::metal

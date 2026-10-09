@@ -3,6 +3,7 @@
 
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/gr_dispatch.hpp"
+#include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/mv_dispatch.hpp"
 #include "strata/metal/qsa_dispatch.hpp"
 
@@ -30,6 +31,8 @@ constexpr std::uint32_t kMtpQueryHeadWidth =
     N_HEAD_Q * HEAD_DIM;
 constexpr std::uint32_t kMtpOutputProjectionInputWidth =
     N_HEAD_Q * HEAD_DIM;
+constexpr std::uint32_t kMtpRouterExperts = 512u;
+constexpr std::uint32_t kMtpRouterTopK = 10u;
 constexpr std::uint32_t kMtpQ8BlockValues = 32u;
 constexpr std::uint32_t kMtpQ81BlockBytes = 36u;
 constexpr std::uint32_t kMtpAddStreamsThreads = 256u;
@@ -1795,6 +1798,161 @@ bool encode_mtp_feed_forward_read(
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_mtp_feed_forward_read(context, encoder, buffers,
                                                 encode_error);
+        },
+        error);
+}
+
+bool encode_mtp_router(Context& context, Encoder& encoder,
+                       const MtpRouterBuffers& buffers,
+                       std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "MTP router requires an ordered concurrent-group boundary";
+        return false;
+    }
+
+    constexpr char operation[] = "MTP router";
+    std::uint32_t rows = 0u;
+    if (!read_mtp_rows(context, buffers.params, operation, rows, error)) {
+        return false;
+    }
+    if (rows != 1u) {
+        error = std::string(operation) +
+                " requires T=1 for the full-layer pass";
+        return false;
+    }
+    if (!validate_read_only_buffer(context, buffers.params,
+                                   sizeof(MtpParams), alignof(MtpParams),
+                                   "params", operation, error)) {
+        return false;
+    }
+
+    const ReadOnlyBufferRef active_rows =
+        buffers.params.slice(offsetof(MtpParams, T), sizeof(std::uint32_t));
+    if (!active_rows) {
+        error = std::string(operation) +
+                " could not form the active-row count view";
+        return false;
+    }
+
+    constexpr std::size_t mixed_bytes =
+        static_cast<std::size_t>(N_EMBD) * sizeof(float);
+    constexpr std::size_t router_weight_bytes =
+        static_cast<std::size_t>(kMtpRouterExperts) * N_EMBD *
+        sizeof(std::uint16_t);
+    constexpr std::size_t logits_bytes =
+        static_cast<std::size_t>(kMtpRouterExperts) * sizeof(float);
+    constexpr std::size_t ids_bytes =
+        static_cast<std::size_t>(kMtpRouterTopK) * sizeof(std::int32_t);
+    constexpr std::size_t route_weight_bytes =
+        static_cast<std::size_t>(kMtpRouterTopK) * sizeof(float);
+    constexpr std::size_t sink_bytes = sizeof(float);
+
+    const std::array<std::pair<const char*, ReadOnlyBufferRef>, 2> inputs{{
+        {"mixed", buffers.mixed},
+        {"router_weights", buffers.router_weights},
+    }};
+    const std::array<std::size_t, 2> input_bytes{
+        mixed_bytes, router_weight_bytes};
+    for (std::size_t index = 0u; index < inputs.size(); ++index) {
+        const std::size_t alignment =
+            index == 0u ? 2u * alignof(float) : alignof(std::uint32_t);
+        if (!validate_read_only_buffer(
+                context, inputs[index].second, input_bytes[index], alignment,
+                inputs[index].first, operation, error)) {
+            return false;
+        }
+        if (overlaps(buffers.params, sizeof(MtpParams),
+                     inputs[index].second, input_bytes[index])) {
+            error = std::string(operation) +
+                    " parameter block overlaps active view " +
+                    inputs[index].first;
+            return false;
+        }
+    }
+    if (overlaps(buffers.mixed, mixed_bytes, buffers.router_weights,
+                 router_weight_bytes)) {
+        error = std::string(operation) +
+                " mixed activations overlap router weights";
+        return false;
+    }
+
+    if (!validate_output_buffer(context, buffers.logits_r, logits_bytes,
+                                operation, "logits_r", error) ||
+        !validate_buffer_view(context, buffers.ids, ids_bytes,
+                              alignof(std::int32_t), operation, "ids",
+                              error) ||
+        !validate_buffer_view(context, buffers.weights, route_weight_bytes,
+                              alignof(float), operation, "weights", error) ||
+        !validate_output_buffer(context, buffers.matvec_sink, sink_bytes,
+                                operation, "matvec sink", error)) {
+        return false;
+    }
+
+    const std::array<std::pair<const char*, BufferRef>, 4> outputs{{
+        {"logits_r", buffers.logits_r},
+        {"ids", buffers.ids},
+        {"weights", buffers.weights},
+        {"matvec_sink", buffers.matvec_sink},
+    }};
+    const std::array<std::size_t, 4> output_bytes{
+        logits_bytes, ids_bytes, route_weight_bytes, sink_bytes};
+    for (std::size_t index = 0u; index < outputs.size(); ++index) {
+        if (overlaps(buffers.params, sizeof(MtpParams),
+                     outputs[index].second, output_bytes[index])) {
+            error = std::string(operation) +
+                    " parameter block overlaps active view " +
+                    outputs[index].first;
+            return false;
+        }
+        for (std::size_t input = 0u; input < inputs.size(); ++input) {
+            if (overlaps(inputs[input].second, input_bytes[input],
+                         outputs[index].second, output_bytes[index])) {
+                error = std::string(operation) + " output " +
+                        outputs[index].first + " overlaps active input " +
+                        inputs[input].first;
+                return false;
+            }
+        }
+        for (std::size_t prior = 0u; prior < index; ++prior) {
+            if (overlaps(outputs[index].second, output_bytes[index],
+                         outputs[prior].second, output_bytes[prior])) {
+                error = std::string(operation) + " outputs " +
+                        outputs[index].first + " and " +
+                        outputs[prior].first + " overlap";
+                return false;
+            }
+        }
+    }
+
+    const ReadOnlyBF16MatVecBuffers matvec_buffers{
+        buffers.mixed, buffers.router_weights, active_rows,
+        buffers.logits_r, buffers.matvec_sink};
+    if (!encode_bf16_matvec(context, encoder, N_EMBD, kMtpRouterExperts,
+                            1u, 1u, matvec_buffers, error)) {
+        return false;
+    }
+
+    const ReadOnlyBufferRef logits =
+        context.buffers().read_only(buffers.logits_r);
+    if (!logits) {
+        error = std::string(operation) +
+                " could not form the route-logits input view";
+        return false;
+    }
+    const MoeRouteBuffers route_buffers{
+        logits, buffers.ids, buffers.weights};
+    return encode_moe_route(context, encoder, 1u, kMtpRouterExperts, false,
+                            route_buffers, error);
+}
+
+bool encode_mtp_router(Context& context, CommandBuffer& command_buffer,
+                       const MtpRouterBuffers& buffers,
+                       std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "MTP router",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_mtp_router(context, encoder, buffers, encode_error);
         },
         error);
 }
