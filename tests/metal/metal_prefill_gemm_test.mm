@@ -349,6 +349,197 @@ bool dispatch_case(Context& context, std::uint32_t rows, std::uint32_t n,
            w.guards_intact() && y.guards_intact();
 }
 
+bool dispatch_bf16x2_case(Context& context, std::uint32_t rows,
+                          std::uint32_t n, std::uint32_t k,
+                          bool accumulate) {
+    const std::uint32_t col0 = 3u;
+    const std::uint32_t ldy = col0 + n + 5u;
+    const std::size_t x_count = static_cast<std::size_t>(rows) * k;
+    const std::size_t w_count = static_cast<std::size_t>(n) * k;
+    const std::size_t y_count = static_cast<std::size_t>(rows) * ldy;
+    const PrefillGemmMPPParams params{rows, n, k, ldy, col0, accumulate};
+    const PrefillGemmBackend expected = expected_auto_backend(context, params);
+    const std::string backend =
+        expected == PrefillGemmBackend::MPP ? "MPP" : "SIMD";
+    const std::string label =
+        "Prefill BF16X2 " + backend + " GEMM rows=" +
+        std::to_string(rows) + " n=" + std::to_string(n) +
+        " k=" + std::to_string(k) +
+        (accumulate ? " accumulate" : " overwrite");
+
+    std::string error;
+    TestBuffer x_hi, x_lo, w, y;
+    const bool allocated =
+        x_hi.allocate(context, label + " X high",
+                      x_count * sizeof(std::uint16_t), error) &&
+        x_lo.allocate(context, label + " X low",
+                      x_count * sizeof(std::uint16_t), error) &&
+        w.allocate(context, label + " W",
+                   w_count * sizeof(std::uint16_t), error) &&
+        y.allocate(context, label + " Y", y_count * sizeof(float), error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+
+    std::vector<std::uint16_t> high_values(x_count);
+    std::vector<std::uint16_t> low_values(x_count);
+    std::vector<std::uint16_t> weight_values(w_count);
+    std::vector<float> original_values(x_count);
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        for (std::uint32_t inner = 0u; inner < k; ++inner) {
+            const float sign = (inner & 1u) == 0u ? 1.0f : -1.0f;
+            const float original =
+                sign * (0.300123f + static_cast<float>(row) * 0.0011f +
+                        static_cast<float>(inner % 9u) * 0.0007f);
+            const std::size_t index =
+                static_cast<std::size_t>(row) * k + inner;
+            original_values[index] = original;
+            high_values[index] = strata::kernels::bf16_from_f32(original);
+            const float high =
+                strata::kernels::f32_from_bf16(high_values[index]);
+            low_values[index] =
+                strata::kernels::bf16_from_f32(original - high);
+        }
+    }
+    const bool has_nonzero_remainder =
+        std::any_of(low_values.begin(), low_values.end(),
+                    [](std::uint16_t value) {
+                        return (value & 0x7fffu) != 0u;
+                    });
+    check(has_nonzero_remainder, label + " exercises nonzero low activations");
+    if (!has_nonzero_remainder) return false;
+    const bool remainders_follow_bf16x2_rule =
+        std::equal(low_values.begin(), low_values.end(), original_values.begin(),
+                   [](std::uint16_t low, float original) {
+                       return low == strata::kernels::bf16_from_f32(
+                                         original -
+                                         strata::kernels::f32_from_bf16(
+                                             strata::kernels::bf16_from_f32(
+                                                 original)));
+                   });
+    check(remainders_follow_bf16x2_rule,
+          label + " low activations match the BF16X2 remainder rule");
+    if (!remainders_follow_bf16x2_rule) return false;
+    for (std::size_t i = 0u; i < w_count; ++i) {
+        const std::uint32_t inner = static_cast<std::uint32_t>(i % k);
+        const std::uint32_t column = static_cast<std::uint32_t>(i / k);
+        const float value =
+            column == 0u
+                ? 1.0f + (inner + 1u == k ? 0x1.0p-7f : 0.0f)
+                : 0.25f +
+                      static_cast<float>((i * 13u) % 17u) * 0.03125f;
+        weight_values[i] = strata::kernels::bf16_from_f32(value);
+    }
+    std::memcpy(x_hi.payload().data(), high_values.data(),
+                high_values.size() * sizeof(std::uint16_t));
+    std::memcpy(x_lo.payload().data(), low_values.data(),
+                low_values.size() * sizeof(std::uint16_t));
+    std::memcpy(w.payload().data(), weight_values.data(),
+                weight_values.size() * sizeof(std::uint16_t));
+    auto* const y_values = reinterpret_cast<float*>(y.payload().data());
+    std::fill(y_values, y_values + y_count, kInitialOutput);
+
+    const std::vector<std::uint8_t> high_before(x_hi.allocation().begin(),
+                                                x_hi.allocation().end());
+    const std::vector<std::uint8_t> low_before(x_lo.allocation().begin(),
+                                               x_lo.allocation().end());
+    const std::vector<std::uint8_t> weight_before(w.allocation().begin(),
+                                                 w.allocation().end());
+    const PrefillGemmBF16X2Buffers buffers{
+        context.buffers().read_only(x_hi.view()),
+        context.buffers().read_only(x_lo.view()),
+        context.buffers().read_only(w.view()), y.view()};
+    auto command = context.make_command_buffer(label, error);
+    check(command != nullptr, label + " command buffer", error);
+    if (!command) return false;
+
+    PrefillGemmBackend selected =
+        expected == PrefillGemmBackend::MPP ? PrefillGemmBackend::SIMD
+                                            : PrefillGemmBackend::MPP;
+    const bool encoded = encode_prefill_gemm_bf16x2(
+        context, *command, params, buffers, error, &selected);
+    const bool selected_expected = encoded && selected == expected;
+    check(selected_expected, label + " selected backend", error);
+    if (!encoded) return false;
+    const bool completed = submit_and_wait(command, error);
+    check(completed, label + " complete", error);
+    if (!completed) return false;
+
+    bool within_u = true;
+    std::vector<double> row_error_squared(rows, 0.0);
+    std::vector<double> row_reference_squared(rows, 0.0);
+    const double unit_bound_scale =
+        (2.0 * static_cast<double>(k) + 2.0) * kUnitRoundoff;
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        for (std::uint32_t column = 0u; column < n; ++column) {
+            double reference = 0.0;
+            double magnitude = 0.0;
+            for (std::uint32_t inner = 0u; inner < k; ++inner) {
+                const std::size_t x_index =
+                    static_cast<std::size_t>(row) * k + inner;
+                const std::size_t weight_index =
+                    static_cast<std::size_t>(column) * k + inner;
+                const double weight =
+                    strata::kernels::f32_from_bf16(
+                        weight_values[weight_index]);
+                const double high =
+                    strata::kernels::f32_from_bf16(high_values[x_index]);
+                const double low =
+                    strata::kernels::f32_from_bf16(low_values[x_index]);
+                const double high_product = high * weight;
+                const double low_product = low * weight;
+                reference += high_product;
+                reference += low_product;
+                magnitude += std::abs(high_product) + std::abs(low_product);
+            }
+            if (accumulate) {
+                reference += kInitialOutput;
+                magnitude += std::abs(static_cast<double>(kInitialOutput));
+            }
+            const float actual =
+                y_values[static_cast<std::size_t>(row) * ldy + col0 + column];
+            const double error_value =
+                static_cast<double>(actual) - reference;
+            const double bound = unit_bound_scale * magnitude +
+                                 kUnderflowAllowance;
+            within_u &= std::isfinite(actual) &&
+                        std::abs(error_value) <= bound;
+            row_error_squared[row] += error_value * error_value;
+            row_reference_squared[row] += reference * reference;
+        }
+        for (std::uint32_t column = 0u; column < ldy; ++column) {
+            if (column >= col0 && column < col0 + n) continue;
+            within_u &= y_values[static_cast<std::size_t>(row) * ldy +
+                                 column] == kInitialOutput;
+        }
+    }
+    bool within_r = true;
+    double max_relative_l2 = 0.0;
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        const double reference_norm =
+            std::sqrt(row_reference_squared[row]);
+        const double relative_l2 =
+            std::sqrt(row_error_squared[row]) / reference_norm;
+        max_relative_l2 = std::max(max_relative_l2, relative_l2);
+        within_r &= relative_l2 <= kRelativeTolerance;
+    }
+    check(within_u, label + " U(2K), output padding");
+    check(within_r, label + " R(2^-16)",
+          "max row-relative L2 error " + std::to_string(max_relative_l2));
+    const bool immutable =
+        std::equal(high_before.begin(), high_before.end(),
+                   x_hi.allocation().begin()) &&
+        std::equal(low_before.begin(), low_before.end(),
+                   x_lo.allocation().begin()) &&
+        std::equal(weight_before.begin(), weight_before.end(),
+                   w.allocation().begin());
+    check(immutable, label + " read-only inputs");
+    const bool guards =
+        x_hi.guards_intact() && x_lo.guards_intact() && w.guards_intact() &&
+        y.guards_intact();
+    check(guards, label + " guard zones");
+    return selected_expected && within_u && within_r && immutable && guards;
+}
+
 bool expect_rejected(Context& context,
                      bool f16, bool simd,
                      const PrefillGemmMPPParams& params,
@@ -541,6 +732,60 @@ bool test_validation(Context& context, Context& foreign_context, bool f16,
               error);
         passed &= group_rejected;
     }
+    if (!f16) {
+        TestBuffer bf16x2_w, bf16x2_y;
+        const bool bf16x2_allocated =
+            bf16x2_w.allocate(context, prefix + " BF16X2 W",
+                              64u * 32u * sizeof(std::uint16_t), error) &&
+            bf16x2_y.allocate(context, prefix + " BF16X2 Y",
+                              64u * sizeof(float), error);
+        check(bf16x2_allocated, prefix + " allocate BF16X2 rollback buffers",
+              error);
+        if (!bf16x2_allocated) return false;
+        const PrefillGemmMPPParams bf16x2_params{
+            1u, 64u, 32u, 64u, 0u, false};
+        const auto bf16x2_y_before = std::vector<std::uint8_t>(
+            bf16x2_y.allocation().begin(), bf16x2_y.allocation().end());
+        const auto check_bf16x2_rollback =
+            [&](const PrefillGemmBF16X2Buffers& buffers,
+                std::string_view expected_error,
+                const std::string& label) {
+                auto command = context.make_command_buffer(label, error);
+                if (!command) {
+                    check(false, label + " command buffer", error);
+                    return false;
+                }
+                PrefillGemmBackend selected = PrefillGemmBackend::MPP;
+                const bool encoded = encode_prefill_gemm_bf16x2(
+                    context, *command, bf16x2_params, buffers, error,
+                    &selected);
+                const bool rolled_back =
+                    !encoded && command->unsafe_native_handle() == nullptr &&
+                    selected == PrefillGemmBackend::MPP &&
+                    error.find(expected_error) != std::string::npos &&
+                    std::equal(bf16x2_y_before.begin(),
+                               bf16x2_y_before.end(),
+                               bf16x2_y.allocation().begin());
+                check(rolled_back, label, error);
+                return rolled_back;
+            };
+        const PrefillGemmBF16X2Buffers short_low_buffers{
+            valid_buffers.x,
+            context.buffers().read_only(x.view().slice(0u, 2u)),
+            context.buffers().read_only(bf16x2_w.view()), bf16x2_y.view()};
+        passed &= check_bf16x2_rollback(
+            short_low_buffers, "X buffer",
+            prefix + " BF16X2 wide late-input rollback");
+
+        const auto low_alias = context.buffers().read_only(
+            bf16x2_y.view().slice(0u, 128u));
+        const PrefillGemmBF16X2Buffers aliased_low_buffers{
+            valid_buffers.x, low_alias,
+            context.buffers().read_only(bf16x2_w.view()), bf16x2_y.view()};
+        passed &= check_bf16x2_rollback(
+            aliased_low_buffers, "overlaps a read-only input",
+            prefix + " BF16X2 low/output alias rollback");
+    }
     return passed;
 }
 
@@ -588,7 +833,27 @@ int main(int argc, char** argv) {
             command->unsafe_native_handle() == nullptr;
         check(rejected, "invalid selector rejects and discards command buffer",
               error);
-        return rejected ? 0 : 1;
+        auto bf16x2_command =
+            context->make_command_buffer("invalid BF16X2 GEMM selector",
+                                         error);
+        if (!bf16x2_command) {
+            check(false, "invalid BF16X2 selector command buffer", error);
+            return 1;
+        }
+        PrefillGemmBackend selected = PrefillGemmBackend::MPP;
+        const bool bf16x2_encoded = encode_prefill_gemm_bf16x2(
+            *context, *bf16x2_command,
+            PrefillGemmMPPParams{1u, 64u, 32u, 64u, 0u, false},
+            PrefillGemmBF16X2Buffers{}, error, &selected);
+        const bool bf16x2_rejected =
+            !bf16x2_encoded &&
+            error == "STRATA_METAL_GEMM must be 'mpp' or 'simd'" &&
+            bf16x2_command->unsafe_native_handle() == nullptr &&
+            selected == PrefillGemmBackend::MPP;
+        check(bf16x2_rejected,
+              "invalid BF16X2 selector rejects and rolls back",
+              error);
+        return rejected && bf16x2_rejected ? 0 : 1;
     }
 
     ContextOptions foreign_options = options;
@@ -615,6 +880,14 @@ int main(int argc, char** argv) {
                                 simd);
         passed &= dispatch_case(*context, 65u, 65u, 2560u, true, false, f16,
                                 simd);
+    }
+    for (const std::uint32_t rows : {1u, 3u, 8u}) {
+        for (const std::uint32_t columns : edge_columns) {
+            passed &= dispatch_bf16x2_case(*context, rows, columns, 32u,
+                                           false);
+            passed &= dispatch_bf16x2_case(*context, rows, columns, 32u,
+                                           true);
+        }
     }
     if (g_failures != 0 || !passed) {
         std::fprintf(stderr,

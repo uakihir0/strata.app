@@ -238,6 +238,29 @@ bool encode_prefill_gemm_component(
         error);
 }
 
+bool encode_selected_prefill_gemm(
+    Context& context, Encoder& encoder,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, PrefillGemmFormat format,
+    PrefillGemmBackend backend, std::string& error) {
+    if (format == PrefillGemmFormat::F16) {
+        return backend == PrefillGemmBackend::MPP
+                   ? encode_prefill_gemm_f16_mpp(context, encoder, params,
+                                                 buffers, error)
+                   : encode_prefill_gemm_f16_simd(context, encoder, params,
+                                                  buffers, error);
+    }
+    if (format == PrefillGemmFormat::BF16) {
+        return backend == PrefillGemmBackend::MPP
+                   ? encode_prefill_gemm_bf16_mpp(context, encoder, params,
+                                                  buffers, error)
+                   : encode_prefill_gemm_bf16_simd(context, encoder, params,
+                                                   buffers, error);
+    }
+    error = "Prefill GEMM format is invalid";
+    return false;
+}
+
 }  // namespace
 
 bool encode_prefill_gemm(
@@ -254,24 +277,8 @@ bool encode_prefill_gemm(
                                       setting, backend, error)) {
         return false;
     }
-
-    bool encoded = false;
-    if (format == PrefillGemmFormat::F16) {
-        encoded = backend == PrefillGemmBackend::MPP
-                      ? encode_prefill_gemm_f16_mpp(context, encoder, params,
-                                                    buffers, error)
-                      : encode_prefill_gemm_f16_simd(context, encoder, params,
-                                                     buffers, error);
-    } else if (format == PrefillGemmFormat::BF16) {
-        encoded = backend == PrefillGemmBackend::MPP
-                      ? encode_prefill_gemm_bf16_mpp(context, encoder, params,
-                                                     buffers, error)
-                      : encode_prefill_gemm_bf16_simd(context, encoder, params,
-                                                      buffers, error);
-    } else {
-        error = "Prefill GEMM format is invalid";
-        return false;
-    }
+    const bool encoded = encode_selected_prefill_gemm(
+        context, encoder, params, buffers, format, backend, error);
     if (encoded && selected_backend != nullptr) {
         *selected_backend = backend;
     }
@@ -289,6 +296,48 @@ bool encode_prefill_gemm(
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_prefill_gemm(context, encoder, params, buffers,
                                        format, encode_error, &selected);
+        },
+        error);
+    if (encoded && selected_backend != nullptr) {
+        *selected_backend = selected;
+    }
+    return encoded;
+}
+
+bool encode_prefill_gemm_bf16x2(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmBF16X2Buffers& buffers, std::string& error,
+    PrefillGemmBackend* selected_backend) {
+    PrefillGemmBackend selected = PrefillGemmBackend::SIMD;
+    const bool encoded = Encoder::encode(
+        context, command_buffer, "Prefill BF16X2 GEMM",
+        [&](Encoder& encoder, std::string& encode_error) {
+            const char* const configured = std::getenv("STRATA_METAL_GEMM");
+            const std::string_view setting =
+                configured == nullptr ? std::string_view{}
+                                      : std::string_view(configured);
+            if (!resolve_prefill_gemm_backend(
+                    supports_apple10(context), params.n, setting, selected,
+                    encode_error)) {
+                return false;
+            }
+
+            const PrefillGemmMPPBuffers high_buffers{
+                buffers.x_hi, buffers.w, buffers.y};
+            if (!encode_selected_prefill_gemm(
+                    context, encoder, params, high_buffers,
+                    PrefillGemmFormat::BF16, selected, encode_error)) {
+                return false;
+            }
+
+            PrefillGemmMPPParams low_params = params;
+            low_params.accumulate = true;
+            const PrefillGemmMPPBuffers low_buffers{
+                buffers.x_lo, buffers.w, buffers.y};
+            return encode_selected_prefill_gemm(
+                context, encoder, low_params, low_buffers,
+                PrefillGemmFormat::BF16, selected, encode_error);
         },
         error);
     if (encoded && selected_backend != nullptr) {

@@ -286,25 +286,25 @@ strata_metal_test(metal_prefill_gemm_test metal metal_prefill_gemm_test
 set_tests_properties(metal_prefill_gemm_test PROPERTIES
   TIMEOUT 120
   SKIP_RETURN_CODE 77
-  ENVIRONMENT "STRATA_METAL_DISPATCH=serial")
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial;STRATA_METAL_GEMM=mpp")
 strata_metal_test(metal_prefill_gemm_test_concurrent metal
                   metal_prefill_gemm_test ${STRATA_METALLIB} mpp)
 set_tests_properties(metal_prefill_gemm_test_concurrent PROPERTIES
   TIMEOUT 120
   SKIP_RETURN_CODE 77
-  ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
+  ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent;STRATA_METAL_GEMM=mpp")
 strata_metal_test(metal_prefill_gemm_simd_test metal
                   metal_prefill_gemm_test ${STRATA_METALLIB} simd)
 set_tests_properties(metal_prefill_gemm_simd_test PROPERTIES
   TIMEOUT 120
   SKIP_RETURN_CODE 77
-  ENVIRONMENT "STRATA_METAL_DISPATCH=serial")
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial;STRATA_METAL_GEMM=simd")
 strata_metal_test(metal_prefill_gemm_simd_test_concurrent metal
                   metal_prefill_gemm_test ${STRATA_METALLIB} simd)
 set_tests_properties(metal_prefill_gemm_simd_test_concurrent PROPERTIES
   TIMEOUT 120
   SKIP_RETURN_CODE 77
-  ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
+  ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent;STRATA_METAL_GEMM=simd")
 strata_metal_test(metal_prefill_gemm_auto_test metal
                   metal_prefill_gemm_test ${STRATA_METALLIB} auto)
 set_tests_properties(metal_prefill_gemm_auto_test PROPERTIES

@@ -26,6 +26,13 @@ struct PrefillGemmMPPBuffers {
     BufferRef y;
 };
 
+struct PrefillGemmBF16X2Buffers {
+    ReadOnlyBufferRef x_hi;
+    ReadOnlyBufferRef x_lo;
+    ReadOnlyBufferRef w;
+    BufferRef y;
+};
+
 using PrefillGemmBF16MPPParams = PrefillGemmMPPParams;
 using PrefillGemmBF16MPPBuffers = PrefillGemmMPPBuffers;
 using PrefillGemmF16MPPParams = PrefillGemmMPPParams;
@@ -54,6 +61,15 @@ bool encode_prefill_gemm(
     const PrefillGemmMPPParams& params,
     const PrefillGemmMPPBuffers& buffers, PrefillGemmFormat format,
     std::string& error,
+    PrefillGemmBackend* selected_backend = nullptr);
+
+/// Transactionally encode both BF16X2 activation products into one command
+/// buffer. The high product uses params.accumulate; the low product always
+/// accumulates into its result. Both products use the same selected backend.
+bool encode_prefill_gemm_bf16x2(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmBF16X2Buffers& buffers, std::string& error,
     PrefillGemmBackend* selected_backend = nullptr);
 
 /// Encode an Apple10 BF16 matrix product. X is row-major [rows, k], W is
