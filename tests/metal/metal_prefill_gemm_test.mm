@@ -1,4 +1,5 @@
-// GPU twin for isolated Prefill F16/BF16 MPP GEMM components (docs/mac/04 §6.2).
+// GPU twins for isolated Prefill F16/BF16 MPP and SIMD GEMM components
+// (docs/mac/04 §6.2).
 #include "metallib_sha256.inc"
 
 #include "strata/kernels/bf16_bits.hpp"
@@ -112,6 +113,10 @@ std::string_view precision_name(bool f16) {
     return f16 ? "F16" : "BF16";
 }
 
+std::string_view backend_name(bool simd) {
+    return simd ? "SIMD" : "MPP";
+}
+
 std::uint16_t encode_input(float value, bool f16) {
     return f16 ? strata::kernels::f16_from_f32(value)
                : strata::kernels::bf16_from_f32(value);
@@ -122,18 +127,30 @@ double decode_input(std::uint16_t bits, bool f16) {
                : strata::kernels::f32_from_bf16(bits);
 }
 
-bool encode_case(Context& context, bool f16, Encoder& encoder,
+bool encode_case(Context& context, bool f16, bool simd, Encoder& encoder,
                  const PrefillGemmMPPParams& params,
                  const PrefillGemmMPPBuffers& buffers, std::string& error) {
-    return f16 ? encode_prefill_gemm_f16_mpp(context, encoder, params,
-                                             buffers, error)
-               : encode_prefill_gemm_bf16_mpp(context, encoder, params,
-                                              buffers, error);
+    if (simd) {
+        return f16 ? encode_prefill_gemm_f16_simd(context, encoder, params,
+                                                  buffers, error)
+                   : encode_prefill_gemm_bf16_simd(context, encoder, params,
+                                                   buffers, error);
+    }
+    return f16 ? encode_prefill_gemm_f16_mpp(context, encoder, params, buffers,
+                                             error)
+               : encode_prefill_gemm_bf16_mpp(context, encoder, params, buffers,
+                                              error);
 }
 
-bool encode_case(Context& context, bool f16, CommandBuffer& command,
+bool encode_case(Context& context, bool f16, bool simd, CommandBuffer& command,
                  const PrefillGemmMPPParams& params,
                  const PrefillGemmMPPBuffers& buffers, std::string& error) {
+    if (simd) {
+        return f16 ? encode_prefill_gemm_f16_simd(context, command, params,
+                                                  buffers, error)
+                   : encode_prefill_gemm_bf16_simd(context, command, params,
+                                                   buffers, error);
+    }
     return f16 ? encode_prefill_gemm_f16_mpp(context, command, params, buffers,
                                              error)
                : encode_prefill_gemm_bf16_mpp(context, command, params, buffers,
@@ -142,10 +159,11 @@ bool encode_case(Context& context, bool f16, CommandBuffer& command,
 
 bool dispatch_case(Context& context, std::uint32_t rows, std::uint32_t n,
                    std::uint32_t k, bool accumulate, bool use_wrapper,
-                   bool f16) {
+                   bool f16, bool simd) {
     const std::string label =
         "Prefill " + std::string(precision_name(f16)) +
-        " MPP GEMM rows=" + std::to_string(rows) +
+        " " + std::string(backend_name(simd)) + " GEMM rows=" +
+        std::to_string(rows) +
         " n=" + std::to_string(n) + " k=" + std::to_string(k) +
         (accumulate ? " accumulate" : " overwrite");
     const std::uint32_t col0 = 3u;
@@ -166,14 +184,28 @@ bool dispatch_case(Context& context, std::uint32_t rows, std::uint32_t n,
 
     std::vector<std::uint16_t> x_values(x_count);
     std::vector<std::uint16_t> w_values(w_count);
-    for (std::size_t i = 0u; i < x_count; ++i) {
-        const float value =
-            0.5f + static_cast<float>((i * 7u) % 11u) * 0.0625f;
-        x_values[i] = encode_input(value, f16);
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        const float row_scale =
+            1.0f + static_cast<float>(row) * 0x1.0p-7f;
+        for (std::uint32_t inner = 0u; inner < k; ++inner) {
+            const float value =
+                (inner & 1u) == 0u ? row_scale : -row_scale;
+            x_values[static_cast<std::size_t>(row) * k + inner] =
+                encode_input(value, f16);
+        }
     }
     for (std::size_t i = 0u; i < w_count; ++i) {
+        const std::uint32_t inner =
+            f16 ? static_cast<std::uint32_t>(i / n)
+                : static_cast<std::uint32_t>(i % k);
+        const std::uint32_t column =
+            f16 ? static_cast<std::uint32_t>(i % n)
+                : static_cast<std::uint32_t>(i / k);
         const float value =
-            0.25f + static_cast<float>((i * 13u) % 17u) * 0.03125f;
+            column == 0u
+                ? 1.0f + (inner + 1u == k ? 0x1.0p-7f : 0.0f)
+                : 0.25f +
+                      static_cast<float>((i * 13u) % 17u) * 0.03125f;
         w_values[i] = encode_input(value, f16);
     }
     std::memcpy(x.payload().data(), x_values.data(),
@@ -197,11 +229,11 @@ bool dispatch_case(Context& context, std::uint32_t rows, std::uint32_t n,
 
     const bool encoded =
         use_wrapper
-            ? encode_case(context, f16, *command, params, buffers, error)
+            ? encode_case(context, f16, simd, *command, params, buffers, error)
             : Encoder::encode(
                   context, *command, label,
                   [&](Encoder& encoder, std::string& encode_error) {
-                      return encode_case(context, f16, encoder, params,
+                      return encode_case(context, f16, simd, encoder, params,
                                          buffers, encode_error);
                   },
                   error);
@@ -276,7 +308,8 @@ bool dispatch_case(Context& context, std::uint32_t rows, std::uint32_t n,
 }
 
 bool expect_rejected(Context& context,
-                     bool f16, const PrefillGemmMPPParams& params,
+                     bool f16, bool simd,
+                     const PrefillGemmMPPParams& params,
                      const PrefillGemmMPPBuffers& buffers,
                      std::string_view expected_error,
                      const std::string& label) {
@@ -287,7 +320,7 @@ bool expect_rejected(Context& context,
         return false;
     }
     const bool encoded =
-        encode_case(context, f16, *command, params, buffers, error);
+        encode_case(context, f16, simd, *command, params, buffers, error);
     const bool rejected =
         !encoded && command->unsafe_native_handle() == nullptr &&
         error.find(expected_error) != std::string::npos;
@@ -295,9 +328,11 @@ bool expect_rejected(Context& context,
     return rejected;
 }
 
-bool test_validation(Context& context, Context& foreign_context, bool f16) {
+bool test_validation(Context& context, Context& foreign_context, bool f16,
+                     bool simd) {
     const std::string prefix =
-        "Prefill " + std::string(precision_name(f16)) + " MPP GEMM validation";
+        "Prefill " + std::string(precision_name(f16)) + " " +
+        std::string(backend_name(simd)) + " GEMM validation";
     std::string error;
     TestBuffer x, w, y, oversized;
     const bool allocated =
@@ -314,49 +349,49 @@ bool test_validation(Context& context, Context& foreign_context, bool f16) {
     bool passed = true;
     auto invalid = valid;
     invalid.rows = 0u;
-    passed &= expect_rejected(context, f16, invalid, valid_buffers,
+    passed &= expect_rejected(context, f16, simd, invalid, valid_buffers,
                               "row count", prefix + " zero rows");
     invalid = valid;
     invalid.n = 0u;
-    passed &= expect_rejected(context, f16, invalid, valid_buffers, "n > 0",
-                              prefix + " zero columns");
+    passed &= expect_rejected(context, f16, simd, invalid, valid_buffers,
+                              "n > 0", prefix + " zero columns");
     invalid = valid;
     invalid.k = 33u;
-    passed &= expect_rejected(context, f16, invalid, valid_buffers,
+    passed &= expect_rejected(context, f16, simd, invalid, valid_buffers,
                               "K divisible", prefix + " K alignment");
     invalid = valid;
     invalid.ldy = 2u;
-    passed &= expect_rejected(context, f16, invalid, valid_buffers,
+    passed &= expect_rejected(context, f16, simd, invalid, valid_buffers,
                               "extent or stride", prefix + " short output stride");
     invalid = valid;
     invalid.ldy =
         static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) +
         1u;
-    passed &= expect_rejected(context, f16, invalid, valid_buffers,
+    passed &= expect_rejected(context, f16, simd, invalid, valid_buffers,
                               "extent or stride", prefix + " signed extent");
 
     const PrefillGemmMPPBuffers short_x{
         context.buffers().read_only(x.view().slice(0u, 2u)),
         valid_buffers.w, valid_buffers.y};
-    passed &= expect_rejected(context, f16, valid, short_x, "X buffer",
+    passed &= expect_rejected(context, f16, simd, valid, short_x, "X buffer",
                               prefix + " short X");
     const PrefillGemmMPPBuffers short_w{
         valid_buffers.x,
         context.buffers().read_only(w.view().slice(0u, 2u)), valid_buffers.y};
-    passed &= expect_rejected(context, f16, valid, short_w, "W buffer",
+    passed &= expect_rejected(context, f16, simd, valid, short_w, "W buffer",
                               prefix + " short W");
     const PrefillGemmMPPBuffers short_y{
         valid_buffers.x, valid_buffers.w, y.view().slice(0u, 4u)};
-    passed &= expect_rejected(context, f16, valid, short_y, "y buffer",
+    passed &= expect_rejected(context, f16, simd, valid, short_y, "y buffer",
                               prefix + " short Y");
     const PrefillGemmMPPBuffers misaligned_x{
         context.buffers().read_only(x.view().slice(1u, 64u)),
         valid_buffers.w, valid_buffers.y};
-    passed &= expect_rejected(context, f16, valid, misaligned_x, "X buffer",
+    passed &= expect_rejected(context, f16, simd, valid, misaligned_x, "X buffer",
                               prefix + " misaligned X");
     const PrefillGemmMPPBuffers misaligned_y{
         valid_buffers.x, valid_buffers.w, y.view().slice(2u, 62u)};
-    passed &= expect_rejected(context, f16, valid, misaligned_y, "y buffer",
+    passed &= expect_rejected(context, f16, simd, valid, misaligned_y, "y buffer",
                               prefix + " misaligned Y");
 
     std::string foreign_error;
@@ -369,24 +404,24 @@ bool test_validation(Context& context, Context& foreign_context, bool f16) {
     const PrefillGemmMPPBuffers foreign_inputs{
         foreign_context.buffers().read_only(foreign_x.view()),
         valid_buffers.w, valid_buffers.y};
-    passed &= expect_rejected(context, f16, valid, foreign_inputs, "not owned",
+    passed &= expect_rejected(context, f16, simd, valid, foreign_inputs, "not owned",
                               prefix + " foreign input");
 
     const auto alias_x = context.buffers().read_only(
         oversized.view().slice(0u, 64u));
     const PrefillGemmMPPBuffers exact_alias{
         alias_x, valid_buffers.w, oversized.view().slice(0u, 128u)};
-    passed &= expect_rejected(context, f16, valid, exact_alias, "overlaps",
+    passed &= expect_rejected(context, f16, simd, valid, exact_alias, "overlaps",
                               prefix + " exact output/input alias");
     const PrefillGemmMPPBuffers partial_alias{
         alias_x, valid_buffers.w, oversized.view().slice(60u, 68u)};
-    passed &= expect_rejected(context, f16, valid, partial_alias, "overlaps",
+    passed &= expect_rejected(context, f16, simd, valid, partial_alias, "overlaps",
                               prefix + " partial output/input alias");
     const auto alias_w = context.buffers().read_only(
         oversized.view().slice(0u, 128u));
     const PrefillGemmMPPBuffers partial_w_alias{
         valid_buffers.x, alias_w, oversized.view().slice(120u, 12u)};
-    passed &= expect_rejected(context, f16, valid, partial_w_alias, "overlaps",
+    passed &= expect_rejected(context, f16, simd, valid, partial_w_alias, "overlaps",
                               prefix + " partial W/output alias");
 
     auto adjacent_command = context.make_command_buffer(
@@ -400,7 +435,7 @@ bool test_validation(Context& context, Context& foreign_context, bool f16) {
     const bool adjacent_encoded = Encoder::encode(
         context, *adjacent_command, prefix + " adjacent views",
         [&](Encoder& encoder, std::string& encode_error) {
-            return encode_case(context, f16, encoder, valid, adjacent_views,
+            return encode_case(context, f16, simd, encoder, valid, adjacent_views,
                                encode_error);
         },
         error);
@@ -420,13 +455,13 @@ bool test_validation(Context& context, Context& foreign_context, bool f16) {
     const bool rollback_encoded = Encoder::encode(
         context, *rollback_command, prefix + " rollback",
         [&](Encoder& encoder, std::string& encode_error) {
-            if (!encode_case(context, f16, encoder, valid, valid_buffers,
+            if (!encode_case(context, f16, simd, encoder, valid, valid_buffers,
                              encode_error)) {
                 return false;
             }
             auto late_failure = valid;
             late_failure.rows = 0u;
-            return encode_case(context, f16, encoder, late_failure,
+            return encode_case(context, f16, simd, encoder, late_failure,
                                valid_buffers, encode_error);
         },
         error);
@@ -451,7 +486,8 @@ bool test_validation(Context& context, Context& foreign_context, bool f16) {
             context, *group_command, "open concurrent " + prefix,
             [&](Encoder& encoder, std::string& encode_error) {
                 if (!encoder.group_begin(encode_error)) return false;
-                return encode_case(context, f16, encoder, valid, valid_buffers,
+                return encode_case(context, f16, simd, encoder, valid,
+                                   valid_buffers,
                                    encode_error);
             },
             error);
@@ -469,10 +505,15 @@ bool test_validation(Context& context, Context& foreign_context, bool f16) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        std::fprintf(stderr, "usage: metal_prefill_gemm_test strata.metallib\n");
+    if (argc != 3 ||
+        (std::string_view(argv[2]) != "mpp" &&
+         std::string_view(argv[2]) != "simd")) {
+        std::fprintf(stderr,
+                     "usage: metal_prefill_gemm_test strata.metallib "
+                     "<mpp|simd>\n");
         return 2;
     }
+    const bool simd = std::string_view(argv[2]) == "simd";
     ContextOptions options;
     options.metallib = argv[1];
     options.metallib_sha256 = STRATA_METALLIB_SHA256;
@@ -480,7 +521,7 @@ int main(int argc, char** argv) {
     auto context = Context::open(options, error);
     check(context != nullptr, "open Metal Context", error);
     if (!context) return 1;
-    if (!supports_apple10(*context)) {
+    if (!simd && !supports_apple10(*context)) {
         std::puts("skip: F16/BF16 MPP GEMM requires an Apple10 GPU");
         return 77;
     }
@@ -495,24 +536,28 @@ int main(int argc, char** argv) {
     const std::array<std::uint32_t, 3u> edge_rows{1u, 63u, 65u};
     const std::array<std::uint32_t, 3u> edge_columns{1u, 63u, 65u};
     for (const bool f16 : {true, false}) {
-        passed &= test_validation(*context, *foreign_context, f16);
+        passed &= test_validation(*context, *foreign_context, f16, simd);
         for (const std::uint32_t rows : edge_rows) {
             for (const std::uint32_t columns : edge_columns) {
                 const bool wrapper = rows == 1u && columns == 1u;
                 passed &= dispatch_case(*context, rows, columns, 32u, false,
-                                        wrapper, f16);
+                                        wrapper, f16, simd);
                 passed &= dispatch_case(*context, rows, columns, 32u, true,
-                                        false, f16);
+                                        false, f16, simd);
             }
         }
-        passed &= dispatch_case(*context, 65u, 65u, 2560u, false, false, f16);
-        passed &= dispatch_case(*context, 65u, 65u, 2560u, true, false, f16);
+        passed &= dispatch_case(*context, 65u, 65u, 2560u, false, false, f16,
+                                simd);
+        passed &= dispatch_case(*context, 65u, 65u, 2560u, true, false, f16,
+                                simd);
     }
     if (g_failures != 0 || !passed) {
-        std::fprintf(stderr, "%d Prefill F16/BF16 MPP GEMM test(s) failed\n",
-                     g_failures);
+        std::fprintf(stderr,
+                     "%d Prefill F16/BF16 %s GEMM test(s) failed\n",
+                     g_failures, simd ? "SIMD" : "MPP");
         return 1;
     }
-    std::puts("all Prefill F16/BF16 MPP GEMM tests passed");
+    std::printf("all Prefill F16/BF16 %s GEMM tests passed\n",
+                simd ? "SIMD" : "MPP");
     return 0;
 }

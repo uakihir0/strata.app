@@ -460,6 +460,14 @@
       "label": "metal",
       "origin": "04 §6.2/§10.5 / 09 9.1 / D-IMPL-356/357 / REV-153/154"
     },
+    "metal_prefill_gemm_simd_test": {
+      "label": "metal",
+      "origin": "04 §6.2/§10.5 / 09 9.1 / D-IMPL-358 / REV-155"
+    },
+    "metal_prefill_gemm_simd_test_concurrent": {
+      "label": "metal",
+      "origin": "04 §6.2/§10.5 / 09 9.1 / D-IMPL-358 / REV-155"
+    },
     "metal_qsa_test": {
       "label": "metal",
       "origin": "04 10.5"
