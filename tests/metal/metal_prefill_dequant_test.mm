@@ -936,22 +936,40 @@ struct FormatTraits<block_iq3_s> {
         }
     }
 
-    static std::uint32_t oracle_code(std::uint32_t column,
-                                    std::uint32_t block_index,
-                                    std::uint32_t value) {
-        const std::uint32_t ib = value / 32u;
-        const std::uint32_t il = (value % 32u) / 8u;
-        const std::uint32_t pos = value % 8u;
-        const std::uint32_t lane = pos % 4u;
-        const std::uint32_t record = 8u * ib + 2u * il + pos / 4u;
-        const std::uint32_t index =
-            logical_grid_index(row_id(column, block_index), record);
-        const std::uint32_t magnitude =
-            (iq3s_grid[index] >> (8u * lane)) & 0xffu;
-        const std::uint32_t sign_group = 4u * ib + il;
-        bool negative = ((sign_masks[sign_group] >> pos) & 1u) != 0u;
-        negative ^= (row_id(column, block_index) & 1u) != 0u;
-        return magnitude | (negative ? 0x100u : 0u);
+    static std::array<std::uint32_t, 256> oracle_codes(
+        const block_iq3_s& block) {
+        std::array<std::uint32_t, 256> codes{};
+        // Decode the bytes actually stored in the fixture. Walk two packed
+        // four-value grid words per eight-value subgroup, then scatter those
+        // quartets into K order. This differs from the GPU's value-indexed
+        // record/lane calculation and does not reuse the fixture generator.
+        for (std::uint32_t ib = 0u; ib < 8u; ++ib) {
+            for (std::uint32_t il = 0u; il < 4u; ++il) {
+                const std::uint32_t qs_base = 8u * ib + 2u * il;
+                const std::uint32_t sign_group = 4u * ib + il;
+                for (std::uint32_t pair = 0u; pair < 2u; ++pair) {
+                    const std::uint32_t qh_bit =
+                        (uint(block.qh[ib]) >> (2u * il + pair)) & 1u;
+                    const std::uint32_t grid_index =
+                        uint(block.qs[qs_base + pair]) | (qh_bit << 8u);
+                    const std::uint32_t grid_word = iq3s_grid[grid_index];
+                    for (std::uint32_t byte = 0u; byte < 4u; ++byte) {
+                        const std::uint32_t subgroup_value =
+                            4u * pair + byte;
+                        const std::uint32_t k =
+                            32u * ib + 8u * il + subgroup_value;
+                        const std::uint32_t magnitude =
+                            (grid_word >> (8u * byte)) & 0xffu;
+                        const bool negative =
+                            (uint(block.signs[sign_group]) &
+                             (1u << subgroup_value)) != 0u;
+                        codes[k] =
+                            magnitude | (negative ? 0x100u : 0u);
+                    }
+                }
+            }
+        }
+        return codes;
     }
 
     static float expanded_value(std::uint32_t code, std::uint32_t value,
@@ -1045,6 +1063,11 @@ bool test_dequant_format(Context& context) {
             } else {
                 block.d = static_cast<strata_half>(scale);
             }
+            std::array<std::uint32_t, Format::values_per_block>
+                iq3_s_oracle_codes{};
+            if constexpr (std::is_same_v<Block, block_iq3_s>) {
+                iq3_s_oracle_codes = Format::oracle_codes(block);
+            }
             for (std::uint32_t value = 0u;
                  value < Format::values_per_block; ++value) {
                 const std::uint32_t code =
@@ -1075,8 +1098,7 @@ bool test_dequant_format(Context& context) {
                     oracle_code =
                         Format::oracle_code(column, block_index, value);
                 } else if constexpr (std::is_same_v<Block, block_iq3_s>) {
-                    oracle_code =
-                        Format::oracle_code(column, block_index, value);
+                    oracle_code = iq3_s_oracle_codes[value];
                 } else {
                     Format::store(block, value, code);
                 }
