@@ -43,6 +43,7 @@ static_assert(sizeof(block_q4_K) == 144u);
 static_assert(sizeof(block_q5_K) == 176u);
 static_assert(sizeof(block_q6_K) == 210u);
 static_assert(sizeof(block_q3_K) == 110u);
+static_assert(sizeof(block_iq4_xs) == 136u);
 
 int g_failures = 0;
 
@@ -223,6 +224,122 @@ struct FormatTraits<block_iq4_nl> {
 
     static float dequantized_value(std::uint32_t code) {
         return static_cast<float>(iq4_nl_values[code]);
+    }
+};
+
+template <>
+struct FormatTraits<block_iq4_xs> {
+    static constexpr const char* name = "IQ4_XS";
+    static constexpr std::uint32_t values_per_block = 256u;
+    static constexpr std::uint32_t code_count = 16u;
+    static constexpr EncodeCommandBuffer encode =
+        &encode_prefill_dequant_iq4_xs;
+    static constexpr EncodeEncoder encode_encoder =
+        &encode_prefill_dequant_iq4_xs;
+
+    // Eight literal 16-byte segments make both nibble halves and each
+    // 32-value group observably different.
+    static constexpr std::array<std::uint8_t, 128> packed_qs{
+        0xf0u, 0xe1u, 0xd2u, 0xc3u, 0xb4u, 0xa5u, 0x96u, 0x87u,
+        0x78u, 0x69u, 0x5au, 0x4bu, 0x3cu, 0x2du, 0x1eu, 0x0fu,
+        0x23u, 0x14u, 0x05u, 0xf6u, 0xe7u, 0xd8u, 0xc9u, 0xbau,
+        0xabu, 0x9cu, 0x8du, 0x7eu, 0x6fu, 0x50u, 0x41u, 0x32u,
+        0x56u, 0x47u, 0x38u, 0x29u, 0x1au, 0x0bu, 0xfcu, 0xedu,
+        0xdeu, 0xcfu, 0xb0u, 0xa1u, 0x92u, 0x83u, 0x74u, 0x65u,
+        0x89u, 0x7au, 0x6bu, 0x5cu, 0x4du, 0x3eu, 0x2fu, 0x10u,
+        0x01u, 0xf2u, 0xe3u, 0xd4u, 0xc5u, 0xb6u, 0xa7u, 0x98u,
+        0xbcu, 0xadu, 0x9eu, 0x8fu, 0x70u, 0x61u, 0x52u, 0x43u,
+        0x34u, 0x25u, 0x16u, 0x07u, 0xf8u, 0xe9u, 0xdau, 0xcbu,
+        0xefu, 0xd0u, 0xc1u, 0xb2u, 0xa3u, 0x94u, 0x85u, 0x76u,
+        0x67u, 0x58u, 0x49u, 0x3au, 0x2bu, 0x1cu, 0x0du, 0xfeu,
+        0x12u, 0x03u, 0xf4u, 0xe5u, 0xd6u, 0xc7u, 0xb8u, 0xa9u,
+        0x9au, 0x8bu, 0x7cu, 0x6du, 0x5eu, 0x4fu, 0x30u, 0x21u,
+        0x45u, 0x36u, 0x27u, 0x18u, 0x09u, 0xfau, 0xebu, 0xdcu,
+        0xcdu, 0xbeu, 0xafu, 0x90u, 0x81u, 0x72u, 0x63u, 0x54u};
+    static constexpr std::array<std::uint8_t, 8> logical_scales{
+        0u, 1u, 2u, 15u, 16u, 17u, 31u, 63u};
+    static constexpr std::array<std::int8_t, 16> iq4_nl_values{
+        -127, -104, -83, -65, -49, -35, -22, -10,
+        1,    13,   25,  38,  53,  69,  89,  113};
+
+    static std::uint32_t scale_rotation(std::uint32_t column,
+                                        std::uint32_t block_index) {
+        return (column * 2u + block_index) % logical_scales.size();
+    }
+
+    static std::uint32_t scale_offset(std::uint32_t column,
+                                      std::uint32_t block_index) {
+        return (column * 2u + block_index) / logical_scales.size();
+    }
+
+    static std::uint32_t scale_epoch(std::uint32_t column,
+                                     std::uint32_t block_index) {
+        return (column * 2u + block_index) / 512u;
+    }
+
+    static std::uint32_t logical_scale(std::uint32_t column,
+                                       std::uint32_t block_index,
+                                       std::uint32_t group) {
+        const std::uint32_t index =
+            (group + scale_rotation(column, block_index)) %
+            logical_scales.size();
+        return (logical_scales[index] +
+                scale_offset(column, block_index) +
+                scale_epoch(column, block_index) * (7u + 11u * group)) &
+               0x3fu;
+    }
+
+    static void store_fixture(block_iq4_xs& block, std::uint32_t column,
+                              std::uint32_t block_index,
+                              std::uint16_t d_bits) {
+        block.d = d_bits;
+        const bool complement = ((column + block_index) & 1u) != 0u;
+        for (std::uint32_t byte = 0u; byte < packed_qs.size(); ++byte) {
+            block.qs[byte] = static_cast<strata_u8>(
+                complement ? packed_qs[byte] ^ 0xffu : packed_qs[byte]);
+        }
+
+        for (std::uint32_t group = 0u; group < 4u; ++group) {
+            block.scales_l[group] = 0u;
+        }
+        std::uint16_t scales_high = 0u;
+        for (std::uint32_t group = 0u; group < logical_scales.size();
+             ++group) {
+            const std::uint32_t scale =
+                logical_scale(column, block_index, group);
+            const std::uint32_t shift = 4u * (group % 2u);
+            const std::uint32_t old =
+                static_cast<std::uint32_t>(block.scales_l[group / 2u]);
+            block.scales_l[group / 2u] = static_cast<strata_u8>(
+                old | ((scale & 0x0fu) << shift));
+            scales_high = static_cast<std::uint16_t>(
+                scales_high |
+                (((scale >> 4u) & 0x03u) << (2u * group)));
+        }
+        block.scales_h = static_cast<strata_u16>(scales_high);
+    }
+
+    static std::uint32_t oracle_code(std::uint32_t column,
+                                    std::uint32_t block_index,
+                                    std::uint32_t value) {
+        const std::uint32_t group = value / 32u;
+        const std::uint32_t within_group = value % 32u;
+        const std::uint32_t base =
+            within_group < 16u ? within_group : 31u - within_group;
+        const std::uint32_t code = (base + 3u * group) & 0x0fu;
+        const bool complement = ((column + block_index) & 1u) != 0u;
+        return complement ? 15u - code : code;
+    }
+
+    static float expanded_value(std::uint32_t code, std::uint32_t value,
+                                float d, std::uint32_t column,
+                                std::uint32_t block_index) {
+        const float scale =
+            static_cast<float>(
+                static_cast<std::int32_t>(
+                    logical_scale(column, block_index, value / 32u)) -
+                32);
+        return (d * scale) * static_cast<float>(iq4_nl_values[code]);
     }
 };
 
@@ -553,6 +670,16 @@ struct FormatTraits<block_q3_K> {
         0u,  1u,  2u,  15u, 16u, 17u, 31u, 32u,
         33u, 47u, 48u, 49u, 61u, 62u, 63u, 30u};
 
+    static std::uint32_t scale_rotation(std::uint32_t column,
+                                        std::uint32_t block_index) {
+        return (column * 2u + block_index) % logical_scales.size();
+    }
+
+    static std::uint32_t scale_offset(std::uint32_t column,
+                                      std::uint32_t block_index) {
+        return (column * 2u + block_index) / logical_scales.size();
+    }
+
     static void store_fixture(block_q3_K& block, std::uint32_t column,
                               std::uint32_t block_index,
                               std::uint16_t d_bits) {
@@ -567,7 +694,37 @@ struct FormatTraits<block_q3_K> {
             block.qs[byte] = static_cast<strata_u8>(
                 complement ? packed_qs[byte] ^ 0xffu : packed_qs[byte]);
         }
-        std::copy(packed_scales.begin(), packed_scales.end(), block.scales);
+        const std::uint32_t row_index = column * 2u + block_index;
+        if (row_index == 0u) {
+            std::copy(packed_scales.begin(), packed_scales.end(),
+                      block.scales);
+            return;
+        }
+
+        std::array<std::uint8_t, 16> scales{};
+        std::array<std::uint8_t, 12> packed{};
+        const std::uint32_t rotation = scale_rotation(column, block_index);
+        const std::uint32_t offset = scale_offset(column, block_index);
+        for (std::uint32_t group = 0u; group < scales.size(); ++group) {
+            scales[group] = static_cast<std::uint8_t>(
+                (logical_scales[(group + rotation) % logical_scales.size()] +
+                 offset) &
+                0x3fu);
+        }
+        for (std::uint32_t group = 0u; group < 4u; ++group) {
+            packed[group] = static_cast<std::uint8_t>(
+                (scales[group] & 0x0fu) |
+                ((scales[group + 8u] & 0x0fu) << 4u));
+            packed[group + 4u] = static_cast<std::uint8_t>(
+                (scales[group + 4u] & 0x0fu) |
+                ((scales[group + 12u] & 0x0fu) << 4u));
+            packed[group + 8u] = static_cast<std::uint8_t>(
+                ((scales[group] >> 4u) & 0x03u) |
+                (((scales[group + 4u] >> 4u) & 0x03u) << 2u) |
+                (((scales[group + 8u] >> 4u) & 0x03u) << 4u) |
+                (((scales[group + 12u] >> 4u) & 0x03u) << 6u));
+        }
+        std::copy(packed.begin(), packed.end(), block.scales);
     }
 
     static bool positive(std::uint32_t group, std::uint32_t lane) {
@@ -605,13 +762,19 @@ struct FormatTraits<block_q3_K> {
     }
 
     static float expanded_value(std::uint32_t code, std::uint32_t value,
-                                float d) {
+                                float d, std::uint32_t column,
+                                std::uint32_t block_index) {
         const std::uint32_t scale_group = value / 16u;
-        const float scale =
-            static_cast<float>(logical_scales[scale_group]) - 32.0f;
+        const std::uint32_t scale_index =
+            (scale_group + scale_rotation(column, block_index)) %
+            logical_scales.size();
+        const std::uint32_t scale =
+            (logical_scales[scale_index] +
+             scale_offset(column, block_index)) &
+            0x3fu;
         const float signed_code =
             static_cast<float>(static_cast<std::int32_t>(code) - 4);
-        return (d * scale) * signed_code;
+        return (d * (static_cast<float>(scale) - 32.0f)) * signed_code;
     }
 };
 
@@ -750,6 +913,8 @@ bool test_dequant_format(Context& context) {
                 Format::store_fixture(block, column, block_index, scale);
             } else if constexpr (std::is_same_v<Block, block_q3_K>) {
                 Format::store_fixture(block, column, block_index, scale);
+            } else if constexpr (std::is_same_v<Block, block_iq4_xs>) {
+                Format::store_fixture(block, column, block_index, scale);
             } else {
                 block.d = static_cast<strata_half>(scale);
             }
@@ -779,6 +944,9 @@ bool test_dequant_format(Context& context) {
                 } else if constexpr (std::is_same_v<Block, block_q3_K>) {
                     oracle_code =
                         Format::oracle_code(column, block_index, value);
+                } else if constexpr (std::is_same_v<Block, block_iq4_xs>) {
+                    oracle_code =
+                        Format::oracle_code(column, block_index, value);
                 } else {
                     Format::store(block, value, code);
                 }
@@ -796,7 +964,12 @@ bool test_dequant_format(Context& context) {
                         column, block_index);
                 } else if constexpr (std::is_same_v<Block, block_q3_K>) {
                     expanded_value = Format::expanded_value(
-                        oracle_code, value, expanded_scale);
+                        oracle_code, value, expanded_scale,
+                        column, block_index);
+                } else if constexpr (std::is_same_v<Block, block_iq4_xs>) {
+                    expanded_value = Format::expanded_value(
+                        oracle_code, value, expanded_scale,
+                        column, block_index);
                 } else {
                     expanded_value =
                         expanded_scale *
@@ -1021,6 +1194,9 @@ int main(int argc, char** argv) {
                                                   *foreign_context);
     passed &= test_dequant_format<block_iq4_nl>(*context);
     passed &= test_validation_format<block_iq4_nl>(*context,
+                                                    *foreign_context);
+    passed &= test_dequant_format<block_iq4_xs>(*context);
+    passed &= test_validation_format<block_iq4_xs>(*context,
                                                     *foreign_context);
     passed &= test_dequant_format<block_q4_K>(*context);
     passed &= test_validation_format<block_q4_K>(*context,
