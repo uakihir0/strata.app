@@ -144,6 +144,90 @@ bool multiply_size(std::size_t left, std::size_t right,
     return true;
 }
 
+bool validate_window_gdn_ple_commit_views(
+    Context& context, std::uint32_t rows,
+    const WindowGdnPleCommitBuffers& buffers, std::string& error) {
+    if (rows > kWindowScratchTokenRows) {
+        error = "Window GDN/PLE commit row count must be in 0..8";
+        return false;
+    }
+    if (rows == 0u) return true;
+    if (buffers.gdn.states.size() != kSessionGdnLayers ||
+        buffers.gdn.gamma.size() != kSessionGdnLayers) {
+        error = "Window GDN/PLE commit requires one GDN state and gamma per layer";
+        return false;
+    }
+    if (!buffers.ple.history || !context.buffers().owns(buffers.ple.history) ||
+        !buffers.ple.ple_norm ||
+        !context.buffers().owns(buffers.ple.ple_norm)) {
+        error = "Window GDN/PLE commit PLE views are not owned by this Context";
+        return false;
+    }
+
+    constexpr std::size_t kFloatBytes = sizeof(float);
+    const std::size_t history_bytes =
+        static_cast<std::size_t>(kSessionPleHistoryElements) * kFloatBytes;
+    const std::size_t norm_bytes =
+        static_cast<std::size_t>(rows) * kSessionEmbeddingWidth *
+        kSessionHyperconnections * kFloatBytes;
+    if (buffers.ple.history.length < history_bytes ||
+        buffers.ple.ple_norm.length < norm_bytes) {
+        error = "Window GDN/PLE commit has a PLE view shorter than its active extent";
+        return false;
+    }
+    if (buffers.ple.history.offset % alignof(float) != 0u ||
+        buffers.ple.ple_norm.offset % alignof(float) != 0u) {
+        error = "Window GDN/PLE commit has a misaligned PLE view";
+        return false;
+    }
+    if (views_overlap(buffers.ple.history, buffers.ple.ple_norm)) {
+        error = "Window GDN/PLE commit PLE history and normalized rows overlap";
+        return false;
+    }
+
+    const std::array gdn_bases{
+        NamedView{buffers.gdn.qkv_replay, "qkv replay"},
+        NamedView{buffers.gdn.h_replay, "h replay"},
+        NamedView{buffers.gdn.gate_replay, "gate replay"},
+        NamedView{buffers.gdn.beta_replay, "beta replay"},
+        NamedView{buffers.gdn.z, "z scratch"},
+        NamedView{buffers.gdn.output_scratch, "output scratch"},
+    };
+    for (const NamedView& gdn_view : gdn_bases) {
+        if (!gdn_view.view || !context.buffers().owns(gdn_view.view)) {
+            error = "Window GDN/PLE commit " + std::string(gdn_view.name) +
+                    " buffer is not owned by this Context";
+            return false;
+        }
+        if (views_overlap(buffers.ple.history, gdn_view.view) ||
+            views_overlap(buffers.ple.ple_norm, gdn_view.view)) {
+            error = "Window GDN/PLE commit PLE views overlap GDN " +
+                    std::string(gdn_view.name);
+            return false;
+        }
+    }
+    for (std::size_t i = 0u; i < buffers.gdn.states.size(); ++i) {
+        const GdnSessionStateViews& state = buffers.gdn.states[i];
+        if (!state.conv_history || !context.buffers().owns(state.conv_history) ||
+            !state.recurrent || !context.buffers().owns(state.recurrent) ||
+            !buffers.gdn.gamma[i] ||
+            !context.buffers().owns(buffers.gdn.gamma[i])) {
+            error = "Window GDN/PLE commit has a GDN state or gamma outside this Context";
+            return false;
+        }
+        for (const BufferRef& view : {state.conv_history, state.recurrent,
+                                      buffers.gdn.gamma[i]}) {
+            if (views_overlap(buffers.ple.history, view) ||
+                views_overlap(buffers.ple.ple_norm, view)) {
+                error = "Window GDN/PLE commit PLE views overlap GDN layer " +
+                        std::to_string(i);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 bool encode_window_gdn_commit(Context& context, Encoder& encoder,
@@ -378,6 +462,42 @@ bool encode_window_gdn_commit_batch(
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_window_gdn_commit_batch(context, encoder, rows,
                                                   buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_window_gdn_ple_commit(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    const WindowGdnPleCommitBuffers& buffers, std::string& error) {
+    error.clear();
+    if (rows > kWindowScratchTokenRows) {
+        error = "Window GDN/PLE commit row count must be in 0..8";
+        return false;
+    }
+    if (rows == 0u) return true;
+    if (encoder.concurrent_group_open()) {
+        error =
+            "Window GDN/PLE commit requires an ordered concurrent-group boundary";
+        return false;
+    }
+    if (!validate_window_gdn_ple_commit_views(context, rows, buffers, error)) {
+        return false;
+    }
+    if (!encode_window_gdn_commit_batch(context, encoder, rows, buffers.gdn,
+                                        error)) {
+        return false;
+    }
+    return encode_ple_history(context, encoder, rows, buffers.ple, error);
+}
+
+bool encode_window_gdn_ple_commit(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    const WindowGdnPleCommitBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Window GDN/PLE accepted-prefix commit",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_gdn_ple_commit(context, encoder, rows,
+                                                buffers, encode_error);
         },
         error);
 }

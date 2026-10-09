@@ -290,11 +290,11 @@
     },
     "metal_window_gdn_commit_batch_test": {
       "label": "metal",
-      "origin": "04 §5.5, 09 9.1, L10 all-layer accepted-prefix GDN commit batch, D-IMPL-309, REV-106"
+      "origin": "04 §5.5, 09 9.1, L10 all-layer accepted-prefix GDN/PLE commit, D-IMPL-309/310, REV-106/107"
     },
     "metal_window_gdn_commit_batch_test_concurrent": {
       "label": "metal",
-      "origin": "04 §5.5, 09 9.1, L10 all-layer accepted-prefix GDN commit batch, D-IMPL-309, REV-106"
+      "origin": "04 §5.5, 09 9.1, L10 all-layer accepted-prefix GDN/PLE commit, D-IMPL-309/310, REV-106/107"
     },
     "metal_gr_test": {
       "label": "metal",

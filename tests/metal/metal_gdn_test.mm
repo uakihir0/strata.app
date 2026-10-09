@@ -4160,11 +4160,16 @@ bool test_window_gdn_commit_batch(Context& context) {
         "batch GDN z scratch", row_capacity * value_row_bytes);
     const BufferRef output_scratch = allocate(
         "batch GDN output scratch", row_capacity * value_row_bytes);
+    const BufferRef ple_norm = allocate(
+        "batch PLE normalized replay",
+        row_capacity * static_cast<std::size_t>(GDN_CONV_CHANNELS) *
+            sizeof(float));
+    const BufferRef ple_history = state_storage->ple_history();
     const BufferRef gamma_storage = allocate(
         "batch GDN gamma", layers * static_cast<std::size_t>(GDN_VALUE_DIM) *
                                sizeof(float));
     if (!qkv_replay || !h_replay || !gate_replay || !beta_replay || !z ||
-        !output_scratch || !gamma_storage) {
+        !output_scratch || !ple_norm || !ple_history || !gamma_storage) {
         return false;
     }
 
@@ -4197,6 +4202,8 @@ bool test_window_gdn_commit_batch(Context& context) {
     auto* beta_values = static_cast<float*>(beta_replay.contents);
     auto* z_values = static_cast<float*>(z.contents);
     auto* output_values = static_cast<float*>(output_scratch.contents);
+    auto* ple_norm_values = static_cast<float*>(ple_norm.contents);
+    auto* ple_history_values = static_cast<float*>(ple_history.contents);
     std::fill_n(qkv_values, layers * row_capacity * GDN_CONV_CHANNELS,
                 -71.0f);
     std::fill_n(h_values, layers * row_capacity * GDN_CONV_CHANNELS, -72.0f);
@@ -4204,6 +4211,8 @@ bool test_window_gdn_commit_batch(Context& context) {
     std::fill_n(beta_values, layers * row_capacity * GDN_V_HEADS, -74.0f);
     std::fill_n(z_values, row_capacity * GDN_VALUE_DIM, 0.0f);
     std::fill_n(output_values, row_capacity * GDN_VALUE_DIM, 19.0f);
+    std::fill_n(ple_norm_values, row_capacity * GDN_CONV_CHANNELS, -82.0f);
+    std::fill_n(ple_history_values, kSessionPleHistoryElements, -2.0f);
 
     const std::size_t active_h_layer_values =
         static_cast<std::size_t>(rows) * GDN_CONV_CHANNELS;
@@ -4214,6 +4223,18 @@ bool test_window_gdn_commit_batch(Context& context) {
     std::vector<float> active_beta(layers * active_gate_layer_values);
     std::vector<float> active_z(static_cast<std::size_t>(rows) *
                                 GDN_VALUE_DIM, 0.0f);
+    const std::size_t ple_width =
+        static_cast<std::size_t>(kSessionEmbeddingWidth) *
+        kSessionHyperconnections;
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        for (std::size_t channel = 0u; channel < ple_width; ++channel) {
+            const float sample_value =
+                1.0f + static_cast<float>(row) * 0.25f +
+                static_cast<float>(channel) * 0.0001f;
+            ple_norm_values[static_cast<std::size_t>(row) * ple_width +
+                            channel] = sample_value;
+        }
+    }
     for (std::uint32_t layer = 0u; layer < kSessionGdnLayers; ++layer) {
         const std::size_t qkv_layer_offset =
             static_cast<std::size_t>(layer) * row_capacity *
@@ -4269,6 +4290,8 @@ bool test_window_gdn_commit_batch(Context& context) {
         qkv_replay, h_replay, gate_replay, beta_replay, z, output_scratch,
         std::span<const GdnSessionStateViews>(states),
         std::span<const BufferRef>(gamma)};
+    WindowGdnPleCommitBuffers gdn_ple_buffers{
+        buffers, PLEHistoryBuffers{ple_history, ple_norm}};
 
     auto state_and_history_unchanged = [&] {
         for (const GdnSessionStateViews& state : states) {
@@ -4283,7 +4306,10 @@ bool test_window_gdn_commit_batch(Context& context) {
                 return false;
             }
         }
-        return true;
+        return std::all_of(
+            ple_history_values,
+            ple_history_values + kSessionPleHistoryElements,
+            [](float value) { return value == -2.0f; });
     };
 
     bool passed = true;
@@ -4329,6 +4355,85 @@ bool test_window_gdn_commit_batch(Context& context) {
     }
     {
         auto command = context.make_command_buffer(
+            "Window GDN PLE state alias", error);
+        check(command != nullptr, "create GDN/PLE alias command", error);
+        if (!command) return false;
+        WindowGdnPleCommitBuffers invalid = gdn_ple_buffers;
+        invalid.ple.history = states[0].recurrent;
+        const bool accepted = encode_window_gdn_ple_commit(
+            context, *command, rows, invalid, error);
+        const bool rejected = !accepted &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find("PLE views overlap GDN layer") != std::string::npos &&
+            state_and_history_unchanged();
+        check(rejected,
+              "GDN/PLE commit rejects PLE history aliasing a GDN state",
+              error);
+        passed &= rejected;
+    }
+    {
+        auto command = context.make_command_buffer(
+            "Window GDN PLE short normalized rows", error);
+        check(command != nullptr,
+              "create short PLE replay command", error);
+        if (!command) return false;
+        WindowGdnPleCommitBuffers invalid = gdn_ple_buffers;
+        invalid.ple.ple_norm = ple_norm.slice(
+            0u, static_cast<std::size_t>(rows) * ple_width *
+                    sizeof(float) -
+                sizeof(float));
+        const bool accepted = encode_window_gdn_ple_commit(
+            context, *command, rows, invalid, error);
+        const bool rejected = !accepted &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find("PLE view shorter than its active extent") !=
+                std::string::npos &&
+            state_and_history_unchanged();
+        check(rejected,
+              "GDN/PLE commit rejects short accepted-prefix normalized rows",
+              error);
+        passed &= rejected;
+    }
+    {
+        auto command = context.make_command_buffer(
+            "Window GDN PLE misaligned normalized rows", error);
+        check(command != nullptr,
+              "create misaligned PLE replay command", error);
+        if (!command) return false;
+        WindowGdnPleCommitBuffers invalid = gdn_ple_buffers;
+        invalid.ple.ple_norm = ple_norm.slice(
+            1u,
+            static_cast<std::size_t>(rows) * ple_width * sizeof(float));
+        const WindowGDNCommitBuffers first_layer{
+            states[0].conv_history,
+            qkv_replay.slice(0u, active_qkv_bytes),
+            states[0].recurrent,
+            h_replay.slice(0u, active_qkv_bytes),
+            gate_replay.slice(0u, active_gate_bytes),
+            beta_replay.slice(0u, active_gate_bytes),
+            z, gamma[0], output_scratch};
+        const bool accepted = Encoder::encode(
+            context, *command, "Window GDN/PLE enclosing rollback",
+            [&](Encoder& encoder, std::string& body_error) {
+                if (!encode_window_gdn_commit(context, encoder, rows,
+                                              first_layer, body_error)) {
+                    return false;
+                }
+                return encode_window_gdn_ple_commit(
+                    context, encoder, rows, invalid, body_error);
+            },
+            error);
+        const bool rejected = !accepted &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find("misaligned PLE view") != std::string::npos &&
+            state_and_history_unchanged();
+        check(rejected,
+              "caller-owned GDN/PLE failure discards earlier encoded GDN",
+              error);
+        passed &= rejected;
+    }
+    {
+        auto command = context.make_command_buffer(
             "Window GDN caller-owned batch rollback", error);
         check(command != nullptr, "create caller-owned batch command", error);
         if (!command) return false;
@@ -4367,13 +4472,13 @@ bool test_window_gdn_commit_batch(Context& context) {
     }
 
     const bool committed = run_command(
-        context, "Window GDN all-layer accepted-prefix commit",
+        context, "Window GDN/PLE accepted-prefix commit",
         [&](CommandBuffer& command, std::string& command_error) {
-            return encode_window_gdn_commit_batch(
-                context, command, rows, buffers, command_error);
+            return encode_window_gdn_ple_commit(
+                context, command, rows, gdn_ple_buffers, command_error);
         },
         error);
-    check(committed, "encode and complete all-layer GDN commit", error);
+    check(committed, "encode and complete GDN/PLE accepted-prefix state", error);
     passed &= committed;
     if (!committed) return false;
 
@@ -4426,6 +4531,22 @@ bool test_window_gdn_commit_batch(Context& context) {
     check(states_match,
           "all 36 GDN states match the independent accepted-prefix oracle");
     passed &= histories_match && states_match;
+
+    bool ple_history_matches = true;
+    for (std::size_t channel = 0u; channel < ple_width; ++channel) {
+        const std::size_t base = channel * PLE_HISTORY_ROWS;
+        for (std::size_t row = 0u; row < PLE_HISTORY_ROWS - rows; ++row) {
+            ple_history_matches &= ple_history_values[base + row] == -2.0f;
+        }
+        for (std::size_t row = 0u; row < rows; ++row) {
+            ple_history_matches &=
+                ple_history_values[base + PLE_HISTORY_ROWS - rows + row] ==
+                ple_norm_values[row * ple_width + channel];
+        }
+    }
+    check(ple_history_matches,
+          "PLE history advances from only the accepted normalized rows");
+    passed &= ple_history_matches;
 
     bool inputs_unchanged = true;
     for (std::uint32_t layer = 0u; layer < kSessionGdnLayers; ++layer) {
@@ -4488,6 +4609,17 @@ bool test_window_gdn_commit_batch(Context& context) {
     inputs_unchanged &= std::all_of(
         output_values, output_values + row_capacity * GDN_VALUE_DIM,
         [](float value) { return value == 19.0f; });
+    for (std::uint32_t row = 0u; row < row_capacity; ++row) {
+        for (std::size_t channel = 0u; channel < ple_width; ++channel) {
+            const float expected = row < rows
+                ? 1.0f + static_cast<float>(row) * 0.25f +
+                      static_cast<float>(channel) * 0.0001f
+                : -82.0f;
+            inputs_unchanged &=
+                ple_norm_values[static_cast<std::size_t>(row) * ple_width +
+                                channel] == expected;
+        }
+    }
     check(inputs_unchanged,
           "batch commit preserves replay inputs and unused scratch");
     passed &= inputs_unchanged;

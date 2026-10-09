@@ -3,6 +3,7 @@
 
 #include "strata/metal/gdn_dispatch.hpp"
 #include "strata/metal/mv_dispatch.hpp"
+#include "strata/metal/ple_dispatch.hpp"
 #include "strata/metal/session_state.hpp"
 
 #include <cstdint>
@@ -74,6 +75,15 @@ struct WindowGDNCommitBatchBuffers {
     std::span<const BufferRef> gamma;
 };
 
+/// Inputs for the GDN plus PLE portion of one accepted-prefix state commit.
+/// `rows` is the accepted count (`WindowParams.n_keep`); the PLE history is
+/// advanced from the retained prefix of normalized PLE rows after all GDN
+/// commits have been encoded in the same ordered segment.
+struct WindowGdnPleCommitBuffers {
+    WindowGDNCommitBatchBuffers gdn;
+    PLEHistoryBuffers ple;
+};
+
 /// Encode the accepted prefix in documented order: advance convolution history,
 /// then replay the GDN recurrence into state. Rows may be 0..8; zero is a no-op.
 /// The caller-owned form requires an ordered segment and must propagate false
@@ -102,6 +112,21 @@ bool encode_window_gdn_commit_batch(
 bool encode_window_gdn_commit_batch(
     Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
     const WindowGDNCommitBatchBuffers& buffers, std::string& error);
+
+/// Encode the accepted-prefix GDN and PLE history updates in one ordered
+/// segment. The session owner must register this command buffer with
+/// `SessionStateStorage::track_use` and advance committed PLE token IDs only
+/// after successful GPU completion. The caller-owned form must propagate
+/// false from its enclosing Encoder::encode body. QSA/indexer rollback is
+/// separate.
+bool encode_window_gdn_ple_commit(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    const WindowGdnPleCommitBuffers& buffers, std::string& error);
+/// Standalone transactional form; either both state-update sequences are
+/// encoded or the command buffer is discarded.
+bool encode_window_gdn_ple_commit(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    const WindowGdnPleCommitBuffers& buffers, std::string& error);
 
 /// Encode the speculative GDN block for T in 1..8 in documented order:
 /// mixed→Q8_1→qkv→conv/L2, then alpha/beta, gate projection, window
