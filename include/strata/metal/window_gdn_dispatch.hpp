@@ -4,6 +4,7 @@
 #include "strata/metal/gdn_dispatch.hpp"
 #include "strata/metal/mv_dispatch.hpp"
 #include "strata/metal/ple_dispatch.hpp"
+#include "strata/metal/qsa_dispatch.hpp"
 #include "strata/metal/session_state.hpp"
 
 #include <cstdint>
@@ -84,6 +85,16 @@ struct WindowGdnPleCommitBuffers {
     PLEHistoryBuffers ple;
 };
 
+/// Inputs for an accepted-prefix state commit across GDN, PLE and QSA.
+/// QSA indexer views must contain one entry per QSA layer.
+struct WindowAcceptedPrefixStateCommitBuffers {
+    WindowGdnPleCommitBuffers gdn_ple;
+    std::span<const QsaIndexerAppendBuffers> qsa_indexers;
+    std::uint32_t qsa_cell_capacity = 0u;
+    float qsa_rope_zero_cos = 1.0f;
+    float qsa_rope_zero_sin = 0.0f;
+};
+
 /// Encode the accepted prefix in documented order: advance convolution history,
 /// then replay the GDN recurrence into state. Rows may be 0..8; zero is a no-op.
 /// The caller-owned form requires an ordered segment and must propagate false
@@ -127,6 +138,22 @@ bool encode_window_gdn_ple_commit(
 bool encode_window_gdn_ple_commit(
     Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
     const WindowGdnPleCommitBuffers& buffers, std::string& error);
+
+/// Encode one accepted prefix's GDN convolution-history/recurrent-state,
+/// PLE-history and all-layer QSA-indexer updates in order. Cross-component
+/// writable/readable views must not overlap. The caller-owned form must
+/// propagate false from its enclosing Encoder::encode body so all earlier
+/// dispatches are discarded. After successful GPU completion, the session
+/// owner advances committed PLE token IDs.
+bool encode_window_accepted_prefix_state_commit(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    const WindowAcceptedPrefixStateCommitBuffers& buffers,
+    std::string& error);
+/// Standalone transactional form; failure discards the complete state commit.
+bool encode_window_accepted_prefix_state_commit(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    const WindowAcceptedPrefixStateCommitBuffers& buffers,
+    std::string& error);
 
 /// Encode the speculative GDN block for T in 1..8 in documented order:
 /// mixed→Q8_1→qkv→conv/L2, then alpha/beta, gate projection, window

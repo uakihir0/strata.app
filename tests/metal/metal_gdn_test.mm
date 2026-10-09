@@ -4,6 +4,7 @@
 #include "oracles/gdn.hpp"
 #include "oracles/moe_plan.hpp"
 #include "oracles/moe_route.hpp"
+#include "oracles/qsa.hpp"
 #include "oracles/q8_0_mv.hpp"
 #include "oracles/q8_1.hpp"
 #include "strata/metal/context.hpp"
@@ -12,6 +13,7 @@
 #include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/session_state.hpp"
 #include "strata/metal/mv_dispatch.hpp"
+#include "strata/metal/qsa_dispatch.hpp"
 #include "strata/metal/tiered.hpp"
 #include "strata/metal/window_dispatch.hpp"
 #include "strata/metal/window_gdn_dispatch.hpp"
@@ -4129,6 +4131,27 @@ bool test_window_gdn_commit_batch(Context& context) {
         static_cast<std::size_t>(rows) * qkv_row_bytes;
     constexpr std::size_t active_gate_bytes =
         static_cast<std::size_t>(rows) * gate_row_bytes;
+    constexpr std::uint32_t qsa_window_rows = 3u;
+    constexpr std::uint32_t qsa_cell_capacity = 16u;
+    constexpr std::size_t qsa_tail_floats =
+        3u * static_cast<std::size_t>(INDEXER_HEAD_DIM);
+    constexpr std::size_t qsa_dead_floats = INDEXER_HEAD_DIM;
+    constexpr std::size_t qsa_pool_rows =
+        qsa_cell_capacity / INDEXER_BLOCK_CELLS + 2u;
+    constexpr std::size_t qsa_pooled_floats =
+        qsa_pool_rows * static_cast<std::size_t>(INDEXER_HEAD_DIM);
+    constexpr std::size_t qsa_tail_bytes = qsa_tail_floats * sizeof(float);
+    constexpr std::size_t qsa_dead_bytes = qsa_dead_floats * sizeof(float);
+    constexpr std::size_t qsa_pooled_bytes =
+        qsa_pooled_floats * sizeof(float);
+    constexpr std::size_t qsa_raw_layer_bytes =
+        static_cast<std::size_t>(qsa_window_rows) * INDEXER_HEAD_DIM *
+        sizeof(float);
+    constexpr std::size_t qsa_gamma_layer_bytes =
+        static_cast<std::size_t>(INDEXER_HEAD_DIM) * sizeof(float);
+    constexpr std::size_t qsa_rope_bytes =
+        static_cast<std::size_t>(qsa_cell_capacity) * 32u * 2u *
+        sizeof(float);
     std::string error;
     Geometry geometry;
     geometry.family = "qwen4exp";
@@ -4168,8 +4191,40 @@ bool test_window_gdn_commit_batch(Context& context) {
     const BufferRef gamma_storage = allocate(
         "batch GDN gamma", layers * static_cast<std::size_t>(GDN_VALUE_DIM) *
                                sizeof(float));
+    const BufferRef qsa_raw_storage = allocate(
+        "accepted-prefix QSA raw keys",
+        kSessionQsaLayers * qsa_raw_layer_bytes);
+    const BufferRef qsa_gamma_storage = allocate(
+        "accepted-prefix QSA gamma",
+        kSessionQsaLayers * qsa_gamma_layer_bytes);
+    const BufferRef qsa_tails =
+        allocate("accepted-prefix QSA tails",
+                 kSessionQsaLayers * qsa_tail_bytes);
+    const BufferRef qsa_dead =
+        allocate("accepted-prefix QSA dead keys",
+                 kSessionQsaLayers * qsa_dead_bytes);
+    const BufferRef qsa_pooled =
+        allocate("accepted-prefix QSA pooled keys",
+                 kSessionQsaLayers * qsa_pooled_bytes);
+    const BufferRef qsa_block_positions =
+        allocate("accepted-prefix QSA block positions",
+                 kSessionQsaLayers * sizeof(std::int32_t));
+    const BufferRef qsa_steps =
+        allocate("accepted-prefix QSA StepRows",
+                 qsa_window_rows * sizeof(StepRow));
+    const BufferRef qsa_rope =
+        allocate("accepted-prefix QSA RoPE", qsa_rope_bytes);
+    const BufferRef qsa_tail_snapshot =
+        allocate("accepted-prefix QSA tail snapshot",
+                 kSessionQsaLayers * qsa_tail_bytes);
+    const BufferRef qsa_block_pos_snapshot =
+        allocate("accepted-prefix QSA block-position snapshot",
+                 kSessionQsaLayers * sizeof(std::int32_t));
     if (!qkv_replay || !h_replay || !gate_replay || !beta_replay || !z ||
-        !output_scratch || !ple_norm || !ple_history || !gamma_storage) {
+        !output_scratch || !ple_norm || !ple_history || !gamma_storage ||
+        !qsa_raw_storage || !qsa_gamma_storage || !qsa_tails || !qsa_dead ||
+        !qsa_pooled || !qsa_block_positions || !qsa_steps || !qsa_rope ||
+        !qsa_tail_snapshot || !qsa_block_pos_snapshot) {
         return false;
     }
 
@@ -4292,6 +4347,204 @@ bool test_window_gdn_commit_batch(Context& context) {
         std::span<const BufferRef>(gamma)};
     WindowGdnPleCommitBuffers gdn_ple_buffers{
         buffers, PLEHistoryBuffers{ple_history, ple_norm}};
+
+    const std::array<std::int32_t, qsa_window_rows> qsa_positions{1, 2, 3};
+    const std::array<StepRow, qsa_window_rows> qsa_step_rows{{
+        {1, 2, 0, 2},
+        {2, 3, 0, 3},
+        {3, 4, 1, 4},
+    }};
+    std::memcpy(qsa_steps.contents, qsa_step_rows.data(),
+                sizeof(qsa_step_rows));
+    std::vector<float> qsa_rope_reference(qsa_rope_bytes / sizeof(float));
+    for (std::uint32_t cell = 0u; cell < qsa_cell_capacity; ++cell) {
+        for (std::uint32_t pair = 0u; pair < 32u; ++pair) {
+            const float angle = static_cast<float>(
+                (cell * 7u + pair * 11u) % 97u) * 0.0078125f;
+            const std::size_t index =
+                (static_cast<std::size_t>(cell) * 32u + pair) * 2u;
+            qsa_rope_reference[index] = std::cos(angle) * 1.0625f;
+            qsa_rope_reference[index + 1u] = std::sin(angle) * 1.0625f;
+        }
+    }
+    std::memcpy(qsa_rope.contents, qsa_rope_reference.data(), qsa_rope_bytes);
+    std::array<oracle::QsaIndexerState, kSessionQsaLayers> qsa_initial{};
+    std::array<oracle::QsaIndexerState, kSessionQsaLayers> qsa_after_window{};
+    std::array<oracle::QsaIndexerState, kSessionQsaLayers> qsa_expected{};
+    std::array<std::vector<float>, kSessionQsaLayers> qsa_raw_keys{};
+    std::array<std::vector<float>, kSessionQsaLayers> qsa_gammas{};
+    std::array<QsaIndexerAppendBuffers, kSessionQsaLayers> qsa_layers{};
+    for (std::uint32_t layer = 0u; layer < kSessionQsaLayers; ++layer) {
+        oracle::QsaIndexerState& initial = qsa_initial[layer];
+        initial.tail.resize(qsa_tail_floats);
+        initial.dead.resize(qsa_dead_floats);
+        initial.pooled.resize(qsa_pooled_floats);
+        initial.block_position = static_cast<std::int32_t>(layer * 4u);
+        for (std::size_t index = 0u; index < qsa_tail_floats; ++index) {
+            initial.tail[index] =
+                0.015625f * static_cast<float>(layer + 1u) +
+                static_cast<float>(index % 23u) * 0.0005f;
+        }
+        for (std::size_t index = 0u; index < qsa_dead_floats; ++index) {
+            initial.dead[index] =
+                -0.375f + static_cast<float>(layer) * 0.0078125f +
+                static_cast<float>(index % 19u) * 0.00025f;
+        }
+        for (std::size_t index = 0u; index < qsa_pooled_floats; ++index) {
+            initial.pooled[index] =
+                -0.625f + static_cast<float>(layer) * 0.00390625f +
+                static_cast<float>(index % 31u) * 0.000125f;
+        }
+        const std::size_t raw_offset =
+            static_cast<std::size_t>(layer) * qsa_raw_layer_bytes;
+        const std::size_t gamma_offset =
+            static_cast<std::size_t>(layer) * qsa_gamma_layer_bytes;
+        const std::size_t tail_offset =
+            static_cast<std::size_t>(layer) * qsa_tail_bytes;
+        const std::size_t dead_offset =
+            static_cast<std::size_t>(layer) * qsa_dead_bytes;
+        const std::size_t pooled_offset =
+            static_cast<std::size_t>(layer) * qsa_pooled_bytes;
+        const std::size_t block_pos_offset =
+            static_cast<std::size_t>(layer) * sizeof(std::int32_t);
+        std::memcpy(static_cast<std::byte*>(qsa_tails.contents) + tail_offset,
+                    initial.tail.data(), qsa_tail_bytes);
+        std::memcpy(static_cast<std::byte*>(qsa_dead.contents) + dead_offset,
+                    initial.dead.data(), qsa_dead_bytes);
+        std::memcpy(static_cast<std::byte*>(qsa_pooled.contents) +
+                        pooled_offset,
+                    initial.pooled.data(), qsa_pooled_bytes);
+        std::memcpy(static_cast<std::byte*>(qsa_block_positions.contents) +
+                        block_pos_offset,
+                    &initial.block_position, sizeof(std::int32_t));
+
+        qsa_raw_keys[layer].resize(
+            static_cast<std::size_t>(qsa_window_rows) * INDEXER_HEAD_DIM);
+        qsa_gammas[layer].resize(INDEXER_HEAD_DIM);
+        for (std::uint32_t row = 0u; row < qsa_window_rows; ++row) {
+            for (std::uint32_t dimension = 0u;
+                 dimension < INDEXER_HEAD_DIM; ++dimension) {
+                const std::size_t index =
+                    static_cast<std::size_t>(row) * INDEXER_HEAD_DIM +
+                    dimension;
+                const int pattern = static_cast<int>(
+                    (dimension * 11u + row * 17u + layer * 29u) % 101u) -
+                    50;
+                qsa_raw_keys[layer][index] =
+                    static_cast<float>(pattern) * 0.00390625f;
+            }
+        }
+        BufferRef qsa_raw_view =
+            qsa_raw_storage.slice(raw_offset, qsa_raw_layer_bytes);
+        if (layer == 0u) {
+            qsa_raw_view = qkv_replay.slice(0u, qsa_raw_layer_bytes);
+            std::memcpy(qsa_raw_keys[layer].data(),
+                        qsa_raw_view.contents, qsa_raw_layer_bytes);
+        }
+        for (std::uint32_t dimension = 0u;
+             dimension < INDEXER_HEAD_DIM; ++dimension) {
+            qsa_gammas[layer][dimension] =
+                0.75f + static_cast<float>(layer) * 0.015625f +
+                static_cast<float>(dimension % 17u) * 0.0009765625f;
+        }
+        std::memcpy(static_cast<std::byte*>(qsa_raw_storage.contents) +
+                        raw_offset,
+                    qsa_raw_keys[layer].data(), qsa_raw_layer_bytes);
+        std::memcpy(static_cast<std::byte*>(qsa_gamma_storage.contents) +
+                        gamma_offset,
+                    qsa_gammas[layer].data(), qsa_gamma_layer_bytes);
+        qsa_layers[layer] = QsaIndexerAppendBuffers{
+            qsa_raw_view,
+            qsa_steps,
+            qsa_gamma_storage.slice(gamma_offset, qsa_gamma_layer_bytes),
+            qsa_rope,
+            qsa_tails.slice(tail_offset, qsa_tail_bytes),
+            qsa_dead.slice(dead_offset, qsa_dead_bytes),
+            qsa_pooled.slice(pooled_offset, qsa_pooled_bytes),
+            qsa_block_positions.slice(block_pos_offset,
+                                      sizeof(std::int32_t)),
+            qsa_tail_snapshot,
+            qsa_block_pos_snapshot,
+        };
+        qsa_after_window[layer] = initial;
+        oracle::qsa_indexer_append(
+            qsa_raw_keys[layer], qsa_positions, qsa_gammas[layer],
+            qsa_rope_reference, 1.0625f, 0.0f, qsa_after_window[layer]);
+        qsa_expected[layer] = qsa_after_window[layer];
+        qsa_expected[layer].tail = initial.tail;
+        qsa_expected[layer].block_position = initial.block_position;
+        oracle::qsa_indexer_append(
+            std::span<const float>(qsa_raw_keys[layer]).first(
+                static_cast<std::size_t>(rows) * INDEXER_HEAD_DIM),
+            std::span<const std::int32_t>(qsa_positions).first(rows),
+            qsa_gammas[layer], qsa_rope_reference, 1.0625f, 0.0f,
+            qsa_expected[layer]);
+    }
+    const bool qsa_rejected_tail_pool_is_stale =
+        qsa_after_window[0].pooled[0] != qsa_initial[0].pooled[0];
+    const QsaIndexerSnapshotBuffers qsa_snapshot_buffers{
+        qsa_tails, qsa_block_positions, qsa_tail_snapshot,
+        qsa_block_pos_snapshot};
+    const bool qsa_window_prepared = run_command(
+        context, "Window state-commit QSA snapshot and speculative append",
+        [&](CommandBuffer& command, std::string& command_error) {
+            return Encoder::encode(
+                context, command, "QSA snapshot and speculative append",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    if (!encode_qsa_indexer_snapshot(
+                            context, encoder, qsa_tail_floats, 1u,
+                            qsa_snapshot_buffers, encode_error)) {
+                        return false;
+                    }
+                    for (std::uint32_t layer = 0u;
+                         layer < kSessionQsaLayers; ++layer) {
+                        if (!encode_qsa_indexer_append(
+                                context, encoder, qsa_window_rows,
+                                qsa_cell_capacity,
+                                QsaIndexerAppendMode::window, layer,
+                                1.0625f, 0.0f, qsa_layers[layer],
+                                encode_error)) {
+                            return false;
+                        }
+                    }
+                    return true;
+                },
+                command_error);
+        },
+        error);
+    check(qsa_window_prepared,
+          "prepare speculative QSA indexer state for composite commit", error);
+    if (!qsa_window_prepared) return false;
+
+    const std::vector<std::byte> qsa_before_commit_tails(
+        static_cast<const std::byte*>(qsa_tails.contents),
+        static_cast<const std::byte*>(qsa_tails.contents) + qsa_tails.length);
+    const std::vector<std::byte> qsa_before_commit_dead(
+        static_cast<const std::byte*>(qsa_dead.contents),
+        static_cast<const std::byte*>(qsa_dead.contents) + qsa_dead.length);
+    const std::vector<std::byte> qsa_before_commit_pooled(
+        static_cast<const std::byte*>(qsa_pooled.contents),
+        static_cast<const std::byte*>(qsa_pooled.contents) +
+            qsa_pooled.length);
+    const std::vector<std::byte> qsa_before_commit_block_positions(
+        static_cast<const std::byte*>(qsa_block_positions.contents),
+        static_cast<const std::byte*>(qsa_block_positions.contents) +
+            qsa_block_positions.length);
+    auto qsa_state_matches_before_commit = [&] {
+        return std::memcmp(qsa_tails.contents, qsa_before_commit_tails.data(),
+                           qsa_tails.length) == 0 &&
+               std::memcmp(qsa_dead.contents, qsa_before_commit_dead.data(),
+                           qsa_dead.length) == 0 &&
+               std::memcmp(qsa_pooled.contents,
+                           qsa_before_commit_pooled.data(),
+                           qsa_pooled.length) == 0 &&
+               std::memcmp(qsa_block_positions.contents,
+                           qsa_before_commit_block_positions.data(),
+                           qsa_block_positions.length) == 0;
+    };
+    WindowAcceptedPrefixStateCommitBuffers combined_buffers{
+        gdn_ple_buffers, std::span<const QsaIndexerAppendBuffers>(qsa_layers),
+        qsa_cell_capacity, 1.0625f, 0.0f};
 
     auto state_and_history_unchanged = [&] {
         for (const GdnSessionStateViews& state : states) {
@@ -4470,15 +4723,97 @@ bool test_window_gdn_commit_batch(Context& context) {
               error);
         passed &= rolled_back;
     }
+    {
+        auto command = context.make_command_buffer(
+            "Window accepted-prefix cross-stage alias", error);
+        check(command != nullptr,
+              "create accepted-prefix cross-stage alias command", error);
+        if (!command) return false;
+        auto aliased_qsa = qsa_layers;
+        aliased_qsa.back().tail =
+            ple_history.slice(0u, qsa_tail_bytes);
+        WindowAcceptedPrefixStateCommitBuffers invalid = combined_buffers;
+        invalid.qsa_indexers =
+            std::span<const QsaIndexerAppendBuffers>(aliased_qsa);
+        const bool accepted = encode_window_accepted_prefix_state_commit(
+            context, *command, rows, invalid, error);
+        const bool rejected = !accepted &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find("overlaps QSA layer 11 tail") != std::string::npos &&
+            state_and_history_unchanged() &&
+            qsa_state_matches_before_commit();
+        check(rejected,
+              "combined commit rejects QSA/GDN-PLE state alias before encoding",
+              error);
+        passed &= rejected;
+    }
+    {
+        auto command = context.make_command_buffer(
+            "Window accepted-prefix writable/read-only alias", error);
+        check(command != nullptr,
+              "create accepted-prefix writable/read-only alias command",
+              error);
+        if (!command) return false;
+        auto aliased_qsa = qsa_layers;
+        aliased_qsa.back().raw_keys =
+            ple_history.slice(0u, qsa_raw_layer_bytes);
+        WindowAcceptedPrefixStateCommitBuffers invalid = combined_buffers;
+        invalid.qsa_indexers =
+            std::span<const QsaIndexerAppendBuffers>(aliased_qsa);
+        const bool accepted = encode_window_accepted_prefix_state_commit(
+            context, *command, rows, invalid, error);
+        const bool rejected = !accepted &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find("overlaps QSA layer 11 raw keys") !=
+                std::string::npos &&
+            state_and_history_unchanged() &&
+            qsa_state_matches_before_commit();
+        check(rejected,
+              "combined commit rejects GDN-PLE write/QSA read alias",
+              error);
+        passed &= rejected;
+    }
+    {
+        auto command = context.make_command_buffer(
+            "Window accepted-prefix late QSA rollback", error);
+        check(command != nullptr,
+              "create accepted-prefix late-QSA command", error);
+        if (!command) return false;
+        auto short_qsa = qsa_layers;
+        short_qsa.back().raw_keys = short_qsa.back().raw_keys.slice(
+            0u, static_cast<std::size_t>(rows) * INDEXER_HEAD_DIM *
+                    sizeof(float) -
+                sizeof(float));
+        WindowAcceptedPrefixStateCommitBuffers invalid = combined_buffers;
+        invalid.qsa_indexers =
+            std::span<const QsaIndexerAppendBuffers>(short_qsa);
+        const bool accepted = Encoder::encode(
+            context, *command, "Window full state-commit rollback",
+            [&](Encoder& encoder, std::string& body_error) {
+                return encode_window_accepted_prefix_state_commit(
+                    context, encoder, rows, invalid, body_error);
+            },
+            error);
+        const bool rolled_back = !accepted &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find("undersized or misaligned") != std::string::npos &&
+            state_and_history_unchanged() &&
+            qsa_state_matches_before_commit();
+        check(rolled_back,
+              "late QSA failure discards earlier GDN and PLE dispatches",
+              error);
+        passed &= rolled_back;
+    }
 
     const bool committed = run_command(
-        context, "Window GDN/PLE accepted-prefix commit",
+        context, "Window GDN/PLE/QSA accepted-prefix commit",
         [&](CommandBuffer& command, std::string& command_error) {
-            return encode_window_gdn_ple_commit(
-                context, command, rows, gdn_ple_buffers, command_error);
+            return encode_window_accepted_prefix_state_commit(
+                context, command, rows, combined_buffers, command_error);
         },
         error);
-    check(committed, "encode and complete GDN/PLE accepted-prefix state", error);
+    check(committed,
+          "encode and complete GDN/PLE/QSA accepted-prefix state", error);
     passed &= committed;
     if (!committed) return false;
 
@@ -4547,6 +4882,82 @@ bool test_window_gdn_commit_batch(Context& context) {
     check(ple_history_matches,
           "PLE history advances from only the accepted normalized rows");
     passed &= ple_history_matches;
+
+    bool qsa_tails_match = true;
+    bool qsa_block_positions_match = true;
+    bool qsa_dead_match = true;
+    bool qsa_pooled_match = true;
+    bool qsa_inputs_unchanged =
+        std::memcmp(qsa_steps.contents, qsa_step_rows.data(),
+                    sizeof(qsa_step_rows)) == 0 &&
+        std::memcmp(qsa_rope.contents, qsa_rope_reference.data(),
+                    qsa_rope_bytes) == 0;
+    for (std::uint32_t layer = 0u; layer < kSessionQsaLayers; ++layer) {
+        const auto* actual_tail =
+            static_cast<const float*>(qsa_layers[layer].tail.contents);
+        const auto* actual_dead =
+            static_cast<const float*>(qsa_layers[layer].dead.contents);
+        const auto* actual_pooled =
+            static_cast<const float*>(qsa_layers[layer].pooled.contents);
+        const std::int32_t actual_block_position =
+            *static_cast<const std::int32_t*>(
+                qsa_layers[layer].block_position.contents);
+        qsa_tails_match &= std::memcmp(
+            actual_tail, qsa_expected[layer].tail.data(),
+            qsa_tail_bytes) == 0;
+        qsa_block_positions_match &=
+            actual_block_position == qsa_expected[layer].block_position;
+        std::vector<twin::tf> expected_dead(qsa_dead_floats);
+        std::transform(qsa_expected[layer].dead.begin(),
+                       qsa_expected[layer].dead.end(),
+                       expected_dead.begin(),
+                       [](float value) { return twin::tf{value}; });
+        qsa_dead_match &= !twin::compare_floats(
+            std::span<const float>(actual_dead, qsa_dead_floats),
+            expected_dead, {twin::Comparison::units, 64.0});
+        std::vector<twin::tf> expected_pooled(qsa_pooled_floats);
+        std::transform(qsa_expected[layer].pooled.begin(),
+                       qsa_expected[layer].pooled.end(),
+                       expected_pooled.begin(),
+                       [](float value) { return twin::tf{value}; });
+        qsa_pooled_match &= !twin::compare_floats(
+            std::span<const float>(actual_pooled, qsa_pooled_floats),
+            expected_pooled, {twin::Comparison::units, 64.0});
+        qsa_inputs_unchanged &=
+            std::memcmp(qsa_layers[layer].raw_keys.contents,
+                        qsa_raw_keys[layer].data(),
+                        qsa_raw_layer_bytes) == 0 &&
+            std::memcmp(qsa_layers[layer].gamma.contents,
+                        qsa_gammas[layer].data(),
+                        qsa_gamma_layer_bytes) == 0 &&
+            std::memcmp(
+                static_cast<const std::byte*>(
+                    qsa_tail_snapshot.contents) +
+                    static_cast<std::size_t>(layer) * qsa_tail_bytes,
+                qsa_initial[layer].tail.data(), qsa_tail_bytes) == 0 &&
+            std::memcmp(
+                static_cast<const std::byte*>(
+                    qsa_block_pos_snapshot.contents) +
+                    static_cast<std::size_t>(layer) *
+                        sizeof(std::int32_t),
+                &qsa_initial[layer].block_position,
+                sizeof(std::int32_t)) == 0;
+    }
+    check(qsa_tails_match,
+          "combined commit restores and replays all QSA tails exactly");
+    check(qsa_block_positions_match,
+          "combined commit restores all QSA block positions");
+    check(qsa_dead_match,
+          "combined commit preserves all QSA dead-key rows at U(64)");
+    check(qsa_pooled_match,
+          "combined commit preserves visible and ignored pooled rows at U(64)");
+    check(qsa_rejected_tail_pool_is_stale,
+          "rejected QSA pooled row at n_bid stays stale and ignored");
+    check(qsa_inputs_unchanged,
+          "combined commit preserves QSA replay and snapshot inputs");
+    passed &= qsa_tails_match && qsa_block_positions_match &&
+              qsa_dead_match && qsa_pooled_match &&
+              qsa_rejected_tail_pool_is_stale && qsa_inputs_unchanged;
 
     bool inputs_unchanged = true;
     for (std::uint32_t layer = 0u; layer < kSessionGdnLayers; ++layer) {

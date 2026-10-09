@@ -228,6 +228,104 @@ bool validate_window_gdn_ple_commit_views(
     return true;
 }
 
+struct CommitStageView {
+    BufferRef view;
+    std::string name;
+    bool writes = false;
+};
+
+bool validate_window_accepted_prefix_cross_stage_views(
+    Context& context, std::uint32_t rows,
+    const WindowAcceptedPrefixStateCommitBuffers& buffers,
+    std::string& error) {
+    if (rows == 0u || rows > kWindowScratchTokenRows) {
+        error = "Window accepted-prefix state commit row count must be in 1..8";
+        return false;
+    }
+    if (buffers.qsa_indexers.size() != kSessionQsaLayers) {
+        error = "Window accepted-prefix state commit requires exactly 12 QSA indexer layers";
+        return false;
+    }
+    if (!validate_window_gdn_ple_commit_views(
+            context, rows, buffers.gdn_ple, error)) {
+        return false;
+    }
+
+    std::vector<CommitStageView> gdn_ple_views;
+    gdn_ple_views.reserve(4u + kSessionGdnLayers * 3u);
+    auto add_gdn_ple = [&](BufferRef view, std::string name,
+                           bool writes) {
+        gdn_ple_views.push_back(
+            CommitStageView{view, std::move(name), writes});
+    };
+    const WindowGDNCommitBatchBuffers& gdn = buffers.gdn_ple.gdn;
+    add_gdn_ple(gdn.qkv_replay, "GDN qkv replay", false);
+    add_gdn_ple(gdn.h_replay, "GDN h replay", false);
+    add_gdn_ple(gdn.gate_replay, "GDN gate replay", false);
+    add_gdn_ple(gdn.beta_replay, "GDN beta replay", false);
+    add_gdn_ple(buffers.gdn_ple.ple.ple_norm, "PLE normalized rows", false);
+    add_gdn_ple(buffers.gdn_ple.ple.history, "PLE history", true);
+    for (std::size_t layer = 0u; layer < gdn.states.size(); ++layer) {
+        add_gdn_ple(gdn.states[layer].conv_history,
+                    "GDN layer " + std::to_string(layer) +
+                        " convolution history",
+                    true);
+        add_gdn_ple(gdn.states[layer].recurrent,
+                    "GDN layer " + std::to_string(layer) +
+                        " recurrent state",
+                    true);
+        add_gdn_ple(gdn.gamma[layer],
+                    "GDN layer " + std::to_string(layer) + " gamma",
+                    false);
+    }
+
+    std::vector<CommitStageView> qsa_views;
+    qsa_views.reserve(static_cast<std::size_t>(kSessionQsaLayers) * 10u);
+    auto add_qsa = [&](BufferRef view, std::uint32_t layer,
+                       const char* role, bool writes) {
+        if (!view || !context.buffers().owns(view)) {
+            error = "Window accepted-prefix state commit QSA layer " +
+                    std::to_string(layer) + " " + role +
+                    " view is not owned by this Context";
+            return false;
+        }
+        qsa_views.push_back(CommitStageView{
+            view,
+            "QSA layer " + std::to_string(layer) + " " + role,
+            writes});
+        return true;
+    };
+    for (std::uint32_t layer = 0u; layer < kSessionQsaLayers; ++layer) {
+        const QsaIndexerAppendBuffers& qsa = buffers.qsa_indexers[layer];
+        if (!add_qsa(qsa.raw_keys, layer, "raw keys", false) ||
+            !add_qsa(qsa.steps, layer, "StepRows", false) ||
+            !add_qsa(qsa.gamma, layer, "gamma", false) ||
+            !add_qsa(qsa.rope, layer, "RoPE", false) ||
+            !add_qsa(qsa.tail, layer, "tail", true) ||
+            !add_qsa(qsa.dead, layer, "dead key", true) ||
+            !add_qsa(qsa.pooled, layer, "pooled keys", true) ||
+            !add_qsa(qsa.block_position, layer, "block position", true) ||
+            !add_qsa(qsa.tail_snapshot, layer, "tail snapshot", false) ||
+            !add_qsa(qsa.block_pos_snapshot, layer,
+                     "block-position snapshot", false)) {
+            return false;
+        }
+    }
+
+    for (const CommitStageView& gdn_ple : gdn_ple_views) {
+        for (const CommitStageView& qsa : qsa_views) {
+            if ((!gdn_ple.writes && !qsa.writes) ||
+                !views_overlap(gdn_ple.view, qsa.view)) {
+                continue;
+            }
+            error = "Window accepted-prefix state commit " + gdn_ple.name +
+                    " overlaps " + qsa.name;
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 bool encode_window_gdn_commit(Context& context, Encoder& encoder,
@@ -498,6 +596,43 @@ bool encode_window_gdn_ple_commit(
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_window_gdn_ple_commit(context, encoder, rows,
                                                 buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_window_accepted_prefix_state_commit(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    const WindowAcceptedPrefixStateCommitBuffers& buffers,
+    std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error =
+            "Window accepted-prefix state commit requires an ordered concurrent-group boundary";
+        return false;
+    }
+    if (!validate_window_accepted_prefix_cross_stage_views(
+            context, rows, buffers, error)) {
+        return false;
+    }
+    if (!encode_window_gdn_ple_commit(context, encoder, rows,
+                                      buffers.gdn_ple, error)) {
+        return false;
+    }
+    return encode_qsa_indexer_commit_batch(
+        context, encoder, rows, buffers.qsa_cell_capacity,
+        buffers.qsa_rope_zero_cos, buffers.qsa_rope_zero_sin,
+        buffers.qsa_indexers, error);
+}
+
+bool encode_window_accepted_prefix_state_commit(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    const WindowAcceptedPrefixStateCommitBuffers& buffers,
+    std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Window accepted-prefix state commit",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_accepted_prefix_state_commit(
+                context, encoder, rows, buffers, encode_error);
         },
         error);
 }
