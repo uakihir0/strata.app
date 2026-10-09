@@ -9813,3 +9813,47 @@ measuring L-15 remain open.
   `git diff --check` passed; the pinned Python runner passed 35/35 modules.
   The synthetic tests do not establish production Prefill integration or
   model-backed inference.
+
+### D-IMPL-354: Implement Prefill GDN recurrence
+
+- **Decision:** Add the isolated `strata_pf_gdn_rec` kernel and validated
+  standalone and caller-owned `encode_prefill_gdn_rec` APIs. Keep the
+  four-row-group state partition, ordered partial reductions and per-row
+  update sequence from §6.4; write raw F32 recurrent outputs to a separate
+  buffer and update the F32 state in place after processing T rows. Reject
+  unsafe row counts, short or misaligned views, foreign Context buffers,
+  writable aliases and calls inside an open concurrent group. Keep the stage
+  ordered after q/k L2 normalization as a composable component. Output
+  normalization, Prefill GEMMs and chunk-loop integration remain pending.
+- **Reason:** The recurrence's FMA and reduction order define the documented
+  state and output behavior. An isolated encoder exposes that exact stage for
+  testing and later composition without claiming the production Prefill path
+  is wired.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the full `mac-dev` build succeeded. Focused Prefill serial and
+  concurrent CTests passed 2/2, `mac-metal` passed 80/80 and `mac-host`
+  passed 43 tests with the model-input-dependent test skipped because its
+  fixtures were unavailable. `test_map.py` reported all checks passed with
+  notes for planned or unimplemented requirements; `check_drift.py` found no
+  upstream changes and valid golden files, and `git diff --check` passed.
+
+### REV-151: Hostile review of Prefill GDN recurrence
+
+- **Scope:** `strata_pf_gdn_rec`, both host encoder forms, row bounds and
+  buffer validation, threadgroup mapping and barriers, ordered arithmetic,
+  state/output layout, rollback, open-group rejection, scalar oracle and
+  serial/concurrent fixtures.
+- **Findings:** The read-only hostile review found no actionable P1–P3
+  correctness, synchronization, bounds, aliasing, transaction or coverage
+  defects. It confirmed that the threadgroup mapping, state and `h` offsets,
+  four-partial reduction order, row sequencing and final state write match
+  §6.4 step 7. This was a static review; the implementation build and GPU
+  tests are verified separately.
+- **Disposition:** No code changes were required by the review. On Mac17,9
+  (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a), the full `mac-dev` build
+  succeeded; focused Prefill serial/concurrent tests passed 2/2, `mac-metal`
+  passed 80/80 and `mac-host` passed 43 tests with one model-input-dependent
+  test skipped because fixtures were unavailable. `test_map.py`,
+  `check_drift.py` and `git diff --check` passed. These synthetic component
+  tests do not establish production Prefill integration or model-backed
+  inference.
