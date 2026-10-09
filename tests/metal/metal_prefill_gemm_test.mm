@@ -34,6 +34,7 @@ constexpr double kUnderflowAllowance = 0x1.0p-126;
 constexpr double kRelativeTolerance = 0x1.0p-16;
 
 int g_failures = 0;
+bool g_auto_select = false;
 
 void check(bool condition, const std::string& label,
            const std::string& detail = {}) {
@@ -114,7 +115,18 @@ std::string_view precision_name(bool f16) {
 }
 
 std::string_view backend_name(bool simd) {
-    return simd ? "SIMD" : "MPP";
+    return g_auto_select ? "AUTO" : simd ? "SIMD" : "MPP";
+}
+
+PrefillGemmBackend expected_auto_backend(
+    const Context& context, const PrefillGemmMPPParams& params) {
+    const char* const configured = std::getenv("STRATA_METAL_GEMM");
+    const std::string_view setting =
+        configured == nullptr ? std::string_view{} : std::string_view(configured);
+    return params.n >= 64u && supports_apple10(context) &&
+                   (setting.empty() || setting == "mpp")
+               ? PrefillGemmBackend::MPP
+               : PrefillGemmBackend::SIMD;
 }
 
 std::uint16_t encode_input(float value, bool f16) {
@@ -130,6 +142,21 @@ double decode_input(std::uint16_t bits, bool f16) {
 bool encode_case(Context& context, bool f16, bool simd, Encoder& encoder,
                  const PrefillGemmMPPParams& params,
                  const PrefillGemmMPPBuffers& buffers, std::string& error) {
+    if (g_auto_select) {
+        const auto expected = expected_auto_backend(context, params);
+        PrefillGemmBackend selected =
+            expected == PrefillGemmBackend::MPP ? PrefillGemmBackend::SIMD
+                                                : PrefillGemmBackend::MPP;
+        const bool encoded = encode_prefill_gemm(
+            context, encoder, params, buffers,
+            f16 ? PrefillGemmFormat::F16 : PrefillGemmFormat::BF16, error,
+            &selected);
+        if (encoded) {
+            check(selected == expected,
+                  "AUTO GEMM selected backend matches the active policy");
+        }
+        return encoded;
+    }
     if (simd) {
         return f16 ? encode_prefill_gemm_f16_simd(context, encoder, params,
                                                   buffers, error)
@@ -145,6 +172,21 @@ bool encode_case(Context& context, bool f16, bool simd, Encoder& encoder,
 bool encode_case(Context& context, bool f16, bool simd, CommandBuffer& command,
                  const PrefillGemmMPPParams& params,
                  const PrefillGemmMPPBuffers& buffers, std::string& error) {
+    if (g_auto_select) {
+        const auto expected = expected_auto_backend(context, params);
+        PrefillGemmBackend selected =
+            expected == PrefillGemmBackend::MPP ? PrefillGemmBackend::SIMD
+                                                : PrefillGemmBackend::MPP;
+        const bool encoded = encode_prefill_gemm(
+            context, command, params, buffers,
+            f16 ? PrefillGemmFormat::F16 : PrefillGemmFormat::BF16, error,
+            &selected);
+        if (encoded) {
+            check(selected == expected,
+                  "AUTO GEMM selected backend matches the active policy");
+        }
+        return encoded;
+    }
     if (simd) {
         return f16 ? encode_prefill_gemm_f16_simd(context, command, params,
                                                   buffers, error)
@@ -507,13 +549,17 @@ bool test_validation(Context& context, Context& foreign_context, bool f16,
 int main(int argc, char** argv) {
     if (argc != 3 ||
         (std::string_view(argv[2]) != "mpp" &&
-         std::string_view(argv[2]) != "simd")) {
+         std::string_view(argv[2]) != "simd" &&
+         std::string_view(argv[2]) != "auto" &&
+         std::string_view(argv[2]) != "invalid-setting")) {
         std::fprintf(stderr,
                      "usage: metal_prefill_gemm_test strata.metallib "
-                     "<mpp|simd>\n");
+                     "<mpp|simd|auto|invalid-setting>\n");
         return 2;
     }
-    const bool simd = std::string_view(argv[2]) == "simd";
+    const std::string_view mode(argv[2]);
+    const bool simd = mode == "simd";
+    g_auto_select = mode == "auto" || mode == "invalid-setting";
     ContextOptions options;
     options.metallib = argv[1];
     options.metallib_sha256 = STRATA_METALLIB_SHA256;
@@ -521,9 +567,28 @@ int main(int argc, char** argv) {
     auto context = Context::open(options, error);
     check(context != nullptr, "open Metal Context", error);
     if (!context) return 1;
-    if (!simd && !supports_apple10(*context)) {
+    if (!simd && !g_auto_select && !supports_apple10(*context)) {
         std::puts("skip: F16/BF16 MPP GEMM requires an Apple10 GPU");
         return 77;
+    }
+    if (mode == "invalid-setting") {
+        auto command =
+            context->make_command_buffer("invalid Prefill GEMM selector",
+                                         error);
+        if (!command) {
+            check(false, "invalid selector command buffer", error);
+            return 1;
+        }
+        const bool encoded = encode_prefill_gemm(
+            *context, *command, PrefillGemmMPPParams{1u, 64u, 32u, 64u, 0u,
+                                                      false},
+            PrefillGemmMPPBuffers{}, PrefillGemmFormat::F16, error);
+        const bool rejected =
+            !encoded && error == "STRATA_METAL_GEMM must be 'mpp' or 'simd'" &&
+            command->unsafe_native_handle() == nullptr;
+        check(rejected, "invalid selector rejects and discards command buffer",
+              error);
+        return rejected ? 0 : 1;
     }
 
     ContextOptions foreign_options = options;
@@ -554,10 +619,10 @@ int main(int argc, char** argv) {
     if (g_failures != 0 || !passed) {
         std::fprintf(stderr,
                      "%d Prefill F16/BF16 %s GEMM test(s) failed\n",
-                     g_failures, simd ? "SIMD" : "MPP");
+                     g_failures, backend_name(simd).data());
         return 1;
     }
     std::printf("all Prefill F16/BF16 %s GEMM tests passed\n",
-                simd ? "SIMD" : "MPP");
+                backend_name(simd).data());
     return 0;
 }

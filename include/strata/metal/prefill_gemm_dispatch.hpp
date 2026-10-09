@@ -1,10 +1,11 @@
-// Validated encoders for the isolated Prefill F16/BF16 MPP GEMM components.
+// Validated encoders for isolated and selected Prefill F16/BF16 GEMM paths.
 #pragma once
 
 #include "strata/metal/context.hpp"
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace strata::metal {
 
@@ -29,6 +30,31 @@ using PrefillGemmBF16MPPParams = PrefillGemmMPPParams;
 using PrefillGemmBF16MPPBuffers = PrefillGemmMPPBuffers;
 using PrefillGemmF16MPPParams = PrefillGemmMPPParams;
 using PrefillGemmF16MPPBuffers = PrefillGemmMPPBuffers;
+
+enum class PrefillGemmBackend : std::uint8_t { MPP, SIMD };
+enum class PrefillGemmFormat : std::uint8_t { F16, BF16 };
+
+/// Resolve STRATA_METAL_GEMM for the projection shape. An empty setting uses
+/// the device default. Projections with n < 64 always select SIMD. MPP
+/// requires Apple10 until cross-family support is validated.
+bool resolve_prefill_gemm_backend(
+    bool apple10, std::uint32_t n, std::string_view setting,
+    PrefillGemmBackend& backend, std::string& error);
+
+/// Select a validated F16/BF16 encoder from STRATA_METAL_GEMM and the active
+/// device family. The standalone and caller-owned Encoder forms share policy.
+bool encode_prefill_gemm(
+    Context& context, Encoder& encoder,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, PrefillGemmFormat format,
+    std::string& error,
+    PrefillGemmBackend* selected_backend = nullptr);
+bool encode_prefill_gemm(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, PrefillGemmFormat format,
+    std::string& error,
+    PrefillGemmBackend* selected_backend = nullptr);
 
 /// Encode an Apple10 BF16 matrix product. X is row-major [rows, k], W is
 /// row-major [n, k], and the output starts at column col0 in row-major Y with

@@ -83,6 +83,14 @@ add_executable(dequant_oracle_test tests/metal/dequant_oracle_test.cpp)
 target_link_libraries(dequant_oracle_test PRIVATE strata_artifact strata_ggml_oracle strata_metal_options)
 strata_metal_test(dequant_oracle_test host dequant_oracle_test)
 
+add_executable(prefill_gemm_selector_test
+  tests/metal/prefill_gemm_selector_test.cpp
+  src/metal/engine/prefill_gemm_selector.cpp)
+target_include_directories(prefill_gemm_selector_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(prefill_gemm_selector_test PRIVATE strata_metal_options)
+strata_metal_test(prefill_gemm_selector_test host prefill_gemm_selector_test)
+
 add_executable(codebooks_test tests/metal/codebooks_test.cpp)
 target_include_directories(codebooks_test PRIVATE ${CMAKE_SOURCE_DIR}/src/metal/kernels/common
                            ${_strata_llama}/ggml/src)
@@ -297,6 +305,26 @@ set_tests_properties(metal_prefill_gemm_simd_test_concurrent PROPERTIES
   TIMEOUT 120
   SKIP_RETURN_CODE 77
   ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
+strata_metal_test(metal_prefill_gemm_auto_test metal
+                  metal_prefill_gemm_test ${STRATA_METALLIB} auto)
+set_tests_properties(metal_prefill_gemm_auto_test PROPERTIES
+  TIMEOUT 120
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial;STRATA_METAL_GEMM=")
+strata_metal_test(metal_prefill_gemm_auto_test_concurrent metal
+                  metal_prefill_gemm_test ${STRATA_METALLIB} auto)
+set_tests_properties(metal_prefill_gemm_auto_test_concurrent PROPERTIES
+  TIMEOUT 120
+  ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent;STRATA_METAL_GEMM=")
+strata_metal_test(metal_prefill_gemm_override_simd_test metal
+                  metal_prefill_gemm_test ${STRATA_METALLIB} auto)
+set_tests_properties(metal_prefill_gemm_override_simd_test PROPERTIES
+  TIMEOUT 120
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial;STRATA_METAL_GEMM=simd")
+strata_metal_test(metal_prefill_gemm_invalid_setting_test metal
+                  metal_prefill_gemm_test ${STRATA_METALLIB} invalid-setting)
+set_tests_properties(metal_prefill_gemm_invalid_setting_test PROPERTIES
+  TIMEOUT 120
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial;STRATA_METAL_GEMM=invalid")
 
 add_executable(metal_ple_test tests/metal/metal_ple_test.mm)
 target_include_directories(metal_ple_test PRIVATE ${STRATA_METAL_GENERATED_DIR})

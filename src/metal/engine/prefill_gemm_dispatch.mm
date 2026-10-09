@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <span>
 #include <string>
@@ -238,6 +239,63 @@ bool encode_prefill_gemm_component(
 }
 
 }  // namespace
+
+bool encode_prefill_gemm(
+    Context& context, Encoder& encoder,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, PrefillGemmFormat format,
+    std::string& error, PrefillGemmBackend* selected_backend) {
+    error.clear();
+    const char* const configured = std::getenv("STRATA_METAL_GEMM");
+    const std::string_view setting =
+        configured == nullptr ? std::string_view{} : std::string_view(configured);
+    PrefillGemmBackend backend = PrefillGemmBackend::SIMD;
+    if (!resolve_prefill_gemm_backend(supports_apple10(context), params.n,
+                                      setting, backend, error)) {
+        return false;
+    }
+
+    bool encoded = false;
+    if (format == PrefillGemmFormat::F16) {
+        encoded = backend == PrefillGemmBackend::MPP
+                      ? encode_prefill_gemm_f16_mpp(context, encoder, params,
+                                                    buffers, error)
+                      : encode_prefill_gemm_f16_simd(context, encoder, params,
+                                                     buffers, error);
+    } else if (format == PrefillGemmFormat::BF16) {
+        encoded = backend == PrefillGemmBackend::MPP
+                      ? encode_prefill_gemm_bf16_mpp(context, encoder, params,
+                                                     buffers, error)
+                      : encode_prefill_gemm_bf16_simd(context, encoder, params,
+                                                      buffers, error);
+    } else {
+        error = "Prefill GEMM format is invalid";
+        return false;
+    }
+    if (encoded && selected_backend != nullptr) {
+        *selected_backend = backend;
+    }
+    return encoded;
+}
+
+bool encode_prefill_gemm(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, PrefillGemmFormat format,
+    std::string& error, PrefillGemmBackend* selected_backend) {
+    PrefillGemmBackend selected = PrefillGemmBackend::SIMD;
+    const bool encoded = Encoder::encode(
+        context, command_buffer, "Prefill GEMM",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_gemm(context, encoder, params, buffers,
+                                       format, encode_error, &selected);
+        },
+        error);
+    if (encoded && selected_backend != nullptr) {
+        *selected_backend = selected;
+    }
+    return encoded;
+}
 
 bool encode_prefill_gemm_bf16_mpp(
     Context& context, Encoder& encoder,
