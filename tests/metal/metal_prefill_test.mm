@@ -9,6 +9,7 @@
 #include "strata/metal/prefill_dispatch.hpp"
 #include "strata/metal/prefill_gemm_dispatch.hpp"
 #include "strata/metal/prefill_gr_read_dispatch.hpp"
+#include "strata/metal/prefill_gr_read_mix_dispatch.hpp"
 #include "strata/metal/prefill_gr_mix_dispatch.hpp"
 #include "strata/metal/prefill_gr_norm_dispatch.hpp"
 #include "strata/metal/prefill_gr_silu_dispatch.hpp"
@@ -1061,6 +1062,8 @@ bool test_prefill_gr_read_chain(Context& context) {
         const std::uint32_t rows = rows_by_mode[mode_index];
         const bool write_low =
             modes[mode_index] == PrefillBF16X2Mode::all_projections;
+        const bool mix_write_low =
+            modes[mode_index] != PrefillBF16X2Mode::off;
         PrefillGRReadTestOutputs composed, reference;
         const bool outputs_allocated =
             composed.allocate(context, rows, write_low,
@@ -1240,6 +1243,149 @@ bool test_prefill_gr_read_chain(Context& context) {
             std::span<const float>(
                 inject_result, static_cast<std::size_t>(rows) * kStreams));
 
+        PrefillGRReadTestOutputs integrated_read, direct_read;
+        TestBuffer mixed_bf, mixed_bf_lo, mixed_h;
+        TestBuffer direct_mixed_bf, direct_mixed_bf_lo, direct_mixed_h;
+        const std::size_t mixed_bytes =
+            static_cast<std::size_t>(rows) * kWidth *
+            sizeof(std::uint16_t);
+        const bool integrated_allocated =
+            integrated_read.allocate(context, rows, write_low,
+                                     label + " integrated read", error) &&
+            direct_read.allocate(context, rows, write_low,
+                                 label + " direct read", error) &&
+            mixed_bf.allocate(context, label + " integrated mixed BF16",
+                              mixed_bytes, error) &&
+            (!mix_write_low ||
+             mixed_bf_lo.allocate(context,
+                                  label + " integrated mixed BF16 low",
+                                  mixed_bytes, error)) &&
+            mixed_h.allocate(context, label + " integrated mixed F16",
+                             mixed_bytes, error) &&
+            direct_mixed_bf.allocate(context, label + " direct mixed BF16",
+                                     mixed_bytes, error) &&
+            (!mix_write_low ||
+             direct_mixed_bf_lo.allocate(
+                 context, label + " direct mixed BF16 low", mixed_bytes,
+                 error)) &&
+            direct_mixed_h.allocate(context, label + " direct mixed F16",
+                                    mixed_bytes, error);
+        check(integrated_allocated, label + " allocate read/mix outputs",
+              error);
+        if (!integrated_allocated) return false;
+        const PrefillGRReadBuffers integrated_read_buffers =
+            integrated_read.bind(residual.view(), norm.view(), down_read,
+                                 up_read, inject_read, write_low);
+        const PrefillGRReadBuffers direct_read_buffers =
+            direct_read.bind(residual.view(), norm.view(), down_read,
+                             up_read, inject_read, write_low);
+        const PrefillGRReadMixBuffers integrated_buffers{
+            integrated_read_buffers,
+            mixed_bf.view(),
+            mix_write_low ? mixed_bf_lo.view() : BufferRef{},
+            mixed_h.view()};
+        auto integrated_command =
+            context.make_command_buffer(label + " read and mix", error);
+        if (!integrated_command) {
+            check(false, label + " integrated command buffer", error);
+            return false;
+        }
+        const bool integrated_encoded = encode_prefill_gr_read_mix(
+            context, *integrated_command, rows, modes[mode_index],
+            integrated_buffers, error);
+        check(integrated_encoded, label + " complete GR read/mix encode",
+              error);
+        if (!integrated_encoded) return false;
+        const bool integrated_completed =
+            submit_and_wait(integrated_command, label + " read and mix",
+                            error);
+        check(integrated_completed, label + " complete GR read/mix dispatch",
+              error);
+        if (!integrated_completed) return false;
+
+        const PrefillGRMixBuffers direct_mix_buffers{
+            context.buffers().read_only(residual.view()),
+            context.buffers().read_only(direct_read.rs.view()),
+            context.buffers().read_only(norm.view()),
+            context.buffers().read_only(direct_read.gated.view()),
+            direct_mixed_bf.view(),
+            mix_write_low ? direct_mixed_bf_lo.view() : BufferRef{},
+            direct_mixed_h.view()};
+        auto direct_mix_command =
+            context.make_command_buffer(label + " direct read and mix", error);
+        if (!direct_mix_command) {
+            check(false, label + " direct read/mix command buffer", error);
+            return false;
+        }
+        const bool direct_mix_encoded = Encoder::encode(
+            context, *direct_mix_command, "direct Prefill GR read and mix",
+            [&](Encoder& encoder, std::string& encode_error) {
+                if (!encode_prefill_gr_read_reference(
+                        context, encoder, rows, modes[mode_index],
+                        direct_read_buffers, encode_error)) {
+                    return false;
+                }
+                return encode_prefill_gr_mix(
+                    context, encoder, rows, modes[mode_index],
+                    direct_mix_buffers, encode_error);
+            },
+            error);
+        check(direct_mix_encoded, label + " direct component read/mix encode",
+              error);
+        if (!direct_mix_encoded) return false;
+        const bool direct_mix_completed =
+            submit_and_wait(direct_mix_command, label + " direct read/mix",
+                            error);
+        check(direct_mix_completed,
+              label + " direct component read/mix dispatch", error);
+        if (!direct_mix_completed) return false;
+
+        passed &= compare(integrated_read.rs, direct_read.rs,
+                          "complete read/mix scale");
+        passed &= compare(integrated_read.xn16, direct_read.xn16,
+                          "complete read/mix normalized input");
+        passed &= compare(integrated_read.low_rank, direct_read.low_rank,
+                          "complete read/mix down projection");
+        passed &= compare(integrated_read.low_rank_bf16,
+                          direct_read.low_rank_bf16,
+                          "complete read/mix SiLU conversion");
+        passed &= compare(integrated_read.gated, direct_read.gated,
+                          "complete read/mix up projection");
+        passed &= compare(integrated_read.inject, direct_read.inject,
+                          "complete read/mix injection projection");
+        passed &= compare(mixed_bf, direct_mixed_bf, "mixer BF16 output");
+        passed &= compare(mixed_h, direct_mixed_h, "mixer F16 output");
+        if (write_low) {
+            passed &= compare(integrated_read.xn16_lo, direct_read.xn16_lo,
+                              "complete read/mix normalized remainder");
+            passed &= compare(integrated_read.low_rank_bf16_lo,
+                              direct_read.low_rank_bf16_lo,
+                              "complete read/mix SiLU remainder");
+        }
+        if (mix_write_low) {
+            passed &= compare(mixed_bf_lo, direct_mixed_bf_lo,
+                              "mixer BF16 remainder");
+        }
+
+        const bool integrated_guards =
+            integrated_read.rs.guards_intact() &&
+            integrated_read.xn16.guards_intact() &&
+            integrated_read.low_rank.guards_intact() &&
+            integrated_read.low_rank_bf16.guards_intact() &&
+            integrated_read.gated.guards_intact() &&
+            integrated_read.inject.guards_intact() &&
+            mixed_bf.guards_intact() && mixed_h.guards_intact() &&
+            (!mix_write_low || mixed_bf_lo.guards_intact()) &&
+            (!write_low ||
+             (integrated_read.xn16_lo.guards_intact() &&
+              integrated_read.low_rank_bf16_lo.guards_intact()));
+        check(integrated_guards, label + " integrated read/mix guards");
+        passed &= integrated_guards;
+
+        struct ReadInputAlias {
+            std::string_view name;
+            BufferRef view;
+        };
         const bool guards_intact =
             composed.rs.guards_intact() && composed.xn16.guards_intact() &&
             composed.low_rank.guards_intact() &&
@@ -1306,25 +1452,222 @@ bool test_prefill_gr_read_chain(Context& context) {
                 check(group_rejected,
                       label + " rejects an open concurrent group", error);
                 passed &= group_rejected;
+
+                auto integrated_group_command = context.make_command_buffer(
+                    label + " open read/mix concurrent group", error);
+                if (!integrated_group_command) {
+                    check(false,
+                          label + " open read/mix group command buffer",
+                          error);
+                    return false;
+                }
+                const bool integrated_group_encoded = Encoder::encode(
+                    context, *integrated_group_command,
+                    "open concurrent Prefill GR read/mix",
+                    [&](Encoder& encoder, std::string& encode_error) {
+                        if (!encoder.group_begin(encode_error)) return false;
+                        return encode_prefill_gr_read_mix(
+                            context, encoder, rows, modes[mode_index],
+                            integrated_buffers, encode_error);
+                    },
+                    error);
+                const bool integrated_group_rejected =
+                    !integrated_group_encoded &&
+                    error.find("ordered concurrent-group boundary") !=
+                        std::string::npos;
+                check(integrated_group_rejected,
+                      label + " read/mix rejects an open concurrent group",
+                      error);
+                passed &= integrated_group_rejected;
+            }
+        }
+
+        const std::array<ReadInputAlias, 5> read_inputs{{
+            {"residual", residual.view()},
+            {"norm", norm.view()},
+            {"down weights", down_weights.view()},
+            {"up weights", up_weights.view()},
+            {"injection weights", inject_weights.view()},
+        }};
+        const std::array<std::string_view, 3> mixer_output_names{
+            "mixed BF16", "mixed F16", "mixed BF16 remainder"};
+        const std::size_t active_mixer_outputs =
+            mix_write_low ? mixer_output_names.size()
+                          : mixer_output_names.size() - 1u;
+        for (std::size_t output_index = 0u;
+             output_index < active_mixer_outputs; ++output_index) {
+            for (const ReadInputAlias& input : read_inputs) {
+                PrefillGRReadMixBuffers input_aliased = integrated_buffers;
+                const BufferRef alias_view =
+                    input.view.slice(0u, mixed_bytes);
+                if (!alias_view) {
+                    check(false,
+                          label + " create " +
+                              std::string(mixer_output_names[output_index]) +
+                              " input-alias view",
+                          std::string(input.name));
+                    return false;
+                }
+                switch (output_index) {
+                    case 0u:
+                        input_aliased.mixed_bf = alias_view;
+                        break;
+                    case 1u:
+                        input_aliased.mixed_h = alias_view;
+                        break;
+                    default:
+                        input_aliased.mixed_bf_lo = alias_view;
+                        break;
+                }
+                const std::vector<std::uint8_t> input_before(
+                    static_cast<const std::uint8_t*>(alias_view.contents),
+                    static_cast<const std::uint8_t*>(alias_view.contents) +
+                        alias_view.length);
+                auto input_alias_command = context.make_command_buffer(
+                    label + " read/mix " +
+                        std::string(mixer_output_names[output_index]) +
+                        " / " + std::string(input.name) + " alias",
+                    error);
+                if (!input_alias_command) {
+                    check(false,
+                          label + " read/mix input-alias command buffer",
+                          error);
+                    return false;
+                }
+                const bool input_alias_encoded =
+                    encode_prefill_gr_read_mix(
+                        context, *input_alias_command, rows,
+                        modes[mode_index], input_aliased, error);
+                const bool input_alias_rejected =
+                    !input_alias_encoded &&
+                    input_alias_command->unsafe_native_handle() == nullptr &&
+                    error.find("mixer output overlaps a read input") !=
+                        std::string::npos &&
+                    std::equal(
+                        input_before.begin(), input_before.end(),
+                        static_cast<const std::uint8_t*>(
+                            alias_view.contents));
+                check(input_alias_rejected,
+                      label + " rejects " +
+                          std::string(mixer_output_names[output_index]) +
+                          " alias with " + std::string(input.name),
+                      error);
+                passed &= input_alias_rejected;
+            }
+        }
+
+        if (mode_index != 0u) {
+            PrefillGRReadMixBuffers remainder_aliased = integrated_buffers;
+            remainder_aliased.mixed_bf_lo =
+                mode_index == 1u
+                    ? integrated_read.xn16_lo.view().slice(0u, mixed_bytes)
+                    : integrated_read.gated.view().slice(0u, mixed_bytes);
+            const BufferRef aliased_read_output =
+                remainder_aliased.mixed_bf_lo;
+            const std::vector<std::uint8_t> remainder_alias_before(
+                static_cast<const std::uint8_t*>(
+                    aliased_read_output.contents),
+                static_cast<const std::uint8_t*>(
+                    aliased_read_output.contents) +
+                    aliased_read_output.length);
+            auto remainder_alias_command = context.make_command_buffer(
+                label + " active remainder alias rejection", error);
+            if (!remainder_alias_command) {
+                check(false,
+                      label + " active remainder-alias command buffer",
+                      error);
+                return false;
+            }
+            const bool remainder_alias_encoded =
+                encode_prefill_gr_read_mix(
+                    context, *remainder_alias_command, rows,
+                    modes[mode_index], remainder_aliased, error);
+            const bool remainder_alias_rejected =
+                !remainder_alias_encoded &&
+                remainder_alias_command->unsafe_native_handle() == nullptr &&
+                error.find("mixer output overlaps a GR read output") !=
+                    std::string::npos &&
+                std::equal(
+                    remainder_alias_before.begin(),
+                    remainder_alias_before.end(),
+                    static_cast<const std::uint8_t*>(
+                        aliased_read_output.contents));
+            check(remainder_alias_rejected,
+                  label + " rejects mixer remainder alias with active " +
+                      (mode_index == 1u ? "GR remainder" : "GR output"),
+                  error);
+            passed &= remainder_alias_rejected;
+
+            if (mode_index == 1u) {
+                TestBuffer low_rank_remainder_alias;
+                const bool alias_allocated =
+                    low_rank_remainder_alias.allocate(
+                        context, label + " low-rank remainder alias",
+                        mixed_bytes, error);
+                check(alias_allocated,
+                      label + " allocate low-rank remainder alias", error);
+                if (!alias_allocated) return false;
+                PrefillGRReadMixBuffers low_rank_remainder_aliased =
+                    integrated_buffers;
+                low_rank_remainder_aliased.read.low_rank_bf16_lo =
+                    low_rank_remainder_alias.view();
+                low_rank_remainder_aliased.mixed_bf_lo =
+                    low_rank_remainder_alias.view();
+                const std::vector<std::uint8_t> alias_before(
+                    low_rank_remainder_alias.allocation().begin(),
+                    low_rank_remainder_alias.allocation().end());
+                auto low_rank_alias_command = context.make_command_buffer(
+                    label + " low-rank remainder alias rejection", error);
+                if (!low_rank_alias_command) {
+                    check(false,
+                          label +
+                              " low-rank remainder-alias command buffer",
+                          error);
+                    return false;
+                }
+                const bool low_rank_alias_encoded =
+                    encode_prefill_gr_read_mix(
+                        context, *low_rank_alias_command, rows,
+                        modes[mode_index], low_rank_remainder_aliased, error);
+                const bool low_rank_alias_rejected =
+                    !low_rank_alias_encoded &&
+                    low_rank_alias_command->unsafe_native_handle() == nullptr &&
+                    error.find("mixer output overlaps a GR read output") !=
+                        std::string::npos &&
+                    std::equal(
+                        alias_before.begin(), alias_before.end(),
+                        low_rank_remainder_alias.allocation().begin());
+                check(low_rank_alias_rejected,
+                      label +
+                          " rejects mixer remainder alias with low-rank GR remainder",
+                      error);
+                passed &= low_rank_alias_rejected;
             }
         }
     }
 
     PrefillGRReadTestOutputs late_failure;
+    TestBuffer late_mixed_bf, late_mixed_h;
     const bool late_failure_allocated =
         late_failure.allocate(context, 1u, false, label + " late failure",
-                              error);
+                              error) &&
+        late_mixed_bf.allocate(context, label + " late mixed BF16",
+                               kWidth * sizeof(std::uint16_t), error) &&
+        late_mixed_h.allocate(context, label + " late mixed F16",
+                              kWidth * sizeof(std::uint16_t), error);
     check(late_failure_allocated, label + " allocate late-failure outputs",
           error);
     if (!late_failure_allocated) return false;
     const PrefillGRReadBuffers late_failure_buffers = late_failure.bind(
         residual.view(), norm.view(), down_read, up_read, inject_read, false);
-    const std::array<TestBuffer*, 6> late_failure_outputs{
+    const PrefillGRReadMixBuffers late_failure_mix_buffers{
+        late_failure_buffers, late_mixed_bf.view(), {}, late_mixed_h.view()};
+    const std::array<TestBuffer*, 8> late_failure_outputs{
         &late_failure.rs, &late_failure.xn16, &late_failure.low_rank,
-        &late_failure.low_rank_bf16, &late_failure.gated,
-        &late_failure.inject};
+        &late_failure.low_rank_bf16, &late_failure.gated, &late_failure.inject,
+        &late_mixed_bf, &late_mixed_h};
     const auto snapshot_late_failure_outputs = [&] {
-        std::array<std::vector<std::uint8_t>, 6> snapshots;
+        std::array<std::vector<std::uint8_t>, 8> snapshots;
         for (std::size_t index = 0u; index < snapshots.size(); ++index) {
             const auto bytes = late_failure_outputs[index]->allocation();
             snapshots[index].assign(bytes.begin(), bytes.end());
@@ -1342,7 +1685,7 @@ bool test_prefill_gr_read_chain(Context& context) {
         return true;
     };
     const auto run_late_failure = [&](std::string_view form,
-                                      bool caller_owned) {
+                                      bool caller_owned, bool include_mix) {
         const auto before = snapshot_late_failure_outputs();
         auto command = context.make_command_buffer(
             label + " late failure " + std::string(form), error);
@@ -1353,17 +1696,29 @@ bool test_prefill_gr_read_chain(Context& context) {
         bool encoded = false;
         if (caller_owned) {
             encoded = Encoder::encode(
-                context, *command, "caller-owned Prefill GR read failure",
+                context, *command, "caller-owned Prefill GR read/mix failure",
                 [&](Encoder& encoder, std::string& encode_error) {
-                    return encode_prefill_gr_read(
-                        context, encoder, 1u, PrefillBF16X2Mode::off,
-                        late_failure_buffers, encode_error);
+                    return include_mix
+                               ? encode_prefill_gr_read_mix(
+                                     context, encoder, 1u,
+                                     PrefillBF16X2Mode::off,
+                                     late_failure_mix_buffers, encode_error)
+                               : encode_prefill_gr_read(
+                                     context, encoder, 1u,
+                                     PrefillBF16X2Mode::off,
+                                     late_failure_buffers, encode_error);
                 },
                 error);
         } else {
-            encoded = encode_prefill_gr_read(
-                context, *command, 1u, PrefillBF16X2Mode::off,
-                late_failure_buffers, error);
+            encoded = include_mix
+                          ? encode_prefill_gr_read_mix(
+                                context, *command, 1u,
+                                PrefillBF16X2Mode::off,
+                                late_failure_mix_buffers, error)
+                          : encode_prefill_gr_read(
+                                context, *command, 1u,
+                                PrefillBF16X2Mode::off,
+                                late_failure_buffers, error);
         }
         const bool discarded =
             command->unsafe_native_handle() == nullptr;
@@ -1374,6 +1729,7 @@ bool test_prefill_gr_read_chain(Context& context) {
             error.find("STRATA_METAL_GEMM must be") != std::string::npos;
         check(rejected,
               label + " " + std::string(form) +
+                  (include_mix ? " read/mix" : " read") +
                   " discards normalization prefix after GEMM selector failure",
               error + (discarded ? " (command buffer discarded)"
                                  : " (command buffer remained submit-capable)"));
@@ -1386,13 +1742,76 @@ bool test_prefill_gr_read_chain(Context& context) {
     check(invalid_setting_applied,
           label + " installs deterministic late GEMM failure");
     if (invalid_setting_applied) {
-        passed &= run_late_failure("transactional", false);
-        passed &= run_late_failure("caller-owned", true);
+        passed &= run_late_failure("transactional", false, false);
+        passed &= run_late_failure("caller-owned", true, false);
+        passed &= run_late_failure("transactional", false, true);
+        passed &= run_late_failure("caller-owned", true, true);
         const bool environment_restored = invalid_gemm_setting.restore();
         check(environment_restored,
               label + " restores STRATA_METAL_GEMM after late-failure checks");
         passed &= environment_restored;
     }
+
+    TestBuffer late_mix_shared;
+    const std::size_t late_mix_output_bytes =
+        static_cast<std::size_t>(kWidth) * sizeof(std::uint16_t);
+    const bool late_mix_shared_allocated =
+        late_mix_shared.allocate(context, label + " late mixer overlap",
+                                 late_mix_output_bytes * 2u, error);
+    check(late_mix_shared_allocated,
+          label + " allocate late mixer-overlap fixture", error);
+    if (!late_mix_shared_allocated) return false;
+    const PrefillGRReadMixBuffers late_mix_overlap_buffers{
+        late_failure_buffers,
+        late_mix_shared.view(),
+        {},
+        late_mix_shared.view().slice(late_mix_output_bytes,
+                                     late_mix_output_bytes)};
+    // The active mixer outputs are adjacent, but the first view's unused tail
+    // overlaps the second view. The read prefix encodes before the mixer
+    // performs its stricter full-view overlap validation.
+    const auto run_late_mix_failure = [&](std::string_view form,
+                                          bool caller_owned) {
+        const auto before = snapshot_late_failure_outputs();
+        const std::vector<std::uint8_t> shared_before(
+            late_mix_shared.allocation().begin(),
+            late_mix_shared.allocation().end());
+        auto command = context.make_command_buffer(
+            label + " late mixer validation " + std::string(form), error);
+        if (!command) {
+            check(false, label + " late mixer-validation command buffer",
+                  error);
+            return false;
+        }
+        const auto encode_body = [&](Encoder& encoder,
+                                     std::string& encode_error) {
+            return encode_prefill_gr_read_mix(
+                context, encoder, 1u, PrefillBF16X2Mode::off,
+                late_mix_overlap_buffers, encode_error);
+        };
+        const bool encoded =
+            caller_owned
+                ? Encoder::encode(context, *command,
+                                  "caller-owned Prefill late mixer failure",
+                                  encode_body, error)
+                : encode_prefill_gr_read_mix(
+                      context, *command, 1u, PrefillBF16X2Mode::off,
+                      late_mix_overlap_buffers, error);
+        const bool rejected =
+            !encoded && command->unsafe_native_handle() == nullptr &&
+            late_failure_outputs_unchanged(before) &&
+            std::equal(shared_before.begin(), shared_before.end(),
+                       late_mix_shared.allocation().begin()) &&
+            error.find("Prefill GR mix output buffer views overlap") !=
+                std::string::npos;
+        check(rejected,
+              label + " " + std::string(form) +
+                  " read/mix failure after GR read discards its encoded prefix",
+              error);
+        return rejected;
+    };
+    passed &= run_late_mix_failure("transactional", false);
+    passed &= run_late_mix_failure("caller-owned", true);
 
     const bool immutable_inputs =
         std::equal(residual_before.begin(), residual_before.end(),
