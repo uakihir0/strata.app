@@ -2937,6 +2937,15 @@ writes, with `row(c) = {c, c + 1, (c + 1) / 4, window > 0 ? min(c + 1, window) :
   `divide_weights=false`, and requires an ordered concurrent-group boundary.
   This isolated encoder does not bind `MtpRuntimeStorage` or establish
   model-backed parity.
+- Stage 17's `encode_mtp_routed_experts` quantizes stage 15's `mixed` row
+  with scaled Q8_0, computes gate/up projections for the ten stage-16 route
+  IDs from S2 expert weights, applies SwiGLU, quantizes its ten rows, and
+  computes each down projection into `parts`. The wrapper requires one
+  contiguous complete `experts.bin` image, validates active extents and
+  aliases before dispatch, and keeps all five dispatches ordered. Its
+  serial/concurrent twin uses a synthetic complete 675 MiB blob and
+  independent scalar references. Production `MtpRuntimeStorage` view binding
+  and inspected-model parity remain open.
 - Stages 2 and 4 are upstream's `native_qsa_rms_norm_weighted`, whose `norm<1024>` (for rows of 1024 or more) is
   the same arithmetic as `native_gr_rms_norm_weighted`. `strata_rms_norm_w` serves both with `n_cols` and the gamma
   period `gp` as `setBytes` constants (section 5.4).
@@ -2971,7 +2980,7 @@ ordered Q8_0 key and value projections to `kcur` and `vcur`. It selects the
 smallest supported NC at least T, shares the padded-column sink across those
 ordered dispatches, and rejects parameter, input, output and sink aliases that
 could corrupt later reads. These are isolated stage encoders only;
-runtime-storage wiring, stages 1–5 and 9–22, and the complete drafter remain
+runtime-storage wiring, stages 1–5 and 18–22, and the complete drafter remain
 open.
 
 **`strata_q_q8_0_scaled`**, grid ⌈n/4096⌉ × 128, one 32-value block per thread. Upstream
@@ -3072,6 +3081,17 @@ for (rr = warp; rr < 64; rr += 8) {
   rank, so `parts[rank]` is the same place.
 - Upstream also has `gu_grouped_t_kernel` and `down_grouped_t_kernel` (bank-conflict-free staging, two rows per
   warp). Their comments and parity tests state they are bitwise the plain ones; the Mac follows the plain form.
+
+The validated `encode_mtp_routed_experts` host entry composes the two scaled
+Q8_0 activation quantizers, S2 gate/up and down kernels, and SwiGLU in one
+ordered Encoder segment. Its input contract is the full contiguous
+512-expert file and ten in-range IDs from stage 16, including expert 511 at
+the file's final blob. The serial and concurrent twins compare quantized
+codes/scales and gate/up/SwiGLU/down values with an independent CPU oracle,
+and check alias/extent/ownership rejection, output guards, read-only inputs,
+open-group refusal, standalone parity, and rollback.
+The test's complete synthetic expert allocation is about 675 MiB. Production
+runtime-view composition and model-backed parity are still open.
 
 **`strata_mtp_window_ids`**, grid 8 × 256, encoded only when the drafter has a window. Upstream
 `window_ids_kernel`, `window` a `setBytes` constant:

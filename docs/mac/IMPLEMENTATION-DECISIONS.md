@@ -8663,3 +8663,55 @@ measuring L-15 remain open.
   stage-16 focused coverage.
 - **Review required:** Production runtime binding and inspected-model
   stage-16/full-drafter parity remain open under D-IMPL-332.
+
+### D-IMPL-333: Compose MTP drafter stage 17 routed S2 experts
+
+- **Decision:** Add caller-owned Encoder and standalone transactional forms
+  for the T=1 routed-expert pass. Quantize the stage-15 `mixed` row with
+  scaled Q8_0, compute gate/up projections for the ten device-produced
+  stage-16 route IDs from S2 weights, apply SwiGLU, quantize the hidden rows,
+  and write each down projection to `parts`. Accept one contiguous image of
+  all 512 experts and validate active extents, ownership, aliases and group
+  boundaries before dispatch.
+- **Reason:** This follows the specified S2 expert offsets and keeps route-ID
+  lookup on the device without reading IDs back to the host. Requiring a
+  contiguous 707,788,800-byte image is the simplest full-blob ABI for this
+  isolated stage and avoids inventing a view table before runtime storage is
+  connected. That choice costs roughly 675 MiB per fixture and does not match
+  `MtpRuntimeStorage`, which currently exposes individual expert views.
+- **Validation:** A synthetic complete expert image and independent scalar
+  references exercise the exact quantized codes, scales, gate/up values,
+  SwiGLU and down projections, plus standalone/caller-owned parity, guards,
+  invalid views, aliases and rollback. Expert 511 is included to cover the
+  final valid blob boundary. Q8 scales use a small relative tolerance because
+  GPU division can differ by a few ULPs; quantized codes remain exact. The
+  scalar oracle exposed a half-scale indexing error during implementation;
+  the Metal indexing was corrected before the hostile full-diff review.
+- **Review required:** Decide how production binds per-expert `MtpRuntimeStorage`
+  views (including whether a windowed strategy is needed), connect stage 17
+  to that runtime, and establish parity against an inspected model. The
+  contiguous-image ABI is an expedient isolated-stage choice, not a settled
+  production storage contract.
+
+### REV-130: Hostile review of MTP drafter stage 17
+
+- **Scope:** The stage-17 host composer, four Metal kernels, serial/concurrent
+  twin, CMake and test-map registrations, and status documentation.
+- **Adversarial review:** The reviewer found that the test did not include the
+  highest valid expert ID and that the decision/review records and README
+  status were missing. The test now routes to expert 511 and checks the final
+  blob boundary. The required records are added here; the README status is
+  updated with the final suite results. No direct arithmetic, ordering,
+  validation or rollback defect was reported.
+- **Disposition:** The independent oracle exposed and led to the fix for
+  half-scale indexing. After adding the expert-511 fixture,
+  `cmake --build --preset mac-dev` succeeded and the focused serial/concurrent
+  tests passed 2/2. The complete `mac-metal` suite passed 77/77;
+  `mac-host` ran 44 tests, with 43 passing and one unavailable-real-input
+  case skipped. The host preset's `test_map` passed,
+  `check_drift.py` reported no upstream changes and valid golden files, and
+  `git diff --check` was clean. The README records the Mac17,9 (64 GB,
+  macOS 27.0.1, Xcode 27.0 build 27A266a) conditions. No model-backed parity
+  result is claimed because `STRATA_TEST_MODELS` is unavailable.
+- **Review required:** Production runtime-view binding and inspected-model
+  stage-17/full-drafter parity remain open under D-IMPL-333.
