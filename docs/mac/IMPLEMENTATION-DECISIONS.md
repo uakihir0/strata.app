@@ -10610,3 +10610,51 @@ measuring L-15 remain open.
 - **Validation:** The full `mac-metal` suite passed 90/90 before the final
   fixture change. The rebuilt serial and concurrent dequant tests passed
   2/2 afterwards; `git diff --check` passed.
+
+### D-IMPL-370: Add the Q6_K Prefill dequantizer
+
+- **Decision:** Add `strata_pf_dequant_q6_k` and caller-owned/standalone
+  `encode_prefill_dequant_q6_k` APIs. Decode the native 256-value, 210-byte
+  block by combining each `ql` nibble with its two-bit `qh` field, apply the
+  signed scale for each 16-value group and subtract the six-bit code midpoint
+  of 32. Evaluate in F32, round once to F16 and write K-major `[k][n_out]`
+  scratch. Reuse the common checked dispatch with Q6_K-specific block size.
+- **Reason:** Q6_K is a Phase-1 dense format already used by the native
+  mat-vec, indexed output head and model catalogue. Supporting it exercises
+  the two-bit high plane and signed per-group scales while preserving the
+  Prefill component boundary.
+- **Review items:** Compare `ql` chunk/nibble order, all four `qh` two-bit
+  fields, 16 signed scale groups, midpoint, block extent and arithmetic
+  against the native decoders and scalar oracle. Ensure the fixture covers
+  all 64 codes and distinguishes every nibble half and chunk; exercise two
+  consecutive blocks, output-column tails, exact F16 rounding, host extents,
+  alignment, ownership, overlap, input preservation, guards and transactional
+  rollback; verify manifest and progress documentation.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the build passed, Q6_K serial/concurrent dequant tests passed 2/2,
+  and the full `mac-metal` suite passed 90/90. The Q6_K test uses all 64
+  logical codes and signed scales over `[N=257,K=512]`. The complete Python
+  runner passed all 35 modules in a temporary environment installed from
+  `requirements.txt`; declared fixture/optional-dependency skips were
+  preserved. Manifest and test-map checks passed. Review findings and
+  disposition are in REV-167.
+
+### REV-167: Hostile review of Q6_K Prefill dequantization
+
+- **Scope:** Q6_K's 256-value/210-byte block; `ql` chunks and nibbles, `qh`
+  two-bit fields, signed 16-value scales, midpoint, F32 arithmetic and F16
+  conversion; host dispatch checks, logical fixture, manifest and docs.
+- **Findings and fixes:** The reviewer found no kernel, host, arithmetic or
+  fixture defect. It cross-checked the Metal path against the native Q6_K
+  decoder, CUDA `group32` decoder and scalar CPU oracle. One P2 documentation
+  finding identified stale statements that only Q4_K/Q5_K use 256-value
+  blocks and that four dense formats remain. The docs and test map now include
+  Q6_K and list three remaining formats.
+- **Disposition:** The documented omission is fixed; no actionable findings
+  remain. Q6_K is an isolated Prefill dequantizer, so production
+  `Prefill::run` scheduling and model-backed inference remain open.
+- **Validation:** The full `mac-metal` suite passed 90/90, including serial
+  and concurrent Q6_K coverage. The full `mac-host` result is 44 passed and
+  one unavailable-real-input test skipped; the Python runner passed 35/35
+  modules with declared skips. Manifest and `test_map` checks passed, and
+  `git diff --check` passed.
