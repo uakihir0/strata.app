@@ -298,7 +298,7 @@ column points to the specification. "Threads" is the manifest value.
 
 | Kernel | Specialisations | Section |
 | --- | --- | --- |
-| `strata_pf_gr_norm`, `strata_pf_gr_norm_lo`, `strata_pf_gr_mix`, `strata_pf_gr_mix_lo`, `strata_pf_gr_write_norm`, `strata_pf_gr_silu`, `strata_pf_gr_silu_lo` | | 6.3 |
+| `strata_pf_gr_norm`, `strata_pf_gr_norm_lo`, `strata_pf_gr_mix`, `strata_pf_gr_mix_lo`, `strata_pf_gr_write_norm`, `strata_pf_gr_write_norm_lo`, `strata_pf_gr_silu`, `strata_pf_gr_silu_lo` | | 6.3 |
 | `strata_pf_gdn_gates`, `strata_pf_gdn_conv_tiled`, `strata_pf_gdn_conv_hist`, `strata_pf_gdn_l2`, `strata_pf_gdn_rec`, `strata_pf_gdn_out_norm` | | 6.4 |
 | `strata_pf_gate_attn` | | 6.5 |
 | `strata_idx_append_first`, `strata_idx_append_blocks`, `strata_idx_append_tail` | | 6.5 |
@@ -4125,7 +4125,7 @@ if (tid == 0) rs_out[row] = rs;
 for (k = 0, d = tid; d < 2560; d += 256, ++k) {
     y = (v[k] * rs) * w_next[c*2560 + d];          // the next half's *_norm
     h = f32_to_bf16_rne(y);  xn16[row*2560 + d] = h;
-    if (lo_on) xn16_lo[row*2560 + d] = f32_to_bf16_rne(y - bf16_to_f32(h));
+    if (mode == 1) xn16_lo[row*2560 + d] = f32_to_bf16_rne(y - bf16_to_f32(h));
 }
 ```
 
@@ -4157,6 +4157,17 @@ So half 0 is always fused. An unfused write uses decode's kernels, which are alr
 
 **Tolerance.** These kernels are B against their upstream kernels, apart from the deviations named. The GEMMs between
 them carry section 6.2's tolerance.
+
+The isolated `strata_pf_gr_write_norm` and `_lo` kernels and validated
+`encode_prefill_gr_write_norm` entry point are implemented. The encoder binds
+the residual in place, treats block output, injection and next-half norm as
+read-only, validates their extents, alignment, ownership and output aliases,
+and requires an ordered dispatch boundary. Mode 1 selects the low-remainder
+pipeline; modes 0 and 2 omit that output. Serial and concurrent tests cover
+T=1/3/8 and every BF16X2 mode. The fused residual, scale, high BF16 and
+mode-1 low BF16 bits are compared with `strata_gr_post` followed by
+`strata_pf_gr_norm` on the same inputs. This kernel is not yet connected to
+Prefill GEMMs, layer scheduling or the production chunk loop.
 
 ### 6.4 GDN mixer
 
@@ -5507,7 +5518,7 @@ and foreign Context ownership.
 | Test | Label | Kernels | Classes |
 | --- | --- | --- | --- |
 | `metal_embed_test_concurrent` | metal | `strata_embed_rows_{q3_k,iq3_s,iq4_xs,bf16}`, `strata_embed_image`, `strata_gr_broadcast` | Runs the embedding test binary with concurrent dispatch; its shared Encoder gather → optional image copy → broadcast chain matches the bitwise stage oracles |
-| `metal_prefill_test_concurrent` | metal | `strata_pf_gr_norm`, `strata_pf_gr_norm_lo`, `strata_pf_gr_silu`, `strata_pf_gr_silu_lo`, `strata_pf_gr_mix`, `strata_pf_gr_mix_lo`, and the kernels listed for `metal_embed_test` | Runs Prefill GR normalization, SiLU and mix with concurrent dispatch, plus embedding → broadcast → normalization composition; checks reduction, SiLU and GR-mix output oracles, BF16X2 reconstruction and exact mix RNE ties, invalid-group rejection and discard after late validation failure |
+| `metal_prefill_test_concurrent` | metal | `strata_pf_gr_norm`, `strata_pf_gr_norm_lo`, `strata_pf_gr_write_norm`, `strata_pf_gr_write_norm_lo`, `strata_pf_gr_silu`, `strata_pf_gr_silu_lo`, `strata_pf_gr_mix`, `strata_pf_gr_mix_lo`, and the kernels listed for `metal_embed_test` | Runs Prefill GR normalization, fused GR write/next-read normalization, SiLU and mix with concurrent dispatch, plus embedding → broadcast → normalization composition; checks stage-chain bit parity, reduction and conversion oracles, BF16X2 ties, invalid-group rejection and discard after late validation failure |
 | `metal_mv_test_concurrent` | metal | `strata_q_q8_1`, `strata_mv_<fmt>_n<NC>` (Q5_K, Q6_K and IQ4_XS read-only head formats), Q2_0 and BF16 mat-vec | Runs the mat-vec test binary with concurrent dispatch; the shared Encoder Q8_1 → Q2_0/BF16 projection checks retain bitwise oracle parity, and immutable Q5_K, Q6_K and IQ4_XS mat-vecs match the scalar oracles |
 | `metal_math_test` | metal | The helpers of section 3.6 over dense grids (2^24 points on their ranges), `butterfly`, the conversions of section 3.5, `strata_selftest_*` | Helpers U(n), with n = 2 × A.10's bound in ulps where measured; `silu_k` uses U(8) by analogy with `sigmoid_k`. Butterfly and conversions B |
 | `codebooks` | host | `common/codebooks.h` against upstream's copy and ggml-common.h (section 3.7) | Bytes equal |
@@ -5544,7 +5555,7 @@ and foreign Context ownership.
 | `metal_mtp_window_ids_test_concurrent` | metal | Same kernel as `metal_mtp_window_ids_test` | Repeats stage 12 with concurrent dispatch and verifies ordered-boundary rejection without changing fixture buffers |
 | `metal_sampler_parity_test`, `metal_sampler_parity_test_concurrent` | metal | Section 5.12's greedy, split-part, split-merge, composite sampled, coupled-penalty and CPU-tail twin on random, edge and fixture inputs for T=1..8 and model/maximum vocabularies; standalone and shared Encoder paths match the scalar references; concurrent tests reject dependent merge/sample calls in an open group and verify segment discard, including discard of a prior split-part dispatch; shared coupled-penalty→sampled composition and 248,320/262,144 vocabulary merge scratch are checked in one Encoder segment; fixtures 16 and 17 are deterministic semantic ports, with host fixture 15 in `sampler_tail_test`; literal upstream fixtures 1-14 and 18 and production sampler integration remain open under REV-028 | Candidate IDs/logit bits and CPU-tail tokens/probabilities exact |
 | `metal_util_test` | metal | `strata_util_*` | B |
-| `metal_prefill_test` | metal | `strata_pf_gr_norm`, `strata_pf_gr_norm_lo`, `strata_pf_gr_silu`, `strata_pf_gr_silu_lo`, `strata_pf_gr_mix`, `strata_pf_gr_mix_lo`, `strata_embed_rows_{q3_k,iq3_s,iq4_xs,bf16}`, `strata_gr_broadcast` | Prefill GR normalization T=1/3/8 covers BF16X2 modes 0/1/2 and random, edge (including an order-sensitive reduction sentinel) and fixture data against a scalar oracle that reproduces 256-thread FMA accumulation and both XOR reduction stages. Scale is U(4), high BF16 is U(1), and the low remainder is bitwise checked from the GPU scale/high outputs. GR SiLU T=1/3/8 covers modes 0/1/2 with positive, negative, zero and tail values; high BF16 is U(1) and the BF16 remainder is U(2) against the scalar SiLU oracle. Exact high-output BF16 halfway cases check RNE bits in every mode; mode 1 also checks positive and negative remainder halfway cases against exact even-result bits. GR mix covers T=1/3/8 × BF16X2 mode 0/1/2, checks high BF16 and F16 against scalar oracles, and checks `high + low` reconstruction within `2^-15` of the absolute-term magnitude in modes 1/2 while requiring the low part to improve more than a quarter of high-only outputs. Exact binary-input midpoint fixtures assert high BF16 and positive/negative low-remainder RNE bits in modes 1/2. Standalone and shared Encoder forms check read-only inputs, guards, invalid mode/extent/alignment/alias/ownership, and late-failure discard. The embedding gather → GR broadcast → Prefill normalization chain runs in one segment; a concurrent-group fixture verifies rejection. Prefill GEMM and chunk-loop integration remain open. |
+| `metal_prefill_test` | metal | `strata_pf_gr_norm`, `strata_pf_gr_norm_lo`, `strata_pf_gr_write_norm`, `strata_pf_gr_write_norm_lo`, `strata_pf_gr_silu`, `strata_pf_gr_silu_lo`, `strata_pf_gr_mix`, `strata_pf_gr_mix_lo`, `strata_embed_rows_{q3_k,iq3_s,iq4_xs,bf16}`, `strata_gr_broadcast` | Prefill GR normalization T=1/3/8 covers BF16X2 modes 0/1/2 and random, edge (including an order-sensitive reduction sentinel) and fixture data against a scalar oracle that reproduces 256-thread FMA accumulation and both XOR reduction stages. Scale is U(4), high BF16 is U(1), and the low remainder is bitwise checked from the GPU scale/high outputs. GR write-norm covers T=1/3/8 in all three modes; the fused residual, scale, high BF16 and mode-1 low BF16 outputs match the separate GR-post then GR-normalization GPU chain bitwise. GR SiLU T=1/3/8 covers modes 0/1/2 with positive, negative, zero and tail values; high BF16 is U(1) and the BF16 remainder is U(2) against the scalar SiLU oracle. Exact high-output BF16 halfway cases check RNE bits in every mode; mode 1 also checks positive and negative remainder halfway cases against exact even-result bits. GR mix covers T=1/3/8 × BF16X2 mode 0/1/2, checks high BF16 and F16 against scalar oracles, and checks `high + low` reconstruction within `2^-15` of the absolute-term magnitude in modes 1/2 while requiring the low part to improve more than a quarter of high-only outputs. Exact binary-input midpoint fixtures assert high BF16 and positive/negative low-remainder RNE bits in modes 1/2. Standalone and shared Encoder forms check read-only inputs, guards, invalid mode/extent/alignment/alias/ownership, and late-failure discard. The embedding gather → GR broadcast → Prefill normalization chain runs in one segment; a concurrent-group fixture verifies rejection. Prefill GEMM and chunk-loop integration remain open. |
 | `metal_dispatch_modes_test` and the `model` properties | model | Section 10.4 | B |
 | `metal_window_gdn_commit_batch_test` | metal | `strata_gdn_conv_commit`, `strata_gdn_step_norm` mode 1, `strata_ple_history` | T=2 accepted-prefix replay across all 36 GDN state ordinals, followed by PLE history advancement in the same segment. Per-layer convolution history uses distinct qkv rows; every recurrent state matches an independent per-layer scalar oracle; PLE history matches the two accepted normalized rows. Rejects a short final gamma, short PLE rows, a repeated GDN state and a PLE/GDN alias before dispatch, verifies caller-owned rollback after an earlier encoded layer, and preserves replay inputs and unused scratch |
 | `metal_window_gdn_commit_batch_test_concurrent` | metal | Same GDN/PLE commit kernels and batch fixture | Runs the same GDN and PLE accepted-prefix state fixture with `STRATA_METAL_DISPATCH=concurrent`, preserving serial layer ordering and all oracle, alias and rollback checks |

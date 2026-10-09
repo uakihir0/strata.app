@@ -9556,3 +9556,51 @@ measuring L-15 remain open.
   and whitespace checks are recorded after the final doc update. The tests
   cover isolated encoder behavior; MTP runtime binding, scheduler integration
   and inspected-model drafter parity remain open.
+
+### D-IMPL-349: Implement Prefill GR write and next-read normalization
+
+- **Decision:** Implement `strata_pf_gr_write_norm` and `_lo` as isolated
+  kernels with a validated `encode_prefill_gr_write_norm` host API. Perform
+  the GR post FMA in place, retain each thread's ten residual values, reduce
+  their squares with the same Prefill butterfly as `strata_pf_gr_norm`, and
+  use those retained values for the next-half normalized BF16 output. Bind
+  block output, injection and next norm as read-only inputs; validate extents,
+  alignment, Context ownership and writable aliases. Select the low-remainder
+  pipeline only for BF16X2 mode 1. Provide standalone transactional and
+  caller-owned Encoder forms, and reject dispatch from an open concurrent
+  group.
+- **Reason:** Section 6.3 specifies this fusion when the next read consumes
+  the just-written residual. Matching the existing GR post gate/FMA and norm
+  reduction lets the fused stage replace those two dispatches without
+  changing residual, scale or normalized BF16 bits. Retaining ten values
+  avoids rereading the just-written residual. Mode 2 excludes GR remainder
+  output by definition. This remains an isolated encoder and does not imply
+  Prefill GEMM or scheduler integration.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `cmake --build --preset mac-dev` succeeded and the focused
+  `metal_prefill_test` and `metal_prefill_test_concurrent` CTests passed 2/2.
+  Rows 1/3/8 and modes 0/1/2 compare residual, scale, high BF16 and mode-1
+  low BF16 bits against the ordered `strata_gr_post` → `strata_pf_gr_norm`
+  reference chain; fixtures cover read-only inputs, guards, invalid modes and
+  ranges, input/output and output/output aliases, rollback and concurrent
+  group refusal. The complete `mac-metal` suite passed 80/80; `test_map.py`
+  passed with its documented planned-work notices, `check_drift.py` found no
+  upstream changes and valid golden files, and `git diff --check` passed.
+  The hostile review found no actionable issue (REV-146). The tests use
+  synthetic inputs and do not establish model-backed behavior.
+
+### REV-146: Hostile review of Prefill GR write and next-read normalization
+
+- **Scope:** `strata_pf_gr_write_norm` and `_lo`, the validated host
+  dispatch, buffer contracts, fused-versus-separate bit-parity fixtures, and
+  synchronized status documentation.
+- **Findings:** The read-only adversarial review found no actionable issue in
+  arithmetic, indexing, reduction order, bindings, ownership, alias checks,
+  mode-specific outputs, rollback coverage or test integration.
+- **Disposition:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `cmake --build --preset mac-dev` succeeded, focused Prefill
+  serial/concurrent CTests passed 2/2, and the full `mac-metal` suite passed
+  80/80. `test_map.py` passed with existing planned-work notices;
+  `check_drift.py` found no upstream changes and valid golden files; and
+  `git diff --check` passed. Inputs were synthetic; Prefill GEMMs, chunk
+  scheduling and model-backed inference remain open.
