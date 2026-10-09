@@ -3952,10 +3952,23 @@ strided Y, overwrite and accumulate modes, and edge slices; the F16 weight
 fixture uses the documented K-major scratch layout. Their Metal tests exercise
 T and n at 1/63/65 and K=32/2560 against the U(2K) and R(2^-16) contracts.
 Context skips `_mpp` pipelines on other GPU families, and the encoders reject
-dispatch there. These components do not implement either SIMD fallback,
-BF16X2 activation remainder, the production `STRATA_METAL_GEMM` selector,
+dispatch there. The MPP components do not implement the BF16X2 activation
+remainder, the production `STRATA_METAL_GEMM` selector,
 GEMM scheduling or Prefill chunk integration. L-6, testing on the other GPU
 families, and the production Prefill path remain open.
+
+The repository also implements isolated `strata_pf_gemm_f16_simd` and
+`strata_pf_gemm_bf16_simd` paths with the documented 32×64 output tile,
+8×8 SIMD-group matrix operations and 32-element K staging. F16 loads
+K-major scratch directly into half staging; BF16 widens the file-layout
+operands exactly to F32 and transposes W into the tile. Both use F32
+accumulators, mask row/column edges, and support overwrite and accumulate
+modes through validated standalone and caller-owned Encoder APIs. Serial and
+concurrent tests exercise both formats at T,n=1/63/65 and K=32/2560 against
+FP64 products under U(2K) and R(2^-16), as well as guards, aliases, rollback
+and validation. The implementation compiles and runs on the current Apple10
+Mac; the other Apple GPU families have not yet been tested. The production
+selector and Prefill scheduling/chunk integration remain pending.
 
 **`simd`** (`simdgroup_matrix`, every family). Grid (⌈n / 64⌉, ⌈T / 32⌉) × 128. The output tile is 32 rows × 64
 columns. Simdgroup sg computes rows `16·(sg / 2)` .. +15 and columns `32·(sg % 2)` .. +31 of it, as 2 × 4 blocks of
@@ -5611,7 +5624,8 @@ and foreign Context ownership.
 | --- | --- | --- | --- |
 | `metal_embed_test_concurrent` | metal | `strata_embed_rows_{q3_k,iq3_s,iq4_xs,bf16}`, `strata_embed_image`, `strata_gr_broadcast` | Runs the embedding test binary with concurrent dispatch; its shared Encoder gather → optional image copy → broadcast chain matches the bitwise stage oracles |
 | `metal_prefill_test_concurrent` | metal | `strata_pf_gr_norm`, `strata_pf_gr_norm_lo`, `strata_pf_gr_write_norm`, `strata_pf_gr_write_norm_lo`, `strata_pf_gdn_gates`, `strata_pf_gdn_conv_tiled`, `strata_pf_gdn_conv_hist`, `strata_pf_gdn_l2`, `strata_pf_gdn_rec`, `strata_pf_gdn_out_norm`, `strata_pf_gr_silu`, `strata_pf_gr_silu_lo`, `strata_pf_gr_mix`, `strata_pf_gr_mix_lo`, and the kernels listed for `metal_embed_test` | Runs Prefill GR normalization, fused GR write/next-read normalization, GDN gates, tiled convolution, history update and q/k L2 normalization, SiLU and mix with concurrent dispatch, plus embedding → broadcast → normalization composition; checks stage-chain bit parity, scalar gate and convolution oracles including tile-boundary and FMA-order controls, history oracles at T=1/2/3/8/65, old-history convolution→update ordering and rollback for both APIs, q/k L2 oracles at T=1/2/3/8/65 with order- and epsilon-sensitive sentinels, unchanged v heads, and L2 rollback, reduction and conversion oracles, BF16X2 ties, invalid-group rejection and discard after late validation failure. The concurrent Prefill tests also compare recurrence raw outputs and final state to a scalar oracle at T=1/2/3/8/65, exercise L2→recurrence at T=1/3/8 and check ordered reduction, input immutability, view validation, rollback and open-group refusal. Output normalization checks scalar F16 parity and epsilon at T=1/2/3/8/65, a four-partial-order sentinel with an F16-distinguishing regrouping control, exact halfway RNE bits, unsaturated signed overflow, both Encoder forms, L2→recurrence→out-normalization composition, validation, guards, immutability and rollback. |
-| `metal_prefill_gemm_test`, `metal_prefill_gemm_test_concurrent` | metal | `strata_pf_gemm_bf16_mpp` | Apple10-only. T and n = 1/63/65 at K=32 plus 65×65×2560 production-shaped inputs exercise overwrite and accumulate against FP64 products under U(2K) and R(2^-16); output stride/padding, input immutability, guards, read/write aliases, short/misaligned/foreign buffers, rollback and concurrent-group rejection are checked. Returns CTest skip on other GPU families. |
+| `metal_prefill_gemm_test`, `metal_prefill_gemm_test_concurrent` | metal | `strata_pf_gemm_{f16,bf16}_mpp` | Apple10-only. T and n = 1/63/65 at K=32 plus 65×65×2560 production-shaped inputs exercise overwrite and accumulate against FP64 products under U(2K) and R(2^-16); output stride/padding, input immutability, guards, read/write aliases, short/misaligned/foreign buffers, rollback and concurrent-group rejection are checked. Returns CTest skip on other GPU families. |
+| `metal_prefill_gemm_simd_test`, `metal_prefill_gemm_simd_test_concurrent` | metal | `strata_pf_gemm_{f16,bf16}_simd` | Runs the SIMD-group matrix fallback on Apple Silicon. Same T,n/K shapes, FP64 oracle, overwrite/accumulate, output padding, input immutability, guards, read/write aliases, invalid views, rollback and open-group checks as the MPP tests. Tested on Apple10; other GPU families remain unverified. |
 | `metal_mv_test_concurrent` | metal | `strata_q_q8_1`, `strata_mv_<fmt>_n<NC>` (Q5_K, Q6_K and IQ4_XS read-only head formats), Q2_0 and BF16 mat-vec | Runs the mat-vec test binary with concurrent dispatch; the shared Encoder Q8_1 → Q2_0/BF16 projection checks retain bitwise oracle parity, and immutable Q5_K, Q6_K and IQ4_XS mat-vecs match the scalar oracles |
 | `metal_math_test` | metal | The helpers of section 3.6 over dense grids (2^24 points on their ranges), `butterfly`, the conversions of section 3.5, `strata_selftest_*` | Helpers U(n), with n = 2 × A.10's bound in ulps where measured; `silu_k` uses U(8) by analogy with `sigmoid_k`. Butterfly and conversions B |
 | `codebooks` | host | `common/codebooks.h` against upstream's copy and ggml-common.h (section 3.7) | Bytes equal |

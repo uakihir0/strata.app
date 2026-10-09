@@ -10024,3 +10024,64 @@ measuring L-15 remain open.
   focused serial/concurrent CTests passed 2/2 after these fixes, and the full
   `mac-metal` suite passed 82/82. No implementation defect remains from
   review.
+
+### D-IMPL-358: Add isolated F16/BF16 Prefill SIMD GEMM fallbacks
+
+- **Decision:** Implement `strata_pf_gemm_f16_simd` and
+  `strata_pf_gemm_bf16_simd` as isolated 32×64 output-tile kernels using
+  8×8 SIMD-group matrix operations and 32-element K staging. Keep F16 inputs
+  in half staging and use its K-major W scratch directly. Widen BF16 X/W
+  exactly to F32 in threadgroup memory, transposing file-layout W into the
+  K-major tile; use F32 accumulators for both paths. Mask row/column edges,
+  keep overwrite and accumulate modes, and share checked host validation with
+  the MPP encoders. Add serial and concurrent tests for both formats.
+- **Reason:** The plan requires a SIMD path for non-MPP devices and narrow
+  projections. Native BF16 SIMD-group matrix support is newer and separately
+  feature-gated, so the fallback widens BF16 bits exactly to F32 and uses the
+  baseline float matrix type. This avoids silently requiring a newer device
+  family while keeping the file format unchanged. Keep the component
+  independently callable until the production selector and Prefill chunk
+  scheduler are implemented.
+- **Review items:** Current hardware is Apple10; test the SIMD pipelines on
+  earlier Apple GPU families before claiming cross-family parity. BF16X2
+  activation remainder GEMM, production selection, layer scheduling and
+  model-backed inference remain open.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `cmake --build --preset mac-dev` compiled both new Metal kernels
+  and host encoders. The focused MPP/SIMD serial and concurrent CTests passed
+  4/4; each format covers T,n=1/63/65 at K=32 and T=n=65,K=2560 in overwrite
+  and accumulate modes against FP64 products under U(2K) and R(2^-16), plus
+  output padding, guards, immutability, alias/view validation, rollback and
+  concurrent-group refusal. `test_map.py` passes with existing planned-work
+  and missing-requirement diagnostics. The full `mac-metal` suite passed
+  84/84; `mac-host` passed 43 tests with the unavailable-model-input case
+  skipped. Hostile-review findings and their disposition are recorded in
+  REV-155. Testing on other Apple GPU families remains open.
+
+### REV-155: Hostile review of Prefill SIMD GEMM fallbacks
+
+- **Scope:** F16/BF16 SIMD-group matrix layouts and synchronization, edge
+  masks, widened BF16 operands, host-side checked ranges and transactions,
+  overwrite/accumulate behavior, numerical fixtures, family applicability,
+  CTest registration and documentation.
+- **Findings:** The first review found P2 32-bit shader index overflow for
+  dimensions accepted by the host checks and a P3 lack of mixed-sign
+  cancellation coverage. Changed X/W/Y shader indexing to `ulong` and added
+  alternating signed activations with a near-cancelling output column. The
+  second review found that all activation rows were identical, which could
+  hide row-selection errors. Added a distinct exactly representable scale per
+  row while preserving the cancellation residual; a final review confirmed
+  the fixture distinguishes rows and retains the `-row_scale/128` oracle.
+- **Disposition:** All identified code and test gaps are closed, and the final
+  review found no remaining P1/P2 implementation issue. Cross-family GPU
+  testing remains unverified because this host provides Apple10 only; the
+  tests must be run on earlier supported Apple GPU families before claiming
+  cross-family validation.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `cmake --build --preset mac-dev` succeeded, the final focused
+  serial/concurrent MPP/SIMD tests passed 4/4, and the complete `mac-metal`
+  suite passed 84/84. `mac-host` passed 43 tests with one test skipped because
+  model inputs are unavailable. `test_map.py` passed with the repository's
+  existing planned-work and missing-check diagnostics. The tests use
+  synthetic inputs; they do not establish production Prefill integration or
+  model-backed inference.
