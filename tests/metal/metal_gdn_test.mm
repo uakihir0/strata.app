@@ -17,6 +17,7 @@
 #include "strata/metal/tiered.hpp"
 #include "strata/metal/window_dispatch.hpp"
 #include "strata/metal/window_gdn_dispatch.hpp"
+#include "strata/metal/window_params.hpp"
 #include "../../src/metal/engine/window_dispatch_internal.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -1851,6 +1852,7 @@ bool run_window_gdn_block(Context& context, std::uint32_t rows,
     }
 
     twin::GuardedBuffer mixed_buffer, history_buffer, state_buffer;
+    twin::GuardedBuffer window_params_buffer;
     twin::GuardedBuffer qkv_weight_buffer, conv_weight_buffer;
     twin::GuardedBuffer alpha_buffer, beta_weight_buffer, dt_buffer, a_buffer;
     twin::GuardedBuffer gate_weight_buffer, gamma_buffer, output_weight_buffer;
@@ -1868,6 +1870,8 @@ bool run_window_gdn_block(Context& context, std::uint32_t rows,
     if (!alloc(mixed_buffer, "mixed", mixed_count * sizeof(float)) ||
         !alloc(history_buffer, "history", history.size() * sizeof(float)) ||
         !alloc(state_buffer, "state", initial_state.size() * sizeof(float)) ||
+        !alloc(window_params_buffer, "write-through WindowParams",
+               sizeof(strata::metal::WindowParams)) ||
         !alloc(qkv_weight_buffer, "qkv weights",
                qkv_weight_count * sizeof(block_q8_0)) ||
         !alloc(conv_weight_buffer, "convolution weights",
@@ -1920,6 +1924,12 @@ bool run_window_gdn_block(Context& context, std::uint32_t rows,
     fill_q8_0_weights(typed<block_q8_0>(gate_weight_buffer), N_EMBD, 4u);
     fill_q8_0_weights(typed<block_q8_0>(output_weight_buffer), kValueDim, 7u);
     std::memcpy(active_rows_buffer.payload().data(), &rows, sizeof(rows));
+    strata::metal::WindowParams write_through_params{};
+    write_through_params.T = rows;
+    write_through_params.nc = active_columns;
+    write_through_params.n_keep = rows;
+    std::memcpy(window_params_buffer.payload().data(), &write_through_params,
+                sizeof(write_through_params));
 
     const std::array output_buffers{
         &xq_buffer, &qkv_buffer, &h_buffer, &gate_buffer, &beta_buffer,
@@ -1933,7 +1943,7 @@ bool run_window_gdn_block(Context& context, std::uint32_t rows,
         &a_buffer, &gate_weight_buffer, &gamma_buffer, &output_weight_buffer,
         &xq_buffer, &qkv_buffer, &h_buffer, &gate_buffer, &beta_buffer,
         &z_buffer, &y_buffer, &yq_buffer, &block_out_buffer, &sink_buffer,
-        &active_rows_buffer};
+        &active_rows_buffer, &window_params_buffer};
     for (twin::GuardedBuffer* buffer : all_buffers) {
         buffer->capture_before_dispatch();
     }
@@ -1948,6 +1958,8 @@ bool run_window_gdn_block(Context& context, std::uint32_t rows,
         qkv_buffer.view(), h_buffer.view(), gate_buffer.view(), beta_buffer.view(),
         z_buffer.view(), y_buffer.view(), yq_buffer.view(), block_out_buffer.view(),
         sink_buffer.view(), active_rows_buffer.view()};
+    const WindowGDNWriteThroughBuffers write_through_buffers{
+        window_params_buffer.view(), buffers};
 
     if (rows == 1u && !shared_encoder) {
         WindowGDNBlockBuffers aliased = buffers;
@@ -2142,7 +2154,280 @@ bool run_window_gdn_block(Context& context, std::uint32_t rows,
     }
     check(passed, label + " guards and read-only inputs");
 
+    {
+        std::vector<twin::tf> expected_write_through_y;
+        std::vector<twin::tf> expected_write_through_state_tf;
+        std::vector<float> oracle_state = initial_state;
+        oracle::gdn_step_norm(
+            oracle_state, actual_h, actual_gate, actual_beta, actual_z, gamma,
+            rows, GDNStateMode::write_through, expected_write_through_y,
+            expected_write_through_state_tf);
+        std::vector<float> expected_write_through_state;
+        expected_write_through_state.reserve(
+            expected_write_through_state_tf.size());
+        for (const twin::tf value : expected_write_through_state_tf) {
+            expected_write_through_state.push_back(value.value);
+        }
+        std::vector<float> expected_write_through_history = history;
+        oracle::gdn_conv_commit(expected_write_through_history, actual_qkv,
+                                rows);
+        std::vector<float> window_y(
+            typed<const float>(y_buffer).begin(),
+            typed<const float>(y_buffer).begin() + value_count);
+        std::vector<float> window_block_out(
+            typed<const float>(block_out_buffer).begin(),
+            typed<const float>(block_out_buffer).begin() + mixed_count);
+
+        std::memcpy(history_buffer.payload().data(), history.data(),
+                    history.size() * sizeof(float));
+        std::memcpy(state_buffer.payload().data(), initial_state.data(),
+                    initial_state.size() * sizeof(float));
+        for (twin::GuardedBuffer* buffer : output_buffers) {
+            std::fill(buffer->payload().begin(), buffer->payload().end(),
+                      0xa5u);
+        }
+        for (twin::GuardedBuffer* buffer : all_buffers) {
+            buffer->capture_before_dispatch();
+        }
+
+        const bool write_through_dispatched = run_command(
+            context, label + " write-through",
+            [&](CommandBuffer& command, std::string& encode_error) {
+                if (!shared_encoder) {
+                    return encode_window_gdn_write_through_block(
+                        context, command, rows, write_through_buffers,
+                        encode_error);
+                }
+                return Encoder::encode(
+                    context, command, "shared Window GDN write-through block",
+                    [&](Encoder& encoder, std::string& body_error) {
+                        return encode_window_gdn_write_through_block(
+                            context, encoder, rows, write_through_buffers,
+                            body_error);
+                    },
+                    encode_error);
+            },
+            error);
+        check(write_through_dispatched,
+              label + " write-through command completes", error);
+        bool write_through_passed = write_through_dispatched;
+        if (write_through_dispatched) {
+            const auto actual_write_through_y =
+                typed<const float>(y_buffer).first(value_count);
+            const auto actual_write_through_state =
+                typed<const float>(state_buffer);
+            const auto actual_write_through_history =
+                typed<const float>(history_buffer);
+            const bool output_matches_window =
+                std::memcmp(actual_write_through_y.data(), window_y.data(),
+                            value_count * sizeof(float)) == 0;
+            check(output_matches_window,
+                  label + " write-through output matches speculative window");
+            write_through_passed &= output_matches_window;
+            write_through_passed &= compare_units(
+                actual_write_through_y, expected_write_through_y, 512.0,
+                label + " write-through output oracle", options, rows);
+            const bool state_matches_oracle =
+                compare_units(actual_write_through_state,
+                              expected_write_through_state_tf, 512.0,
+                              label + " write-through state scalar oracle",
+                              options, rows);
+            check(state_matches_oracle,
+                  label + " write-through state matches scalar replay");
+            write_through_passed &= state_matches_oracle;
+            const bool history_matches_oracle =
+                std::memcmp(actual_write_through_history.data(),
+                            expected_write_through_history.data(),
+                            expected_write_through_history.size() *
+                                sizeof(float)) == 0;
+            check(history_matches_oracle,
+                  label + " write-through history advances all rows");
+            write_through_passed &= history_matches_oracle;
+            const bool block_output_matches_window =
+                std::memcmp(typed<const float>(block_out_buffer).data(),
+                            window_block_out.data(),
+                            mixed_count * sizeof(float)) == 0;
+            check(block_output_matches_window,
+                  label + " write-through block output matches window");
+            write_through_passed &= block_output_matches_window;
+            const std::array<twin::ByteRange, 1> state_written{{
+                {0u, expected_write_through_state.size() * sizeof(float)}}};
+            const std::array<twin::ByteRange, 1> history_written{{
+                {0u, expected_write_through_history.size() * sizeof(float)}}};
+            write_through_passed &=
+                !state_buffer.first_unwritten_change(state_written);
+            write_through_passed &=
+                !history_buffer.first_unwritten_change(history_written);
+            write_through_passed &= !xq_buffer.first_unwritten_change(xq_written);
+            write_through_passed &= !qkv_buffer.first_unwritten_change(qkv_written);
+            write_through_passed &= !h_buffer.first_unwritten_change(qkv_written);
+            write_through_passed &= !gate_buffer.first_unwritten_change(gate_written);
+            write_through_passed &= !beta_buffer.first_unwritten_change(gate_written);
+            write_through_passed &= !z_buffer.first_unwritten_change(value_written);
+            write_through_passed &= !y_buffer.first_unwritten_change(value_written);
+            write_through_passed &= !yq_buffer.first_unwritten_change(yq_written);
+            write_through_passed &=
+                !block_out_buffer.first_unwritten_change(out_written);
+            write_through_passed &= !sink_buffer.first_unwritten_change(sink_written);
+            check(write_through_passed,
+                  label + " write-through state/output guards and oracle");
+        }
+        std::memcpy(history_buffer.payload().data(), history.data(),
+                    history.size() * sizeof(float));
+        std::memcpy(state_buffer.payload().data(), initial_state.data(),
+                    initial_state.size() * sizeof(float));
+        std::array<std::pair<const char*,
+                             strata::metal::WindowParams>, 3>
+            invalid_params{{
+                {"T", write_through_params},
+                {"n_keep", write_through_params},
+                {"nc", write_through_params},
+            }};
+        invalid_params[0].second.T = rows == 8u ? 7u : rows + 1u;
+        invalid_params[1].second.n_keep = rows == 1u ? 0u : rows - 1u;
+        invalid_params[2].second.nc = active_columns == 1u
+                                         ? 2u
+                                         : active_columns / 2u;
+        for (const auto& [field, malformed_params] : invalid_params) {
+            std::memcpy(window_params_buffer.payload().data(),
+                        &malformed_params, sizeof(malformed_params));
+            for (twin::GuardedBuffer* buffer : all_buffers) {
+                buffer->capture_before_dispatch();
+            }
+            auto invalid_command = context.make_command_buffer(
+                "Window GDN write-through parameter rejection", error);
+            check(invalid_command != nullptr,
+                  label + " write-through invalid " + field + " command",
+                  error);
+            if (!invalid_command) return false;
+            const bool invalid_accepted =
+                encode_window_gdn_write_through_block(
+                    context, *invalid_command, rows, write_through_buffers,
+                    error);
+            bool invalid_unchanged = !invalid_accepted &&
+                invalid_command->unsafe_native_handle() == nullptr &&
+                error.find("T == n_keep == rows") != std::string::npos;
+            for (twin::GuardedBuffer* buffer : all_buffers) {
+                invalid_unchanged &=
+                    !buffer->first_unwritten_change({});
+            }
+            check(invalid_unchanged,
+                  label + " write-through rejects inconsistent " + field,
+                  error);
+            passed &= invalid_unchanged;
+        }
+        std::memcpy(window_params_buffer.payload().data(),
+                    &write_through_params, sizeof(write_through_params));
+        std::memcpy(state_buffer.payload().data(), &write_through_params,
+                    sizeof(write_through_params));
+        const WindowGDNWriteThroughBuffers aliased_params{
+            state_buffer.view().slice(0u, sizeof(write_through_params)),
+            buffers};
+        for (twin::GuardedBuffer* buffer : all_buffers) {
+            buffer->capture_before_dispatch();
+        }
+        auto alias_command = context.make_command_buffer(
+            "Window GDN write-through parameter alias rejection", error);
+        check(alias_command != nullptr,
+              label + " write-through parameter alias command", error);
+        if (!alias_command) return false;
+        const bool alias_accepted = encode_window_gdn_write_through_block(
+            context, *alias_command, rows, aliased_params, error);
+        bool alias_unchanged =
+            !alias_accepted &&
+            alias_command->unsafe_native_handle() == nullptr &&
+            error.find("parameter block overlaps state") != std::string::npos;
+        for (twin::GuardedBuffer* buffer : all_buffers) {
+            alias_unchanged &= !buffer->first_unwritten_change({});
+        }
+        check(alias_unchanged,
+              label + " write-through rejects parameters overlapping state",
+              error);
+        passed &= alias_unchanged;
+        std::memcpy(state_buffer.payload().data(), initial_state.data(),
+                    initial_state.size() * sizeof(float));
+        passed &= write_through_passed;
+    }
+
     if (rows == 2u) {
+        const auto short_yq = yq_buffer.view().slice(
+            0u, yq_buffer.view().length - 1u);
+        WindowGDNBlockBuffers late_write_through = buffers;
+        late_write_through.yq = short_yq;
+        const WindowGDNWriteThroughBuffers late_write_through_buffers{
+            window_params_buffer.view(), late_write_through};
+        const auto reset_write_through_targets = [&] {
+            std::memcpy(history_buffer.payload().data(), history.data(),
+                        history.size() * sizeof(float));
+            std::memcpy(state_buffer.payload().data(), initial_state.data(),
+                        initial_state.size() * sizeof(float));
+            for (twin::GuardedBuffer* buffer : output_buffers) {
+                std::fill(buffer->payload().begin(), buffer->payload().end(),
+                          0xa5u);
+            }
+            for (twin::GuardedBuffer* buffer : all_buffers) {
+                buffer->capture_before_dispatch();
+            }
+        };
+        reset_write_through_targets();
+        auto write_through_command = context.make_command_buffer(
+            "Window GDN write-through late failure", error);
+        check(write_through_command != nullptr,
+              label + " write-through late-failure command buffer", error);
+        if (!write_through_command) return false;
+        const bool accepted_write_through = encode_window_gdn_write_through_block(
+            context, *write_through_command, rows,
+            late_write_through_buffers, error);
+        const bool write_through_command_discarded =
+            !accepted_write_through &&
+            write_through_command->unsafe_native_handle() == nullptr &&
+            error.find("Q8_1 output") != std::string::npos;
+        check(write_through_command_discarded,
+              label + " write-through command-buffer late failure discards prior stages",
+              error);
+        passed &= write_through_command_discarded;
+        bool write_through_command_untouched = true;
+        for (twin::GuardedBuffer* buffer : all_buffers) {
+            write_through_command_untouched &=
+                !buffer->first_unwritten_change({});
+        }
+        check(write_through_command_untouched,
+              label + " write-through command-buffer rollback preserves every buffer");
+        passed &= write_through_command_untouched;
+
+        reset_write_through_targets();
+        auto shared_write_through_command = context.make_command_buffer(
+            "Window GDN caller-owned write-through late failure", error);
+        check(shared_write_through_command != nullptr,
+              label + " caller-owned write-through late-failure command buffer",
+              error);
+        if (!shared_write_through_command) return false;
+        const bool accepted_shared_write_through = Encoder::encode(
+            context, *shared_write_through_command,
+            "Window GDN caller-owned write-through rollback",
+            [&](Encoder& encoder, std::string& body_error) {
+                return encode_window_gdn_write_through_block(
+                    context, encoder, rows, late_write_through_buffers,
+                    body_error);
+            },
+            error);
+        const bool shared_write_through_discarded =
+            !accepted_shared_write_through &&
+            shared_write_through_command->unsafe_native_handle() == nullptr &&
+            error.find("Q8_1 output") != std::string::npos;
+        check(shared_write_through_discarded,
+              label + " caller-owned write-through late failure discards prior stages",
+              error);
+        passed &= shared_write_through_discarded;
+        bool shared_write_through_untouched = true;
+        for (twin::GuardedBuffer* buffer : all_buffers) {
+            shared_write_through_untouched &=
+                !buffer->first_unwritten_change({});
+        }
+        check(shared_write_through_untouched,
+              label + " caller-owned write-through rollback preserves every buffer");
+        passed &= shared_write_through_untouched;
+
         const auto short_gamma = gamma_buffer.view().slice(
             0u, gamma.size() * sizeof(float) - sizeof(float));
         WindowGDNBlockBuffers late_failure = buffers;
@@ -2217,6 +2502,7 @@ bool run_window_gdn_block(Context& context, std::uint32_t rows,
             bool saw_open_group = false;
             bool rejected = false;
             bool commit_rejected = false;
+            bool write_through_rejected = false;
             const WindowGDNCommitBuffers commit_buffers{
                 history_buffer.view(), qkv_buffer.view(), state_buffer.view(),
                 h_buffer.view(), gate_buffer.view(), beta_buffer.view(),
@@ -2232,6 +2518,14 @@ bool run_window_gdn_block(Context& context, std::uint32_t rows,
                             context, encoder, rows, buffers, block_error) &&
                             block_error.find("ordered concurrent-group boundary") !=
                                 std::string::npos;
+                        std::string write_through_error;
+                        write_through_rejected =
+                            !encode_window_gdn_write_through_block(
+                                context, encoder, rows, write_through_buffers,
+                                write_through_error) &&
+                            write_through_error.find(
+                                "ordered concurrent-group boundary") !=
+                                std::string::npos;
                         std::string commit_error;
                         commit_rejected = !encode_window_gdn_commit(
                             context, encoder, rows, commit_buffers, commit_error) &&
@@ -2239,7 +2533,8 @@ bool run_window_gdn_block(Context& context, std::uint32_t rows,
                                 std::string::npos;
                     }
                     if (!encoder.group_end(body_error)) return false;
-                    if (!saw_open_group || !rejected || !commit_rejected) {
+                    if (!saw_open_group || !rejected || !commit_rejected ||
+                        !write_through_rejected) {
                         body_error = "Window GDN coordinator did not reject an open concurrent group";
                         return false;
                     }
@@ -2247,9 +2542,10 @@ bool run_window_gdn_block(Context& context, std::uint32_t rows,
                 },
                 error);
             const bool group_contract = group_encoded && saw_open_group &&
-                                        rejected && commit_rejected;
+                                        rejected && commit_rejected &&
+                                        write_through_rejected;
             check(group_contract,
-                  label + " block and commit reject open concurrent group",
+                  label + " block, write-through and commit reject open group",
                   error);
             if (group_command) group_command->discard();
             passed &= group_contract;
@@ -5083,9 +5379,11 @@ bool run_set(Context& context, twin::InputSet set,
     if (set == twin::InputSet::fixture) {
         passed &= run_step_norm_set(context, set, options,
                                     EdgeProfile::regular, true);
-        passed &= run_window_gdn_block(context, 1u, false, options);
+        for (std::uint32_t rows = 1u; rows <= 8u; ++rows) {
+            passed &= run_window_gdn_block(context, rows, false, options);
+        }
         passed &= run_window_gdn_block(context, 2u, true, options);
-        passed &= run_window_gdn_block(context, 3u, false, options);
+        passed &= run_window_gdn_block(context, 8u, true, options);
     }
     return passed;
 }

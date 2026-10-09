@@ -2,11 +2,13 @@
 #include "strata/metal/window_gdn_dispatch.hpp"
 
 #include "strata/metal/encoder.hpp"
+#include "strata/metal/window_params.hpp"
 #include "strata/metal/window_scratch.hpp"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <string_view>
 #include <vector>
@@ -637,10 +639,60 @@ bool encode_window_accepted_prefix_state_commit(
         error);
 }
 
-bool encode_window_gdn_block(Context& context, Encoder& encoder,
-                             std::uint32_t rows,
-                             const WindowGDNBlockBuffers& buffers,
-                             std::string& error) {
+namespace {
+
+bool validate_write_through_params(Context& context, std::uint32_t rows,
+                                   BufferRef params,
+                                   const WindowGDNBlockBuffers& gdn,
+                                   std::string& error) {
+    if (!params || !context.buffers().owns(params)) {
+        error = "Window GDN write-through parameter block is not owned by this Context";
+        return false;
+    }
+    if (params.contents == nullptr || params.length < sizeof(WindowParams) ||
+        reinterpret_cast<std::uintptr_t>(params.contents) %
+                alignof(WindowParams) !=
+            0u) {
+        error = "Window GDN write-through parameter block is undersized or misaligned";
+        return false;
+    }
+    WindowParams values{};
+    std::memcpy(&values, params.contents, sizeof(values));
+    if (values.T != rows || values.n_keep != rows ||
+        values.nc != compiled_columns(rows)) {
+        error = "Window GDN write-through parameters require T == n_keep == rows and matching nc";
+        return false;
+    }
+    const std::array writes{
+        NamedView{gdn.history, "history"},
+        NamedView{gdn.state, "state"},
+        NamedView{gdn.xq, "xq"},
+        NamedView{gdn.qkv, "qkv"},
+        NamedView{gdn.h, "h"},
+        NamedView{gdn.gate, "gate"},
+        NamedView{gdn.beta, "beta"},
+        NamedView{gdn.z, "z"},
+        NamedView{gdn.y, "y"},
+        NamedView{gdn.yq, "yq"},
+        NamedView{gdn.block_out, "block output"},
+        NamedView{gdn.sink, "matvec sink"},
+    };
+    for (const auto& write : writes) {
+        if (views_overlap(params, write.view)) {
+            error = "Window GDN write-through parameter block overlaps " +
+                    std::string(write.name);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool encode_window_gdn_block_impl(Context& context, Encoder& encoder,
+                                  std::uint32_t rows,
+                                  const WindowGDNBlockBuffers& buffers,
+                                  GDNStateMode state_mode,
+                                  bool commit_history,
+                                  std::string& error) {
     error.clear();
     if (encoder.concurrent_group_open()) {
         error = "Window GDN block requires an ordered concurrent-group boundary";
@@ -654,6 +706,15 @@ bool encode_window_gdn_block(Context& context, Encoder& encoder,
         !q8_1_weight_format(buffers.gate_format) ||
         !q8_1_weight_format(buffers.output_format)) {
         error = "Window GDN Q8_1 matvec stages require quantized weight formats";
+        return false;
+    }
+    if (state_mode != GDNStateMode::window &&
+        state_mode != GDNStateMode::write_through) {
+        error = "Window GDN block mode must be window or write-through";
+        return false;
+    }
+    if (commit_history != (state_mode == GDNStateMode::write_through)) {
+        error = "Window GDN write-through state and history modes must agree";
         return false;
     }
     if (!validate_views(context, buffers, error)) return false;
@@ -694,10 +755,15 @@ bool encode_window_gdn_block(Context& context, Encoder& encoder,
         return false;
     }
     if (!encode_gdn_step_norm(
-            context, encoder, rows, GDNStateMode::window,
+            context, encoder, rows, state_mode,
             {buffers.state, buffers.h, buffers.gate, buffers.beta, buffers.z,
              buffers.gamma, buffers.y},
             error)) {
+        return false;
+    }
+    if (commit_history &&
+        !encode_gdn_conv_commit(context, encoder, rows,
+                                {buffers.history, buffers.qkv}, error)) {
         return false;
     }
     if (!encode_q8_1(context, encoder, rows, GDN_VALUE_DIM,
@@ -709,6 +775,16 @@ bool encode_window_gdn_block(Context& context, Encoder& encoder,
                          error);
 }
 
+}  // namespace
+
+bool encode_window_gdn_block(Context& context, Encoder& encoder,
+                             std::uint32_t rows,
+                             const WindowGDNBlockBuffers& buffers,
+                             std::string& error) {
+    return encode_window_gdn_block_impl(
+        context, encoder, rows, buffers, GDNStateMode::window, false, error);
+}
+
 bool encode_window_gdn_block(Context& context, CommandBuffer& command_buffer,
                              std::uint32_t rows,
                              const WindowGDNBlockBuffers& buffers,
@@ -718,6 +794,35 @@ bool encode_window_gdn_block(Context& context, CommandBuffer& command_buffer,
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_window_gdn_block(context, encoder, rows, buffers,
                                            encode_error);
+        },
+        error);
+}
+
+bool encode_window_gdn_write_through_block(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    const WindowGDNWriteThroughBuffers& buffers, std::string& error) {
+    error.clear();
+    if (rows == 0u || rows > 8u) {
+        error = "Window GDN block row count must be in 1..8";
+        return false;
+    }
+    if (!validate_write_through_params(context, rows, buffers.params,
+                                       buffers.gdn, error)) {
+        return false;
+    }
+    return encode_window_gdn_block_impl(
+        context, encoder, rows, buffers.gdn,
+        GDNStateMode::write_through, true, error);
+}
+
+bool encode_window_gdn_write_through_block(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    const WindowGDNWriteThroughBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Window GDN write-through block",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_gdn_write_through_block(
+                context, encoder, rows, buffers, encode_error);
         },
         error);
 }

@@ -44,6 +44,13 @@ struct WindowGDNBlockBuffers {
     BufferRef active_rows;
 };
 
+/// Parameter block and per-layer buffers for one write-through GDN block.
+/// `params` must describe exactly `rows` retained rows (`T == n_keep == rows`).
+struct WindowGDNWriteThroughBuffers {
+    BufferRef params;
+    WindowGDNBlockBuffers gdn;
+};
+
 /// Inputs and scratch for committing one GDN layer's accepted Window prefix.
 /// `output_scratch` is a required, unused output binding for the recurrent
 /// commit kernel; all views must be Context-owned and pairwise disjoint.
@@ -171,5 +178,19 @@ bool encode_window_gdn_block(Context& context, CommandBuffer& command_buffer,
                              std::uint32_t rows,
                              const WindowGDNBlockBuffers& buffers,
                              std::string& error);
+
+/// Encode one GDN layer of a write-through Window block. Every row is kept:
+/// the recurrent step writes state in write-through mode and convolution
+/// history advances after its last reader. The parameter block is checked
+/// for `T == n_keep == rows`. This function does not roll back. Keep GDN
+/// buffers alive through completion and propagate false from a caller-owned
+/// Encoder body.
+bool encode_window_gdn_write_through_block(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    const WindowGDNWriteThroughBuffers& buffers, std::string& error);
+/// Standalone transactional form for an unsubmitted command buffer.
+bool encode_window_gdn_write_through_block(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    const WindowGDNWriteThroughBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal
