@@ -21,6 +21,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 using namespace strata::metal;
@@ -30,12 +31,12 @@ namespace {
 constexpr std::size_t kGuardBytes = 4096u;
 constexpr std::uint8_t kPoison = 0xa5u;
 constexpr std::uint32_t kColumns = 257u;
-constexpr std::uint32_t kK = 64u;
-constexpr std::uint32_t kValuesPerBlock = 32u;
+constexpr std::uint32_t kK = 128u;
 
 static_assert(sizeof(block_q4_0) == 18u);
 static_assert(sizeof(block_q5_0) == 22u);
 static_assert(sizeof(block_q8_0) == 34u);
+static_assert(sizeof(block_q2_0) == 18u);
 
 int g_failures = 0;
 
@@ -104,8 +105,9 @@ bool submit_and_wait(std::unique_ptr<CommandBuffer>& command,
 }
 
 template <typename Block>
-std::size_t required_weight_bytes(std::uint32_t n_out, std::uint32_t k) {
-    return static_cast<std::size_t>(n_out) * (k / kValuesPerBlock) *
+std::size_t required_weight_bytes(std::uint32_t n_out, std::uint32_t k,
+                                  std::uint32_t values_per_block) {
+    return static_cast<std::size_t>(n_out) * (k / values_per_block) *
            sizeof(Block);
 }
 
@@ -124,8 +126,56 @@ template <typename Block>
 struct FormatTraits;
 
 template <>
+struct FormatTraits<block_q2_0> {
+    static constexpr const char* name = "Q2_0";
+    static constexpr std::uint32_t values_per_block = 64u;
+    static constexpr std::uint32_t code_count = 4u;
+    static constexpr int zero_point = 1;
+    static constexpr EncodeCommandBuffer encode = &encode_prefill_dequant_q2_0;
+    static constexpr EncodeEncoder encode_encoder =
+        &encode_prefill_dequant_q2_0;
+
+    // Literal packed bytes and logical codes deliberately use separate
+    // representations, so the fixture does not repeat the shader decoder.
+    static constexpr std::array<std::uint8_t, 16> packed_pattern_a{
+        0xe4u, 0xb4u, 0xd8u, 0x78u, 0x9cu, 0x6cu, 0xe1u, 0xb1u,
+        0xc9u, 0x39u, 0x8du, 0x2du, 0xd2u, 0x72u, 0xc6u, 0x36u};
+    static constexpr std::array<std::array<std::uint8_t, 4>, 16>
+        logical_codes_a{{
+            {{0u, 1u, 2u, 3u}}, {{0u, 1u, 3u, 2u}},
+            {{0u, 2u, 1u, 3u}}, {{0u, 2u, 3u, 1u}},
+            {{0u, 3u, 1u, 2u}}, {{0u, 3u, 2u, 1u}},
+            {{1u, 0u, 2u, 3u}}, {{1u, 0u, 3u, 2u}},
+            {{1u, 2u, 0u, 3u}}, {{1u, 2u, 3u, 0u}},
+            {{1u, 3u, 0u, 2u}}, {{1u, 3u, 2u, 0u}},
+            {{2u, 0u, 1u, 3u}}, {{2u, 0u, 3u, 1u}},
+            {{2u, 1u, 0u, 3u}}, {{2u, 1u, 3u, 0u}},
+        }};
+
+    static void store_fixture(block_q2_0& block, std::uint32_t column,
+                              std::uint32_t block_index) {
+        const bool complement = ((column + block_index) & 1u) != 0u;
+        for (std::size_t byte = 0u; byte < packed_pattern_a.size(); ++byte) {
+            const std::uint8_t packed = packed_pattern_a[byte];
+            block.qs[byte] = static_cast<strata_u8>(
+                complement ? packed ^ 0xffu : packed);
+        }
+    }
+
+    static std::uint32_t oracle_code(std::uint32_t column,
+                                     std::uint32_t block_index,
+                                     std::uint32_t value) {
+        const std::uint32_t code =
+            logical_codes_a[value >> 2u][value & 3u];
+        const bool complement = ((column + block_index) & 1u) != 0u;
+        return complement ? 3u - code : code;
+    }
+};
+
+template <>
 struct FormatTraits<block_q4_0> {
     static constexpr const char* name = "Q4_0";
+    static constexpr std::uint32_t values_per_block = 32u;
     static constexpr std::uint32_t code_count = 16u;
     static constexpr int zero_point = 8;
     static constexpr EncodeCommandBuffer encode = &encode_prefill_dequant_q4_0;
@@ -144,6 +194,7 @@ struct FormatTraits<block_q4_0> {
 template <>
 struct FormatTraits<block_q5_0> {
     static constexpr const char* name = "Q5_0";
+    static constexpr std::uint32_t values_per_block = 32u;
     static constexpr std::uint32_t code_count = 32u;
     static constexpr int zero_point = 16;
     static constexpr EncodeCommandBuffer encode = &encode_prefill_dequant_q5_0;
@@ -164,6 +215,7 @@ struct FormatTraits<block_q5_0> {
 template <>
 struct FormatTraits<block_q8_0> {
     static constexpr const char* name = "Q8_0";
+    static constexpr std::uint32_t values_per_block = 32u;
     static constexpr std::uint32_t code_count = 255u;
     static constexpr int zero_point = 127;
     static constexpr EncodeCommandBuffer encode = &encode_prefill_dequant_q8_0;
@@ -202,9 +254,11 @@ bool test_dequant_format(Context& context) {
     using Format = FormatTraits<Block>;
     const std::string prefix =
         std::string("Prefill ") + Format::name + " dequant";
-    constexpr std::size_t blocks_per_row = kK / kValuesPerBlock;
+    constexpr std::size_t blocks_per_row =
+        kK / Format::values_per_block;
     const std::size_t weight_bytes =
-        required_weight_bytes<Block>(kColumns, kK);
+        required_weight_bytes<Block>(kColumns, kK,
+                                     Format::values_per_block);
     const std::size_t output_bytes =
         required_output_bytes(kColumns, kK);
     std::string error;
@@ -233,19 +287,30 @@ bool test_dequant_format(Context& context) {
             block.d = static_cast<strata_half>(scale);
             const float expanded_scale =
                 strata::kernels::f32_from_f16(scale);
-            for (std::uint32_t value = 0u; value < kValuesPerBlock; ++value) {
+            for (std::uint32_t value = 0u;
+                 value < Format::values_per_block; ++value) {
                 const std::uint32_t code =
                     (column * 13u + block_index * 31u + value * 7u +
                      (value >> 4u) * 3u) %
                     Format::code_count;
-                Format::store(block, value, code);
+                std::uint32_t oracle_code = code;
+                if constexpr (std::is_same_v<Block, block_q2_0>) {
+                    if (value == 0u) {
+                        Format::store_fixture(block, column, block_index);
+                    }
+                    oracle_code =
+                        Format::oracle_code(column, block_index, value);
+                } else {
+                    Format::store(block, value, code);
+                }
                 const std::uint32_t k =
-                    block_index * kValuesPerBlock + value;
+                    block_index * Format::values_per_block + value;
                 expected[static_cast<std::size_t>(k) * kColumns + column] =
                     strata::kernels::f16_from_f32(
                         expanded_scale *
                         static_cast<float>(
-                            static_cast<int>(code) - Format::zero_point));
+                            static_cast<int>(oracle_code) -
+                            Format::zero_point));
             }
         }
     }
@@ -329,7 +394,8 @@ bool test_validation_format(Context& context, Context& foreign_context) {
         std::string("Prefill ") + Format::name + " dequant validation";
     const PrefillDequantParams valid{kColumns, kK};
     const std::size_t weight_bytes =
-        required_weight_bytes<Block>(kColumns, kK);
+        required_weight_bytes<Block>(kColumns, kK,
+                                     Format::values_per_block);
     const std::size_t output_bytes =
         required_output_bytes(kColumns, kK);
     std::string error;
@@ -357,11 +423,11 @@ bool test_validation_format(Context& context, Context& foreign_context) {
     passed &= expect_rejected(context, Format::encode, invalid, valid_buffers,
                               "positive signed extents", prefix + " zero N");
     invalid = valid;
-    invalid.k = 31u;
+    invalid.k = Format::values_per_block - 1u;
     passed &= expect_rejected(context, Format::encode, invalid, valid_buffers,
                               "positive signed extents", prefix + " short K");
     invalid = valid;
-    invalid.k = 33u;
+    invalid.k = Format::values_per_block + 1u;
     passed &= expect_rejected(context, Format::encode, invalid, valid_buffers,
                               "positive signed extents", prefix + " K remainder");
     invalid = valid;
@@ -375,9 +441,9 @@ bool test_validation_format(Context& context, Context& foreign_context) {
     invalid.k =
         (static_cast<std::uint32_t>(
              std::numeric_limits<std::int32_t>::max()) /
-         kValuesPerBlock +
+         Format::values_per_block +
          1u) *
-        kValuesPerBlock;
+        Format::values_per_block;
     passed &= expect_rejected(context, Format::encode, invalid, valid_buffers,
                               "positive signed extents", prefix + " signed K");
 
@@ -457,6 +523,9 @@ int main(int argc, char** argv) {
     if (!foreign_context) return 1;
 
     bool passed = true;
+    passed &= test_dequant_format<block_q2_0>(*context);
+    passed &= test_validation_format<block_q2_0>(*context,
+                                                  *foreign_context);
     passed &= test_dequant_format<block_q4_0>(*context);
     passed &= test_validation_format<block_q4_0>(*context,
                                                  *foreign_context);

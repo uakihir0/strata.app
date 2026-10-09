@@ -10416,3 +10416,56 @@ measuring L-15 remain open.
   final test-assertion change. The expanded serial/concurrent tests passed
   2/2 after all review fixes. The host `test_map` check and
   `git diff --check` passed.
+
+### D-IMPL-366: Add the Q2_0 Prefill dequantizer
+
+- **Decision:** Add `strata_pf_dequant_q2_0` and caller-owned/standalone
+  `encode_prefill_dequant_q2_0` APIs. Keep Q2_0's native 64-value, 18-byte
+  block geometry distinct from the existing 32-value dequantizers. Extract
+  four 2-bit codes per byte in increasing lane order, center each code by
+  subtracting one, multiply by the F16 scale in F32 and round once to F16
+  while writing K-major `[k][n_out]` scratch. Reuse the shared checked extent,
+  alignment, ownership, overlap and transaction validation with a
+  format-specific values-per-block parameter.
+- **Reason:** Q2_0 is the project's first catalogue format and already has a
+  native mat-vec implementation and scalar oracle that expose its packed
+  ordering. This step advances the Prefill format set without incorrectly
+  assuming that every format uses 32-value blocks, and keeps synthetic
+  component validation separate from production Prefill integration.
+- **Review items:** Verify the 64-value/18-byte layout and ordering against
+  the independent mat-vec implementation/oracle; all four two-bit lanes,
+  `q−1` centering, F32 multiplication and one-round F16 RNE; multiple
+  consecutive blocks and output-column tails; K divisibility, checked weight
+  and output sizes, signed extents, alignment, ownership, exact/partial
+  aliases, input immutability, guards and rollback after a successful prefix
+  dispatch; manifest and documentation accuracy.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the build passed and the complete `mac-metal` preset passed
+  90/90. After hostile review strengthened the Q2_0 packed-byte oracle, the
+  rebuilt serial/concurrent dequant tests passed 2/2. `mac-host` passed
+  44/45 with one unavailable-real-input test skipped; `test_map` and
+  `git diff --check` passed. Review findings and disposition are in REV-163.
+
+### REV-163: Hostile review of Q2_0 Prefill dequantization
+
+- **Scope:** Q2_0's 64-value/18-byte block layout, two-bit lane order,
+  centered values and F16 conversion; host block-size selection and checked
+  extents; test-oracle independence, multiple blocks, rejection and rollback
+  coverage; manifest and documentation.
+- **Finding and fix:** The first review found that the test packed generated
+  logical codes with the same lane mapping used by the shader, allowing a
+  shared packing-order error to pass. Replaced that fixture with literal
+  packed bytes and a separate explicit logical-code table. Alternating the
+  fixture and its complement across output columns and consecutive blocks
+  checks all two-bit lanes, the column tail and the block boundary.
+- **Follow-up:** The reviewer verified the literal bytes against the separate
+  logical table and canonical Q2_0 decode, then rechecked geometry, host
+  sizing, numerical conversion, rejection coverage and manifest registration.
+  No further actionable finding remains.
+- **Disposition:** No actionable implementation, test or documentation
+  findings remain. Q2_0 is still an isolated Prefill dequantizer; production
+  Prefill scheduling and model-backed inference remain open.
+- **Validation:** The full `mac-metal` suite passed 90/90 before the oracle
+  strengthening. After rebuilding the strengthened fixture, the serial and
+  concurrent dequant tests passed 2/2. `mac-host` passed 44/45 with one
+  unavailable-real-input test skipped, and `test_map` passed.
