@@ -7,6 +7,9 @@
 #include <limits>
 #include <utility>
 
+#include "../kernels/common/params.h"
+#include "../kernels/common/types.h"
+
 namespace strata::metal {
 
 struct MtpRuntimeStorage::Impl {
@@ -362,6 +365,123 @@ BufferRef MtpRuntimeStorage::bind_region(MtpBindRegionId id) const noexcept {
     }
     return impl_->bind_scratch.slice(static_cast<std::size_t>(region.offset),
                                      static_cast<std::size_t>(region.bytes));
+}
+
+bool MtpRuntimeStorage::bind_input_projection(
+    Context& context, const MtpInputProjectionSources& sources,
+    MtpInputProjectionBuffers& buffers, std::string& error) const {
+    error.clear();
+    buffers = {};
+    if (!is_valid() || impl_->buffers != &context.buffers()) {
+        error = "MTP input projection needs live runtime storage from this Context";
+        return false;
+    }
+    if (!context.buffers().owns(sources.token_embedding_table) ||
+        !sources.residual || !context.buffers().owns(sources.residual)) {
+        error = "MTP input projection sources must belong to the runtime Context";
+        return false;
+    }
+
+    const BufferRef params_slot = mtp_params_slot(sources.params_slot);
+    if (!params_slot || params_slot.length < sizeof(MtpParams) ||
+        params_slot.contents == nullptr) {
+        error = "MTP input projection parameter slot is unavailable";
+        return false;
+    }
+    MtpParams params{};
+    std::memcpy(&params, params_slot.contents, sizeof(params));
+    if (params.T == 0u || params.T > 8u) {
+        error = "MTP input projection parameter slot T must be in 1..8";
+        return false;
+    }
+
+    switch (sources.token_source) {
+        case MtpInputTokenSource::params_tokens:
+            if (sources.selected_token) {
+                error = "MTP params-token binding cannot include selected_token";
+                return false;
+            }
+            break;
+        case MtpInputTokenSource::selected_token:
+            if (params.T != 1u) {
+                error = "MTP selected-token binding requires T=1";
+                return false;
+            }
+            if (!sources.selected_token ||
+                !context.buffers().owns(sources.selected_token)) {
+                error = "MTP selected token must belong to the runtime Context";
+                return false;
+            }
+            break;
+        default:
+            error = "MTP input projection token source is unsupported";
+            return false;
+    }
+
+    const ReadOnlyBufferRef readonly_params =
+        context.buffers().read_only(params_slot);
+    const ReadOnlyBufferRef embedding_norm_gamma =
+        context.buffers().read_only(
+            dense_weight("pre_fc_norm_embedding.weight"));
+    const ReadOnlyBufferRef fc_embedding_weights =
+        context.buffers().read_only(dense_weight("fc_embedding.weight"));
+    const ReadOnlyBufferRef hidden_norm_gamma =
+        context.buffers().read_only(dense_weight("pre_fc_norm_hidden.weight"));
+    const ReadOnlyBufferRef fc_hidden_weights =
+        context.buffers().read_only(dense_weight("fc_hidden.weight"));
+    BufferRef embedding = bind_region(MtpBindRegionId::emb);
+    BufferRef embedding_norm = bind_region(MtpBindRegionId::en);
+    BufferRef xq = bind_region(MtpBindRegionId::xq);
+    BufferRef e2 = bind_region(MtpBindRegionId::e2);
+    BufferRef hidden_norm = bind_region(MtpBindRegionId::hn);
+    BufferRef h2 = bind_region(MtpBindRegionId::h2);
+    BufferRef matvec_sink;
+
+    constexpr std::size_t kEmbeddingRowBytes =
+        static_cast<std::size_t>(N_EMBD) * sizeof(float);
+    const std::size_t active_embedding_bytes =
+        static_cast<std::size_t>(params.T) * kEmbeddingRowBytes;
+    if (params.T < 8u) {
+        if (!e2 || active_embedding_bytes >= e2.length) {
+            error = "MTP input projection e2 tail is too small for mat-vec padding";
+            return false;
+        }
+        matvec_sink = e2.slice(active_embedding_bytes,
+                               e2.length - active_embedding_bytes);
+    } else {
+        const BufferRef bo = bind_region(MtpBindRegionId::bo);
+        matvec_sink = bo.slice(0u, sizeof(float));
+    }
+
+    if (!readonly_params || !embedding_norm_gamma || !fc_embedding_weights ||
+        !hidden_norm_gamma || !fc_hidden_weights || !embedding ||
+        !embedding_norm || !xq || !e2 || !hidden_norm || !h2 ||
+        !matvec_sink) {
+        error = "MTP input projection runtime weights or bind regions are unavailable";
+        return false;
+    }
+    buffers = {
+        readonly_params,
+        sources.token_source,
+        sources.selected_token,
+        sources.embedding_format,
+        sources.vocabulary_size,
+        sources.token_embedding_table,
+        embedding_norm_gamma,
+        fc_embedding_weights,
+        sources.residual,
+        hidden_norm_gamma,
+        fc_hidden_weights,
+        embedding,
+        embedding_norm,
+        xq,
+        e2,
+        hidden_norm,
+        h2,
+        matvec_sink,
+    };
+    error.clear();
+    return true;
 }
 
 BufferRef MtpRuntimeStorage::shared_rope() const noexcept {

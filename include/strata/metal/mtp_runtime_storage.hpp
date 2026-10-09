@@ -3,6 +3,7 @@
 
 #include "strata/metal/mtp_kv.hpp"
 #include "strata/metal/mtp_bind_layout.hpp"
+#include "strata/metal/mtp_dispatch.hpp"
 #include "strata/metal/mtp_params_layout.hpp"
 #include "strata/metal/mtp_storage.hpp"
 #include "strata/metal/plan.hpp"
@@ -14,6 +15,18 @@
 namespace strata::metal {
 
 class KvStore;
+
+/// Caller-owned inputs needed to resolve stage-1–5 views from MTP storage.
+/// The token table and residual belong to the same Context as the runtime.
+struct MtpInputProjectionSources {
+    std::uint32_t params_slot = 0;
+    MtpInputTokenSource token_source = MtpInputTokenSource::params_tokens;
+    ReadOnlyBufferRef selected_token;
+    EmbedRowsFormat embedding_format = EmbedRowsFormat::bf16;
+    std::uint32_t vocabulary_size = 0;
+    ReadOnlyBufferRef token_embedding_table;
+    BufferRef residual;
+};
 
 /// Own MTP weights, bind scratch, parameter slots, and drafter K/V from one
 /// fitting memory plan.
@@ -57,6 +70,15 @@ public:
     BufferRef dense_weight(const std::string& tensor_name) const noexcept;
     BufferRef bind_region(MtpBindRegionId id) const noexcept;
     BufferRef mtp_params_slot(std::uint32_t slot) const noexcept;
+    /// Resolve the MTP-owned weights and scratch for stages 1–5. The main
+    /// token table and current residual remain caller-owned inputs. Success
+    /// resolves Context-owned views; the encoder remains responsible for
+    /// format, extent, alignment, hid-count, token-value, and alias validation.
+    /// Returned views are borrowed and valid only while this runtime is valid.
+    bool bind_input_projection(Context& context,
+                               const MtpInputProjectionSources& sources,
+                               MtpInputProjectionBuffers& buffers,
+                               std::string& error) const;
     /// Borrowed main RoPE view, or empty when unbound or this owner is invalid.
     BufferRef shared_rope() const noexcept;
     bool kv_views(MtpKvViews& views, std::string& error) const;
