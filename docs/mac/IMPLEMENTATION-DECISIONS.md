@@ -9289,6 +9289,65 @@ measuring L-15 remain open.
   (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a). The tests use synthetic
   inputs and do not establish model-backed behavior.
 
+### D-IMPL-348: Implement the isolated Prefill GR mix stage
+
+- **Decision:** Add the documented ordered four-stream mix kernel and a
+  separate remainder variant for BF16X2 modes 1 and 2. Keep residual, scale,
+  norm and gated inputs read-only; validate row/byte ranges, natural
+  alignment, Context ownership, writable disjointness and the ordered
+  concurrent-group boundary. Expose standalone transactional and
+  caller-owned Encoder forms. Preserve `(R * rs) * norm`, stream order,
+  `fma(value, sigmoid(gated), sum)`, division by four, RNE BF16 high and
+  residual outputs, and F16 conversion. Do not write an F32 mixed buffer
+  because no Mac consumer reads it.
+- **Reason:** The stage is explicitly specified in section 6.3 and is a
+  bounded step toward the GR read chain. Separate pipeline names keep the
+  unused low-output binding absent in mode 0. The `exp` deviation can change
+  tiny BF16 residuals by many ULPs relative to the residual itself, so general
+  tests check the reconstructed high-plus-low value against the scalar sum
+  using `2^-15` of the absolute-term magnitude. Exact binary-input midpoint
+  fixtures separately require the documented RNE bits, preventing that
+  reconstruction tolerance from hiding a truncating conversion. No production
+  Prefill wiring is implied.
+- **Validation:** The current `mac-dev` build succeeded and the focused
+  Prefill serial/concurrent CTests passed 2/2 with rows 1/3/8, all three
+  BF16X2 modes, exact high/low RNE ties, scalar high/F16 oracles,
+  BF16X2 reconstruction, input immutability, guards, invalid-view and alias
+  checks, transactional rollback and concurrent-group refusal. The complete
+  `mac-metal` CTest preset passed 80/80 on Mac17,9 (64 GB, macOS 27.0.1,
+  Xcode 27.0 build 27A266a). `test_map.py` passed with the repository's
+  documented planned-work and missing-check notices; `check_drift.py`
+  reported no upstream changes and valid golden files; `git diff --check`
+  passed. These are synthetic kernel/encoder tests, not model-backed results.
+- **Review:** REV-145's hostile follow-up confirmed the exact tie fixtures,
+  dispatch and validation contracts, and serial/concurrent inventory; no
+  actionable issues remain. The GEMM stages, GR write, layer/chunk scheduler
+  and inspected-model parity remain open.
+
+### REV-145: Hostile review of the Prefill GR mix stage
+
+- **Scope:** `strata_pf_gr_mix` and `_lo`, validated host dispatch,
+  BF16X2 remainder semantics, serial/concurrent fixtures, and synchronized
+  documentation.
+- **Initial findings and fixes:** The first review found that the general
+  reconstruction tolerance did not by itself prove RNE for the low BF16
+  component. Exact binary inputs now check high-output ties and positive and
+  negative low-remainder ties in modes 1 and 2, while the wider general
+  reconstruction check remains. The review also found that the CTest
+  inventory omitted the new kernels; both kernel-guide entries now list the
+  serial/concurrent coverage.
+- **Follow-up:** The reviewer verified the new exact binary fixtures isolate
+  RNE from `exp` variation and the docs list the kernels in both serial and
+  concurrent CTests. It found no remaining issue in indexing, binding,
+  ownership, aliases, size checks or rollback.
+- **Disposition:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `cmake --build --preset mac-dev` succeeded, focused Prefill
+  serial/concurrent CTests passed 2/2, and the full `mac-metal` suite passed
+  80/80. `test_map.py` passed with existing planned-work/missing-check
+  notices; `check_drift.py` found no upstream changes and valid golden files;
+  `git diff --check` passed. Inputs were synthetic; no model inference is
+  established.
+
 ### D-IMPL-341: Bind MTP attention runtime views for stages 7–8
 
 - **Decision:** Add runtime-storage adapters for stage 7's attention read and
