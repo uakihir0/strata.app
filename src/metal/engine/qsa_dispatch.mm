@@ -2122,7 +2122,7 @@ static bool prepare_indexer_append_dispatch(
         {buffers.raw_keys, dispatch.raw_bytes},
         {buffers.steps, dispatch.steps_bytes},
         {buffers.gamma, dispatch.gamma_bytes},
-        {buffers.rope, buffers.rope.length},
+        {buffers.rope, dispatch.rope_required_bytes},
         {buffers.tail_snapshot,
          mode == QsaIndexerAppendMode::commit
              ? dispatch.tail_snapshot_bytes
@@ -2271,6 +2271,138 @@ bool encode_qsa_indexer_append(
         "strata_idx_append", {1u, 1u, 1u},
         {kIndexerAppendThreads, 1u, 1u}, bindings, byte_bindings,
         threadgroup_memory, error);
+}
+
+bool encode_qsa_indexer_commit_batch(
+    Context& context, Encoder& encoder, std::uint32_t accepted_rows,
+    std::uint32_t cell_capacity, float rope_zero_cos, float rope_zero_sin,
+    std::span<const QsaIndexerAppendBuffers> layers, std::string& error) {
+    error.clear();
+    if (accepted_rows == 0u || accepted_rows > VERIFY_MAX_T) {
+        error = "QSA indexer commit batch row count must be in 1..8";
+        return false;
+    }
+    if (layers.size() != kQsaIndexerLayers) {
+        error = "QSA indexer commit batch requires exactly 12 layers";
+        return false;
+    }
+    if (encoder.concurrent_group_open()) {
+        error =
+            "QSA indexer commit batch requires an ordered concurrent-group boundary";
+        return false;
+    }
+
+    struct BufferExtent {
+        BufferRef view;
+        std::size_t bytes;
+        std::uint32_t layer;
+        const char* name;
+    };
+    std::vector<BufferExtent> outputs;
+    outputs.reserve(static_cast<std::size_t>(kQsaIndexerLayers) * 4u);
+    std::vector<BufferExtent> inputs;
+    inputs.reserve(static_cast<std::size_t>(kQsaIndexerLayers) * 6u);
+    for (std::uint32_t layer = 0u; layer < kQsaIndexerLayers; ++layer) {
+        IndexerAppendDispatch dispatch;
+        if (!prepare_indexer_append_dispatch(
+                context, accepted_rows, cell_capacity,
+                QsaIndexerAppendMode::commit, layer, rope_zero_cos,
+                rope_zero_sin, layers[layer], dispatch, error)) {
+            error = "QSA indexer commit batch layer " +
+                    std::to_string(layer) + ": " + error;
+            return false;
+        }
+        if (layer != 0u &&
+            (!same_view(layers[layer].steps, layers[0].steps) ||
+             !same_view(layers[layer].rope, layers[0].rope) ||
+             !same_view(layers[layer].tail_snapshot,
+                        layers[0].tail_snapshot) ||
+             !same_view(layers[layer].block_pos_snapshot,
+                        layers[0].block_pos_snapshot))) {
+            error = "QSA indexer commit batch must share steps, RoPE and "
+                    "snapshot views across all layers";
+            return false;
+        }
+
+        outputs.push_back(
+            {layers[layer].tail, dispatch.tail_bytes, layer, "tail"});
+        outputs.push_back(
+            {layers[layer].dead, dispatch.dead_bytes, layer, "dead"});
+        outputs.push_back(
+            {layers[layer].pooled, dispatch.pooled_bytes, layer, "pooled"});
+        outputs.push_back({layers[layer].block_position,
+                           sizeof(std::int32_t), layer, "block position"});
+
+        inputs.push_back({layers[layer].raw_keys, dispatch.raw_bytes, layer,
+                          "raw keys"});
+        inputs.push_back(
+            {layers[layer].steps, dispatch.steps_bytes, layer, "step rows"});
+        inputs.push_back(
+            {layers[layer].gamma, dispatch.gamma_bytes, layer, "gamma"});
+        inputs.push_back({layers[layer].rope, dispatch.rope_required_bytes,
+                          layer, "RoPE"});
+        inputs.push_back({layers[layer].tail_snapshot,
+                          dispatch.tail_snapshot_bytes, layer,
+                          "tail snapshot"});
+        inputs.push_back({layers[layer].block_pos_snapshot,
+                          dispatch.block_pos_snapshot_bytes, layer,
+                          "block-position snapshot"});
+    }
+
+    for (std::size_t output_index = 0u;
+         output_index < outputs.size(); ++output_index) {
+        const BufferExtent& output = outputs[output_index];
+        for (std::size_t prior = 0u; prior < output_index; ++prior) {
+            const BufferExtent& other = outputs[prior];
+            if (buffer_overlaps(output.view, output.bytes, other.view,
+                                other.bytes)) {
+                error = "QSA indexer commit batch layer " +
+                        std::to_string(output.layer) + " " + output.name +
+                        " overlaps layer " + std::to_string(other.layer) +
+                        " " + other.name;
+                return false;
+            }
+        }
+        for (const BufferExtent& input : inputs) {
+            if (buffer_overlaps(output.view, output.bytes, input.view,
+                                input.bytes)) {
+                error = "QSA indexer commit batch layer " +
+                        std::to_string(output.layer) + " " + output.name +
+                        " overlaps layer " + std::to_string(input.layer) +
+                        " " + input.name;
+                return false;
+            }
+        }
+    }
+    if (!validate_indexer_append_pipeline(context, error)) return false;
+
+    for (std::uint32_t layer = 0u; layer < kQsaIndexerLayers; ++layer) {
+        if (!encode_qsa_indexer_append(
+                context, encoder, accepted_rows, cell_capacity,
+                QsaIndexerAppendMode::commit, layer, rope_zero_cos,
+                rope_zero_sin, layers[layer], error)) {
+            error = "QSA indexer commit batch layer " +
+                    std::to_string(layer) + ": " + error;
+            return false;
+        }
+    }
+    error.clear();
+    return true;
+}
+
+bool encode_qsa_indexer_commit_batch(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t accepted_rows, std::uint32_t cell_capacity,
+    float rope_zero_cos, float rope_zero_sin,
+    std::span<const QsaIndexerAppendBuffers> layers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "QSA indexer accepted-prefix commit",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_qsa_indexer_commit_batch(
+                context, encoder, accepted_rows, cell_capacity,
+                rope_zero_cos, rope_zero_sin, layers, encode_error);
+        },
+        error);
 }
 
 static bool prepare_selection_scores_dispatch(

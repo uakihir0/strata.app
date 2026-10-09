@@ -197,7 +197,7 @@ The verifier requires the native path (`layer_verify_compatible`, layer.cpp:448-
   - `h_commit_[2+t] = last_pos0_ + t` for `t < n_keep`, else `-1`.
 - Per QSA layer: restore `idx_tail` from `tail_snap_` (L987), then replay `native_qsa_indexer_append` for each kept token at position `commit_[2+t]` (L990). A `-1` position makes the kernel return immediately.
 - Why this is sufficient:
-  - Pooled rows written by rejected tokens are either rewritten by the replay or lie beyond the new `n_bid`, which means they are never read. The tail block reads `dead`, not `pooled[n_bid]`.
+  - Replay rewrites accepted complete-block rows. Rejected writes after that prefix are ignored; `pooled[n_bid]` can remain stale when the accepted prefix ends in a partial block, because selection reads `dead` for its tail block rather than `pooled[n_bid]`. The T=8 fixture accepts positions 1..3 and rejects position 7: replay rewrites pooled row 1, while rejected output in spare row 2 lies beyond the accepted `n_bid`.
   - The KV cache needs no fix-up.
 
 ### 1.6 Prefill (chunk of T tokens starting at p0, T <= 8192 by default). `src/prefill/prefill.cpp:1366-1560`

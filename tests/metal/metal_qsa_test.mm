@@ -4890,6 +4890,549 @@ bool run_indexer_append_case(Context& context, std::uint32_t token_rows,
            outer_guards;
 }
 
+bool test_indexer_commit_batch(Context& context) {
+    constexpr std::uint32_t kRows = 8u;
+    constexpr std::uint32_t kAcceptedRows = 3u;
+    constexpr std::uint32_t kCellCapacity = 16u;
+    constexpr std::size_t kLayers = INDEXER_SNAPSHOT_LAYERS;
+    constexpr std::size_t kTailFloats =
+        3u * static_cast<std::size_t>(INDEXER_HEAD_DIM);
+    constexpr std::size_t kDeadFloats = INDEXER_HEAD_DIM;
+    constexpr std::size_t kPoolRows =
+        kCellCapacity / INDEXER_BLOCK_CELLS + 2u;
+    constexpr std::size_t kPooledFloats =
+        kPoolRows * static_cast<std::size_t>(INDEXER_HEAD_DIM);
+    constexpr std::size_t kTailBytes = kTailFloats * sizeof(float);
+    constexpr std::size_t kDeadBytes = kDeadFloats * sizeof(float);
+    constexpr std::size_t kPooledBytes = kPooledFloats * sizeof(float);
+    constexpr std::size_t kRawLayerBytes =
+        static_cast<std::size_t>(kRows) * INDEXER_HEAD_DIM * sizeof(float);
+    constexpr std::size_t kGammaLayerBytes =
+        static_cast<std::size_t>(INDEXER_HEAD_DIM) * sizeof(float);
+    constexpr std::size_t kRopeBytes =
+        static_cast<std::size_t>(kCellCapacity) * 32u * 2u * sizeof(float);
+    constexpr float kRopeZeroCos = 1.0625f;
+    constexpr float kRopeZeroSin = 0.0f;
+    constexpr std::array<std::int32_t, kRows> kPositions{
+        1, 2, 3, 4, 5, 6, 7, 8};
+
+    std::string error;
+    auto allocate = [&](const std::string& name, std::size_t bytes) {
+        BufferRef view = context.buffers().allocate(name, bytes, error);
+        check(static_cast<bool>(view), "allocate " + name, error);
+        return view;
+    };
+    const BufferRef raw_storage =
+        allocate("QSA batch raw replay", kLayers * kRawLayerBytes);
+    const BufferRef gamma_storage =
+        allocate("QSA batch gamma", kLayers * kGammaLayerBytes);
+    const BufferRef tails =
+        allocate("QSA batch indexer tails", kLayers * kTailBytes);
+    const BufferRef dead =
+        allocate("QSA batch indexer dead keys", kLayers * kDeadBytes);
+    const BufferRef pooled =
+        allocate("QSA batch indexer pooled keys", kLayers * kPooledBytes);
+    const BufferRef block_positions =
+        allocate("QSA batch indexer block positions",
+                 kLayers * sizeof(std::int32_t));
+    const BufferRef steps =
+        allocate("QSA batch steps",
+                 kRows * sizeof(StepRow) + kTailBytes);
+    const BufferRef rope =
+        allocate("QSA batch RoPE with inactive suffix",
+                 kRopeBytes + kTailBytes);
+    const BufferRef tail_snapshot =
+        allocate("QSA batch tail snapshot", kLayers * kTailBytes);
+    const BufferRef block_pos_snapshot =
+        allocate("QSA batch block-position snapshot",
+                 kLayers * sizeof(std::int32_t));
+    const BufferRef alternate_steps =
+        allocate("QSA batch alternate steps", kRows * sizeof(StepRow));
+    const BufferRef alternate_rope =
+        allocate("QSA batch alternate RoPE", kRopeBytes);
+    const BufferRef alternate_tail_snapshot =
+        allocate("QSA batch alternate tail snapshot",
+                 kLayers * kTailBytes);
+    const BufferRef alternate_block_pos_snapshot =
+        allocate("QSA batch alternate block-position snapshot",
+                 kLayers * sizeof(std::int32_t));
+    if (!raw_storage || !gamma_storage || !tails || !dead || !pooled ||
+        !block_positions || !steps || !rope || !tail_snapshot ||
+        !block_pos_snapshot || !alternate_steps || !alternate_rope ||
+        !alternate_tail_snapshot || !alternate_block_pos_snapshot) {
+        return false;
+    }
+
+    std::array<StepRow, kRows> expected_steps{};
+    for (std::uint32_t row = 0u; row < kRows; ++row) {
+        const std::int32_t position = kPositions[row];
+        const std::int32_t n_kv = position + 1;
+        expected_steps[row] = StepRow{
+            position, n_kv,
+            static_cast<std::int32_t>(n_kv / INDEXER_BLOCK_CELLS),
+            std::min<std::int32_t>(n_kv, 2051)};
+    }
+    std::memset(steps.contents, 0x6d, steps.length);
+    std::memcpy(steps.contents, expected_steps.data(),
+                kRows * sizeof(StepRow));
+    std::vector<std::byte> initial_step_storage(steps.length);
+    std::memcpy(initial_step_storage.data(), steps.contents, steps.length);
+    std::vector<float> expected_rope(kRopeBytes / sizeof(float));
+    auto* rope_values = static_cast<float*>(rope.contents);
+    for (std::uint32_t cell = 0u; cell < kCellCapacity; ++cell) {
+        for (std::uint32_t pair = 0u; pair < 32u; ++pair) {
+            const float angle =
+                static_cast<float>((cell * 13u + pair * 7u) % 257u) *
+                0.013f;
+            const std::size_t index =
+                (static_cast<std::size_t>(cell) * 32u + pair) * 2u;
+            expected_rope[index] = std::cos(angle) * 1.0625f;
+            expected_rope[index + 1u] = std::sin(angle) * 1.0625f;
+        }
+    }
+    std::memcpy(rope.contents, expected_rope.data(), kRopeBytes);
+    std::memcpy(alternate_steps.contents, expected_steps.data(),
+                kRows * sizeof(StepRow));
+    std::memcpy(alternate_rope.contents, expected_rope.data(), kRopeBytes);
+
+    std::array<oracle::QsaIndexerState, kLayers> initial{};
+    std::array<oracle::QsaIndexerState, kLayers> expected{};
+    std::array<std::vector<float>, kLayers> raw_keys{};
+    std::array<std::vector<float>, kLayers> gammas{};
+    std::array<QsaIndexerAppendBuffers, kLayers> layer_buffers{};
+    std::vector<float> initial_tails(kLayers * kTailFloats);
+    std::vector<float> initial_dead(kLayers * kDeadFloats);
+    std::vector<float> initial_pooled(kLayers * kPooledFloats);
+    std::vector<std::int32_t> initial_block_positions(kLayers);
+    std::memset(tail_snapshot.contents, 0xa5, tail_snapshot.length);
+    std::memset(block_pos_snapshot.contents, 0x5a,
+                block_pos_snapshot.length);
+
+    for (std::uint32_t layer = 0u; layer < kLayers; ++layer) {
+        auto& start = initial[layer];
+        start.tail.resize(kTailFloats);
+        start.dead.resize(kDeadFloats);
+        start.pooled.resize(kPooledFloats);
+        start.block_position = 0;
+        for (std::size_t index = 0u; index < start.tail.size(); ++index) {
+            start.tail[index] = 0.015625f * static_cast<float>(layer + 1u) +
+                                static_cast<float>(index % 23u) * 0.0005f;
+        }
+        for (std::size_t index = 0u; index < start.dead.size(); ++index) {
+            start.dead[index] = -0.375f +
+                                static_cast<float>(layer) * 0.0078125f +
+                                static_cast<float>(index % 19u) * 0.00025f;
+        }
+        for (std::size_t index = 0u; index < start.pooled.size(); ++index) {
+            start.pooled[index] = -0.625f +
+                                  static_cast<float>(layer) * 0.00390625f +
+                                  static_cast<float>(index % 31u) * 0.000125f;
+        }
+        std::copy(start.tail.begin(), start.tail.end(),
+                  initial_tails.begin() + layer * kTailFloats);
+        std::copy(start.dead.begin(), start.dead.end(),
+                  initial_dead.begin() + layer * kDeadFloats);
+        std::copy(start.pooled.begin(), start.pooled.end(),
+                  initial_pooled.begin() + layer * kPooledFloats);
+        initial_block_positions[layer] = start.block_position;
+        std::memcpy(static_cast<std::byte*>(tails.contents) +
+                        static_cast<std::size_t>(layer) * kTailBytes,
+                    start.tail.data(), kTailBytes);
+        std::memcpy(static_cast<std::byte*>(dead.contents) +
+                        static_cast<std::size_t>(layer) * kDeadBytes,
+                    start.dead.data(), kDeadBytes);
+        std::memcpy(static_cast<std::byte*>(pooled.contents) +
+                        static_cast<std::size_t>(layer) * kPooledBytes,
+                    start.pooled.data(), kPooledBytes);
+        std::memcpy(static_cast<std::byte*>(block_positions.contents) +
+                        static_cast<std::size_t>(layer) *
+                            sizeof(std::int32_t),
+                    &start.block_position, sizeof(std::int32_t));
+
+        raw_keys[layer].resize(kRows * INDEXER_HEAD_DIM);
+        gammas[layer].resize(INDEXER_HEAD_DIM);
+        for (std::uint32_t row = 0u; row < kRows; ++row) {
+            for (std::uint32_t dimension = 0u;
+                 dimension < INDEXER_HEAD_DIM; ++dimension) {
+                const std::size_t index =
+                    static_cast<std::size_t>(row) * INDEXER_HEAD_DIM +
+                    dimension;
+                const int pattern = static_cast<int>(
+                    (dimension * 11u + row * 17u + layer * 29u) % 101u) -
+                    50;
+                raw_keys[layer][index] =
+                    static_cast<float>(pattern) * 0.00390625f;
+            }
+        }
+        for (std::uint32_t dimension = 0u;
+             dimension < INDEXER_HEAD_DIM; ++dimension) {
+            gammas[layer][dimension] =
+                0.75f + static_cast<float>(layer) * 0.015625f +
+                static_cast<float>(dimension % 17u) * 0.0009765625f;
+        }
+        std::memcpy(static_cast<std::byte*>(raw_storage.contents) +
+                        static_cast<std::size_t>(layer) * kRawLayerBytes,
+                    raw_keys[layer].data(), kRawLayerBytes);
+        std::memcpy(static_cast<std::byte*>(gamma_storage.contents) +
+                        static_cast<std::size_t>(layer) *
+                            kGammaLayerBytes,
+                    gammas[layer].data(), kGammaLayerBytes);
+
+        layer_buffers[layer] = QsaIndexerAppendBuffers{
+            raw_storage.slice(
+                static_cast<std::size_t>(layer) * kRawLayerBytes,
+                kRawLayerBytes),
+            steps,
+            gamma_storage.slice(
+                static_cast<std::size_t>(layer) * kGammaLayerBytes,
+                kGammaLayerBytes),
+            rope,
+            tails.slice(static_cast<std::size_t>(layer) * kTailBytes,
+                        kTailBytes),
+            dead.slice(static_cast<std::size_t>(layer) * kDeadBytes,
+                       kDeadBytes),
+            pooled.slice(static_cast<std::size_t>(layer) * kPooledBytes,
+                         kPooledBytes),
+            block_positions.slice(
+                static_cast<std::size_t>(layer) * sizeof(std::int32_t),
+                sizeof(std::int32_t)),
+            tail_snapshot,
+            block_pos_snapshot,
+        };
+        check(static_cast<bool>(layer_buffers[layer].raw_keys) &&
+                  static_cast<bool>(layer_buffers[layer].gamma) &&
+                  static_cast<bool>(layer_buffers[layer].tail) &&
+                  static_cast<bool>(layer_buffers[layer].dead) &&
+                  static_cast<bool>(layer_buffers[layer].pooled) &&
+                  static_cast<bool>(layer_buffers[layer].block_position),
+              "slice QSA indexer batch layer " + std::to_string(layer));
+
+        oracle::QsaIndexerState speculative = start;
+        oracle::qsa_indexer_append(
+            raw_keys[layer], kPositions, gammas[layer],
+            std::span<const float>(rope_values,
+                                   kRopeBytes / sizeof(float)),
+            kRopeZeroCos, kRopeZeroSin, speculative);
+        expected[layer] = speculative;
+        expected[layer].tail = start.tail;
+        expected[layer].block_position = start.block_position;
+        oracle::qsa_indexer_append(
+            std::span<const float>(raw_keys[layer]).first(
+                kAcceptedRows * INDEXER_HEAD_DIM),
+            std::span<const std::int32_t>(kPositions).first(kAcceptedRows),
+            gammas[layer],
+            std::span<const float>(rope_values,
+                                   kRopeBytes / sizeof(float)),
+            kRopeZeroCos, kRopeZeroSin, expected[layer]);
+    }
+
+    auto state_unchanged = [&] {
+        return std::memcmp(tails.contents, initial_tails.data(),
+                           initial_tails.size() * sizeof(float)) == 0 &&
+               std::memcmp(dead.contents, initial_dead.data(),
+                           initial_dead.size() * sizeof(float)) == 0 &&
+               std::memcmp(pooled.contents, initial_pooled.data(),
+                           initial_pooled.size() * sizeof(float)) == 0 &&
+               std::memcmp(block_positions.contents,
+                           initial_block_positions.data(),
+                           initial_block_positions.size() *
+                               sizeof(std::int32_t)) == 0;
+    };
+    {
+        auto command = context.make_command_buffer(
+            "QSA indexer batch rejects layer count", error);
+        check(command != nullptr, "create QSA batch layer-count command",
+              error);
+        if (!command) return false;
+        const bool accepted = encode_qsa_indexer_commit_batch(
+            context, *command, kAcceptedRows, kCellCapacity, kRopeZeroCos,
+            kRopeZeroSin,
+            std::span<const QsaIndexerAppendBuffers>(layer_buffers)
+                .first(kLayers - 1u),
+            error);
+        const bool rejected = !accepted &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find("exactly 12 layers") != std::string::npos &&
+            state_unchanged();
+        check(rejected, "QSA indexer batch rejects a short layer list", error);
+        if (!rejected) return false;
+    }
+    auto rejects_shared_view_mismatch = [&](
+                                            const std::string& label,
+                                            const std::array<
+                                                QsaIndexerAppendBuffers,
+                                                kLayers>& invalid_layers) {
+        auto command = context.make_command_buffer(label, error);
+        check(command != nullptr, label + " command", error);
+        if (!command) return false;
+        const bool accepted = encode_qsa_indexer_commit_batch(
+            context, *command, kAcceptedRows, kCellCapacity, kRopeZeroCos,
+            kRopeZeroSin, invalid_layers, error);
+        const bool rejected = !accepted &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find("must share steps, RoPE and snapshot views") !=
+                std::string::npos &&
+            state_unchanged();
+        check(rejected, label, error);
+        return rejected;
+    };
+    {
+        auto invalid_layers = layer_buffers;
+        invalid_layers.back().steps = alternate_steps;
+        if (!rejects_shared_view_mismatch(
+                "QSA indexer batch rejects a distinct valid StepRow view",
+                invalid_layers)) {
+            return false;
+        }
+    }
+    {
+        auto invalid_layers = layer_buffers;
+        invalid_layers.back().rope = alternate_rope;
+        if (!rejects_shared_view_mismatch(
+                "QSA indexer batch rejects a distinct valid RoPE view",
+                invalid_layers)) {
+            return false;
+        }
+    }
+    {
+        auto invalid_layers = layer_buffers;
+        invalid_layers.back().tail_snapshot = alternate_tail_snapshot;
+        if (!rejects_shared_view_mismatch(
+                "QSA indexer batch rejects a distinct tail snapshot view",
+                invalid_layers)) {
+            return false;
+        }
+    }
+    {
+        auto invalid_layers = layer_buffers;
+        invalid_layers.back().block_pos_snapshot =
+            alternate_block_pos_snapshot;
+        if (!rejects_shared_view_mismatch(
+                "QSA indexer batch rejects a distinct block-position snapshot",
+                invalid_layers)) {
+            return false;
+        }
+    }
+    {
+        auto invalid_layers = layer_buffers;
+        invalid_layers.back().tail = invalid_layers.front().raw_keys;
+        auto command = context.make_command_buffer(
+            "QSA indexer batch rejects cross-layer alias", error);
+        check(command != nullptr, "create QSA batch alias command", error);
+        if (!command) return false;
+        const bool accepted = encode_qsa_indexer_commit_batch(
+            context, *command, kAcceptedRows, kCellCapacity, kRopeZeroCos,
+            kRopeZeroSin, invalid_layers, error);
+        const bool rejected = !accepted &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find("overlaps layer 0 raw keys") != std::string::npos &&
+            state_unchanged();
+        check(rejected,
+              "QSA indexer batch rejects cross-layer output/input alias",
+              error);
+        if (!rejected) return false;
+    }
+    {
+        auto reusable_layers = layer_buffers;
+        reusable_layers.back().tail = steps.slice(
+            kAcceptedRows * sizeof(StepRow), kTailBytes);
+        auto command = context.make_command_buffer(
+            "QSA indexer batch permits inactive StepRow suffix reuse", error);
+        check(command != nullptr, "create QSA inactive-suffix command", error);
+        if (!command) return false;
+        const bool accepted = encode_qsa_indexer_commit_batch(
+            context, *command, kAcceptedRows, kCellCapacity, kRopeZeroCos,
+            kRopeZeroSin, reusable_layers, error);
+        const bool allowed = accepted &&
+            reusable_layers.back().tail.length == kTailBytes &&
+            state_unchanged();
+        check(allowed,
+              "QSA indexer batch permits output reuse beyond active StepRows",
+              error);
+        command->discard();
+        if (!allowed) return false;
+    }
+    {
+        auto reusable_layers = layer_buffers;
+        reusable_layers.back().tail =
+            rope.slice(kRopeBytes, kTailBytes);
+        auto command = context.make_command_buffer(
+            "QSA indexer batch permits inactive RoPE suffix reuse", error);
+        check(command != nullptr, "create QSA RoPE-suffix command", error);
+        if (!command) return false;
+        const bool accepted = encode_qsa_indexer_commit_batch(
+            context, *command, kAcceptedRows, kCellCapacity, kRopeZeroCos,
+            kRopeZeroSin, reusable_layers, error);
+        const bool allowed = accepted &&
+            reusable_layers.back().tail.length == kTailBytes &&
+            state_unchanged();
+        check(allowed,
+              "QSA indexer batch permits output reuse beyond active RoPE",
+              error);
+        command->discard();
+        if (!allowed) return false;
+    }
+    {
+        auto invalid_layers = layer_buffers;
+        invalid_layers.back().steps =
+            steps.slice(0u, sizeof(StepRow) - 1u);
+        auto command = context.make_command_buffer(
+            "QSA indexer batch caller-owned rollback", error);
+        check(command != nullptr, "create QSA batch rollback command", error);
+        if (!command) return false;
+        const bool accepted = Encoder::encode(
+            context, *command, "QSA indexer batch enclosing transaction",
+            [&](Encoder& encoder, std::string& encode_error) {
+                if (!encode_qsa_indexer_append(
+                        context, encoder, kAcceptedRows, kCellCapacity,
+                        QsaIndexerAppendMode::commit, 0u, kRopeZeroCos,
+                        kRopeZeroSin, layer_buffers[0], encode_error)) {
+                    return false;
+                }
+                return encode_qsa_indexer_commit_batch(
+                    context, encoder, kAcceptedRows, kCellCapacity,
+                    kRopeZeroCos, kRopeZeroSin, invalid_layers,
+                    encode_error);
+            },
+            error);
+        const bool rejected = !accepted &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find("step rows buffer is undersized or misaligned") !=
+                std::string::npos &&
+            state_unchanged();
+        check(rejected,
+              "caller-owned QSA batch failure discards earlier replay",
+              error);
+        if (!rejected) return false;
+    }
+
+    auto command = context.make_command_buffer(
+        "QSA indexer all-layer accepted-prefix commit", error);
+    check(command != nullptr, "create QSA indexer commit batch command",
+          error);
+    if (!command) return false;
+    const QsaIndexerSnapshotBuffers snapshot_buffers{
+        tails, block_positions, tail_snapshot, block_pos_snapshot};
+    const bool encoded = Encoder::encode(
+        context, *command, "QSA indexer speculative and accepted replay",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_qsa_indexer_snapshot(
+                    context, encoder, kTailFloats, 1u, snapshot_buffers,
+                    encode_error)) {
+                return false;
+            }
+            for (std::uint32_t layer = 0u; layer < kLayers; ++layer) {
+                if (!encode_qsa_indexer_append(
+                        context, encoder, kRows, kCellCapacity,
+                        QsaIndexerAppendMode::window, layer, kRopeZeroCos,
+                        kRopeZeroSin, layer_buffers[layer], encode_error)) {
+                    return false;
+                }
+            }
+            return encode_qsa_indexer_commit_batch(
+                context, encoder, kAcceptedRows, kCellCapacity,
+                kRopeZeroCos, kRopeZeroSin, layer_buffers, encode_error);
+        },
+        error);
+    check(encoded, "encode all-layer QSA indexer commit batch", error);
+    if (!encoded || !command->commit(error)) {
+        check(false, "submit all-layer QSA indexer commit batch", error);
+        return false;
+    }
+    id<MTLCommandBuffer> native =
+        (__bridge id<MTLCommandBuffer>)command->unsafe_native_handle();
+    if (native == nil) {
+        check(false, "QSA indexer commit batch native command buffer",
+              "command buffer became unavailable");
+        return false;
+    }
+    [native waitUntilCompleted];
+    if (native.status != MTLCommandBufferStatusCompleted) {
+        error = native.error.localizedDescription.UTF8String != nullptr
+            ? native.error.localizedDescription.UTF8String
+            : "Metal command buffer failed";
+        check(false, "QSA indexer commit batch GPU completion", error);
+        return false;
+    }
+
+    bool tails_match = true;
+    bool block_positions_match = true;
+    bool dead_match = true;
+    bool pooled_match = true;
+    bool inputs_unchanged =
+        std::memcmp(steps.contents, initial_step_storage.data(),
+                    steps.length) == 0 &&
+        std::memcmp(rope.contents, expected_rope.data(), kRopeBytes) == 0;
+    for (std::uint32_t layer = 0u; layer < kLayers; ++layer) {
+        const BufferRef tail_view = layer_buffers[layer].tail;
+        const BufferRef dead_view = layer_buffers[layer].dead;
+        const BufferRef pooled_view = layer_buffers[layer].pooled;
+        const auto* actual_tail =
+            static_cast<const float*>(tail_view.contents);
+        const auto* actual_dead =
+            static_cast<const float*>(dead_view.contents);
+        const auto* actual_pooled =
+            static_cast<const float*>(pooled_view.contents);
+        tails_match &= !twin::compare_bytes(
+            std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(actual_tail),
+                kTailBytes),
+            std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(
+                    expected[layer].tail.data()),
+                kTailBytes));
+        const std::int32_t actual_block_position =
+            *static_cast<const std::int32_t*>(
+                layer_buffers[layer].block_position.contents);
+        block_positions_match &=
+            actual_block_position == expected[layer].block_position;
+        std::vector<twin::tf> expected_dead(kDeadFloats);
+        std::transform(expected[layer].dead.begin(),
+                       expected[layer].dead.end(), expected_dead.begin(),
+                       [](float value) { return twin::tf{value}; });
+        dead_match &= !twin::compare_floats(
+            std::span<const float>(actual_dead, kDeadFloats), expected_dead,
+            {twin::Comparison::units, 64.0});
+        std::vector<twin::tf> expected_pooled(kPooledFloats);
+        std::transform(expected[layer].pooled.begin(),
+                       expected[layer].pooled.end(), expected_pooled.begin(),
+                       [](float value) { return twin::tf{value}; });
+        pooled_match &= !twin::compare_floats(
+            std::span<const float>(actual_pooled, kPooledFloats),
+            expected_pooled, {twin::Comparison::units, 64.0});
+        inputs_unchanged &=
+            std::memcmp(layer_buffers[layer].raw_keys.contents,
+                        raw_keys[layer].data(), kRawLayerBytes) == 0 &&
+            std::memcmp(layer_buffers[layer].gamma.contents,
+                        gammas[layer].data(), kGammaLayerBytes) == 0;
+    }
+    check(tails_match,
+          "all 12 QSA tails match accepted-prefix replay exactly");
+    check(block_positions_match,
+          "all 12 QSA block positions match accepted-prefix replay");
+    check(dead_match, "all 12 QSA spare keys match U(64)");
+    check(pooled_match,
+          "all 12 QSA pooled rows preserve and replay the right blocks");
+    check(inputs_unchanged,
+          "QSA indexer batch preserves per-layer replay inputs");
+
+    std::vector<std::uint8_t> expected_snapshot(kLayers * kTailBytes);
+    std::vector<std::int32_t> expected_snapshot_positions(
+        initial_block_positions);
+    std::memcpy(expected_snapshot.data(), initial_tails.data(),
+                expected_snapshot.size());
+    const bool snapshots_match =
+        std::memcmp(tail_snapshot.contents, expected_snapshot.data(),
+                    expected_snapshot.size()) == 0 &&
+        std::memcmp(block_pos_snapshot.contents,
+                    expected_snapshot_positions.data(),
+                    expected_snapshot_positions.size() *
+                        sizeof(std::int32_t)) == 0;
+    check(snapshots_match, "QSA batch uses the packed all-layer snapshot");
+    return tails_match && block_positions_match && dead_match &&
+           pooled_match && inputs_unchanged && snapshots_match;
+}
+
 bool test_indexer_append_validation(Context& context,
                                    Context& foreign_context) {
     constexpr std::uint32_t kRows = 2u;
@@ -5839,12 +6382,17 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: metal_qsa_test strata.metallib "
-                     "[--seed N] [--input-set random|edge|fixture]\n");
+                     "[--seed N] [--input-set random|edge|fixture] "
+                     "[--indexer-commit-batch]\n");
         return 2;
     }
+    const bool indexer_commit_batch_only =
+        argc == 3 &&
+        std::string_view(argv[2]) == "--indexer-commit-batch";
     twin::Options options;
     std::string error;
-    if (!twin::parse_options(argc, argv, 2, options, error)) {
+    if (!indexer_commit_batch_only &&
+        !twin::parse_options(argc, argv, 2, options, error)) {
         std::fprintf(stderr, "%s\n", error.c_str());
         return 2;
     }
@@ -5860,6 +6408,13 @@ int main(int argc, char** argv) {
     auto context = Context::open(context_options, error);
     check(context != nullptr, "open Metal context", error);
     if (!context) return 1;
+    if (indexer_commit_batch_only) {
+        const bool passed = test_indexer_commit_batch(*context);
+        check(passed && g_failures == 0,
+              "QSA indexer all-layer accepted-prefix commit batch");
+        std::printf("metal_qsa_test: %d failures\n", g_failures);
+        return g_failures == 0 ? 0 : 1;
+    }
     ContextOptions foreign_options = context_options;
     foreign_options.pipelines = false;
     auto foreign_context = Context::open(foreign_options, error);

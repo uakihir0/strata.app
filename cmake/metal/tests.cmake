@@ -327,6 +327,18 @@ strata_metal_test(metal_qsa_test_concurrent metal
 set_tests_properties(metal_qsa_test_concurrent PROPERTIES
   TIMEOUT 300
   ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
+strata_metal_test(metal_qsa_indexer_commit_batch_test metal
+                  metal_qsa_test ${STRATA_METALLIB}
+                  --indexer-commit-batch)
+set_tests_properties(metal_qsa_indexer_commit_batch_test PROPERTIES
+  TIMEOUT 300
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial")
+strata_metal_test(metal_qsa_indexer_commit_batch_test_concurrent metal
+                  metal_qsa_test ${STRATA_METALLIB}
+                  --indexer-commit-batch)
+set_tests_properties(metal_qsa_indexer_commit_batch_test_concurrent PROPERTIES
+  TIMEOUT 300
+  ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
 
 add_executable(metal_attn_test tests/metal/metal_attn_test.mm)
 target_include_directories(metal_attn_test PRIVATE ${STRATA_METAL_GENERATED_DIR})

@@ -4,6 +4,7 @@
 #include "strata/metal/context.hpp"
 
 #include <cstdint>
+#include <span>
 #include <string>
 
 namespace strata::metal {
@@ -309,6 +310,26 @@ bool encode_qsa_indexer_append(
     QsaIndexerAppendMode mode, std::uint32_t qsa_layer_index,
     float rope_zero_cos, float rope_zero_sin,
     const QsaIndexerAppendBuffers& buffers, std::string& error);
+
+/// Restore each QSA indexer from the shared packed snapshot, then replay the
+/// accepted prefix in layer order. `layers` must contain exactly 12 entries;
+/// each entry supplies that layer's raw keys, gamma and mutable indexer views,
+/// while steps, RoPE and both snapshot views must be identical across entries.
+/// All layer views are preflighted, including cross-layer output/input aliases
+/// over the active read/write extents, before the first append is encoded.
+/// Unused input suffixes may share storage with a disjoint output range. The
+/// caller-owned form requires an ordered Encoder segment and must propagate
+/// false from its enclosing body.
+bool encode_qsa_indexer_commit_batch(
+    Context& context, Encoder& encoder, std::uint32_t accepted_rows,
+    std::uint32_t cell_capacity, float rope_zero_cos, float rope_zero_sin,
+    std::span<const QsaIndexerAppendBuffers> layers, std::string& error);
+/// Standalone transactional form; failure discards the complete batch.
+bool encode_qsa_indexer_commit_batch(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t accepted_rows, std::uint32_t cell_capacity,
+    float rope_zero_cos, float rope_zero_sin,
+    std::span<const QsaIndexerAppendBuffers> layers, std::string& error);
 
 /// Score all indexer blocks needed by 1..8 query rows. `cell_capacity` must
 /// be a positive multiple of four addressable by StepRow. `pooled` contains
