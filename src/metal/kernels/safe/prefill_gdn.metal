@@ -1,6 +1,7 @@
 // Prefill GDN post-projection kernels (docs/mac/04 §6.4).
 #include "../common/math.h"
 #include "../common/params.h"
+#include "../common/reduce.h"
 
 using namespace metal;
 
@@ -91,6 +92,27 @@ kernel void strata_pf_gdn_conv_hist(
     for (uint k = 0u; k < GDN_CONV_KERNEL - 1u; ++k) {
         history[history_base + k] = next[k];
     }
+}
+
+[[max_total_threads_per_threadgroup(128)]]
+kernel void strata_pf_gdn_l2(
+    device float* h [[buffer(0)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint warp [[simdgroup_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]]) {
+    const ulong index =
+        ulong(group.y) * GDN_CONV_CHANNELS +
+        ulong(group.x) * GDN_HEAD_DIM + tid;
+    const float value = h[index];
+    threadgroup float partials[4];
+    const float partial = bfly_sum(value * value);
+    if (lane == 0u) partials[warp] = partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float sum =
+        ((partials[0] + partials[1]) + partials[2]) + partials[3];
+    h[index] = value * rsqrt(sum + RMS_EPSILON);
 }
 
 [[max_total_threads_per_threadgroup(256)]]

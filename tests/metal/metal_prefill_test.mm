@@ -11,6 +11,7 @@
 #include "strata/metal/prefill_gr_silu_dispatch.hpp"
 #include "strata/metal/prefill_gdn_gates_dispatch.hpp"
 #include "strata/metal/prefill_gdn_conv_dispatch.hpp"
+#include "strata/metal/prefill_gdn_l2_dispatch.hpp"
 #include "strata/metal/prefill_gr_write_norm_dispatch.hpp"
 #include "twin.hpp"
 
@@ -2735,6 +2736,340 @@ bool run_prefill_gdn_conv_history_case(Context& context, std::uint32_t rows,
            convolution_matches && guards;
 }
 
+std::vector<float> prefill_gdn_l2_oracle(std::span<const float> input,
+                                         std::uint32_t rows) {
+    std::vector<float> expected(input.begin(), input.end());
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        const std::size_t row_base =
+            static_cast<std::size_t>(row) * kGdnConvChannels;
+        for (std::uint32_t head = 0u; head < 32u; ++head) {
+            const std::size_t head_base =
+                row_base + static_cast<std::size_t>(head) * 128u;
+            std::array<float, 4u> partials{};
+            for (std::uint32_t warp = 0u; warp < 4u; ++warp) {
+                std::array<float, 32u> squares{};
+                for (std::uint32_t lane = 0u; lane < 32u; ++lane) {
+                    const float value =
+                        input[head_base + warp * 32u + lane];
+                    squares[lane] = value * value;
+                }
+                partials[warp] = xor_butterfly_sum(squares);
+            }
+            const float sum =
+                ((partials[0] + partials[1]) + partials[2]) + partials[3];
+            const float scale = 1.0f / std::sqrt(sum + kEpsilon);
+            for (std::uint32_t column = 0u; column < 128u; ++column) {
+                const std::size_t index = head_base + column;
+                expected[index] = input[index] * scale;
+            }
+        }
+    }
+    return expected;
+}
+
+bool run_prefill_gdn_l2_case(Context& context, std::uint32_t rows,
+                             bool shared_encoder,
+                             bool compose_with_convolution) {
+    const std::string label =
+        "Prefill GDN L2 T=" + std::to_string(rows) +
+        (compose_with_convolution
+             ? " composed"
+             : (shared_encoder ? " shared" : " standalone"));
+    const std::size_t h_bytes =
+        static_cast<std::size_t>(rows) * kGdnConvChannels * sizeof(float);
+    const std::size_t history_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) *
+        (kGdnConvKernel - 1u) * sizeof(float);
+    const std::size_t weight_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) * kGdnConvKernel *
+        sizeof(float);
+    const std::size_t value_count =
+        static_cast<std::size_t>(rows) * kGdnConvChannels;
+    std::vector<float> h(value_count);
+    std::vector<float> history(history_bytes / sizeof(float));
+    std::vector<float> qkv(value_count);
+    std::vector<float> weights(weight_bytes / sizeof(float));
+    const auto input_pattern = [](std::size_t index) {
+        const int centered =
+            static_cast<int>((index * 31u + 9u) % 127u) - 63;
+        return static_cast<float>(centered) * (1.0f / 128.0f);
+    };
+    const auto weight_pattern = [](std::size_t index) {
+        const int centered =
+            static_cast<int>((index * 17u + 3u) % 31u) - 15;
+        return static_cast<float>(centered) * (1.0f / 64.0f);
+    };
+    if (compose_with_convolution) {
+        for (std::size_t index = 0u; index < history.size(); ++index) {
+            history[index] = input_pattern(index + 103u);
+        }
+        for (std::size_t index = 0u; index < qkv.size(); ++index) {
+            qkv[index] = input_pattern(index + 211u);
+        }
+        for (std::size_t index = 0u; index < weights.size(); ++index) {
+            weights[index] = weight_pattern(index + 307u);
+        }
+        for (std::uint32_t row = 0u; row < rows; ++row) {
+            for (std::uint32_t channel = 0u; channel < kGdnConvChannels;
+                 ++channel) {
+                const std::size_t index =
+                    static_cast<std::size_t>(row) * kGdnConvChannels +
+                    channel;
+                const std::size_t weight_base =
+                    static_cast<std::size_t>(channel) * kGdnConvKernel;
+                const float x0 = prefill_gdn_conv_input_oracle(
+                    history, qkv, static_cast<int>(row) - 3, channel);
+                const float x1 = prefill_gdn_conv_input_oracle(
+                    history, qkv, static_cast<int>(row) - 2, channel);
+                const float x2 = prefill_gdn_conv_input_oracle(
+                    history, qkv, static_cast<int>(row) - 1, channel);
+                const float current = qkv[index];
+                const float convolved = std::fma(
+                    current, weights[weight_base + 3u],
+                    std::fma(x2, weights[weight_base + 2u],
+                             std::fma(x1, weights[weight_base + 1u],
+                                      x0 * weights[weight_base])));
+                h[index] = convolved / (1.0f + std::exp(-convolved));
+            }
+        }
+    } else {
+        for (std::size_t index = 0u; index < h.size(); ++index) {
+            h[index] = input_pattern(index + 401u);
+        }
+        if (rows > 0u) {
+            std::fill(h.begin(), h.begin() + 128u, 0.0f);
+            h[0u] = 0.03125f;
+            h[32u] = 0.03125f;
+            h[64u] = 0.03125f;
+            h[96u] = 128.0f;
+        }
+    }
+    const std::vector<float> expected =
+        prefill_gdn_l2_oracle(h, rows);
+    bool order_control_passed = true;
+    if (!compose_with_convolution) {
+        const float p0 = h[0u] * h[0u];
+        const float p1 = h[32u] * h[32u];
+        const float p2 = h[64u] * h[64u];
+        const float p3 = h[96u] * h[96u];
+        const float ordered_sum = ((p0 + p1) + p2) + p3;
+        const float regrouped_sum = (p0 + p2) + (p1 + p3);
+        const float ordered_output =
+            h[96u] * (1.0f / std::sqrt(ordered_sum + kEpsilon));
+        const float regrouped_output =
+            h[96u] * (1.0f / std::sqrt(regrouped_sum + kEpsilon));
+        order_control_passed =
+            ordered_output == expected[96u] &&
+            float_ulp_distance(ordered_output, regrouped_output) >= 2u;
+        check(order_control_passed,
+              label + " distinguishes the specified reduction order",
+              "ordered=" + std::to_string(ordered_output) +
+                  ", regrouped=" + std::to_string(regrouped_output));
+    }
+
+    TestBuffer h_buffer, convolution_reference, history_buffer, qkv_buffer,
+        weights_buffer;
+    std::string error;
+    const bool allocated =
+        h_buffer.allocate(context, label + " h", h_bytes, error) &&
+        (!compose_with_convolution ||
+         (convolution_reference.allocate(context, label + " convolution "
+                                                  "reference",
+                                         h_bytes, error) &&
+          history_buffer.allocate(context, label + " history", history_bytes,
+                                  error) &&
+          qkv_buffer.allocate(context, label + " qkv", h_bytes, error) &&
+          weights_buffer.allocate(context, label + " weights", weight_bytes,
+                                  error)));
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    if (!compose_with_convolution) {
+        std::memcpy(h_buffer.payload().data(), h.data(), h_bytes);
+    } else {
+        std::memcpy(history_buffer.payload().data(), history.data(),
+                    history_bytes);
+        std::memcpy(qkv_buffer.payload().data(), qkv.data(), h_bytes);
+        std::memcpy(weights_buffer.payload().data(), weights.data(),
+                    weight_bytes);
+    }
+    const auto history_before = std::vector<std::uint8_t>(
+        history_buffer.allocation().begin(), history_buffer.allocation().end());
+    const auto qkv_before = std::vector<std::uint8_t>(
+        qkv_buffer.allocation().begin(), qkv_buffer.allocation().end());
+    const auto weights_before = std::vector<std::uint8_t>(
+        weights_buffer.allocation().begin(), weights_buffer.allocation().end());
+    auto command = context.make_command_buffer(label, error);
+    check(command != nullptr, label + " command buffer", error);
+    if (!command) return false;
+    bool encoded = false;
+    if (!compose_with_convolution && !shared_encoder) {
+        encoded = encode_prefill_gdn_l2(
+            context, *command, rows, h_buffer.view(), error);
+    } else {
+        encoded = Encoder::encode(
+            context, *command, label,
+            [&](Encoder& encoder, std::string& encode_error) {
+                if (compose_with_convolution) {
+                    PrefillGDNConvTiledBuffers convolution_buffers{
+                        context.buffers().read_only(history_buffer.view()),
+                        context.buffers().read_only(qkv_buffer.view()),
+                        context.buffers().read_only(weights_buffer.view()),
+                        convolution_reference.view()};
+                    if (!encode_prefill_gdn_conv_tiled(
+                            context, encoder, rows, convolution_buffers,
+                            encode_error)) {
+                        return false;
+                    }
+                    convolution_buffers.output = h_buffer.view();
+                    if (!encode_prefill_gdn_conv_tiled(
+                            context, encoder, rows, convolution_buffers,
+                            encode_error)) {
+                        return false;
+                    }
+                }
+                return encode_prefill_gdn_l2(
+                    context, encoder, rows, h_buffer.view(), encode_error);
+            },
+            error);
+    }
+    check(encoded, label + " production encode", error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    if (!submit_and_wait(command, label, error)) {
+        check(false, label + " Metal dispatch", error);
+        return false;
+    }
+
+    const auto actual = std::span<const float>(
+        reinterpret_cast<const float*>(h_buffer.payload().data()), value_count);
+    const auto reference_convolution =
+        compose_with_convolution
+            ? std::span<const float>(
+                  reinterpret_cast<const float*>(
+                      convolution_reference.payload().data()),
+                  value_count)
+            : std::span<const float>(h.data(), h.size());
+    std::uint64_t max_qk_ulp = 0u;
+    const std::uint64_t sentinel_ulp =
+        compose_with_convolution
+            ? 0u
+            : float_ulp_distance(actual[96u], expected[96u]);
+    bool value_heads_unchanged = true;
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        const std::size_t row_base =
+            static_cast<std::size_t>(row) * kGdnConvChannels;
+        for (std::size_t index = 0u; index < 32u * 128u; ++index) {
+            max_qk_ulp = std::max(
+                max_qk_ulp,
+                float_ulp_distance(actual[row_base + index],
+                                   expected[row_base + index]));
+        }
+        for (std::size_t index = 32u * 128u;
+             index < kGdnConvChannels; ++index) {
+            value_heads_unchanged &=
+                actual[row_base + index] ==
+                reference_convolution[row_base + index];
+        }
+    }
+    const bool qk_match = max_qk_ulp <= 32u;
+    check(qk_match, label + " q/k reduction oracle",
+          "max ULP=" + std::to_string(max_qk_ulp) + ", limit=32");
+    const bool sentinel_match =
+        compose_with_convolution || sentinel_ulp <= 1u;
+    if (!compose_with_convolution) {
+        check(sentinel_match,
+              label + " cancellation-sensitive reduction sentinel",
+              "ULP=" + std::to_string(sentinel_ulp) + ", limit=1");
+    }
+    check(value_heads_unchanged, label + " value heads remain unchanged");
+    const bool inputs_unchanged =
+        !compose_with_convolution ||
+        (std::equal(history_before.begin(), history_before.end(),
+                    history_buffer.allocation().begin()) &&
+         std::equal(qkv_before.begin(), qkv_before.end(),
+                    qkv_buffer.allocation().begin()) &&
+         std::equal(weights_before.begin(), weights_before.end(),
+                    weights_buffer.allocation().begin()));
+    check(inputs_unchanged, label + " convolution inputs remain read-only");
+    const bool guards =
+        h_buffer.guards_intact() &&
+        (!compose_with_convolution ||
+         (convolution_reference.guards_intact() &&
+          history_buffer.guards_intact() && qkv_buffer.guards_intact() &&
+          weights_buffer.guards_intact()));
+    check(guards, label + " guard regions");
+    return order_control_passed && qk_match && sentinel_match &&
+           value_heads_unchanged && inputs_unchanged && guards;
+}
+
+bool test_prefill_gdn_l2_epsilon_sentinel(Context& context) {
+    const std::string label = "Prefill GDN L2 epsilon sentinel";
+    constexpr std::size_t h_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) * sizeof(float);
+    std::vector<float> input(kGdnConvChannels, 0.0f);
+    input[0u] = 0.001f;
+    const std::vector<float> expected =
+        prefill_gdn_l2_oracle(input, 1u);
+    const float without_epsilon =
+        input[0u] *
+        (1.0f / std::sqrt(input[0u] * input[0u]));
+    const bool epsilon_control =
+        float_ulp_distance(expected[0u], without_epsilon) > 100000u;
+    check(epsilon_control, label + " distinguishes omitted epsilon",
+          "with epsilon=" + std::to_string(expected[0u]) +
+              ", without=" + std::to_string(without_epsilon));
+
+    TestBuffer h;
+    std::string error;
+    if (!h.allocate(context, label + " h", h_bytes, error)) {
+        check(false, label + " allocate buffer", error);
+        return false;
+    }
+    bool passed = epsilon_control;
+    for (const bool shared_encoder : {false, true}) {
+        const std::string form =
+            shared_encoder ? " caller-owned" : " standalone";
+        std::memcpy(h.payload().data(), input.data(), h_bytes);
+        auto command = context.make_command_buffer(label + form, error);
+        if (!command) {
+            check(false, label + form + " command buffer", error);
+            return false;
+        }
+        const bool encoded =
+            shared_encoder
+                ? Encoder::encode(
+                      context, *command, label + form,
+                      [&](Encoder& encoder, std::string& encode_error) {
+                          return encode_prefill_gdn_l2(
+                              context, encoder, 1u, h.view(), encode_error);
+                      },
+                      error)
+                : encode_prefill_gdn_l2(context, *command, 1u, h.view(),
+                                        error);
+        check(encoded, label + form + " production encode", error);
+        if (!encoded) {
+            command->discard();
+            return false;
+        }
+        if (!submit_and_wait(command, label + form, error)) {
+            check(false, label + form + " Metal dispatch", error);
+            return false;
+        }
+        const float actual =
+            *reinterpret_cast<const float*>(h.payload().data());
+        const std::uint64_t ulp = float_ulp_distance(actual, expected[0u]);
+        const bool matches = ulp <= 2u;
+        check(matches, label + form + " retains epsilon",
+              "ULP=" + std::to_string(ulp) + ", limit=2");
+        const bool guards = h.guards_intact();
+        check(guards, label + form + " guard regions");
+        passed &= matches && guards;
+    }
+    return passed;
+}
+
 bool reject_prefill_gdn_conv_tiled_call(
     Context& context, std::uint32_t rows,
     const PrefillGDNConvTiledBuffers& buffers,
@@ -2931,6 +3266,170 @@ bool test_prefill_gdn_conv_history_validation(Context& context,
         "not owned by this Context",
         label + " rejects foreign Context QKV");
     return passed;
+}
+
+bool reject_prefill_gdn_l2_call(Context& context, std::uint32_t rows,
+                                BufferRef h, std::string_view expected_error,
+                                const std::string& label) {
+    std::string error;
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, "rejected Prefill GDN L2",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_gdn_l2(context, encoder, rows, h,
+                                         encode_error);
+        },
+        error);
+    const bool right_error =
+        !encoded && error.find(expected_error) != std::string::npos;
+    check(right_error, label, error);
+    return right_error;
+}
+
+bool test_prefill_gdn_l2_validation(Context& context,
+                                    Context& foreign_context) {
+    const std::string label = "Prefill GDN L2 validation";
+    constexpr std::size_t row_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) * sizeof(float);
+    TestBuffer h, foreign_h;
+    std::string error;
+    const bool allocated =
+        h.allocate(context, label + " h", row_bytes, error) &&
+        foreign_h.allocate(foreign_context, label + " foreign h", row_bytes,
+                           error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    bool passed = true;
+    passed &= reject_prefill_gdn_l2_call(
+        context, 0u, h.view(), "row count", label + " rejects zero rows");
+    passed &= reject_prefill_gdn_l2_call(
+        context, kPrefillMaxShaderRows + 1u, {},
+        "row count", label + " rejects shader-unsafe rows");
+    passed &= reject_prefill_gdn_l2_call(
+        context, 1u, h.view().slice(0u, row_bytes - sizeof(float)),
+        "undersized or misaligned", label + " rejects short h view");
+    BufferRef raw_misaligned =
+        context.buffers().allocate(label + " misaligned backing",
+                                   row_bytes + 1u, error);
+    if (!raw_misaligned) {
+        check(false, label + " allocate misaligned backing", error);
+        return false;
+    }
+    const BufferRef misaligned_h =
+        raw_misaligned.slice(1u, row_bytes);
+    passed &= reject_prefill_gdn_l2_call(
+        context, 1u, misaligned_h, "undersized or misaligned",
+        label + " rejects misaligned h view");
+    passed &= reject_prefill_gdn_l2_call(
+        context, 1u, foreign_h.view(), "not owned by this Context",
+        label + " rejects foreign Context h");
+    return passed;
+}
+
+bool test_prefill_gdn_l2_open_concurrent_group_rejected(Context& context) {
+    const char* const dispatch = std::getenv("STRATA_METAL_DISPATCH");
+    if (dispatch == nullptr || std::string_view(dispatch) != "concurrent") {
+        return true;
+    }
+    const std::string label =
+        "Prefill GDN L2 rejects open concurrent group";
+    constexpr std::size_t h_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) * sizeof(float);
+    TestBuffer h;
+    std::string error;
+    if (!h.allocate(context, label + " h", h_bytes, error)) {
+        check(false, label + " allocate buffer", error);
+        return false;
+    }
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, "open concurrent Prefill GDN L2",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encoder.group_begin(encode_error)) return false;
+            return encode_prefill_gdn_l2(context, encoder, 1u, h.view(),
+                                         encode_error);
+        },
+        error);
+    const bool rejected =
+        !encoded && error.find("ordered concurrent-group boundary") !=
+                        std::string::npos;
+    check(rejected, label, error);
+    return rejected;
+}
+
+bool test_prefill_gdn_l2_failure_discards_prior_dispatch(Context& context) {
+    const std::string label =
+        "Prefill GDN L2 failure discards prior dispatch";
+    constexpr std::size_t h_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) * sizeof(float);
+    TestBuffer h;
+    std::string error;
+    if (!h.allocate(context, label + " h", h_bytes, error)) {
+        check(false, label + " allocate buffer", error);
+        return false;
+    }
+    std::vector<float> initial(kGdnConvChannels);
+    for (std::size_t index = 0u; index < initial.size(); ++index) {
+        initial[index] =
+            static_cast<float>(static_cast<int>(index % 101u) - 50) / 64.0f;
+    }
+    std::memcpy(h.payload().data(), initial.data(), h_bytes);
+    const auto before = std::vector<std::uint8_t>(
+        h.allocation().begin(), h.allocation().end());
+
+    auto caller_command = context.make_command_buffer(label + " shared", error);
+    if (!caller_command) {
+        check(false, label + " shared command buffer", error);
+        return false;
+    }
+    const bool caller_encoded = Encoder::encode(
+        context, *caller_command, "Prefill GDN L2 shared rollback",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_prefill_gdn_l2(context, encoder, 1u, h.view(),
+                                       encode_error)) {
+                return false;
+            }
+            return encode_prefill_gdn_l2(context, encoder, 0u, {},
+                                         encode_error);
+        },
+        error);
+    const bool caller_discarded =
+        caller_command->unsafe_native_handle() == nullptr;
+    const bool caller_unchanged =
+        !caller_encoded && caller_discarded &&
+        error.find("row count") != std::string::npos &&
+        std::equal(before.begin(), before.end(), h.allocation().begin());
+    check(caller_unchanged, label + " caller-owned Encoder rollback", error);
+
+    auto standalone_command =
+        context.make_command_buffer(label + " standalone", error);
+    if (!standalone_command) {
+        check(false, label + " standalone command buffer", error);
+        return false;
+    }
+    const bool first_standalone =
+        encode_prefill_gdn_l2(context, *standalone_command, 1u, h.view(),
+                              error);
+    const bool second_standalone =
+        first_standalone && encode_prefill_gdn_l2(
+                                context, *standalone_command, 0u, {}, error);
+    const bool standalone_discarded =
+        standalone_command->unsafe_native_handle() == nullptr;
+    const bool standalone_unchanged =
+        first_standalone && !second_standalone && standalone_discarded &&
+        error.find("row count") != std::string::npos &&
+        std::equal(before.begin(), before.end(), h.allocation().begin());
+    check(standalone_unchanged, label + " standalone wrapper rollback",
+          error);
+    return caller_unchanged && standalone_unchanged;
 }
 
 bool test_prefill_gdn_conv_history_open_concurrent_group_rejected(
@@ -3488,6 +3987,8 @@ int main(int argc, char** argv) {
                                                      *foreign_context);
     passed &= test_prefill_gdn_conv_history_validation(*context,
                                                         *foreign_context);
+    passed &= test_prefill_gdn_l2_validation(*context, *foreign_context);
+    passed &= test_prefill_gdn_l2_epsilon_sentinel(*context);
     const std::array<std::uint32_t, 3> rows{1u, 3u, 8u};
     const std::array<PrefillBF16X2Mode, 3> modes{
         PrefillBF16X2Mode::off,
@@ -3530,6 +4031,7 @@ int main(int argc, char** argv) {
         test_prefill_gdn_conv_tiled_failure_discards_prior_dispatch(*context);
     passed &= test_prefill_gdn_conv_history_failure_discards_prior_dispatch(
         *context);
+    passed &= test_prefill_gdn_l2_failure_discards_prior_dispatch(*context);
     passed &= test_open_concurrent_group_rejected(*context);
     passed &= test_silu_open_concurrent_group_rejected(*context);
     passed &= test_gr_mix_open_concurrent_group_rejected(*context);
@@ -3548,6 +4050,7 @@ int main(int argc, char** argv) {
         test_prefill_gdn_conv_tiled_open_concurrent_group_rejected(*context);
     passed &=
         test_prefill_gdn_conv_history_open_concurrent_group_rejected(*context);
+    passed &= test_prefill_gdn_l2_open_concurrent_group_rejected(*context);
     for (const std::uint32_t gate_rows : {1u, 3u, 8u}) {
         passed &= run_prefill_gdn_gates_case(*context, gate_rows, false);
         passed &= run_prefill_gdn_gates_case(*context, gate_rows, true);
@@ -3568,6 +4071,14 @@ int main(int argc, char** argv) {
         passed &=
             run_prefill_gdn_conv_history_case(*context, composed_rows, true,
                                               true);
+    }
+    for (const std::uint32_t l2_rows : {1u, 2u, 3u, 8u, 65u}) {
+        passed &= run_prefill_gdn_l2_case(*context, l2_rows, false, false);
+        passed &= run_prefill_gdn_l2_case(*context, l2_rows, true, false);
+    }
+    for (const std::uint32_t composed_rows : {1u, 2u, 8u, 65u}) {
+        passed &=
+            run_prefill_gdn_l2_case(*context, composed_rows, true, true);
     }
     if (g_failures != 0) {
         std::fprintf(stderr, "%d Prefill Metal test(s) failed\n", g_failures);
