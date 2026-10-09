@@ -2946,6 +2946,19 @@ writes, with `row(c) = {c, c + 1, (c + 1) / 4, window > 0 ? min(c + 1, window) :
   serial/concurrent twin uses a synthetic complete 675 MiB blob and
   independent scalar references. Production `MtpRuntimeStorage` view binding
   and inspected-model parity remain open.
+- Stages 18–19's `encode_mtp_shared_ffn_write` quantizes the `mixed` row to
+  Q8_1, runs the shared expert, combines its sigmoid-gated output with stage
+  17's `parts` and stage 16's route weights, then applies the combined vector
+  to the MTP GR residual. It requires T=1, keeps the full parameter block
+  disjoint from every active view, rejects the Q8_1 output overlapping any
+  later read input or writable scratch, and delegates the ordered shared-FFN,
+  combine and GR-post chain to the validated MoE encoder. The caller keeps
+  every view alive and does not modify inputs, including residual and
+  injection, until GPU completion; the stage reads and then writes residual
+  in place. The serial and concurrent twin checks Q8_1 against the scalar
+  oracle, output parity against the direct shared-FFN/write path, T and alias
+  rejection, concurrent open-group refusal and caller-owned rollback.
+  Production runtime-view binding and inspected-model parity remain open.
 - Stages 2 and 4 are upstream's `native_qsa_rms_norm_weighted`, whose `norm<1024>` (for rows of 1024 or more) is
   the same arithmetic as `native_gr_rms_norm_weighted`. `strata_rms_norm_w` serves both with `n_cols` and the gamma
   period `gp` as `setBytes` constants (section 5.4).

@@ -8719,3 +8719,67 @@ measuring L-15 remain open.
   result is claimed because `STRATA_TEST_MODELS` is unavailable.
 - **Review required:** Production runtime-view binding and inspected-model
   stage-17/full-drafter parity remain open under D-IMPL-333.
+
+### D-IMPL-334: Compose MTP drafter stages 18–19
+
+- **Decision:** Add caller-owned Encoder and standalone transactional forms
+  that quantize the T=1 `mixed` row to Q8_1, run the shared expert, combine
+  it with stage-17 routed parts and stage-16 route weights, then apply the
+  result to the MTP GR residual.
+- **Reason:** The existing shared MoE encoder already implements the
+  validated shared projections, gate, route-weighted combine and GR-post
+  write. Reusing it keeps the math, dispatch order and alias checks aligned
+  with the main model path. This wrapper supplies the MTP-specific Q8_1
+  producer and `MtpParams.T` metadata. It remains an isolated coordinator and
+  does not bind `MtpRuntimeStorage`.
+- **Validation:** The serial/concurrent twin compares the Q8_1 row with the
+  scalar quantizer, all shared and combined outputs with the existing
+  direct MoE path, and the residual with the GR-post oracle. It also checks
+  T=1 enforcement, short and aliased views, parameter separation,
+  caller-owned rollback and concurrent-group rejection. Hostile review added
+  Q8_1 output checks against every active later input, including shared
+  weights, routed parts, route weights, scratch outputs, residual and
+  injection. The public contract now states that the caller keeps every view
+  alive and does not modify inputs, including residual and injection, until
+  GPU completion; the stage reads then writes residual in place. This
+  composes already validated MoE kernels and does not introduce new
+  arithmetic or alter the stage order.
+- **Build and tests:** `cmake --build --preset mac-dev` succeeded. The
+  complete `mac-metal` suite passed 79/79 after the review-driven validation
+  and fixtures were added. The focused serial/concurrent CTests passed 2/2.
+  `mac-host` ran 44 tests: 43 passed and one real-input test was skipped
+  because its model inputs are unavailable. The Python runner passed all
+  35 modules in an isolated environment built from `requirements.txt`.
+  `test_map` passed, `check_drift.py` found no upstream changes and valid
+  golden files, and `git diff --check` passed.
+- **Review required:** Bind the shared tensors and `mixed` row to production
+  MTP runtime views, continue with stages 20–22, and establish parity against
+  an inspected model. Stages 1–5 and the scheduler/upstream-compatible MTP
+  API also remain open.
+
+### REV-131: Hostile review of MTP drafter stages 18–19
+
+- **Scope:** The shared-expert Q8_1 producer, MoE combine/GR-post composition,
+  active view validation, asynchronous input contract, serial/concurrent
+  fixtures, CMake and test-map registrations, and status documentation.
+- **Adversarial findings:** The first review found that the Q8_1 destination
+  could overlap later shared weights, routed parts or route weights. A
+  follow-up also called for checking aliases with all shared weights,
+  downstream scratch, residual and injection before any dispatch; preserving
+  read-only inputs after the MTP path itself; and clarifying that the caller
+  must not modify residual during its asynchronous read/write. Those checks
+  and contract are now explicit, with transactional alias fixtures for each
+  category and a successful-path read-only-input snapshot. Review also
+  caught an inaccurate serial CTest description of open-group coverage; that
+  claim is now limited to the concurrent test. README inventory and stage
+  status are updated. No arithmetic or stage-order defect was reported.
+- **Disposition:** The full Metal suite passed 79/79 after all review-driven
+  validation and fixture additions; the focused serial/concurrent
+  stage-18/19 CTests passed 2/2. The host suite ran 44 tests, with 43 passing
+  and one unavailable-real-input case skipped. The Python runner passed all
+  35 modules in an isolated `requirements.txt` environment. `test_map`,
+  `check_drift.py` and `git diff --check` passed. The public API and testing
+  docs now reflect the asynchronous read/write contract and actual serial vs
+  concurrent coverage.
+- **Review required:** Production runtime-view binding and inspected-model
+  stage-18/19 and full-drafter parity remain open under D-IMPL-334.
