@@ -356,6 +356,14 @@
       "label": "metal",
       "origin": "09 9.1, 04 §5.11, D-IMPL-326, REV-123"
     },
+    "metal_mtp_query_norm_test": {
+      "label": "metal",
+      "origin": "09 9.1, 04 §5.11, D-IMPL-327, REV-124"
+    },
+    "metal_mtp_query_norm_test_concurrent": {
+      "label": "metal",
+      "origin": "09 9.1, 04 §5.11, D-IMPL-327, REV-124"
+    },
     "metal_mv_test": {
       "label": "metal",
       "origin": "09 9.1, D-IMPL-271, D-IMPL-299, REV-096, D-IMPL-305, REV-102, D-IMPL-306"

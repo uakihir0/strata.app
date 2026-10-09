@@ -25,6 +25,8 @@ constexpr std::uint32_t kMtpKvHeadRows = 2u;
 constexpr std::uint32_t kMtpKvHeadWidth = 256u;
 constexpr std::uint32_t kMtpQueryProjectionWidth =
     N_HEAD_Q * 2u * HEAD_DIM;
+constexpr std::uint32_t kMtpQueryHeadWidth =
+    N_HEAD_Q * HEAD_DIM;
 constexpr std::uint32_t kMtpQ8BlockValues = 32u;
 constexpr std::uint32_t kMtpQ81BlockBytes = 36u;
 constexpr std::uint32_t kMtpAddStreamsThreads = 256u;
@@ -39,6 +41,7 @@ static_assert(sizeof(MtpParams) == 236u);
 static_assert(offsetof(MtpParams, T) == 0u);
 static_assert(sizeof(Q81) == kMtpQ81BlockBytes);
 static_assert(kMtpQueryProjectionWidth == 12'288u);
+static_assert(kMtpQueryHeadWidth == 6'144u);
 
 template <class Address>
 bool ranges_overlap(Address left, std::size_t left_bytes,
@@ -653,6 +656,68 @@ bool validate_mtp_query_projection(
     return true;
 }
 
+bool validate_mtp_query_norm(
+    Context& context, const MtpAttentionQueryNormBuffers& buffers,
+    BufferRef& active_steps, std::string& error) {
+    constexpr char operation[] = "MTP attention query norm";
+    const ReadOnlyBufferRef params =
+        context.buffers().read_only(buffers.params);
+    std::uint32_t rows = 0u;
+    if (!read_mtp_rows(context, params, operation, rows, error)) {
+        return false;
+    }
+    if (rows != 1u) {
+        error = std::string(operation) +
+                " requires T=1 for the full-layer pass";
+        return false;
+    }
+
+    constexpr std::size_t q_full_bytes =
+        static_cast<std::size_t>(kMtpQueryProjectionWidth) * sizeof(float);
+    constexpr std::size_t q_norm_bytes = HEAD_DIM * sizeof(float);
+    constexpr std::size_t qcur_bytes =
+        static_cast<std::size_t>(kMtpQueryHeadWidth) * sizeof(float);
+    constexpr std::size_t step_bytes = sizeof(StepRow);
+    if (!validate_buffer_view(context, buffers.params, sizeof(MtpParams),
+                              alignof(MtpParams), operation, "params",
+                              error) ||
+        !validate_buffer_view(context, buffers.q_full, q_full_bytes,
+                              alignof(float), operation, "q_full", error) ||
+        !validate_buffer_view(context, buffers.q_norm, q_norm_bytes,
+                              alignof(float), operation, "q_norm", error) ||
+        !validate_buffer_view(context, buffers.rope, 1u, 1u, operation,
+                              "RoPE", error) ||
+        !validate_output_buffer(context, buffers.qcur, qcur_bytes, operation,
+                                "qcur", error)) {
+        return false;
+    }
+
+    active_steps = buffers.params.slice(offsetof(MtpParams, step), step_bytes);
+    if (!active_steps) {
+        error = std::string(operation) +
+                " cannot form its active StepRow view";
+        return false;
+    }
+
+    const std::array<std::pair<const char*, BufferRef>, 4> views{{
+        {"q_full", buffers.q_full},
+        {"q_norm", buffers.q_norm},
+        {"RoPE", buffers.rope},
+        {"qcur", buffers.qcur},
+    }};
+    const std::array<std::size_t, 4> extents{
+        q_full_bytes, q_norm_bytes, buffers.rope.length, qcur_bytes};
+    for (std::size_t i = 0u; i < views.size(); ++i) {
+        if (overlaps(buffers.params, sizeof(MtpParams), views[i].second,
+                     extents[i])) {
+            error = std::string(operation) + " parameter block overlaps " +
+                    views[i].first;
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 bool encode_mtp_add_streams(Context& context, Encoder& encoder,
@@ -974,6 +1039,49 @@ bool encode_mtp_attention_query_projection(
         context, command_buffer, "MTP attention query projection",
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_mtp_attention_query_projection(
+                context, encoder, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_mtp_attention_query_norm(
+    Context& context, Encoder& encoder,
+    const MtpAttentionQueryNormBuffers& buffers,
+    std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "MTP attention query norm requires an ordered "
+                "concurrent-group boundary";
+        return false;
+    }
+    BufferRef active_steps;
+    if (!validate_mtp_query_norm(context, buffers, active_steps, error)) {
+        return false;
+    }
+
+    const QsaNormRopeBuffers norm_buffers{
+        buffers.q_full, buffers.q_norm, active_steps, buffers.rope,
+        buffers.qcur};
+    if (!encode_qsa_norm_rope(context, encoder, 1u,
+                              QsaNormRopeMode::query, norm_buffers, error)) {
+        return false;
+    }
+    if (buffers.kv_rot &&
+        !encode_qsa_fwht256(context, encoder, N_HEAD_Q, buffers.qcur, error)) {
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
+bool encode_mtp_attention_query_norm(
+    Context& context, CommandBuffer& command_buffer,
+    const MtpAttentionQueryNormBuffers& buffers,
+    std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "MTP attention query norm",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_mtp_attention_query_norm(
                 context, encoder, buffers, encode_error);
         },
         error);

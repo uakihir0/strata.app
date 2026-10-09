@@ -7742,6 +7742,7 @@ measuring L-15 remain open.
 | REV-121 | Implement MTP drafter stage 8 key/value projection | Hostile review found no actionable P1–P3 findings. The stage-8 fixture originally allocated an oversized sink; it now models the named `bo` region at exactly 2560 floats and proves its largest active padded sink use (1536 floats) fits. The scalar oracle independently builds Q8_1 activations and Q8_0 key/value projections for T=1..8 and verifies padded NC rows. `mac-dev` builds; focused stage 6/7/8 and concurrent CTests pass 5/5; `mac-metal` passes 59/59; `mac-host` passes 44/44 with one unavailable real-input case skipped; `test_map` and `git diff --check` pass; the documented `.venv` Python suite passes 35/35 modules (two optional structured-schema tests skipped). | Verify the NC/T active-row contract and scratch lifetimes against model-backed MTP weights; stage 8 remains a typed standalone encoder without runtime-storage wiring |
 | REV-122 | Compose MTP stage 9 K normalization, RoPE, optional rotation and KV append | Hostile review found two P2 lifetime-contract gaps: the API had to require CPU-validated `MtpParams`/StepRows to stay alive and unchanged while GPU dispatches read them, then also name K norm and RoPE as asynchronous read inputs that must remain unchanged through completion. The public contract and both engine/kernel guides now distinguish stable caller inputs from the stage's in-place K, optional V and cache writes. Final hostile re-review found no remaining actionable P1–P3 findings. The `mac-dev` build passes; the focused stage-9 serial/concurrent pair passes 2/2; `mac-metal` passes 61/61; `mac-host` passes 44/44 with one unavailable real-input test skipped; the documented `.venv` Python suite passes 35/35 modules; `test_map` and `git diff --check` pass. | Verify `kv_rot` against the selected runtime KV configuration and establish stage-8→9 parity through `MtpRuntimeStorage` and an inspected model |
 | REV-123 | Implement MTP drafter stage 10 query projection | Initial hostile review identified two P3 gaps: tests did not exercise output/input overlap through stage-8 `xq` (including partial overlap), and engine/kernel docs omitted output-view lifetime. Regressions now use a same-allocation partial `q_full`/`xq` overlap and a `sink`/`xq` overlap; docs require all views to live through GPU completion. The fixture uses the exact named 24×512 `q_full` bind region. Final review confirmed the aligned 2,816-byte partial overlap reaches the alias validator and found no remaining actionable P1–P3 findings. The complete mac-dev build, focused serial/concurrent pair (2/2), mac-metal (63/63), mac-host (44/44 with the unavailable real-input test skipped), Python suite (35/35 modules), test map and diff check pass. | Keep all views alive through completion, reject unsafe read/write aliases, preserve the exact `q_full` bind extent, and compose runtime storage/model-backed parity only in later work |
+| REV-124 | Implement MTP drafter stage 11 query normalization and RoPE | Hostile review found two P3 documentation issues in sequence: an unfilled placeholder and a stale “Final review is pending” status. Both were replaced; final re-review confirmed the fixes and found no remaining actionable findings or implementation defects. On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a), the full mac-dev build succeeds, focused serial/concurrent CTests pass 2/2, mac-metal passes 65/65, mac-host passes 44/44 with one unavailable real-input test skipped, the Python suite passes 35/35 modules, test_map passes with the existing planned-work/missing-check diagnostics, `check_drift.py` reports no upstream changes and a valid golden set, and `git diff --check` passes. | Preserve T=1 full-layer shape, ordered norm/RoPE→optional FWHT, explicit runtime-boundary `kv_rot`, stable asynchronous input lifetimes and rollback coverage; runtime-storage/model parity remains open |
 
 ### D-IMPL-313: Add a per-layer GDN write-through Window block
 
@@ -8398,3 +8399,30 @@ measuring L-15 remain open.
 - **Review required:** See REV-123. Confirm the input and sink lifetimes and
   alias rules; runtime-storage composition and inspected-model stage 8→10
   query parity remain open.
+
+### D-IMPL-327: Compose MTP drafter stage 11 query normalization
+
+- **Decision:** Add caller-owned Encoder and standalone transactional forms
+  for the T=1 query normalization/RoPE stage. Read the active StepRow from the
+  CPU-visible MTP parameter slot, validate the 24×512 `q_full` input, query
+  norm and shared RoPE views, and write the compact 24×256 `qcur` tensor.
+  Append the 24-row FWHT256 pass in the same ordered segment when the caller's
+  explicit `kv_rot` choice is true. Reject invalid positions, unsafe aliases
+  and open concurrent groups before dispatch.
+- **Reason:** The documented stage 11 consumes stage 10's full query rows and
+  the MTP query norm, then uses the active token position and shared RoPE
+  table to produce compact attention queries. O-class KV modes apply FWHT to
+  the resulting query before attention. The existing QSA norm/RoPE and FWHT
+  encoders provide the arithmetic and validation, while this coordinator
+  preserves their required order. Runtime configuration is not yet bound to
+  this isolated entry point, so `kv_rot` remains explicit and review-required.
+- **Validation:** A dedicated Metal fixture compares the qcur results with
+  independent scalar QSA normalization/RoPE and optional FWHT oracles for both
+  `kv_rot` choices, through standalone and caller-owned forms. It checks
+  finite outputs, guards, immutable inputs, malformed T/position, short and
+  foreign views, parameter/input and q_full/qcur aliases, open-group
+  rejection, and rollback after a later invalid call. Full build, focused and
+  suite results plus hostile-review findings are recorded in REV-124.
+- **Review required:** Bind `kv_rot` to the inspected production KV mode;
+  compose stages 6–11 through `MtpRuntimeStorage`, then validate the full
+  stage 8→11 handoff and drafter parity against an inspected model.

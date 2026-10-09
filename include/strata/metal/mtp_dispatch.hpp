@@ -95,6 +95,19 @@ struct MtpAttentionQueryProjectionBuffers {
     BufferRef sink;
 };
 
+/// Inputs and outputs for MTP stage 11. Normalizes/RoPEs the 24 Q heads from
+/// `q_full` into compact `qcur`; `kv_rot` applies an in-place FWHT to qcur
+/// after normalization. Keep all views alive through completion and keep
+/// params, q_full, q_norm and rope unchanged while the GPU reads them.
+struct MtpAttentionQueryNormBuffers {
+    BufferRef params;
+    BufferRef q_full;
+    BufferRef q_norm;
+    BufferRef rope;
+    BufferRef qcur;
+    bool kv_rot = false;
+};
+
 /// Add MTP hidden and embedding streams to the caller-owned Encoder segment.
 /// On failure, the enclosing Encoder::encode body must return false so prior
 /// work in that segment is discarded.
@@ -155,5 +168,16 @@ bool encode_mtp_attention_query_projection(
 bool encode_mtp_attention_query_projection(
     Context& context, CommandBuffer& command_buffer,
     const MtpAttentionQueryProjectionBuffers& buffers, std::string& error);
+
+/// Encode MTP stage 11 for T=1: normalize/RoPE q_full into qcur, then apply
+/// the optional in-place FWHT selected by kv_rot. Both forms require an
+/// ordered concurrent-group boundary. The standalone form is transactional;
+/// the caller-owned form must propagate failure from its Encoder::encode body.
+bool encode_mtp_attention_query_norm(
+    Context& context, Encoder& encoder,
+    const MtpAttentionQueryNormBuffers& buffers, std::string& error);
+bool encode_mtp_attention_query_norm(
+    Context& context, CommandBuffer& command_buffer,
+    const MtpAttentionQueryNormBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal
