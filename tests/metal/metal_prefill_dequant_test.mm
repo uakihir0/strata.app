@@ -1,8 +1,9 @@
-// GPU oracle and buffer-contract tests for Prefill Q8_0 dequantization.
+// GPU oracle and buffer-contract tests for native Prefill dequantization.
 #include "metallib_sha256.inc"
 
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/metal/context.hpp"
+#include "strata/metal/encoder.hpp"
 #include "strata/metal/prefill_dequant_dispatch.hpp"
 
 #include "../../src/metal/kernels/common/types.h"
@@ -32,6 +33,8 @@ constexpr std::uint32_t kColumns = 257u;
 constexpr std::uint32_t kK = 64u;
 constexpr std::uint32_t kValuesPerBlock = 32u;
 
+static_assert(sizeof(block_q4_0) == 18u);
+static_assert(sizeof(block_q5_0) == 22u);
 static_assert(sizeof(block_q8_0) == 34u);
 
 int g_failures = 0;
@@ -100,16 +103,83 @@ bool submit_and_wait(std::unique_ptr<CommandBuffer>& command,
            command->wait_until_completed(error);
 }
 
+template <typename Block>
 std::size_t required_weight_bytes(std::uint32_t n_out, std::uint32_t k) {
     return static_cast<std::size_t>(n_out) * (k / kValuesPerBlock) *
-           sizeof(block_q8_0);
+           sizeof(Block);
 }
 
 std::size_t required_output_bytes(std::uint32_t n_out, std::uint32_t k) {
     return static_cast<std::size_t>(n_out) * k * sizeof(std::uint16_t);
 }
 
-bool expect_rejected(Context& context, const PrefillDequantParams& params,
+using EncodeCommandBuffer = bool (*)(
+    Context&, CommandBuffer&, const PrefillDequantParams&,
+    const PrefillDequantBuffers&, std::string&);
+using EncodeEncoder = bool (*)(Context&, Encoder&,
+                               const PrefillDequantParams&,
+                               const PrefillDequantBuffers&, std::string&);
+
+template <typename Block>
+struct FormatTraits;
+
+template <>
+struct FormatTraits<block_q4_0> {
+    static constexpr const char* name = "Q4_0";
+    static constexpr std::uint32_t code_count = 16u;
+    static constexpr int zero_point = 8;
+    static constexpr EncodeCommandBuffer encode = &encode_prefill_dequant_q4_0;
+    static constexpr EncodeEncoder encode_encoder =
+        &encode_prefill_dequant_q4_0;
+
+    static void store(block_q4_0& block, std::uint32_t value,
+                      std::uint32_t code) {
+        const std::uint32_t shift = (value >> 4u) * 4u;
+        block.qs[value & 15u] |=
+            static_cast<strata_u8>((code & 0x0fu) << shift);
+    }
+
+};
+
+template <>
+struct FormatTraits<block_q5_0> {
+    static constexpr const char* name = "Q5_0";
+    static constexpr std::uint32_t code_count = 32u;
+    static constexpr int zero_point = 16;
+    static constexpr EncodeCommandBuffer encode = &encode_prefill_dequant_q5_0;
+    static constexpr EncodeEncoder encode_encoder =
+        &encode_prefill_dequant_q5_0;
+
+    static void store(block_q5_0& block, std::uint32_t value,
+                      std::uint32_t code) {
+        const std::uint32_t shift = (value >> 4u) * 4u;
+        block.qs[value & 15u] |=
+            static_cast<strata_u8>((code & 0x0fu) << shift);
+        block.qh[value >> 3u] |=
+            static_cast<strata_u8>(((code >> 4u) & 1u) << (value & 7u));
+    }
+
+};
+
+template <>
+struct FormatTraits<block_q8_0> {
+    static constexpr const char* name = "Q8_0";
+    static constexpr std::uint32_t code_count = 255u;
+    static constexpr int zero_point = 127;
+    static constexpr EncodeCommandBuffer encode = &encode_prefill_dequant_q8_0;
+    static constexpr EncodeEncoder encode_encoder =
+        &encode_prefill_dequant_q8_0;
+
+    static void store(block_q8_0& block, std::uint32_t value,
+                      std::uint32_t code) {
+        block.qs[value] =
+            static_cast<strata_i8>(static_cast<int>(code) - 127);
+    }
+
+};
+
+bool expect_rejected(Context& context, EncodeCommandBuffer encode,
+                     const PrefillDequantParams& params,
                      const PrefillDequantBuffers& buffers,
                      std::string_view expected_error,
                      const std::string& label) {
@@ -119,8 +189,7 @@ bool expect_rejected(Context& context, const PrefillDequantParams& params,
         check(false, label + " command buffer", error);
         return false;
     }
-    const bool encoded = encode_prefill_dequant_q8_0(
-        context, *command, params, buffers, error);
+    const bool encoded = encode(context, *command, params, buffers, error);
     const bool rejected =
         !encoded && command->unsafe_native_handle() == nullptr &&
         error.find(expected_error) != std::string::npos;
@@ -128,48 +197,55 @@ bool expect_rejected(Context& context, const PrefillDequantParams& params,
     return rejected;
 }
 
-bool test_q8_0_dequant(Context& context) {
+template <typename Block>
+bool test_dequant_format(Context& context) {
+    using Format = FormatTraits<Block>;
+    const std::string prefix =
+        std::string("Prefill ") + Format::name + " dequant";
     constexpr std::size_t blocks_per_row = kK / kValuesPerBlock;
     const std::size_t weight_bytes =
-        required_weight_bytes(kColumns, kK);
+        required_weight_bytes<Block>(kColumns, kK);
     const std::size_t output_bytes =
         required_output_bytes(kColumns, kK);
     std::string error;
     TestBuffer weights, output;
     const bool allocated =
-        weights.allocate(context, "Prefill Q8_0 weights", weight_bytes + 2u,
+        weights.allocate(context, prefix + " weights", weight_bytes + 2u,
                          error) &&
-        output.allocate(context, "Prefill Q8_0 K-major F16", output_bytes + 2u,
+        output.allocate(context, prefix + " K-major F16", output_bytes + 2u,
                         error);
-    check(allocated, "Prefill Q8_0 dequant allocate buffers", error);
+    check(allocated, prefix + " allocate buffers", error);
     if (!allocated) return false;
 
     constexpr std::array<std::uint16_t, 5> scales{
         0x0001u, 0x0400u, 0x3555u, 0x3c00u, 0x7bffu};
-    std::vector<block_q8_0> source(kColumns * blocks_per_row);
+    std::vector<Block> source(kColumns * blocks_per_row);
     std::vector<std::uint16_t> expected(kColumns * kK);
     for (std::uint32_t column = 0u; column < kColumns; ++column) {
         for (std::uint32_t block_index = 0u;
              block_index < blocks_per_row; ++block_index) {
-            block_q8_0& block =
+            Block& block =
                 source[static_cast<std::size_t>(column) * blocks_per_row +
                        block_index];
+            block = {};
             const std::uint16_t scale =
                 scales[(column + block_index) % scales.size()];
             block.d = static_cast<strata_half>(scale);
             const float expanded_scale =
                 strata::kernels::f32_from_f16(scale);
             for (std::uint32_t value = 0u; value < kValuesPerBlock; ++value) {
-                const auto centered = static_cast<int>(
-                    (column * 13u + block_index * 31u + value * 17u) %
-                    255u);
-                const auto quantized = static_cast<std::int8_t>(centered - 127);
-                block.qs[value] = static_cast<strata_i8>(quantized);
+                const std::uint32_t code =
+                    (column * 13u + block_index * 31u + value * 7u +
+                     (value >> 4u) * 3u) %
+                    Format::code_count;
+                Format::store(block, value, code);
                 const std::uint32_t k =
                     block_index * kValuesPerBlock + value;
                 expected[static_cast<std::size_t>(k) * kColumns + column] =
                     strata::kernels::f16_from_f32(
-                        expanded_scale * static_cast<float>(quantized));
+                        expanded_scale *
+                        static_cast<float>(
+                            static_cast<int>(code) - Format::zero_point));
             }
         }
     }
@@ -182,15 +258,46 @@ bool test_q8_0_dequant(Context& context) {
     const PrefillDequantBuffers buffers{
         context.buffers().read_only(weights.view().slice(0u, weight_bytes)),
         output.view().slice(0u, output_bytes)};
-    auto command = context.make_command_buffer("Prefill Q8_0 dequant", error);
-    check(command != nullptr, "Prefill Q8_0 dequant command buffer", error);
+    auto rollback_command =
+        context.make_command_buffer(prefix + " caller-owned rollback", error);
+    check(rollback_command != nullptr,
+          prefix + " caller-owned rollback command buffer", error);
+    if (!rollback_command) return false;
+    const PrefillDequantParams invalid_params{0u, kK};
+    bool prefix_dispatch_encoded = false;
+    bool late_call_rejected = false;
+    const bool transaction_succeeded = Encoder::encode(
+        context, *rollback_command, prefix + " caller-owned rollback",
+        [&](Encoder& encoder, std::string& encode_error) {
+            prefix_dispatch_encoded = Format::encode_encoder(
+                context, encoder, params, buffers, encode_error);
+            if (!prefix_dispatch_encoded) {
+                return false;
+            }
+            late_call_rejected = !Format::encode_encoder(
+                context, encoder, invalid_params, buffers, encode_error);
+            return false;
+        },
+        error);
+    const bool discard_verified = prefix_dispatch_encoded &&
+        late_call_rejected && !transaction_succeeded &&
+        rollback_command->unsafe_native_handle() == nullptr &&
+        std::all_of(output.payload().begin(), output.payload().end(),
+                    [](std::uint8_t value) { return value == kPoison; });
+    check(discard_verified,
+          prefix + " caller-owned late failure discards the earlier dispatch",
+          error);
+    if (!discard_verified) return false;
+
+    auto command = context.make_command_buffer(prefix, error);
+    check(command != nullptr, prefix + " command buffer", error);
     if (!command) return false;
-    const bool encoded =
-        encode_prefill_dequant_q8_0(context, *command, params, buffers, error);
-    check(encoded, "Prefill Q8_0 dequant encode", error);
+    const bool encoded = Format::encode(context, *command, params, buffers,
+                                        error);
+    check(encoded, prefix + " encode", error);
     if (!encoded) return false;
     const bool completed = submit_and_wait(command, error);
-    check(completed, "Prefill Q8_0 dequant GPU dispatch", error);
+    check(completed, prefix + " GPU dispatch", error);
     if (!completed) return false;
 
     const bool exact =
@@ -202,21 +309,27 @@ bool test_q8_0_dequant(Context& context) {
     const bool trailing_bytes_untouched =
         output_payload[output_bytes] == kPoison &&
         output_payload[output_bytes + 1u] == kPoison;
-    check(exact, "Q8_0 expansion matches exact F16 rounding and K-major layout");
-    check(input_unchanged, "Q8_0 source weights remain unchanged");
+    check(exact, std::string(Format::name) +
+                     " expansion matches exact F16 rounding and K-major layout");
+    check(input_unchanged, std::string(Format::name) +
+                               " source weights remain unchanged");
     check(trailing_bytes_untouched,
-          "Q8_0 dequant leaves unused output bytes untouched");
+          std::string(Format::name) +
+              " dequant leaves unused output bytes untouched");
     check(weights.guards_intact() && output.guards_intact(),
-          "Q8_0 dequant input and output guards");
+          std::string(Format::name) + " dequant input and output guards");
     return exact && input_unchanged && trailing_bytes_untouched &&
            weights.guards_intact() && output.guards_intact();
 }
 
-bool test_validation(Context& context, Context& foreign_context) {
-    const std::string prefix = "Prefill Q8_0 dequant validation";
+template <typename Block>
+bool test_validation_format(Context& context, Context& foreign_context) {
+    using Format = FormatTraits<Block>;
+    const std::string prefix =
+        std::string("Prefill ") + Format::name + " dequant validation";
     const PrefillDequantParams valid{kColumns, kK};
     const std::size_t weight_bytes =
-        required_weight_bytes(kColumns, kK);
+        required_weight_bytes<Block>(kColumns, kK);
     const std::size_t output_bytes =
         required_output_bytes(kColumns, kK);
     std::string error;
@@ -241,22 +354,22 @@ bool test_validation(Context& context, Context& foreign_context) {
     bool passed = true;
     auto invalid = valid;
     invalid.n_out = 0u;
-    passed &= expect_rejected(context, invalid, valid_buffers,
+    passed &= expect_rejected(context, Format::encode, invalid, valid_buffers,
                               "positive signed extents", prefix + " zero N");
     invalid = valid;
     invalid.k = 31u;
-    passed &= expect_rejected(context, invalid, valid_buffers,
+    passed &= expect_rejected(context, Format::encode, invalid, valid_buffers,
                               "positive signed extents", prefix + " short K");
     invalid = valid;
     invalid.k = 33u;
-    passed &= expect_rejected(context, invalid, valid_buffers,
+    passed &= expect_rejected(context, Format::encode, invalid, valid_buffers,
                               "positive signed extents", prefix + " K remainder");
     invalid = valid;
     invalid.n_out =
         static_cast<std::uint32_t>(
             std::numeric_limits<std::int32_t>::max()) +
         1u;
-    passed &= expect_rejected(context, invalid, valid_buffers,
+    passed &= expect_rejected(context, Format::encode, invalid, valid_buffers,
                               "positive signed extents", prefix + " signed N");
     invalid = valid;
     invalid.k =
@@ -265,52 +378,56 @@ bool test_validation(Context& context, Context& foreign_context) {
          kValuesPerBlock +
          1u) *
         kValuesPerBlock;
-    passed &= expect_rejected(context, invalid, valid_buffers,
+    passed &= expect_rejected(context, Format::encode, invalid, valid_buffers,
                               "positive signed extents", prefix + " signed K");
 
     const PrefillDequantBuffers short_weights{
         context.buffers().read_only(
             weights.view().slice(0u, weight_bytes - 1u)),
         valid_buffers.k_major_f16};
-    passed &= expect_rejected(context, valid, short_weights,
+    passed &= expect_rejected(context, Format::encode, valid, short_weights,
                               "weight buffer is undersized",
                               prefix + " short weights");
     const PrefillDequantBuffers short_output{
         valid_buffers.weights, output.view().slice(0u, output_bytes - 1u)};
-    passed &= expect_rejected(context, valid, short_output,
+    passed &= expect_rejected(context, Format::encode, valid, short_output,
                               "output is undersized", prefix + " short output");
 
     const PrefillDequantBuffers misaligned_weights{
         context.buffers().read_only(weights.view().slice(1u, weight_bytes)),
         valid_buffers.k_major_f16};
-    passed &= expect_rejected(context, valid, misaligned_weights, "misaligned",
+    passed &= expect_rejected(context, Format::encode, valid,
+                              misaligned_weights, "misaligned",
                               prefix + " misaligned weights");
     const PrefillDequantBuffers misaligned_output{
         valid_buffers.weights, output.view().slice(1u, output_bytes)};
-    passed &= expect_rejected(context, valid, misaligned_output, "misaligned",
+    passed &= expect_rejected(context, Format::encode, valid,
+                              misaligned_output, "misaligned",
                               prefix + " misaligned output");
 
     const PrefillDequantBuffers overlapping{
         context.buffers().read_only(alias.view().slice(0u, weight_bytes)),
         alias.view().slice(0u, output_bytes)};
-    passed &= expect_rejected(context, valid, overlapping,
+    passed &= expect_rejected(context, Format::encode, valid, overlapping,
                               "overlaps its weights", prefix + " input/output alias");
     const PrefillDequantBuffers partially_overlapping{
         context.buffers().read_only(alias.view().slice(0u, weight_bytes)),
         alias.view().slice(2u, output_bytes)};
     passed &= expect_rejected(
-        context, valid, partially_overlapping, "overlaps its weights",
+        context, Format::encode, valid, partially_overlapping,
+        "overlaps its weights",
         prefix + " partial input/output overlap");
 
     const PrefillDequantBuffers foreign{
         foreign_context.buffers().read_only(foreign_weights.view()),
         valid_buffers.k_major_f16};
-    passed &= expect_rejected(context, valid, foreign,
+    passed &= expect_rejected(context, Format::encode, valid, foreign,
                               "not owned by this Context",
                               prefix + " foreign input");
     const PrefillDequantBuffers foreign_output_buffers{
         valid_buffers.weights, foreign_output.view()};
-    passed &= expect_rejected(context, valid, foreign_output_buffers,
+    passed &= expect_rejected(context, Format::encode, valid,
+                              foreign_output_buffers,
                               "not owned by this Context",
                               prefix + " foreign output");
     return passed;
@@ -339,7 +456,15 @@ int main(int argc, char** argv) {
     check(foreign_context != nullptr, "open foreign Metal Context", error);
     if (!foreign_context) return 1;
 
-    bool passed = test_q8_0_dequant(*context);
-    passed &= test_validation(*context, *foreign_context);
+    bool passed = true;
+    passed &= test_dequant_format<block_q4_0>(*context);
+    passed &= test_validation_format<block_q4_0>(*context,
+                                                 *foreign_context);
+    passed &= test_dequant_format<block_q5_0>(*context);
+    passed &= test_validation_format<block_q5_0>(*context,
+                                                 *foreign_context);
+    passed &= test_dequant_format<block_q8_0>(*context);
+    passed &= test_validation_format<block_q8_0>(*context,
+                                                 *foreign_context);
     return passed && g_failures == 0 ? 0 : 1;
 }

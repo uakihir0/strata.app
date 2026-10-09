@@ -10367,3 +10367,52 @@ measuring L-15 remain open.
   Q8_0 serial/concurrent tests passed 2/2. `mac-host` passed 45/45 with one
   unavailable-real-input test skipped; its `test_map` check passed.
   `git diff --check` passed.
+
+### D-IMPL-365: Add Q4_0 and Q5_0 Prefill dequantizers
+
+- **Decision:** Extend the isolated native Prefill dequantizer to Q4_0 and
+  Q5_0 alongside Q8_0. Share the signed-extent, checked-size, alignment,
+  Context ownership, overlap and transactional-wrapper validation across all
+  three block types. Decode Q4_0's low/high nibbles, Q5_0's nibbles plus
+  high-bit plane, and Q8_0's signed bytes, then write one-round F16 RNE values
+  to K-major `[k][n_out]` scratch.
+- **Reason:** Q4_0 and Q5_0 share the same 32-value block geometry as Q8_0,
+  so the existing host and GPU contracts can be reused while testing distinct
+  packed layouts. Implementing both in the same incremental step covers
+  common simple native formats without claiming support for the other eight
+  formats or production Prefill execution.
+- **Review items:** Independently verify Q4_0 nibble order and Q5_0 `qh`
+  indexing for values 0–31; centered code ranges and half-scale arithmetic;
+  exact F16 conversion; 32-value and output-column edges; per-format block
+  byte sizes; shared checked extents and alignments; input immutability,
+  output guards, aliases, Context ownership and transactional discard; and
+  truthful remaining-format/integration status.
+- **Validation:** Initial serial and concurrent GPU tests passed 2/2 after
+  adding all three formats. Full rebuild, full preset runs and hostile-review
+  disposition are recorded in REV-162.
+
+### REV-162: Hostile review of Q4_0/Q5_0 Prefill dequantization
+
+- **Scope:** Q4_0 nibble decoding, Q5_0 high-bit-plane reconstruction, shared
+  host dispatch validation, exact F16 conversion, GPU oracle and rejection
+  tests, shader manifest/build registration, and documentation.
+- **Findings and fixes:** The first independent review found that the initial
+  code pattern gave values `v` and `v+16` identical low nibbles, masking Q4/Q5
+  nibble-order faults. It also found that command-buffer rejection was
+  covered, but the caller-owned `Encoder&` path had no late-failure rollback
+  fixture. Changed the paired-code pattern so their low nibbles differ, and
+  added per-format composition that encodes a valid dequant dispatch before a
+  later invalid call; the test requires the transaction to discard the
+  command buffer and leave output untouched.
+- **Follow-up:** Review confirmed asymmetric paired codes, then found that
+  the rollback fixture could pass if the valid prefix dispatch itself failed.
+  The test now separately asserts prefix-dispatch success, late-call rejection
+  and transaction discard. Final review confirmed both earlier findings are
+  fixed and reported no further issue.
+- **Disposition:** No actionable implementation, test or documentation
+  findings remain.
+- **Validation:** The full `mac-metal` preset passed 90/90 and `mac-host`
+  passed 45/45 with one unavailable-real-input skip before the additional
+  final test-assertion change. The expanded serial/concurrent tests passed
+  2/2 after all review fixes. The host `test_map` check and
+  `git diff --check` passed.
