@@ -8430,10 +8430,13 @@ measuring L-15 remain open.
 
 ### D-IMPL-328: Implement MTP drafter stage 12 finite-window IDs
 
-- **Decision:** Add caller-owned Encoder and standalone transactional forms
-  for stage 12. Read the T=1 `StepRow` from the CPU-visible parameter slot,
-  require a positive finite window and matching host-published `width`, then
-  write `max(0, n_kv - window) + j` into only the active `mtp_ids` prefix.
+- **Decision:** The initial stage-12 implementation added caller-owned
+  Encoder and standalone transactional forms for finite windows. Stage 12 now
+  also accepts window zero and rewrites the active identity prefix on each
+  runtime pass, as recorded in D-IMPL-346.
+  Read the T=1 `StepRow` from the CPU-visible parameter slot and require its
+  host-published `width` to match the selected finite or full-history mode.
+  Write absolute KV positions into only the active `mtp_ids` prefix.
   Validate the ID region capacity, signed integer range, ownership, alignment
   and active-prefix aliasing; reject an open concurrent group.
 - **Reason:** The MTP attention path addresses cells by absolute KV position,
@@ -8441,8 +8444,9 @@ measuring L-15 remain open.
   therefore must select the newest cells from a longer history without
   reducing those positions modulo the output capacity. The host already
   publishes the matching StepRow width, so the kernel keeps the parameter
-  block read-only. With no finite window this stage is not encoded and the
-  bind-time identity mapping remains in place.
+  block read-only. Rewriting the full-history identity prefix after a finite
+  window prevents stale IDs; D-IMPL-346 supersedes the original decision to
+  skip stage 12 when no finite window is configured.
 - **Validation:** A Metal twin covers short, exact, truncated and long history
   cases, including 262,144 KV cells with a 64-ID capacity, a 4,097-ID
   grid-stride boundary case, signed-range edges, active-prefix contents and
@@ -8451,10 +8455,9 @@ measuring L-15 remain open.
   concurrent-group rejection. The focused serial/concurrent pair passes 2/2
   and the full mac-metal suite passes 67/67; full host, Python, map, drift and
   hostile-review results are recorded in REV-125.
-- **Review required:** Confirm absolute position semantics and capacity/range
-  validation against the runtime bind layout, then wire stage 12 into
-  `MtpRuntimeStorage` and validate the attention handoff with an inspected
-  model.
+- **Review required:** Confirm absolute-position semantics and capacity/range
+  validation against the runtime bind layout. Runtime wiring is recorded in
+  D-IMPL-342; inspected-model parity remains open.
 
 ### D-IMPL-329: Compose MTP drafter stage 13 attention
 
@@ -9011,9 +9014,9 @@ measuring L-15 remain open.
   numerical oracle coverage, scheduler integration or inspected-model
   drafter parity.
 
-### D-IMPL-340: Bind MTP add-streams from runtime storage
+### D-IMPL-340: Bind MTP add-streams from runtime storage (superseded mapping)
 
-- **Decision:** Add `MtpRuntimeStorage::bind_add_streams` to resolve the
+- **Original decision:** Add `MtpRuntimeStorage::bind_add_streams` to resolve the
   selected MTP parameter slot, read-only `h2` and `e2` views, and writable
   `mtp_rin` output for stage 6. The caller must append stage 6 after stages
   1–5 in the same ordered Encoder segment. The stage-6 encoder retains
@@ -9036,6 +9039,10 @@ measuring L-15 remain open.
 - **Review:** REV-137 records the hostile review and final disposition.
   Runtime bindings for stages 7–22, scheduler integration and inspected-model
   drafter parity remain open.
+- **Correction:** The bind-region choice was semantically wrong despite
+  disjoint memory ranges. D-IMPL-343 records the correction: stage 6 writes
+  the dedicated `residual` region, while `mtp_rin` remains the stage-1–5
+  input.
 
 ### REV-137: Hostile review of MTP stage-6 runtime binding
 
@@ -9050,6 +9057,187 @@ measuring L-15 remain open.
   the `mac-dev` build succeeded; focused `metal_mtp_storage_test`,
   `metal_mtp_test` and `metal_mtp_test_concurrent` passed 3/3. The storage
   fixture verifies binding and ordered dispatch, not inspected-model parity.
+
+### D-IMPL-343: Preserve the dedicated MTP residual binding through stage 16
+
+- **Decision:** Correct stage 6 to bind its new R output to the dedicated
+  `residual` region, leaving `mtp_rin` as the stage-1–5 input. Stage 7 and
+  stage 15 both read that same R view. Stage 7 uses the distinct
+  `attn_hyper_connection.*` weights; stage 15 uses
+  `mlp_hyper_connection.*`. Add runtime adapters for stage 15's GR
+  feed-forward read and stage 16's router, then extend the ordered runtime
+  smoke chain through stage 16. The earlier D-IMPL-340 mapping of stage 6's
+  output to `mtp_rin` is superseded.
+- **Reason:** The named arena allocates independent `mtp_rin` and `residual`
+  regions to represent the layer input and MTP's computed R stream. Reusing
+  the input region erased that distinction and did not match the source
+  dataflow. Keeping stage 6's output and stage 7/15's input on `residual`
+  preserves the intended producer/consumer lifetime and leaves `mtp_rin`
+  available for stage-1–5 inputs.
+- **Validation:** The storage fixture checks stage 6's residual output is the
+  dedicated `residual` view, stage 7 and stage 15 consume that same view, and
+  stage 7 resolves all four attention hyperconnection weights while stage 15
+  resolves all four MLP hyperconnection weights. Stage 15/16 also resolve
+  their remaining GR and routing scratch before ordered dispatch. The
+  synthetic T=1 chain dispatches through stage 16; T=5/T=8 coverage continues
+  through stages 1–8. These checks establish runtime binding and dispatch
+  only, not numerical parity, model-backed drafter parity or production
+  scheduling.
+- **Review required:** The earlier hostile review of stage 6 confirmed the
+  memory ranges were disjoint, but missed the semantic mismatch between the
+  input and output named regions. This correction is recorded for renewed
+  review. Runtime bindings for stages 17–22, scheduler integration and
+  inspected-model parity remain open.
+
+### REV-140: Hostile review of MTP residual correction and stages 15–16
+
+- **Scope:** Stage-6 output and stage-7/15 input region identity, runtime
+  binding for feed-forward read and router, the stage-1–16 integration smoke
+  fixture, and synchronized implementation/test documentation.
+- **Findings and disposition:** Hostile review found that stage 15 was bound
+  to the attention hyperconnection weights and that the test repeated the
+  same mistaken expectation. The binder now resolves all four
+  `mlp_hyper_connection.*` tensors, while stage 7 continues to use
+  `attn_hyper_connection.*`; the storage fixture asserts both exact mappings.
+  A fresh review of this correction is pending.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `cmake --build --preset mac-dev` succeeded and the focused
+  runtime-storage plus MTP stages 9–16 serial/concurrent matrix passed
+  17/17. The fixture verifies bindings and dispatch, not inspected-model
+  parity. `test_map.py`, `check_drift.py`, and `git diff --check` are to be
+  rerun after the final documentation and review updates.
+
+### D-IMPL-344: Dispatch MTP routed experts through bounded windows
+
+- **Decision:** Let stage 17 consume either one complete expert blob or an
+  ordered list of read-only expert windows whose ranges cover all 512 experts
+  without gaps or overlap. Dispatch the gate/up and down S2 kernels once per
+  window with its first expert ID and count; only route IDs inside that
+  window dispatch. `MtpRuntimeStorage::bind_routed_experts` resolves these
+  windows from the owner's page-bounded file mapping.
+- **Reason:** A full expert blob may exceed Metal's per-buffer limit even
+  though the underlying source file and the complete model are valid. The
+  runtime owner already maps aligned bounded windows, so dispatch can consume
+  the exact mapped slices without assembling a second full-size GPU buffer.
+  Keep the full-image path available for callers whose allocation fits.
+- **Validation:** When a full expert image fits, the stage-17 fixture compares
+  its GPU output with three windows covering experts `[0,4)`, `[4,9)` and
+  `[9,512)`. A separate data-driven pass derives the first and last expert
+  IDs from every window in the active test partition and checks each batch
+  against the scalar oracle, including partitions determined by the device's
+  maximum buffer length. Serial and concurrent outputs match byte for byte.
+  Runtime storage checks each owner-provided range, mapped extent, Context
+  ownership, first/last expert address and fixture marker. The result verifies
+  kernel behavior and synthetic binding, not inspected-model parity.
+- **Review:** REV-141 closed. The hostile review's conditional boundary
+  coverage finding was resolved by deriving test route batches from the
+  active windows; its per-window mapping finding was resolved with metadata,
+  extent, ownership, address and marker assertions. Production scheduling
+  remains open.
+
+### REV-141: Hostile review of MTP routed-expert windows
+
+- **Scope:** Stage-17 window validation and local expert addressing, runtime
+  expert-window bindings, serial/concurrent boundary fixtures, and status
+  documentation.
+- **Findings and disposition:** The initial review found that the fixed ID 9
+  case did not guarantee coverage of boundaries in the device-derived
+  partition. The test now batches the first and last expert ID of every
+  active window and checks each batch against the scalar oracle. The other
+  initial finding requested per-window runtime metadata and mapping checks;
+  tests now assert those fields, exact extent, Context ownership, first/last
+  addresses and fixture markers. A hostile follow-up found no actionable
+  issues.
+- **Validation:** The `mac-dev` build succeeded and the focused
+  `mac-metal` routed-expert serial/concurrent cases plus runtime-storage test
+  passed 3/3 after the boundary-coverage changes. The full `mac-metal` suite
+  passed 80/80 on the preceding implementation revision.
+
+### D-IMPL-345: Bind the remaining MTP runtime stages
+
+- **Decision:** Add runtime binders for shared-expert/writeback stages 18–19,
+  the final GR mixer at stage 20, the caller-owned main output head at stage
+  21, and the greedy sampler at stage 22. Cache and validate the inspected
+  draft-vocabulary map once when runtime storage opens. Keep its device view
+  read-only, and use the internal prevalidated indexed-head dispatch so each
+  draft token does not rescan the map. Stage 22 accepts only the same
+  immutable map token returned by stage 21. Resolve four shared expert
+  mat-vec sinks in regions whose earlier consumers have completed; use `y[0]`
+  for stage 20/21 only after its earlier output consumer completes.
+- **Reason:** MTP weights, scratch, parameters, KV state and draft IDs belong
+  to one runtime owner, while the main model's output head belongs to
+  `ModelStorage` and must remain a caller-supplied read-only view. Retaining
+  one validated map avoids rescanning more than one hundred thousand IDs for
+  every draft token and prevents the sampler from mapping logits with a
+  different token order than the head projection. Hiding the mutable arena
+  view preserves the validation token's immutable-map contract.
+- **Validation:** Runtime-storage tests assert every stage-18–22 weight and
+  scratch mapping, map identity, wrong-vocabulary failure clearing and
+  wrong-map rejection, and verify the cached map has no mutable bind-region
+  view. The synthetic ordered MTP chain now dispatches stages 1–20; standalone
+  stage-21/22 tests retain their independent numerical oracles. The
+  full-vocabulary head is not dispatched in the storage fixture, and the tests
+  do not establish inspected-model parity or production scheduling.
+- **Review:** Hostile review found and helped correct the stage-15 MLP
+  hyperconnection binding/test expectation, per-token vocabulary-map
+  rescanning, and mutable exposure of the cached device map. It also found
+  that the finite→zero grouped test checked IDs after attention without
+  proving attention consumed them; the fixture now seeds distinguishable
+  K/V rows and compares grouped output with a direct stage-13 identity-ID
+  run. The final follow-up found no actionable issues. Production scheduling
+  remains open.
+
+### REV-142: Hostile review of MTP runtime bindings for stages 18–22
+
+- **Scope:** The new runtime binders, the once-validated vocabulary map,
+  caller-owned main-head weight view, stage-18–20 ordered smoke chain, and
+  documentation claims.
+- **Findings and disposition:** Resolved the findings above. The cached map
+  has no mutable `bind_region` view, and stage 21 uses the private
+  prevalidated indexed-head path while the public indexed API retains its
+  range validation. Final hostile review found no actionable issues.
+- **Validation:** `cmake --build --preset mac-dev` succeeded;
+  `metal_mtp_storage_test` passed with the grouped attention output oracle.
+  The full `mac-metal` suite passed 80/80, `mac-host` passed 44/44 with one
+  unavailable real-input test skipped, and the Python suite passed 35/35
+  modules. `test_map.py`, `check_drift.py` and `git diff --check` passed.
+
+### D-IMPL-346: Refresh MTP attention IDs when leaving a finite window
+
+- **Decision:** Run stage 12 for every runtime-bound attention pass. A zero
+  window writes the identity prefix `[0,n_kv)`; a positive window writes the
+  finite suffix `[max(0,n_kv-window),n_kv)`. Validate the host-published
+  StepRow width against the selected mode.
+- **Reason:** Stage 12 previously ran only for positive windows. After a
+  finite-window pass overwrote the ID prefix, reusing the same runtime for an
+  unwindowed pass consumed those stale IDs and attended to the wrong KV
+  cells. Updating the GPU-owned ID view in order before each attention pass
+  removes mode-history dependence.
+- **Validation:** Stage-12 tests cover zero-window identity generation and a
+  finite-window pass followed by an unwindowed pass on the same ID storage.
+  The grouped runtime regression seeds distinguishable K/V rows, checks the
+  finite and unwindowed attention outputs differ, and matches the grouped
+  unwindowed output against a direct stage-13 run using the refreshed IDs.
+  Serial and concurrent stage-12 variants pass.
+- **Review:** Hostile review confirmed full-history width and bounded ID
+  writes, and the output oracle now proves grouped attention consumes the
+  refreshed identity prefix. Final follow-up found no actionable findings.
+
+### REV-143: Hostile review of MTP attention ID refresh
+
+- **Scope:** Stage-12 zero-window semantics, active-width and StepRow
+  validation, ordered runtime pass composition, finite→unwindowed state
+  reuse, and updated status documentation.
+- **Findings and disposition:** The review first found that checking IDs
+  after the grouped pass did not prove stage 13 had consumed the refreshed
+  values; the grouped output oracle closes that gap. Review also found stale
+  zero-window statements in the kernel guide and D-IMPL-342/328; the guide is
+  corrected and D-IMPL-328/342 now identify the superseded behavior. The
+  final hostile follow-up found no actionable issues.
+- **Validation:** `cmake --build --preset mac-dev` succeeded; the focused
+  serial/concurrent stage-12 tests passed, and the updated
+  `metal_mtp_storage_test` passed with seeded K/V, finite/full output
+  comparison and direct stage-13 identity-ID oracle.
 
 ### D-IMPL-341: Bind MTP attention runtime views for stages 7–8
 
@@ -9108,6 +9296,82 @@ measuring L-15 remain open.
   `check_drift.py` found no upstream changes and a valid golden set;
   `git diff --check` passed. The storage fixture verifies binding and
   dispatch, not inspected-model parity.
+
+### D-IMPL-342: Bind the MTP attention pass for stages 9–14
+
+- **Decision:** Add runtime adapters for stage 9's K/V cache append, stages
+  10–11's query projection and normalization, stage 12's finite or identity
+  window IDs, stage 13's dense attention, and stage 14's gated O projection.
+  Resolve the current K/V rows, norm and projection weights, full/compact
+  query views, canonical MTP cache layout/views, attention scratch and the
+  borrowed main-model RoPE. Stage 10 uses `bo[0]` as its required mat-vec
+  sink; stage 14 uses `y[0]`. `bind_attention_pass` returns stages 9–14 in a
+  private-field bundle whose views are read-only to callers. The caller
+  supplies one noncopyable `MtpAttentionRuntimeMode`; its `kv_rot` is shared
+  by stages 9, 11 and 13. Stage 12 runs on every pass: zero selects the full
+  identity prefix, while a positive finite window selects the matching suffix
+  and must fit the ID region. The combined encoder verifies parameter
+  identity, rotation mode and cross-stage scratch handoffs before dispatch,
+  then appends stages in order. Lower-level stage encoders remain public for
+  specialized callers. This supersedes the earlier bind-time-identity-only
+  behavior recorded before D-IMPL-346.
+- **Reason:** These buffers already belong to the runtime owner and named bind
+  arena, so resolving them there preserves allocation and lifetime identity.
+  K/V cache rotation, query rotation and attention rotation must agree. The
+  owner does not receive the runtime rotation setting, so the caller selects
+  the mode once at the runtime boundary. The immutable grouped binding
+  prevents later mode changes across the supported runtime-bound pass, while
+  direct low-level use retains an explicit caller-owned consistency contract.
+  Encoders continue to validate format, positions, active ranges, alignment
+  and aliases.
+- **Validation:** The T=1 runtime chain now runs a GPU-produced selected token
+  through stages 1–14 in one ordered Encoder segment using the immutable
+  attention-pass bundle. A finite window of one builds the active ID prefix,
+  and a second grouped pass switches the same runtime storage to full history
+  and verifies the identity prefix is refreshed before attention;
+  int8 MTP cache rotation is shared by K/V append, Q normalization and dense
+  attention. T=5 and T=8 continue to cover the preceding stages 1–8 chain.
+  The fixture checks intended cache, RoPE, weight, ID, attention and O
+  projection scratch mappings and verifies that missing shared RoPE or an
+  invalid parameter slot clears a pre-populated pass bundle. Independent
+  stage-9–14 tests retain their numerical oracles. Runtime storage tests are
+  synthetic binding/dispatch smoke tests, not inspected-model parity.
+- **Build and tests:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `cmake --build --preset mac-dev` succeeded and the focused
+  runtime-storage and stage-9–14 serial/concurrent test matrix passed 13/13.
+  `test_map.py` passed with the documented planned-work/missing-check notes,
+  `check_drift.py` found no upstream changes and a valid golden set, and
+  `git diff --check` passed. This slice does not claim full drafter or
+  production scheduler behavior.
+- **Review required:** The caller must resolve `kv_rot` from runtime
+  configuration once and pass the same mode to any lower-level later
+  attention-stage composition. D-IMPL-343 adds runtime bindings for stages
+  15–16; production rotation/configuration, scheduler wiring, runtime
+  bindings for stages 17–22, and inspected-model parity remain open.
+
+### REV-139: Hostile review of MTP stage-9–14 runtime binding
+
+- **Scope:** Runtime view mappings for stages 9–14, the pass-wide rotation
+  mode, stage-1–14 ordered integration, shared-RoPE failure behavior, and
+  current test/status documentation.
+- **Findings and disposition:** Initial review identified a rotation-mode
+  consistency risk, missing failed-bind clearing coverage, and stale stage
+  status. A second review rejected the first fix because a public mutable
+  stage-9 buffer could be fabricated or changed before stage 11 binding.
+  Runtime-bound stages 9–14 now use a private-field pass bundle with const
+  accessors, one runtime mode, and a combined encoder that validates shared
+  parameter identity, rotation and view handoffs before dispatch. Finite-
+  window IDs, dense attention and O projection are included in that pass.
+  Tests verify output clearing for missing shared RoPE and invalid parameter
+  slots; documentation records the immutable pass and retains the
+  configuration/scheduler/model-parity limits. Final hostile follow-up is
+  pending.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a),
+  `cmake --build --preset mac-dev` succeeded; the focused runtime-storage and
+  stage-9–14 serial/concurrent matrix passed 13/13. `test_map.py` passed with
+  the documented notes, `check_drift.py` found no upstream changes and a
+  valid golden set, and `git diff --check` passed. The runtime fixture is
+  synthetic and does not establish inspected-model parity.
 
 ### D-IMPL-338: Compose MTP drafter stages 1–5
 

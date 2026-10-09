@@ -2765,8 +2765,9 @@ weights. Nine kernels are new; they follow the stage table.
 
 **Buffers.** The drafter has its own scratch region, carved once at bind for T = 8 and kept apart from the window
 arena (section 4.4). It is upstream's `arena_` (`mtp.cpp:252-286`) without the grouping buffers. Every named region
-starts on a 256-B boundary. `MtpBindLayout` exposes bounded views into this allocation. Stages 6–8 have
-standalone encoders over typed buffer views, but no production MTP pass yet composes these runtime-storage views.
+starts on a 256-B boundary. `MtpBindLayout` exposes bounded views into this allocation. Runtime-bound
+ordered smoke coverage now reaches stages 1–20; stages 21–22 have runtime view bindings and isolated GPU tests.
+Production scheduler integration remains open.
 
 | Buffer | Shape | Written by |
 | --- | --- | --- |
@@ -2775,12 +2776,12 @@ standalone encoders over typed buffer views, but no production MTP pass yet comp
 | `emb`, `en`, `e2` | F32 [8][2560] | stages 1-3 |
 | `hn`, `h2` | F32 [32][2560]: row 4t + c is stream c of row t | stages 4-5 |
 | `xq` | Q81 [32][80] | every `strata_q_q8_1` of the layer |
-| `R` | F32 [8][4][2560] | stage 6, the MLP read (with `apply`), stage 19 |
+| `R` (`residual` region) | F32 [8][4][2560] | stage 6, the MLP read (with `apply`), stage 19 |
 | `xn`, `lo`, `rs`, `inj`, `inj2`, `mixed` | F32 [8][10240], F32 [8][320], F32 [8][4], F32 [8][4], F32 [8][4], F32 [8][2560] | stages 7, 15 and 20 |
 | `gate` | F32 [1][10240] | stage 20 |
 | `kcur`, `vcur` | F32 [8][2][256] | stage 8 |
 | `q_full`; `qcur`, `attn`, `attn32` | F32 [24][512]; F32 [24][256] each | stages 10-14 |
-| `mtp_ids` | int32 [cap] | bind initializes the identity mapping; `strata_mtp_window_ids` overwrites it for a finite window |
+| `mtp_ids` | int32 [cap] | bind initializes the identity mapping; stage 12 refreshes the active prefix on every pass, writing either the finite suffix or full identity mapping |
 | `att_scratch` | `n_chunks · 24 · 258 + 64` floats (section 5.7) | `strata_attn_chunk_<mode>` |
 | `bo`, `y` | F32 [2560] each | `o_proj`; the combine |
 | `logits_r`, `ids`, `wts` | F32 [512], int32 [10], F32 [10] | stage 16 |
@@ -2849,7 +2850,7 @@ writes, with `row(c) = {c, c + 1, (c + 1) / 4, window > 0 ? min(c + 1, window) :
 | 9 | `strata_qsa_norm_rope` `k` (2T rows); O-class: `strata_qsa_fwht256` on K and V if `kv_rot`; `strata_qsa_kv_append_<mode>` | `self_attn.k_norm` | → the drafter's K and V at `step[t].pos` |
 | 10 | `strata_mv_q8_0_n1` (2560 → 12288) on stage 8's `xq` | `self_attn.q_proj` | → `q_full` |
 | 11 | `strata_qsa_norm_rope` `q` (24 rows, stride 512 in, 256 out); O-class: `strata_qsa_fwht256` if `kv_rot` | `self_attn.q_norm` | `q_full` → `qcur` |
-| 12 | `strata_mtp_window_ids`, only with a window | | → `mtp_ids` |
+| 12 | `strata_mtp_window_ids`, every attention pass | | → `mtp_ids` |
 | 13 | `strata_attn_chunk_<mode>` (n_chunks, 2, 1), `strata_attn_merge` (24, 1); O-class: `strata_qsa_fwht256` on `attn` if `kv_rot` | | `qcur`, the pools, `mtp_ids` → `attn` |
 | 14 | `strata_qsa_gate`; `strata_q_q8_1` (n 6144); `strata_mv_q8_0_n1` (6144 → 2560) | `self_attn.o_proj` | `attn`, `q_full` → `attn32` → `xq` → `bo` |
 | 15 | `strata_gr_norm`, `strata_gr_down`, `strata_gr_up`, apply 1 with `bo` and `inj` | `mlp_hyper_connection.*` | `R` → `R`, `inj2`, `mixed` |
@@ -2878,16 +2879,22 @@ writes, with `row(c) = {c, c + 1, (c + 1) / 4, window > 0 ? min(c + 1, window) :
   the selected-token route, the four mat-vec widths and hidden-pass tails,
   scalar norm/quantization/mat-vec oracles, guards, invalid IDs/metadata,
   output aliases, caller-owned rollback and group-boundary refusal. Production
-  `MtpRuntimeStorage` binding, scheduler integration and inspected-model
-  drafter parity remain open.
+  `MtpRuntimeStorage` binding now covers stages 1–22, while scheduler
+  integration and inspected-model drafter parity remain open. The synthetic
+  runtime-bound ordered chain covers stages 1–20; stage-21/22 bindings are
+  checked against runtime-owned views and their GPU kernels have isolated
+  numerical tests in `metal_mtp_test`.
 - Stage 9 reads the RoPE position from `steps[t].pos`; upstream reads the same cell from its `pos_` array.
 - `encode_mtp_attention_kv_append` composes stage 9 from a live `MtpParams`
   slot, the stage-8 K/V rows, the MTP K norm, and the main model's shared RoPE
   view. It validates the canonical MTP KV layout and its four views before
   dispatch, requires unique in-capacity positions, and uses ordered QSA
   norm/RoPE, optional FWHT and format-specific append encoders. `kv_rot` is
-  explicit at this isolated API boundary; runtime configuration and model
-  storage do not yet call it. The caller keeps `MtpParams`, its active
+  explicit at the encoder boundary; `bind_attention_kv_append` resolves the
+  owned cache, norm and RoPE views using the pass mode. Runtime-bound stages
+  9–14 use `bind_attention_pass` to return one immutable bundle sharing
+  parameters, scratch handoffs and the rotation mode across the pass. The caller
+  keeps `MtpParams`, its active
   StepRows, current K/V, K norm and RoPE alive and unchanged through GPU
   completion; the encoder's in-place K and optional V transforms are the
   writes made by this stage.
@@ -2899,25 +2906,33 @@ writes, with `row(c) = {c, c + 1, (c + 1) / 4, window > 0 ? min(c + 1, window) :
   for the mat-vec ABI's required sink. Keep `MtpParams`, `xq` and the weights
   alive and unchanged until GPU completion, and keep every view including
   `q_full` and the sink alive through completion; stage 14 later reuses `bo`.
-  Stage 10 remains a typed isolated encoder without runtime-storage binding.
+  `bind_attention_query_projection` resolves these views from runtime storage;
+  production drafter scheduling and model-backed parity remain open.
 - Stage 11's `encode_mtp_attention_query_norm` reads the full `q_full`
   tensor, the MTP `self_attn.q_norm`, active `StepRow` and shared RoPE table,
   then writes the compact 24×256 `qcur` view. It requires T=1 and a valid
   RoPE position. O-class callers set the explicit `kv_rot` flag to append
   `strata_qsa_fwht256` after query normalization/RoPE in the same ordered
   Encoder segment. Every view must remain alive through GPU completion;
-  `MtpParams`, `q_full`, `q_norm` and RoPE remain unchanged. The isolated API
-  does not derive `kv_rot` from runtime configuration or bind MTP storage.
-- Stage 12's `encode_mtp_window_ids` runs only for a positive finite window.
-  It requires T=1, a window within StepRow's signed integer range, positive
-  `step[0].n_kv`, and a host-published
-  `step[0].width == min(n_kv, window)`. The first `width` int32 entries become
-  the absolute KV positions `[max(0, n_kv - window), n_kv)`; the inactive
-  suffix is untouched. The ID region must hold at least `window` entries,
-  though the generated positions may exceed that capacity because they index
-  the drafter's larger KV history. Without a window the IDs stay at the
-  identity mapping initialized during bind. Keep params and the ID view alive
-  through completion, and keep params unchanged while the kernel reads it.
+  `MtpParams`, `q_full`, `q_norm` and RoPE remain unchanged.
+  Runtime-bound callers use `bind_attention_pass` and
+  `encode_mtp_attention_pass` to validate shared parameter views, scratch
+  handoffs and rotation mode, then encode stages 9–14 in order. The standalone
+  stage-11 buffer remains available to low-level callers, who own mode
+  consistency when composing stages manually. Production scheduling and
+  model-backed parity remain open.
+- Stage 12's `encode_mtp_window_ids` refreshes IDs on every attention pass.
+  It requires T=1, positive `step[0].n_kv`, and a host-published width equal
+  to `n_kv` when `window == 0`, or `min(n_kv, window)` otherwise. A zero
+  window writes the full identity prefix; a positive finite window must fit
+  the ID region and writes absolute KV positions
+  `[max(0, n_kv - window), n_kv)`. The inactive suffix is untouched. The
+  active prefix must fit the region; generated positions may exceed the
+  finite window because they index the drafter's larger KV history.
+  Refreshing the identity prefix after a finite-window pass prevents
+  stale IDs from affecting a later unwindowed pass. Keep params and the ID
+  view alive through completion, and keep params unchanged while the kernel
+  reads it. The runtime-bound attention pass always runs stage 12.
 - Stage 13's `encode_mtp_attention` composes the QSA chunk pass, fixed-order
   merge, and optional output FWHT in one ordered Encoder segment. It requires
   T=1, a canonical MTP KV layout and its exact views, and the bind-layout ID
@@ -2932,8 +2947,9 @@ writes, with `row(c) = {c, c + 1, (c + 1) / 4, window > 0 ? min(c + 1, window) :
   split into chunk accumulators, maxima, and denominators; the final 64 floats
   remain reserved and untouched. The encoder rejects unsafe aliases and an
   open concurrent group so chunk→merge→FWHT dependencies retain their
-  barriers. This is an isolated host encoder; it does not bind
-  `MtpRuntimeStorage` or establish model-backed attention parity.
+  barriers. The runtime-bound attention pass supplies this encoder with the
+  planned ID stride, KV views and scratch. Its synthetic dispatch does not
+  establish production scheduling or model-backed attention parity.
 - Stage 14's `encode_mtp_attention_output_projection` composes the QSA gate,
   Q8_1 quantization of the 6144-wide gated attention row, and the Q8_0
   6144→2560 O projection in one ordered Encoder segment. It requires T=1 and
@@ -2941,33 +2957,41 @@ writes, with `row(c) = {c, c + 1, (c + 1) / 4, window > 0 ? min(c + 1, window) :
   supplies stage 13's attention output, stage 10's `q_full`, the named Q8_1
   scratch, O-projection weights, `bo`, and the required sink. The wrapper
   validates extents, Context ownership and aliases before dispatch, and
-  refuses an open concurrent group. This isolated encoder does not bind
-  `MtpRuntimeStorage` or establish model-backed attention parity.
+  refuses an open concurrent group. The runtime-bound attention pass resolves
+  the O-projection views and encodes this stage after attention. Its synthetic
+  dispatch does not establish production scheduling or model-backed parity.
 - Stage 15's `encode_mtp_feed_forward_read` composes the GR normalization,
   down/injection and up/mix stages with `apply=true`. It reads the residual
   `R`, stage-14 `bo`, stage-7 `inj`, normalization and GR weights, then writes
   the updated `R`, `inject_out` and `mixed` views. It requires T=1, keeps the
   MTP parameter block disjoint from every active GR view, and preserves
-  normalize→down→up ordering at a closed concurrent-group boundary. This
-  isolated encoder does not bind `MtpRuntimeStorage` or establish
-  model-backed parity.
+  normalize→down→up ordering at a closed concurrent-group boundary.
+  `bind_feed_forward_read` resolves stage 14's output, stage 7's injection,
+  residual and scratch/weights from runtime storage. This synthetic binding
+  does not establish production scheduler integration or model-backed parity.
 - Stage 16's `encode_mtp_router` composes the BF16 2560→512 router projection
   with the stable top-10 route selection. It reads the stage-15 `mixed` row,
   the BF16 `mlp.gate` matrix and T=1 parameters, then writes `logits_r`, `ids`
   and normalized route weights. The MTP wrapper checks all active extents and
   cross-stage aliases before dispatch, uses the full 512-expert route with
   `divide_weights=false`, and requires an ordered concurrent-group boundary.
-  This isolated encoder does not bind `MtpRuntimeStorage` or establish
-  model-backed parity.
+  `bind_router` resolves the mixed row, BF16 router matrix and route outputs
+  from runtime storage. This synthetic binding does not establish production
+  scheduler integration or model-backed parity.
 - Stage 17's `encode_mtp_routed_experts` quantizes stage 15's `mixed` row
   with scaled Q8_0, computes gate/up projections for the ten stage-16 route
   IDs from S2 expert weights, applies SwiGLU, quantizes its ten rows, and
-  computes each down projection into `parts`. The wrapper requires one
-  contiguous complete `experts.bin` image, validates active extents and
-  aliases before dispatch, and keeps all five dispatches ordered. Its
-  serial/concurrent twin uses a synthetic complete 675 MiB blob and
-  independent scalar references. Production `MtpRuntimeStorage` view binding
-  and inspected-model parity remain open.
+  computes each down projection into `parts`. It accepts either a contiguous
+  full image or ordered expert windows that cover all 512 IDs. For each
+  window, the S2 kernels compare device-produced IDs with its expert range and
+  address local blobs; the encoder validates exact coverage, active extents
+  and aliases before dispatch. Quantization, per-window gate/up dispatch,
+  SwiGLU, hidden quantization and per-window down dispatch remain ordered.
+  `MtpRuntimeStorage::bind_routed_experts` supplies the owner's bounded
+  windows and named scratch. The serial/concurrent twin compares full-image
+  and split-window outputs with independent scalar references, and the
+  runtime storage smoke chain dispatches through stage 17. These synthetic
+  checks do not establish production scheduling or inspected-model parity.
 - Stages 18–19's `encode_mtp_shared_ffn_write` quantizes the `mixed` row to
   Q8_1, runs the shared expert, combines its sigmoid-gated output with stage
   17's `parts` and stage 16's route weights, then applies the combined vector
@@ -3162,17 +3186,21 @@ open-group refusal, standalone parity, and rollback.
 The test's complete synthetic expert allocation is about 675 MiB. Production
 runtime-view composition and model-backed parity are still open.
 
-**`strata_mtp_window_ids`**, grid 8 × 256, encoded only when the drafter has a window. Upstream
+**`strata_mtp_window_ids`**, grid 8 × 256, encoded for every runtime-bound attention pass. Upstream
 `window_ids_kernel`, `window` a `setBytes` constant:
 
 ```c++
-n_kv = steps[0].n_kv;  start = n_kv > window ? n_kv - window : 0;  width = n_kv - start;
+n_kv = steps[0].n_kv;
+width = window == 0 ? n_kv : min(n_kv, window);
+start = n_kv - width;
 for (j = 256*tg.x + tid; j < width; j += 2048) mtp_ids[j] = start + j;
 ```
 
 Upstream's block 0 also stores `width` into the step record, which the attention then reads. The Mac's host has
 already written the same value into `step[0].width` (the `row(c)` rule above), so no kernel writes a parameter
-block. With no window, `mtp_ids` is the identity `0..cap−1`, written once at bind, and `width = n_kv ≤ cap`.
+block. A zero window rewrites the active identity prefix `0..n_kv−1`; bind-time initialization of the full
+capacity remains a startup safeguard. Rewriting on each pass prevents a previous finite window from leaving
+stale IDs when the runtime returns to full history.
 
 The attention kernels of section 5.7 run with the drafter's `cap` and `n_chunks` as `setBytes` constants and one
 query row. A chunk past `width` exits after writing its empty marker, so a short context costs little more than
@@ -5475,18 +5503,20 @@ and foreign Context ownership.
 | `metal_attn_test_concurrent` | metal | Same binary and fixtures as `metal_attn_test` | Runs shared chunk→merge composition, validation and late-failure discard with `STRATA_METAL_DISPATCH=concurrent`; the dependent passes remain ordered by the Encoder barrier; the selection→attention coordinator also rejects calls inside an open concurrent dispatch group |
 | `metal_mv_test` | metal | `strata_q_q8_1`, every `strata_mv_<fmt>_n<NC>` and `_n1_x`, `strata_mv_bf16_b<BS>_n<NC>` | B. The weights' dequantisation is also checked against ggml's. Engine encoders quantize Q8_1 against the scalar oracle and check nonzero engine results for every dense quantized format and BF16 against their scalar mat-vec oracles. Engine routing covers NC=1/2/4/8, large-K Q4_0 NC=2 (R=1), BF16 NC=8 (256 threads), padded output and sink handling, and a same-command-buffer Q8_1→Q2_0 chain. The indexed draft-head encoder checks nonzero Q5_K, Q6_K and IQ4_XS results at n_in=2560 against their scalar oracles with an unsorted, non-contiguous row map; it rejects negative and out-of-range indices, invalid row counts, signed and shader-index overflow, unsupported formats, a wrong live-row value, short or misaligned maps, and output/sink overlap with the map. Guards and read-only input preservation are checked. Dense encoder rejection cases cover forged CPU/GPU-view metadata, mismatched row count, invalid NC, Q8_1 input/output overlap, and mat-vec output/sink overlap with activations, weights, active-row metadata, and each other. Both same-handle subviews and distinct no-copy handles sharing a CPU backing are covered; an adjacent Q8_1 view is accepted. A read-only Q2_0-by-Q8_1 path checks overlapping read-only views, disjoint writable output/sink ranges and a 65-block input row against its scalar oracle. The format-general read-only path also checks Q5_K, Q6_K and IQ4_XS against scalar results; Q6_K checks caller-owned failure rollback after an earlier dispatch. MTP stage 21 composes this indexed read path with draft-head projection; the L-15 indexed-read measurement and production MTP runtime-view binding remain open. |
 | `metal_moe_test`, `metal_moe_test_concurrent` | metal | `strata_moe_route` (`r16`, `r8`), exact weight-mode probe, `strata_moe_plan` (T=1..8, full/tiered), `strata_moe_swiglu` and `strata_shx_swiglu` (T=1..8), `strata_moe_combine` (T=1..8), grouped `strata_moe_gu_q2_0`, `strata_moe_gu_iq1_m`, `strata_moe_gu_iq2_xxs`, `strata_moe_gu_iq2_xs`, `strata_moe_gu_iq2_s`, `strata_moe_gu_iq3_xxs`, `strata_moe_gu_iq3_s`, `strata_moe_gu_iq4_xs`, `strata_moe_down_q2_0` and `strata_moe_down_iq4_nl` (256/512 experts, T=1..8) across random, edge and fixture inputs; a synthetic shared-expert GPU chain feeds Q8_1 input quantization through Q8_0 gate/up, shared SwiGLU, Q8_1 hidden requantization, Q8_0 down, BF16 gate and combine for T=1..8, checking each intermediate against scalar references and checking partial-batch sinks and guards; both SwiGLU entry points are checked against the scalar oracle, including the 128-value tail in the shared-expert grid; combine pins fused-rank accumulation with an analytic golden and checks the final shared multiply/add bitwise against a same-dispatch sigmoid probe; IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS check 80 unique gate/up expert groups; both down kernels check 80 permuted expert IDs and `ent_dst` restoration; IQ4_NL down also checks exact two-part FMA-sensitive answers, grouped-versus-single-entry bit parity and a weight-bit negative control; remaining L7: production shared-expert dispatch and inference integration | Exact route IDs and plan bytes, independent tie/order fixtures, route weights, routed/shared SwiGLU U(16), combine U(16) plus contraction checks, grouped gate/up and down U(16), fixed IQ4_NL two-part codebook goldens, 80-group endpoints, singleton parity, negative-control sensitivity and `ent_dst` permutation, plus address-table/guard checks; exact multiply/divide mode bits. Explicit `--input-set real` is reported as skipped (CTest exit 77) until REV-002's model pack and CUDA dump fixture are available; route oracle cases use the validated route encoder, every grouped gate/up format runs through the validated engine encoder, and validation rejects bad shapes/formats, short or misaligned views, input/output aliases and caller-owned late-failure rollback; the concurrent CTest also checks open-group refusal |
-| `metal_mtp_test` | metal | `strata_embed_rows_bf16`, `strata_rms_norm_w`, `strata_q_q8_1`, `strata_mv_q8_0_n<NC>`, MTP add-streams, indexed output-head mat-vec kernels, `strata_samp_greedy`, `strata_mtp_row_top_prob`, `strata_mtp_map_ids` | MTP stages 1–5 are composed and compared with independent BF16 gather, weighted RMS, Q8_1 and Q8_0 mat-vec oracles for K/V-only T=1,2,3,8 and full-layer selected-token T=1; checks NC=1/2/4/8, hidden-pass tails, exact in-place embedding norm, immutable inputs, active extents, guards, invalid hid/OOV/image-marker tokens, selected-token/parameter overlap, other aliases, caller-owned rollback and concurrent-group refusal. Stage 6 T=1..8 matches the independent scalar addition oracle bit for bit. Stage 21 checks full-vocabulary and mapped draft-head logits for Q5_K, Q6_K and IQ4_XS against independent Q8_1/mat-vec oracles, including one-time range/uniqueness map validation, output guards, immutable inputs, aliases and caller-owned rollback. Stage 22 checks greedy full-vocabulary and strict-subset token IDs and probabilities against independent softmax expectations, excluding logits outside the mapped rows; also checks malformed sampler/history, aliases, guards, immutable inputs, caller-owned rollback and open-group refusal in concurrent mode. Runtime view binding and an ordered smoke chain for stages 1–8 are covered separately by `metal_mtp_storage_test`; runtime stages 9–22, scheduler integration and full drafter parity remain open |
+| `metal_mtp_test` | metal | `strata_embed_rows_bf16`, `strata_rms_norm_w`, `strata_q_q8_1`, `strata_mv_q8_0_n<NC>`, MTP add-streams, indexed output-head mat-vec kernels, `strata_samp_greedy`, `strata_mtp_row_top_prob`, `strata_mtp_map_ids` | MTP stages 1–5 are composed and compared with independent BF16 gather, weighted RMS, Q8_1 and Q8_0 mat-vec oracles for K/V-only T=1,2,3,8 and full-layer selected-token T=1; checks NC=1/2/4/8, hidden-pass tails, exact in-place embedding norm, immutable inputs, active extents, guards, invalid hid/OOV/image-marker tokens, selected-token/parameter overlap, other aliases, caller-owned rollback and concurrent-group refusal. Stage 6 T=1..8 matches the independent scalar addition oracle bit for bit. Stage 21 checks full-vocabulary and mapped draft-head logits for Q5_K, Q6_K and IQ4_XS against independent Q8_1/mat-vec oracles, including one-time range/uniqueness map validation, output guards, immutable inputs, aliases and caller-owned rollback. Stage 22 checks greedy full-vocabulary and strict-subset token IDs and probabilities against independent softmax expectations, excluding logits outside the mapped rows; also checks malformed sampler/history, aliases, guards, immutable inputs, caller-owned rollback and open-group refusal in concurrent mode. Runtime bindings through stage 22 and ordered synthetic smoke coverage for stages 1–20 are covered separately by `metal_mtp_storage_test`; scheduler integration and full drafter parity remain open |
+| `metal_mtp_routed_experts_test` | metal | `strata_q_q8_0_scaled`, `strata_mtp_gu_s2`, `strata_mtp_swiglu_s2`, `strata_mtp_down_s2` | MTP stage 17 compares one full expert image with three ordered GPU-buffer windows covering experts 0–511, including route IDs at every boundary; validates complete nonoverlapping coverage, context ownership, scratch aliases, output guards and late caller-owned rollback. Serial and concurrent outputs match byte for byte. |
+| `metal_mtp_storage_test` | metal | Runtime-bound MTP stages 1–20 and the stage-21/22 bind views | Checks planned weights, named scratch regions, shared parameters, draft-vocabulary identity, routing windows, MLP versus attention hyperconnection weights and exact inter-stage view handoffs. Dispatches the synthetic ordered chain through stage 20. Stage 21/22 bindings reuse the caller-owned main head and the same once-validated vocabulary token. These bindings and synthetic dispatch checks do not establish model parity, production scheduling or end-to-end inference. |
 | `metal_mtp_gr_test` | metal | `strata_gr_norm`, `strata_gr_down`, `strata_gr_up` | MTP stage 7 composes the existing ordered GR read with `apply=false` for T=1..8 and matches the direct GR chain bit for bit; verifies finite populated outputs, residual and params preservation, active-row output bounds, malformed T, dead-h2 scratch size/alignment, foreign params, parameter/input and parameter/output alias rejection, and standalone/caller-owned rollback after late failures. `metal_mtp_storage_test` separately verifies the runtime mappings and ordered chain; these synthetic tests do not establish inspected-model drafter parity |
 | `metal_mtp_gr_test_concurrent` | metal | Same GR kernels as `metal_mtp_gr_test` | Repeats the MTP stage-7 fixture with concurrent dispatch enabled and verifies that the ordered GR chain rejects an open concurrent group without changing any buffers |
 | `metal_mtp_kv_projection_test` | metal | `strata_q_q8_1`, `strata_mv_q8_0_n<NC>` | MTP stage 8 covers T=1..8, compares the quantized rows and both 2560→512 Q8_0 projections with independent scalar oracles, checks padded sink values, active output bounds and guards, immutable inputs, malformed T, short weights/sink, foreign weights, parameter/output aliases and overlapping K/V outputs, and verifies caller-owned rollback after a later invalid stage-8 call. `metal_mtp_storage_test` separately verifies runtime mappings and ordered integration; inspected-model drafter parity remains open |
 | `metal_mtp_kv_projection_test_concurrent` | metal | Same Q8_1 and Q8_0 matvec kernels as `metal_mtp_kv_projection_test` | Repeats the stage-8 fixture under concurrent dispatch and verifies rejection inside an open group without changing any buffers |
-| `metal_mtp_kv_append_test` | metal | `strata_qsa_norm_rope`, `strata_qsa_fwht256`, `strata_qsa_kv_append_<mode>` | MTP stage 9 covers T=1..8 for fp16, int8 without and with `kv_rot`, rotated q4_0, and the K8v4-requested→int8 MTP mapping. It compares K norm/RoPE and FWHT against scalar oracles, then compares every cache byte with scalar format-specific append oracles. It checks untouched cache cells and tails, immutable parameters/norm/RoPE, malformed T, duplicate and out-of-capacity positions, forged layout, short and foreign cache views, invalid rotation/format combinations, caller-owned late rollback and open-group rejection. The isolated wrapper does not derive `kv_rot` from runtime settings or establish runtime-storage/model parity |
+| `metal_mtp_kv_append_test` | metal | `strata_qsa_norm_rope`, `strata_qsa_fwht256`, `strata_qsa_kv_append_<mode>` | MTP stage 9 covers T=1..8 for fp16, int8 without and with `kv_rot`, rotated q4_0, and the K8v4-requested→int8 MTP mapping. It compares K norm/RoPE and FWHT against scalar oracles, then compares every cache byte with scalar format-specific append oracles. It checks untouched cache cells and tails, immutable parameters/norm/RoPE, malformed T, duplicate and out-of-capacity positions, forged layout, short and foreign cache views, invalid rotation/format combinations, caller-owned late rollback and open-group rejection. `metal_mtp_storage_test` separately binds and dispatches stage 9 in an int8 pass with the shared rotation mode enabled; production configuration and inspected-model parity remain open |
 | `metal_mtp_kv_append_test_concurrent` | metal | Same QSA kernels as `metal_mtp_kv_append_test` | Repeats the stage-9 formats with concurrent dispatch and verifies rejection inside an open group without changing fixture buffers |
-| `metal_mtp_query_projection_test` | metal | `strata_mv_q8_0_n1` | MTP stage 10 requires T=1 and reuses stage 8's Q8_1 activation row for the 2560→12288 Q8_0 query projection. Checks exact scalar-oracle output across the full 24×512 q_full tensor, finite values, allocation guards, untouched sink and immutable inputs, invalid T, short weights/sink, foreign weights, q_full/sink and partial q_full/xq plus sink/xq aliases, caller-owned rollback and open-group rejection. Runtime-storage wiring and drafter parity remain open |
+| `metal_mtp_query_projection_test` | metal | `strata_mv_q8_0_n1` | MTP stage 10 requires T=1 and reuses stage 8's Q8_1 activation row for the 2560→12288 Q8_0 query projection. Checks exact scalar-oracle output across the full 24×512 q_full tensor, finite values, allocation guards, untouched sink and immutable inputs, invalid T, short weights/sink, foreign weights, q_full/sink and partial q_full/xq plus sink/xq aliases, caller-owned rollback and open-group rejection. `metal_mtp_storage_test` also verifies the runtime mapping in its full ordered chain; inspected-model parity remains open |
 | `metal_mtp_query_projection_test_concurrent` | metal | Same Q8_0 mat-vec kernel as `metal_mtp_query_projection_test` | Repeats stage 10 with concurrent dispatch and verifies ordered-boundary rejection without changing fixture buffers |
-| `metal_mtp_query_norm_test` | metal | `strata_qsa_norm_rope`, O-class `strata_qsa_fwht256` | MTP stage 11 requires T=1 and compares qcur against scalar QSA normalization/RoPE and optional FWHT oracles in standalone and caller-owned segments. Checks finite outputs, guards, immutable inputs, invalid T/position, short and foreign views, q_full/qcur and params/input aliases, ordered-group rejection, and rollback after a later stage validation failure. Runtime-derived `kv_rot`, MTP storage wiring and drafter parity remain open |
+| `metal_mtp_query_norm_test` | metal | `strata_qsa_norm_rope`, O-class `strata_qsa_fwht256` | MTP stage 11 requires T=1 and compares qcur against scalar QSA normalization/RoPE and optional FWHT oracles in standalone and caller-owned segments. Checks finite outputs, guards, immutable inputs, invalid T/position, short and foreign views, q_full/qcur and params/input aliases, ordered-group rejection, and rollback after a later stage validation failure. `metal_mtp_storage_test` also checks runtime binding with the same explicit rotation mode as stage 9; production configuration and inspected-model parity remain open |
 | `metal_mtp_query_norm_test_concurrent` | metal | Same QSA kernels as `metal_mtp_query_norm_test` | Repeats stage 11 with concurrent dispatch and verifies ordered-boundary rejection without changing fixture buffers |
-| `metal_mtp_window_ids_test` | metal | `strata_mtp_window_ids` | MTP stage 12 compares active IDs for short, exact, truncated and full-history windows against absolute-cell expectations, including IDs greater than the ID-region capacity and a 4,097-ID window that crosses threadgroup and 2,048-thread grid-stride boundaries. Verifies inactive-tail sentinels, guards, immutable params, signed-range edges, malformed T/window/n_kv/StepRow width, short/misaligned/foreign views, active output/params alias rejection, caller-owned rollback and open-group rejection |
+| `metal_mtp_window_ids_test` | metal | `strata_mtp_window_ids` | MTP stage 12 compares active IDs for short, exact, truncated and full-history finite windows against absolute-cell expectations, including IDs greater than the ID-region capacity and a 4,097-ID window that crosses threadgroup and 2,048-thread grid-stride boundaries. A zero window writes full-history identity IDs; a finite→unwindowed reuse case verifies stale finite IDs are replaced. Verifies inactive-tail sentinels, guards, immutable params, signed-range edges, malformed T/window/n_kv/StepRow width, short/misaligned/foreign views, active output/params alias rejection, caller-owned rollback and open-group rejection |
 | `metal_mtp_window_ids_test_concurrent` | metal | Same kernel as `metal_mtp_window_ids_test` | Repeats stage 12 with concurrent dispatch and verifies ordered-boundary rejection without changing fixture buffers |
 | `metal_sampler_parity_test`, `metal_sampler_parity_test_concurrent` | metal | Section 5.12's greedy, split-part, split-merge, composite sampled, coupled-penalty and CPU-tail twin on random, edge and fixture inputs for T=1..8 and model/maximum vocabularies; standalone and shared Encoder paths match the scalar references; concurrent tests reject dependent merge/sample calls in an open group and verify segment discard, including discard of a prior split-part dispatch; shared coupled-penalty→sampled composition and 248,320/262,144 vocabulary merge scratch are checked in one Encoder segment; fixtures 16 and 17 are deterministic semantic ports, with host fixture 15 in `sampler_tail_test`; literal upstream fixtures 1-14 and 18 and production sampler integration remain open under REV-028 | Candidate IDs/logit bits and CPU-tail tokens/probabilities exact |
 | `metal_util_test` | metal | `strata_util_*` | B |
