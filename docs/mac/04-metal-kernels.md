@@ -2959,6 +2959,15 @@ writes, with `row(c) = {c, c + 1, (c + 1) / 4, window > 0 ? min(c + 1, window) :
   oracle, output parity against the direct shared-FFN/write path, T and alias
   rejection, concurrent open-group refusal and caller-owned rollback.
   Production runtime-view binding and inspected-model parity remain open.
+- Stage 20's `encode_mtp_final_mixer` composes the validated Window head mixer
+  with `MtpParams.T` as its active-row source and requires T=1. It reads the
+  stage-19 residual and the three mixer weights, then writes `sample`; the
+  caller keeps every view alive and does not access or reuse any active view
+  until GPU completion. The serial/concurrent GR twins compare against the
+  scalar head-mixer oracle, preserve the residual and model inputs, and cover
+  parameter/residual and residual/weight aliases, caller-owned rollback, and
+  open-group refusal in concurrent mode. This isolated wrapper does not bind
+  `MtpRuntimeStorage` or establish model-backed parity.
 - Stages 2 and 4 are upstream's `native_qsa_rms_norm_weighted`, whose `norm<1024>` (for rows of 1024 or more) is
   the same arithmetic as `native_gr_rms_norm_weighted`. `strata_rms_norm_w` serves both with `n_cols` and the gamma
   period `gp` as `setBytes` constants (section 5.4).
@@ -2993,7 +3002,7 @@ ordered Q8_0 key and value projections to `kcur` and `vcur`. It selects the
 smallest supported NC at least T, shares the padded-column sink across those
 ordered dispatches, and rejects parameter, input, output and sink aliases that
 could corrupt later reads. These are isolated stage encoders only;
-runtime-storage wiring, stages 1–5 and 18–22, and the complete drafter remain
+runtime-storage wiring, stages 1–5 and 21–22, and the complete drafter remain
 open.
 
 **`strata_q_q8_0_scaled`**, grid ⌈n/4096⌉ × 128, one 32-value block per thread. Upstream

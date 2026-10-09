@@ -8783,3 +8783,51 @@ measuring L-15 remain open.
   concurrent coverage.
 - **Review required:** Production runtime-view binding and inspected-model
   stage-18/19 and full-drafter parity remain open under D-IMPL-334.
+
+### D-IMPL-335: Compose MTP drafter stage 20
+
+- **Decision:** Add standalone transactional and caller-owned Encoder forms
+  for MTP's T=1 final mixer. Derive the active-row metadata from
+  `MtpParams.T` and compose the validated Window head mixer over the residual,
+  mixer weights and named `sample` output. Require all views to be disjoint
+  where the component mixer requires it, and reject parameter overlap with
+  active views and residual overlap with model weights.
+- **Reason:** Stage 20 uses the same norm, down projection, SiLU, up projection
+  and pre-gated reduction as the existing Window head mixer. Reusing that
+  validated chain preserves its arithmetic and dispatch order while exposing
+  the MTP-specific T=1 boundary without duplicating kernels. Runtime-storage
+  binding and full drafter scheduling remain separate work.
+- **Validation:** The serial and concurrent GR twins compare the MTP result
+  against the independent scalar head-mixer oracle and verify residual and
+  model-input preservation, invalid T, parameter/residual and residual/weight
+  alias rejection, caller-owned rollback, and concurrent open-group refusal.
+  Hostile review identified an incomplete asynchronous contract for scratch
+  views; the public API now requires every view to remain alive and forbids
+  CPU access or reuse until GPU completion.
+- **Build and tests:** `cmake --build --preset mac-dev` succeeded, the
+  focused `metal_gr_test` and `metal_gr_test_concurrent` CTests passed 2/2,
+  and the complete `mac-metal` suite passed 79/79. The host suite and Python
+  runner results remain as recorded above; model-backed parity is unavailable
+  without model inputs.
+- **Review required:** Implement stages 21–22, bind stages 6–20 to
+  `MtpRuntimeStorage`, and establish parity against an inspected model.
+  Stages 1–5 and production MTP scheduling remain open.
+
+### REV-132: Hostile review of MTP drafter stage 20
+
+- **Scope:** Stage-20 API validation, Window head-mixer composition,
+  asynchronous buffer lifetime, serial/concurrent scalar-oracle fixtures,
+  rollback and documentation.
+- **Adversarial findings:** The initial API contract required views to stay
+  alive and inputs to remain unchanged but did not prohibit CPU access or
+  reuse of writable scratch before GPU completion. Updated the contract to
+  cover every active view. No arithmetic, alias-validation or ordering defect
+  was found. A local alias-test fixture also compared its snapshot after
+  restoring the deliberately modified parameter bytes; that comparison was
+  moved before restoration so it measures the dispatch's effects.
+- **Disposition:** The Stage-20 focused serial/concurrent CTests passed 2/2,
+  and all 79 `mac-metal` CTests passed. Build and complete implementation
+  status are recorded in D-IMPL-335. This step adds isolated encoder coverage;
+  it does not establish MTP runtime wiring or model-backed parity.
+- **Review required:** Continue with stages 21–22 and production
+  `MtpRuntimeStorage` wiring and parity under D-IMPL-335.
