@@ -1160,7 +1160,7 @@ name, except `row_t_independent`, which is step 6 of every twin and has no test 
 
 ### 9.1 CTest tests
 
-With every work item done, a `mac-dev` build registers 147 tests: 46 `host`, 73 `metal` and 28 `model`. The 28 tests
+With every work item done, a `mac-dev` build registers 149 tests: 46 `host`, 75 `metal` and 28 `model`. The 28 tests
 of the bootstrap ([08](08-build-and-distribution.md), section 6.4) are among them.
 
 | Label | Preset | Runs on |
@@ -1204,7 +1204,7 @@ of the bootstrap ([08](08-build-and-distribution.md), section 6.4) are among the
 | `prompts_manifest_test` | Section 2.2 | `python3 -m unittest tools.metal.test_make_prompts`: the prompt sets against their manifest |
 | `test_map` | Section 9.4 | `python3 tools/metal/test_map.py` with `STRATA_BUILD_DIR` set |
 
-**`metal` (73).**
+**`metal` (75).**
 
 The `metal_ple_test` fixture chains the three weighted RMS norms, PLE gate,
 value broadcast, convolution-residual and history update at T=1, 2 and 8. The
@@ -1251,6 +1251,8 @@ CTest cases pass.
 | `metal_mtp_query_norm_test_concurrent` | [04](04-metal-kernels.md), section 5.11; D-IMPL-327; REV-124 | Repeats stage 11 with concurrent dispatch and verifies ordered-boundary rejection with all fixture buffers unchanged |
 | `metal_mtp_window_ids_test` | [04](04-metal-kernels.md), section 5.11; D-IMPL-328; REV-125 | MTP stage 12 compares active IDs for short, exact, truncated and full-history windows with absolute KV-cell expectations, including a 262,144-cell history with a 64-ID output capacity and a 4,097-ID window crossing threadgroup and grid-stride boundaries. Checks inactive-tail sentinels, guards, immutable params, signed-range edges, malformed T/window/n_kv/StepRow width, short/misaligned/foreign views, active output/params alias rejection and caller-owned rollback |
 | `metal_mtp_window_ids_test_concurrent` | [04](04-metal-kernels.md), section 5.11; D-IMPL-328; REV-125 | Repeats stage 12 with concurrent dispatch and verifies ordered-boundary rejection without changing fixture buffers |
+| `metal_mtp_attention_test` | [04](04-metal-kernels.md), section 5.11; D-IMPL-329; REV-126 | MTP stage 13 compares dense chunk attention, ordered merge and optional output FWHT with scalar oracles for fp16, int8 with and without rotation, rotated q4_0 and K8v4-requested→int8 storage. Checks the finite-window stage-12→13 handoff in one Encoder segment, an ID stride larger than KV cell capacity, active outputs and guards, untouched reserved scratch tail, immutable params/query/KV, invalid stride and short views, format/rotation mismatch, forged layout, scratch/query and output/query/cache aliases, and rollback after stage 12 has already encoded |
+| `metal_mtp_attention_test_concurrent` | [04](04-metal-kernels.md), section 5.11; D-IMPL-329; REV-126 | Repeats the stage-13 format matrix under concurrent dispatch and verifies open-group rejection while preserving ordered chunk→merge→FWHT dependencies |
 | `window_params_ring_test` | [04](04-metal-kernels.md), section 4.2; work item L9 | T=1 and T=8 blocks are built into a fixed-address two-slot Shared ring with 256-byte strides; invalid construction preserves published bytes, slots remain bounded and generation-checked, outer rollback invalidates views, and a too-small live `maxBufferLength` is rejected before allocation |
 | `metal_window_scratch_storage_test` | [04](04-metal-kernels.md), section 4.4; D-IMPL-183 | One Context-owned Shared allocation with exact logical size; bounded views for every named region; allocator poison, maxBufferLength refusal, unsupported-input refusal and outer-transaction rollback |
 | `metal_window_storage_test` | [05](05-memory-and-residency.md), work item U3; L9 prerequisite | A nine-expert synthetic GGUF validates exact-plan union checking, full-mode tables, checked named dense tensor views for mapped and BF16-converted weights including a second row at nonzero offset, rejection of expert slabs, the separate per-layer embedding PLE table (`per_layer_token_embd.weight`), unknown and rolled-back views, and CPU/GPU warm-up; it checks that the full-mode PLE reader view has row access but no public open/close lifecycle, while tiered publishes no reader. The FullMode T=1 PLE handoff also clears its caller-supplied projection/norm/convolution views and uses a deliberately incorrect key format to verify that the wrapper resolves all six mapped model tensors itself |

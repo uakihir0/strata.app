@@ -2896,6 +2896,22 @@ writes, with `row(c) = {c, c + 1, (c + 1) / 4, window > 0 ? min(c + 1, window) :
   the drafter's larger KV history. Without a window the IDs stay at the
   identity mapping initialized during bind. Keep params and the ID view alive
   through completion, and keep params unchanged while the kernel reads it.
+- Stage 13's `encode_mtp_attention` composes the QSA chunk pass, fixed-order
+  merge, and optional output FWHT in one ordered Encoder segment. It requires
+  T=1, a canonical MTP KV layout and its exact views, and the bind-layout ID
+  stride (a positive multiple of 64). The ID stride may exceed the rounded KV
+  cell capacity by the bind layout's padding; `StepRow.width`, rather than
+  either capacity, bounds the live IDs. QSA mode follows the MTP store's
+  **storage** format: fp16, int8, or q4_0; a K8v4 request uses MTP's int8
+  storage mapping and therefore dispatches int8 attention. `kv_rot` must agree
+  with stages 9 and 11: fp16 forbids it, q4_0 requires it, and int8 accepts
+  either choice. The named `att_scratch` view must cover
+  `ceil(id_row_stride / 64) * 24 * 258 + 64` floats. Its active prefix is
+  split into chunk accumulators, maxima, and denominators; the final 64 floats
+  remain reserved and untouched. The encoder rejects unsafe aliases and an
+  open concurrent group so chunk→merge→FWHT dependencies retain their
+  barriers. This is an isolated host encoder; it does not bind
+  `MtpRuntimeStorage` or establish model-backed attention parity.
 - Stages 2 and 4 are upstream's `native_qsa_rms_norm_weighted`, whose `norm<1024>` (for rows of 1024 or more) is
   the same arithmetic as `native_gr_rms_norm_weighted`. `strata_rms_norm_w` serves both with `n_cols` and the gamma
   period `gp` as `setBytes` constants (section 5.4).

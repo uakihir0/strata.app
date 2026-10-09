@@ -8455,3 +8455,71 @@ measuring L-15 remain open.
   validation against the runtime bind layout, then wire stage 12 into
   `MtpRuntimeStorage` and validate the attention handoff with an inspected
   model.
+
+### D-IMPL-329: Compose MTP drafter stage 13 attention
+
+- **Decision:** Add caller-owned Encoder and standalone transactional forms
+  for T=1 MTP attention. Derive the QSA kernel mode from the canonical MTP
+  store's storage format, mapping K8v4 requests to int8 attention. Preserve
+  the bind-layout ID stride even when it is larger than KV cell capacity;
+  `StepRow.width` bounds the live prefix. Split the named attention scratch
+  into QSA accumulator, maximum and denominator views, reserve its final
+  64-float tail, and compose chunk attention→ordered merge→optional output
+  FWHT in one barrier-preserving segment. Enforce the stage-9/11 `kv_rot`
+  rules, exact canonical KV views, safe aliases and a closed concurrent group.
+- **Reason:** The documented MTP stage uses the existing QSA attention
+  kernels and MTP bind arena. Keeping this as a typed coordinator avoids
+  duplicating attention arithmetic while checking MTP-specific layout,
+  format and lifetime contracts. The ID stride and KV capacity are rounded
+  independently, so using capacity as the stride would mis-size chunks and
+  scratch or drop valid padded IDs. K8v4 is represented as int8 in the MTP
+  cache, so the attention pipeline must follow storage format rather than the
+  original request. The final 64 scratch floats are reserved by the bind
+  layout and remain untouched. The API does not bind `MtpRuntimeStorage` or
+  establish full-drafter/model parity.
+- **Validation:** `metal_mtp_attention_test` compares chunk attention, merge
+  and optional FWHT against scalar QSA oracles for fp16, int8 with and without
+  rotation, rotated q4_0, and K8v4-requested int8 storage. It composes stages
+  12–13 in one Encoder segment; exercises stride 64 with KV capacity 20 and
+  an 80-ID, two-chunk window at stride 128; and checks guards, the reserved
+  scratch tail, immutable inputs/cache, format/layout/extent errors, aliases,
+  concurrent-group rejection and late rollback. Focused serial/concurrent
+  CTests pass 2/2. The current complete `mac-metal`, `mac-host` and Python
+  suite results, drift check, map result and hostile-review disposition are
+  recorded in REV-126.
+- **Review required:** Bind `kv_rot` and the named `att_scratch`/ID views to
+  production runtime configuration; compose stages 6–13 through
+  `MtpRuntimeStorage`, then compare the recorded attention handoff and full
+  drafter round with an inspected model. Production MTP scheduling and the
+  upstream-compatible MTP API remain open.
+
+### REV-126: Hostile review of MTP drafter stage 13
+
+- **Scope:** The MTP attention validator/coordinator, its Metal twin, CMake
+  registration, test-map entry and stage-status documentation.
+- **Initial finding (P3):** Every attention case used a single 64-ID chunk, so
+  the MTP scratch split and ordered merge were not exercised with multiple
+  chunks. **Resolution:** Added an 80-ID finite window at stride 128, with a
+  128-cell KV store. The scalar-oracle case passes in both serial and
+  concurrent CTests; the separate padded-stride case uses stride 64 with a
+  20-cell KV capacity.
+- **Re-review finding (P3):** D-IMPL-329/REV-126 and the project overview had
+  not yet been recorded consistently. **Resolution:** Added this decision and
+  review record, linked both test-map entries and updated the engine-host
+  status row and macOS README to include stage 13.
+- **Final review finding (P3):** REV-126 still lacked the complete-suite
+  evidence while the full Metal run was in progress. **Resolution:** After the
+  run finished, recorded the 69/69 Metal result alongside the 44 registered
+  host tests, Python suite, map and drift results; the README now reports the
+  same 113 registered host/Metal tests and the expected single skip.
+- **Disposition:** The re-review confirmed the multi-chunk coverage and found
+  no implementation defects in bounds, aliasing, overflow, format mapping,
+  ordering, rollback or test validity. Focused serial/concurrent tests passed
+  2/2. `cmake --preset mac-dev` and the complete build passed;
+  `ctest --preset mac-metal --output-on-failure` passed 69/69, and
+  `ctest --preset mac-host --output-on-failure` passed all 44 registered
+  tests with the one documented real-input test skipped. The Python suite
+  passed 35/35 modules, `test_map` passed, and `check_drift.py` reported no
+  upstream changes with goldens still valid. `git diff --check` was clean.
+- **Review required:** Production runtime-view binding and inspected-model
+  stage 13/full-drafter parity remain open under D-IMPL-329.
