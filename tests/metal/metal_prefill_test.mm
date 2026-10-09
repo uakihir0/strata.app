@@ -1,9 +1,11 @@
 // Metal twins for Prefill's hyper-connection normalization (docs/mac/04 §6.3).
 #include "metallib_sha256.inc"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/metal/context.hpp"
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/prefill_dispatch.hpp"
+#include "strata/metal/prefill_gr_mix_dispatch.hpp"
 #include "strata/metal/prefill_gr_norm_dispatch.hpp"
 #include "strata/metal/prefill_gr_silu_dispatch.hpp"
 #include "twin.hpp"
@@ -1112,6 +1114,686 @@ bool test_silu_open_concurrent_group_rejected(Context& context) {
     return rejected;
 }
 
+struct GRMixOracle {
+    std::vector<std::uint16_t> high;
+    std::vector<std::uint16_t> half;
+    std::vector<float> values;
+    std::vector<float> magnitudes;
+};
+
+GRMixOracle prefill_gr_mix_oracle(std::span<const float> residual,
+                                  std::span<const float> rs,
+                                  std::span<const float> norm,
+                                  std::span<const float> gated,
+                                  std::uint32_t rows) {
+    const std::size_t values = static_cast<std::size_t>(rows) * kWidth;
+    GRMixOracle result;
+    result.high.resize(values);
+    result.half.resize(values);
+    result.values.resize(values);
+    result.magnitudes.resize(values);
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        for (std::uint32_t column = 0u; column < kWidth; ++column) {
+            float sum = 0.0f;
+            float magnitude = 0.0f;
+            for (std::uint32_t stream = 0u; stream < kStreams; ++stream) {
+                const std::size_t input_index =
+                    (static_cast<std::size_t>(row) * kStreams + stream) *
+                    kWidth +
+                    column;
+                const float value =
+                    (residual[input_index] * rs[row * kStreams + stream]) *
+                    norm[stream * kWidth + column];
+                const float gate =
+                    1.0f / (1.0f + std::exp(-gated[input_index]));
+                sum = std::fma(value, gate, sum);
+                magnitude += std::abs(value * gate);
+            }
+            sum /= 4.0f;
+            magnitude /= 4.0f;
+            const std::size_t output_index =
+                static_cast<std::size_t>(row) * kWidth + column;
+            result.values[output_index] = sum;
+            result.magnitudes[output_index] = magnitude;
+            const std::uint16_t high =
+                strata::kernels::bf16_from_f32(sum);
+            result.high[output_index] = high;
+            result.half[output_index] =
+                strata::kernels::f16_from_f32(sum);
+        }
+    }
+    return result;
+}
+
+void fill_gr_mix_inputs(std::vector<float>& residual, std::vector<float>& rs,
+                        std::vector<float>& norm, std::vector<float>& gated,
+                        std::uint32_t rows) {
+    for (std::size_t index = 0u; index < residual.size(); ++index) {
+        const int centered =
+            static_cast<int>((index * 13u + index / kWidth * 7u) % 97u) - 48;
+        residual[index] = static_cast<float>(centered) * 0.03125f;
+        const int gate_centered =
+            static_cast<int>((index * 5u + index / kWidth * 11u) % 41u) - 20;
+        gated[index] = static_cast<float>(gate_centered) * 0.5f;
+    }
+    for (std::size_t index = 0u; index < rs.size(); ++index) {
+        rs[index] = 0.75f + static_cast<float>(index % kStreams) * 0.125f +
+                    static_cast<float>(index / kStreams) * 0.015625f;
+    }
+    for (std::size_t index = 0u; index < norm.size(); ++index) {
+        const int centered = static_cast<int>((index * 17u + rows) % 33u) - 16;
+        norm[index] = 0.9375f + static_cast<float>(centered) * 0.0078125f;
+    }
+}
+
+bool run_gr_mix_case(Context& context, std::uint32_t rows,
+                     PrefillBF16X2Mode mode, bool shared_encoder) {
+    const bool write_low = mode != PrefillBF16X2Mode::off;
+    const std::string label = "Prefill GR mix T=" + std::to_string(rows) +
+        " mode=" + std::to_string(static_cast<std::uint32_t>(mode)) +
+        (shared_encoder ? " shared" : " standalone");
+    const std::size_t stream_values =
+        static_cast<std::size_t>(rows) * kStreams * kWidth;
+    const std::size_t output_values = static_cast<std::size_t>(rows) * kWidth;
+    const std::size_t stream_bytes = stream_values * sizeof(float);
+    const std::size_t scale_bytes =
+        static_cast<std::size_t>(rows) * kStreams * sizeof(float);
+    const std::size_t norm_bytes =
+        static_cast<std::size_t>(kStreams) * kWidth * sizeof(float);
+    const std::size_t output_bytes =
+        output_values * sizeof(std::uint16_t);
+    std::vector<float> residual(stream_values);
+    std::vector<float> rs(static_cast<std::size_t>(rows) * kStreams);
+    std::vector<float> norm(kStreams * kWidth);
+    std::vector<float> gated(stream_values);
+    fill_gr_mix_inputs(residual, rs, norm, gated, rows);
+    const GRMixOracle expected =
+        prefill_gr_mix_oracle(residual, rs, norm, gated, rows);
+
+    TestBuffer residual_buffer, rs_buffer, norm_buffer, gated_buffer;
+    TestBuffer high_buffer, low_buffer, half_buffer;
+    std::string error;
+    const bool allocated =
+        residual_buffer.allocate(context, label + " residual", stream_bytes,
+                                 error) &&
+        rs_buffer.allocate(context, label + " scale", scale_bytes, error) &&
+        norm_buffer.allocate(context, label + " norm", norm_bytes, error) &&
+        gated_buffer.allocate(context, label + " gated", stream_bytes, error) &&
+        high_buffer.allocate(context, label + " mixed_bf", output_bytes,
+                             error) &&
+        (!write_low ||
+         low_buffer.allocate(context, label + " mixed_bf_lo", output_bytes,
+                             error)) &&
+        half_buffer.allocate(context, label + " mixed_h", output_bytes, error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    std::memcpy(residual_buffer.payload().data(), residual.data(), stream_bytes);
+    std::memcpy(rs_buffer.payload().data(), rs.data(), scale_bytes);
+    std::memcpy(norm_buffer.payload().data(), norm.data(), norm_bytes);
+    std::memcpy(gated_buffer.payload().data(), gated.data(), stream_bytes);
+    const std::array<std::vector<std::uint8_t>, 4> input_before{{
+        {residual_buffer.allocation().begin(),
+         residual_buffer.allocation().end()},
+        {rs_buffer.allocation().begin(), rs_buffer.allocation().end()},
+        {norm_buffer.allocation().begin(), norm_buffer.allocation().end()},
+        {gated_buffer.allocation().begin(), gated_buffer.allocation().end()},
+    }};
+
+    auto command = context.make_command_buffer(label, error);
+    check(command != nullptr, label + " command buffer", error);
+    if (!command) return false;
+    const PrefillGRMixBuffers buffers{
+        context.buffers().read_only(residual_buffer.view()),
+        context.buffers().read_only(rs_buffer.view()),
+        context.buffers().read_only(norm_buffer.view()),
+        context.buffers().read_only(gated_buffer.view()),
+        high_buffer.view(),
+        write_low ? low_buffer.view() : BufferRef{}, half_buffer.view()};
+    const bool encoded = shared_encoder
+        ? Encoder::encode(
+              context, *command, "shared Prefill GR mix",
+              [&](Encoder& encoder, std::string& encode_error) {
+                  return encode_prefill_gr_mix(context, encoder, rows, mode,
+                                               buffers, encode_error);
+              },
+              error)
+        : encode_prefill_gr_mix(context, *command, rows, mode, buffers, error);
+    check(encoded, label + " production encode", error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    const bool dispatched = submit_and_wait(command, label, error);
+    check(dispatched, label + " Metal dispatch", error);
+    if (!dispatched) return false;
+
+    const auto actual_high = std::span<const std::uint16_t>(
+        reinterpret_cast<const std::uint16_t*>(high_buffer.payload().data()),
+        output_values);
+    const auto actual_half = std::span<const std::uint16_t>(
+        reinterpret_cast<const std::uint16_t*>(half_buffer.payload().data()),
+        output_values);
+    std::uint16_t max_high_ulp = 0u;
+    std::uint16_t max_half_ulp = 0u;
+    for (std::size_t index = 0u; index < output_values; ++index) {
+        max_high_ulp = std::max(
+            max_high_ulp, bf16_ulp_distance(actual_high[index],
+                                            expected.high[index]));
+        max_half_ulp = std::max(
+            max_half_ulp, bf16_ulp_distance(actual_half[index],
+                                            expected.half[index]));
+    }
+    check(max_high_ulp <= 1u, label + " BF16 high output oracle",
+          "max ULP=" + std::to_string(max_high_ulp) + ", limit=1");
+    check(max_half_ulp <= 2u, label + " F16 output oracle",
+          "max ULP=" + std::to_string(max_half_ulp) + ", limit=2");
+    bool low_matches = true;
+    if (write_low) {
+        const auto actual_low = std::span<const std::uint16_t>(
+            reinterpret_cast<const std::uint16_t*>(low_buffer.payload().data()),
+            output_values);
+        constexpr float kBf16x2RelativeTolerance = 0x1p-15f;
+        float max_reconstruction_error = 0.0f;
+        float max_allowed_error = 0.0f;
+        std::size_t improved_count = 0u;
+        bool remainder_matches = true;
+        for (std::size_t index = 0u; index < output_values; ++index) {
+            const float high_value =
+                strata::kernels::f32_from_bf16(actual_high[index]);
+            const float low_value =
+                strata::kernels::f32_from_bf16(actual_low[index]);
+            const float reconstructed = high_value + low_value;
+            const float reconstruction_error =
+                std::abs(reconstructed - expected.values[index]);
+            const float allowed_error =
+                kBf16x2RelativeTolerance * expected.magnitudes[index] +
+                0x1p-126f;
+            max_reconstruction_error =
+                std::max(max_reconstruction_error, reconstruction_error);
+            max_allowed_error = std::max(max_allowed_error, allowed_error);
+            remainder_matches &= reconstruction_error <= allowed_error;
+            if (std::abs(high_value - expected.values[index]) >
+                allowed_error) {
+                ++improved_count;
+            }
+        }
+        low_matches = remainder_matches && improved_count > output_values / 4u;
+        check(low_matches, label + " BF16X2 reconstruction oracle",
+              "max absolute error=" +
+                  std::to_string(max_reconstruction_error) +
+                  ", max allowed=" + std::to_string(max_allowed_error) +
+                  ", high-only values improved=" +
+                  std::to_string(improved_count) + "/" +
+                  std::to_string(output_values));
+        check(low_buffer.guards_intact(), label + " remainder guards");
+    }
+    const std::array<const TestBuffer*, 4> input_buffers{
+        &residual_buffer, &rs_buffer, &norm_buffer, &gated_buffer};
+    bool inputs_unchanged = true;
+    for (std::size_t index = 0u; index < input_buffers.size(); ++index) {
+        const auto allocation = input_buffers[index]->allocation();
+        inputs_unchanged &=
+            std::equal(input_before[index].begin(), input_before[index].end(),
+                       allocation.begin());
+        check(input_buffers[index]->guards_intact(),
+              label + " input guards " + std::to_string(index));
+    }
+    check(inputs_unchanged, label + " inputs remain read-only");
+    check(high_buffer.guards_intact(), label + " BF16 output guards");
+    check(half_buffer.guards_intact(), label + " F16 output guards");
+    return max_high_ulp <= 1u && max_half_ulp <= 2u && low_matches &&
+           inputs_unchanged;
+}
+
+bool test_gr_mix_rne_boundaries(Context& context,
+                                PrefillBF16X2Mode mode) {
+    constexpr std::array<float, 8> sums{
+        64.25f, 64.75f, 65.25f, 65.75f,
+        64.12548828125f, 64.12646484375f,
+        64.87451171875f, 64.87353515625f};
+    constexpr std::array<std::uint16_t, 8> expected_high{
+        0x4280u, 0x4282u, 0x4282u, 0x4284u,
+        0x4280u, 0x4280u, 0x4282u, 0x4282u};
+    constexpr std::array<std::uint16_t, 8> expected_low{
+        0x3e80u, 0xbe80u, 0x3e80u, 0xbe80u,
+        0x3e00u, 0x3e02u, 0xbe00u, 0xbe02u};
+    const bool write_low = mode != PrefillBF16X2Mode::off;
+    const std::string label =
+        "Prefill GR mix exact BF16 RNE ties mode=" +
+        std::to_string(static_cast<std::uint32_t>(mode));
+    bool oracle_bits_match = true;
+    for (std::size_t index = 0u; index < sums.size(); ++index) {
+        const std::uint16_t high =
+            strata::kernels::bf16_from_f32(sums[index]);
+        oracle_bits_match &= high == expected_high[index];
+        if (write_low) {
+            const float remainder =
+                sums[index] - strata::kernels::f32_from_bf16(high);
+            oracle_bits_match &=
+                strata::kernels::bf16_from_f32(remainder) ==
+                expected_low[index];
+        }
+    }
+    check(oracle_bits_match, label + " fixed oracle bits");
+    if (!oracle_bits_match) return false;
+
+    const std::size_t stream_values =
+        static_cast<std::size_t>(kStreams) * kWidth;
+    const std::size_t input_bytes = stream_values * sizeof(float);
+    const std::size_t scale_bytes =
+        static_cast<std::size_t>(kStreams) * sizeof(float);
+    const std::size_t output_bytes =
+        static_cast<std::size_t>(kWidth) * sizeof(std::uint16_t);
+    std::vector<float> residual(stream_values, 0.0f);
+    std::vector<float> rs(kStreams, 1.0f);
+    std::vector<float> norm(stream_values, 1.0f);
+    std::vector<float> gated(stream_values, 0.0f);
+    for (std::uint32_t column = 0u; column < kWidth; ++column) {
+        const float twice_sum = 2.0f * sums[column % sums.size()];
+        for (std::uint32_t stream = 0u; stream < kStreams; ++stream) {
+            residual[static_cast<std::size_t>(stream) * kWidth + column] =
+                twice_sum;
+        }
+    }
+
+    TestBuffer residual_buffer, rs_buffer, norm_buffer, gated_buffer;
+    TestBuffer high_buffer, low_buffer, half_buffer;
+    std::string error;
+    const bool allocated =
+        residual_buffer.allocate(context, label + " residual", input_bytes,
+                                 error) &&
+        rs_buffer.allocate(context, label + " scale", scale_bytes, error) &&
+        norm_buffer.allocate(context, label + " norm", input_bytes, error) &&
+        gated_buffer.allocate(context, label + " gated", input_bytes, error) &&
+        high_buffer.allocate(context, label + " high", output_bytes, error) &&
+        (!write_low ||
+         low_buffer.allocate(context, label + " low", output_bytes, error)) &&
+        half_buffer.allocate(context, label + " half", output_bytes, error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    std::memcpy(residual_buffer.payload().data(), residual.data(), input_bytes);
+    std::memcpy(rs_buffer.payload().data(), rs.data(), scale_bytes);
+    std::memcpy(norm_buffer.payload().data(), norm.data(), input_bytes);
+    std::memcpy(gated_buffer.payload().data(), gated.data(), input_bytes);
+
+    const PrefillGRMixBuffers buffers{
+        context.buffers().read_only(residual_buffer.view()),
+        context.buffers().read_only(rs_buffer.view()),
+        context.buffers().read_only(norm_buffer.view()),
+        context.buffers().read_only(gated_buffer.view()),
+        high_buffer.view(), write_low ? low_buffer.view() : BufferRef{},
+        half_buffer.view()};
+    auto command = context.make_command_buffer(label, error);
+    check(command != nullptr, label + " command buffer", error);
+    if (!command) return false;
+    const bool encoded =
+        encode_prefill_gr_mix(context, *command, 1u, mode, buffers, error);
+    check(encoded, label + " production encode", error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    const bool dispatched = submit_and_wait(command, label, error);
+    check(dispatched, label + " Metal dispatch", error);
+    if (!dispatched) return false;
+
+    const auto actual_high = std::span<const std::uint16_t>(
+        reinterpret_cast<const std::uint16_t*>(high_buffer.payload().data()),
+        kWidth);
+    const auto actual_half = std::span<const std::uint16_t>(
+        reinterpret_cast<const std::uint16_t*>(half_buffer.payload().data()),
+        kWidth);
+    std::span<const std::uint16_t> actual_low;
+    if (write_low) {
+        actual_low = std::span<const std::uint16_t>(
+            reinterpret_cast<const std::uint16_t*>(
+                low_buffer.payload().data()),
+            kWidth);
+    }
+    bool high_matches = true;
+    bool half_matches = true;
+    bool low_matches = true;
+    std::string high_mismatch;
+    std::string low_mismatch;
+    for (std::size_t column = 0u; column < kWidth; ++column) {
+        const std::size_t tie = column % sums.size();
+        if (actual_high[column] != expected_high[tie]) {
+            high_matches = false;
+            if (high_mismatch.empty()) {
+                char detail[96]{};
+                std::snprintf(detail, sizeof(detail),
+                              "column=%zu actual=0x%04x expected=0x%04x",
+                              column, actual_high[column],
+                              expected_high[tie]);
+                high_mismatch = detail;
+            }
+        }
+        half_matches &=
+            actual_half[column] ==
+            strata::kernels::f16_from_f32(sums[tie]);
+        if (write_low && actual_low[column] != expected_low[tie]) {
+            low_matches = false;
+            if (low_mismatch.empty()) {
+                char detail[96]{};
+                std::snprintf(detail, sizeof(detail),
+                              "column=%zu actual=0x%04x expected=0x%04x",
+                              column, actual_low[column], expected_low[tie]);
+                low_mismatch = detail;
+            }
+        }
+    }
+    check(high_matches, label + " high BF16 ties match RNE exactly",
+          high_mismatch);
+    check(half_matches, label + " F16 matches scalar conversion exactly");
+    if (write_low) {
+        check(low_matches, label + " low BF16 ties match RNE exactly",
+              low_mismatch);
+    }
+    check(residual_buffer.guards_intact() && rs_buffer.guards_intact() &&
+              norm_buffer.guards_intact() && gated_buffer.guards_intact() &&
+              high_buffer.guards_intact() && half_buffer.guards_intact() &&
+              (!write_low || low_buffer.guards_intact()),
+          label + " input and output guards");
+    return high_matches && half_matches && low_matches;
+}
+
+bool reject_gr_mix_call(Context& context, std::uint32_t rows,
+                        PrefillBF16X2Mode mode,
+                        const PrefillGRMixBuffers& buffers,
+                        std::string_view expected_error,
+                        const std::string& label) {
+    std::string error;
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded =
+        encode_prefill_gr_mix(context, *command, rows, mode, buffers, error);
+    const bool right_error =
+        !encoded && error.find(expected_error) != std::string::npos;
+    check(right_error, label, error);
+    return right_error;
+}
+
+bool test_gr_mix_encoder_validation(Context& context,
+                                    Context& foreign_context) {
+    const std::string label = "Prefill GR mix validation";
+    std::string error;
+    constexpr std::size_t kStreamBytes =
+        kStreams * kWidth * sizeof(float);
+    constexpr std::size_t kScaleBytes = kStreams * sizeof(float);
+    constexpr std::size_t kNormBytes = kStreams * kWidth * sizeof(float);
+    constexpr std::size_t kOutputBytes = kWidth * sizeof(std::uint16_t);
+    TestBuffer residual, rs, norm, gated, high, low, half, foreign_residual,
+        foreign_high;
+    const bool allocated =
+        residual.allocate(context, label + " residual", kStreamBytes, error) &&
+        rs.allocate(context, label + " scale", kScaleBytes + sizeof(float),
+                    error) &&
+        norm.allocate(context, label + " norm", kNormBytes, error) &&
+        gated.allocate(context, label + " gated", kStreamBytes, error) &&
+        high.allocate(context, label + " high",
+                      kOutputBytes + sizeof(std::uint16_t), error) &&
+        low.allocate(context, label + " low",
+                     kOutputBytes + sizeof(std::uint16_t), error) &&
+        half.allocate(context, label + " half",
+                      kOutputBytes + sizeof(std::uint16_t), error) &&
+        foreign_residual.allocate(foreign_context, label + " foreign residual",
+                                  kStreamBytes, error) &&
+        foreign_high.allocate(foreign_context, label + " foreign high",
+                              kOutputBytes, error);
+    check(allocated, label + " allocate validation buffers", error);
+    if (!allocated) return false;
+
+    const ReadOnlyBufferRef residual_ro =
+        context.buffers().read_only(residual.view());
+    const ReadOnlyBufferRef rs_ro = context.buffers().read_only(rs.view());
+    const ReadOnlyBufferRef norm_ro = context.buffers().read_only(norm.view());
+    const ReadOnlyBufferRef gated_ro =
+        context.buffers().read_only(gated.view());
+    const PrefillGRMixBuffers valid{
+        residual_ro, rs_ro, norm_ro, gated_ro,
+        high.view(), low.view(), half.view()};
+    bool passed = true;
+    passed &= reject_gr_mix_call(
+        context, 0u, PrefillBF16X2Mode::off,
+        {residual_ro, rs_ro, norm_ro, gated_ro, high.view(), {}, half.view()},
+        "row count", label + " rejects zero rows");
+    passed &= reject_gr_mix_call(
+        context, kPrefillMaxShaderRows + 1u, PrefillBF16X2Mode::off,
+        {residual_ro, rs_ro, norm_ro, gated_ro, high.view(), {}, half.view()},
+        "row count", label + " rejects rows beyond shader range");
+    passed &= reject_gr_mix_call(
+        context, 1u, static_cast<PrefillBF16X2Mode>(3u),
+        {residual_ro, rs_ro, norm_ro, gated_ro, high.view(), {}, half.view()},
+        "mode is invalid", label + " rejects unknown mode");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::all_projections,
+        {residual_ro, rs_ro, norm_ro, gated_ro, high.view(), {}, half.view()},
+        "require mixed_bf_lo", label + " mode 1 requires remainder");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::except_gr,
+        {residual_ro, rs_ro, norm_ro, gated_ro, high.view(), {}, half.view()},
+        "require mixed_bf_lo", label + " mode 2 requires remainder");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::off, valid,
+        "only valid in modes 1 and 2",
+        label + " mode 0 rejects remainder");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {residual_ro.slice(0u, kStreamBytes - sizeof(float)), rs_ro,
+         norm_ro, gated_ro, high.view(), {}, half.view()},
+        "undersized", label + " rejects short residual");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {residual_ro, context.buffers().read_only(
+                          rs.view().slice(1u, kScaleBytes)),
+         norm_ro, gated_ro, high.view(), {}, half.view()},
+        "misaligned", label + " rejects misaligned scale");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {residual_ro, rs_ro,
+         context.buffers().read_only(
+             norm.view().slice(0u, kNormBytes - sizeof(float))),
+         gated_ro, high.view(), {}, half.view()},
+        "undersized", label + " rejects short norm");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {residual_ro, rs_ro, norm_ro,
+         context.buffers().read_only(
+             gated.view().slice(0u, kStreamBytes - sizeof(float))),
+         high.view(), {}, half.view()},
+        "undersized", label + " rejects short gated input");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {residual_ro, rs_ro, norm_ro, gated_ro,
+         high.view().slice(0u, kOutputBytes - sizeof(std::uint16_t)), {},
+         half.view()},
+        "undersized", label + " rejects short BF16 output");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {residual_ro, rs_ro, norm_ro, gated_ro,
+         high.view().slice(1u, kOutputBytes), {}, half.view()},
+        "misaligned", label + " rejects misaligned BF16 output");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::all_projections,
+        {residual_ro, rs_ro, norm_ro, gated_ro, high.view(),
+         low.view().slice(1u, kOutputBytes), half.view()},
+        "misaligned", label + " rejects misaligned BF16 remainder");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::all_projections,
+        {residual_ro, rs_ro, norm_ro, gated_ro, high.view(),
+         low.view().slice(0u, kOutputBytes - sizeof(std::uint16_t)),
+         half.view()},
+        "undersized", label + " rejects short BF16 remainder");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {residual_ro, rs_ro, norm_ro, gated_ro, high.view(), {},
+         half.view().slice(0u, kOutputBytes - sizeof(std::uint16_t))},
+        "undersized", label + " rejects short F16 output");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {residual_ro, rs_ro, norm_ro, gated_ro, high.view(), {},
+         half.view().slice(1u, kOutputBytes)},
+        "misaligned", label + " rejects misaligned F16 output");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {residual_ro, rs_ro, norm_ro, gated_ro, high.view(), {}, high.view()},
+        "output buffer views overlap",
+        label + " rejects overlapping output views");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::all_projections,
+        {residual_ro, rs_ro, norm_ro, gated_ro, high.view(), high.view(),
+         half.view()},
+        "output buffer views overlap",
+        label + " rejects high/remainder output alias");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::all_projections,
+        {residual_ro, rs_ro, norm_ro, gated_ro, high.view(), half.view(),
+         half.view()},
+        "output buffer views overlap",
+        label + " rejects half/remainder output alias");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::all_projections,
+        {residual_ro, rs_ro, norm_ro, gated_ro, high.view(),
+         residual.view().slice(0u, kOutputBytes), half.view()},
+        "read-only input overlaps a writable buffer view",
+        label + " rejects remainder/input overlap");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {context.buffers().read_only(residual.view()), rs_ro, norm_ro, gated_ro,
+         residual.view().slice(0u, kOutputBytes), {}, half.view()},
+        "overlaps a writable buffer view",
+        label + " rejects input/output overlap");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {foreign_context.buffers().read_only(foreign_residual.view()), rs_ro,
+         norm_ro, gated_ro, high.view(), {}, half.view()},
+        "not owned by this Context",
+        label + " rejects foreign input");
+    passed &= reject_gr_mix_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {residual_ro, rs_ro, norm_ro, gated_ro,
+         foreign_high.view(), {}, half.view()},
+        "not owned by this Context",
+        label + " rejects foreign output");
+    return passed;
+}
+
+bool test_gr_mix_failure_discards_prior_dispatch(Context& context) {
+    const std::string label = "Prefill GR mix failure discards earlier dispatch";
+    std::string error;
+    TestBuffer residual, rs, norm, gated, high, half;
+    const bool allocated =
+        residual.allocate(context, label + " residual",
+                          kStreams * kWidth * sizeof(float), error) &&
+        rs.allocate(context, label + " scale",
+                    kStreams * sizeof(float), error) &&
+        norm.allocate(context, label + " norm",
+                      kStreams * kWidth * sizeof(float), error) &&
+        gated.allocate(context, label + " gated",
+                       kStreams * kWidth * sizeof(float), error) &&
+        high.allocate(context, label + " high", kWidth * sizeof(std::uint16_t),
+                      error) &&
+        half.allocate(context, label + " half", kWidth * sizeof(std::uint16_t),
+                      error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    const std::vector<std::uint8_t> high_before(
+        high.allocation().begin(), high.allocation().end());
+    const std::vector<std::uint8_t> half_before(
+        half.allocation().begin(), half.allocation().end());
+    const PrefillGRMixBuffers buffers{
+        context.buffers().read_only(residual.view()),
+        context.buffers().read_only(rs.view()),
+        context.buffers().read_only(norm.view()),
+        context.buffers().read_only(gated.view()),
+        high.view(), {}, half.view()};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, "Prefill GR mix rollback fixture",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_prefill_gr_mix(context, encoder, 1u,
+                                       PrefillBF16X2Mode::off, buffers,
+                                       encode_error)) {
+                return false;
+            }
+            return encode_prefill_gr_mix(
+                context, encoder, 0u, PrefillBF16X2Mode::off, buffers,
+                encode_error);
+        },
+        error);
+    const bool discarded = command->unsafe_native_handle() == nullptr;
+    const bool unchanged =
+        !encoded && discarded &&
+        error.find("row count") != std::string::npos &&
+        std::equal(high_before.begin(), high_before.end(),
+                   high.allocation().begin()) &&
+        std::equal(half_before.begin(), half_before.end(),
+                   half.allocation().begin());
+    check(unchanged, label,
+          error + (discarded ? " (command buffer discarded)"
+                             : " (command buffer remained submit-capable)"));
+    return unchanged;
+}
+
+bool test_gr_mix_open_concurrent_group_rejected(Context& context) {
+    const char* const dispatch = std::getenv("STRATA_METAL_DISPATCH");
+    if (dispatch == nullptr || std::string_view(dispatch) != "concurrent") {
+        return true;
+    }
+    const std::string label = "Prefill GR mix rejects open concurrent group";
+    std::string error;
+    TestBuffer residual, rs, norm, gated, high, half;
+    const bool allocated =
+        residual.allocate(context, label + " residual",
+                          kStreams * kWidth * sizeof(float), error) &&
+        rs.allocate(context, label + " scale",
+                    kStreams * sizeof(float), error) &&
+        norm.allocate(context, label + " norm",
+                      kStreams * kWidth * sizeof(float), error) &&
+        gated.allocate(context, label + " gated",
+                       kStreams * kWidth * sizeof(float), error) &&
+        high.allocate(context, label + " high", kWidth * sizeof(std::uint16_t),
+                      error) &&
+        half.allocate(context, label + " half", kWidth * sizeof(std::uint16_t),
+                      error);
+    if (!allocated) {
+        check(false, label + " allocate buffers", error);
+        return false;
+    }
+    const PrefillGRMixBuffers buffers{
+        context.buffers().read_only(residual.view()),
+        context.buffers().read_only(rs.view()),
+        context.buffers().read_only(norm.view()),
+        context.buffers().read_only(gated.view()),
+        high.view(), {}, half.view()};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, "open concurrent Prefill GR mix",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encoder.group_begin(encode_error)) return false;
+            return encode_prefill_gr_mix(context, encoder, 1u,
+                                         PrefillBF16X2Mode::off, buffers,
+                                         encode_error);
+        },
+        error);
+    const bool rejected =
+        !encoded && error.find("ordered concurrent-group boundary") !=
+                        std::string::npos;
+    check(rejected, label, error);
+    return rejected;
+}
+
 bool test_open_concurrent_group_rejected(Context& context) {
     const char* const dispatch = std::getenv("STRATA_METAL_DISPATCH");
     if (dispatch == nullptr || std::string_view(dispatch) != "concurrent") {
@@ -1208,18 +1890,32 @@ int main(int argc, char** argv) {
         passed &= run_silu_case(*context, rows[index], modes[index], false);
         passed &= test_silu_rne_boundaries(*context, modes[index]);
     }
+    passed &= test_gr_mix_encoder_validation(*context, *foreign_context);
+    for (std::size_t row_index = 0u; row_index < rows.size(); ++row_index) {
+        for (std::size_t mode_index = 0u; mode_index < modes.size();
+             ++mode_index) {
+            const bool shared = row_index == 1u && mode_index == 1u;
+            passed &= run_gr_mix_case(*context, rows[row_index],
+                                      modes[mode_index], shared);
+        }
+    }
+    for (const PrefillBF16X2Mode mode : modes) {
+        passed &= test_gr_mix_rne_boundaries(*context, mode);
+    }
     passed &= run_silu_case(*context, 3u,
                             PrefillBF16X2Mode::all_projections, true);
     passed &= test_prefill_embedding_chain(*context);
     passed &= test_failure_discards_prior_prefill_dispatch(*context);
     passed &= test_silu_failure_discards_prior_dispatch(*context);
+    passed &= test_gr_mix_failure_discards_prior_dispatch(*context);
     passed &= test_open_concurrent_group_rejected(*context);
     passed &= test_silu_open_concurrent_group_rejected(*context);
+    passed &= test_gr_mix_open_concurrent_group_rejected(*context);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d Prefill Metal test(s) failed\n", g_failures);
         return 1;
     }
     if (!passed) return 1;
-    std::puts("all Prefill GR normalization and SiLU tests passed");
+    std::puts("all Prefill GR normalization, SiLU and mix tests passed");
     return 0;
 }

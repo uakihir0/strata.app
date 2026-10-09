@@ -112,3 +112,64 @@ kernel void strata_pf_gr_silu_lo(device const float* low_rank [[buffer(0)]],
                                  uint index [[thread_position_in_grid]]) {
     prefill_gr_silu(low_rank, high_bf16, low_bf16, rows, index, true);
 }
+
+static inline void prefill_gr_mix(device const float* residual,
+                                  device const float* rs,
+                                  device const float* norm,
+                                  device const float* gated,
+                                  device ushort* mixed_bf,
+                                  device half* mixed_h,
+                                  device ushort* mixed_bf_lo,
+                                  bool write_low_remainder,
+                                  uint row, uint tile, uint tid) {
+    const uint column = tile * 256u + tid;
+    if (column >= N_EMBD) return;
+
+    float sum = 0.0f;
+    const ulong row_offset = ulong(row) * HC * N_EMBD;
+    for (uint stream = 0u; stream < HC; ++stream) {
+        const ulong index =
+            row_offset + ulong(stream) * N_EMBD + column;
+        const float value =
+            (residual[index] * rs[row * HC + stream]) *
+            norm[stream * N_EMBD + column];
+        sum = fma(value, sigmoid_k(gated[index]), sum);
+    }
+    sum /= 4.0f;
+    const ulong output_index = ulong(row) * N_EMBD + column;
+    const ushort high = f32_to_bf16_rne(sum);
+    mixed_bf[output_index] = high;
+    if (write_low_remainder) {
+        mixed_bf_lo[output_index] =
+            f32_to_bf16_rne(sum - bf16_to_f32(high));
+    }
+    mixed_h[output_index] = half(sum);
+}
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void strata_pf_gr_mix(device const float* residual [[buffer(0)]],
+                             device const float* rs [[buffer(1)]],
+                             device const float* norm [[buffer(2)]],
+                             device const float* gated [[buffer(3)]],
+                             device ushort* mixed_bf [[buffer(4)]],
+                             device half* mixed_h [[buffer(5)]],
+                             uint3 group [[threadgroup_position_in_grid]],
+                             uint3 tid3 [[thread_position_in_threadgroup]]) {
+    prefill_gr_mix(residual, rs, norm, gated, mixed_bf, mixed_h, nullptr,
+                   false, group.y, group.x, tid3.x);
+}
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void strata_pf_gr_mix_lo(
+    device const float* residual [[buffer(0)]],
+    device const float* rs [[buffer(1)]],
+    device const float* norm [[buffer(2)]],
+    device const float* gated [[buffer(3)]],
+    device ushort* mixed_bf [[buffer(4)]],
+    device half* mixed_h [[buffer(5)]],
+    device ushort* mixed_bf_lo [[buffer(6)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint3 tid3 [[thread_position_in_threadgroup]]) {
+    prefill_gr_mix(residual, rs, norm, gated, mixed_bf, mixed_h,
+                   mixed_bf_lo, true, group.y, group.x, tid3.x);
+}
