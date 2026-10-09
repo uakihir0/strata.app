@@ -159,6 +159,27 @@ struct MtpAttentionOutputProjectionBuffers {
     BufferRef sink;
 };
 
+/// Inputs and outputs for MTP stage 15's feed-forward hyperconnection read.
+/// It applies the GR block output `bo` and prior injection `inj` to `residual`,
+/// producing the updated residual, `inject_out`, and `mixed` values. Keep all
+/// views alive through GPU completion and keep params and read-only inputs
+/// unchanged until the encoder has consumed them.
+struct MtpFeedForwardReadBuffers {
+    ReadOnlyBufferRef params;
+    BufferRef residual;
+    BufferRef bo;
+    BufferRef inj;
+    BufferRef norm;
+    BufferRef normalized;
+    BufferRef rs;
+    BufferRef hc_down;
+    BufferRef hc_inject;
+    BufferRef lo;
+    BufferRef inject_out;
+    BufferRef hc_up;
+    BufferRef mixed;
+};
+
 /// Add MTP hidden and embedding streams to the caller-owned Encoder segment.
 /// On failure, the enclosing Encoder::encode body must return false so prior
 /// work in that segment is discarded.
@@ -267,5 +288,16 @@ bool encode_mtp_attention_output_projection(
     Context& context, CommandBuffer& command_buffer,
     const MtpAttentionOutputProjectionBuffers& buffers,
     std::string& error);
+
+/// Encode MTP stage 15 by composing the GR normalize/down/up chain with
+/// apply=true. Requires T=1; the standalone form is transactional, and the
+/// caller-owned form must propagate failure from its enclosing
+/// `Encoder::encode` body.
+bool encode_mtp_feed_forward_read(Context& context, Encoder& encoder,
+                                  const MtpFeedForwardReadBuffers& buffers,
+                                  std::string& error);
+bool encode_mtp_feed_forward_read(
+    Context& context, CommandBuffer& command_buffer,
+    const MtpFeedForwardReadBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal

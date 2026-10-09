@@ -1688,4 +1688,115 @@ bool encode_mtp_attention_output_projection(
         error);
 }
 
+bool encode_mtp_feed_forward_read(Context& context, Encoder& encoder,
+                                  const MtpFeedForwardReadBuffers& buffers,
+                                  std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "MTP feed-forward read requires an ordered "
+                "concurrent-group boundary";
+        return false;
+    }
+
+    constexpr char operation[] = "MTP feed-forward read";
+    std::uint32_t rows = 0u;
+    if (!read_mtp_rows(context, buffers.params, operation, rows, error)) {
+        return false;
+    }
+    if (rows != 1u) {
+        error = std::string(operation) +
+                " requires T=1 for the full-layer pass";
+        return false;
+    }
+    if (!validate_read_only_buffer(context, buffers.params,
+                                   sizeof(MtpParams), alignof(MtpParams),
+                                   "params", operation, error)) {
+        return false;
+    }
+
+    const std::size_t residual_bytes =
+        static_cast<std::size_t>(rows) * HC_DIM * sizeof(float);
+    const std::size_t block_bytes =
+        static_cast<std::size_t>(rows) * N_EMBD * sizeof(float);
+    const std::size_t injection_bytes =
+        static_cast<std::size_t>(rows) * HC * sizeof(float);
+    const std::size_t norm_bytes =
+        static_cast<std::size_t>(HC_DIM) * sizeof(float);
+    const std::size_t low_rank_bytes =
+        static_cast<std::size_t>(rows) * HC_LOW_RANK * sizeof(float);
+    const std::size_t down_weight_bytes =
+        static_cast<std::size_t>(HC_LOW_RANK) * HC_DIM *
+        sizeof(std::uint16_t);
+    const std::size_t inject_weight_bytes =
+        static_cast<std::size_t>(HC) * HC_DIM * sizeof(std::uint16_t);
+    const std::size_t up_weight_bytes =
+        static_cast<std::size_t>(HC_DIM) * HC_LOW_RANK *
+        sizeof(std::uint16_t);
+    const std::array<std::pair<const char*, BufferRef>, 12> active_views{{
+        {"residual", buffers.residual},
+        {"bo", buffers.bo},
+        {"inj", buffers.inj},
+        {"norm", buffers.norm},
+        {"normalized", buffers.normalized},
+        {"rs", buffers.rs},
+        {"hc_down", buffers.hc_down},
+        {"hc_inject", buffers.hc_inject},
+        {"lo", buffers.lo},
+        {"inject_out", buffers.inject_out},
+        {"hc_up", buffers.hc_up},
+        {"mixed", buffers.mixed},
+    }};
+    const std::array<std::size_t, 12> active_bytes{
+        residual_bytes,
+        block_bytes,
+        injection_bytes,
+        norm_bytes,
+        residual_bytes,
+        injection_bytes,
+        down_weight_bytes,
+        inject_weight_bytes,
+        low_rank_bytes,
+        injection_bytes,
+        up_weight_bytes,
+        block_bytes,
+    };
+    for (std::size_t index = 0u; index < active_views.size(); ++index) {
+        if (overlaps(buffers.params, sizeof(MtpParams),
+                     active_views[index].second, active_bytes[index])) {
+            error = std::string(operation) +
+                    " parameter block overlaps active view " +
+                    active_views[index].first;
+            return false;
+        }
+    }
+
+    const GRReadBuffers gr_buffers{
+        buffers.residual,
+        buffers.bo,
+        buffers.inj,
+        buffers.norm,
+        buffers.normalized,
+        buffers.rs,
+        buffers.hc_down,
+        buffers.hc_inject,
+        buffers.lo,
+        buffers.inject_out,
+        buffers.hc_up,
+        buffers.mixed,
+    };
+    return encode_gr_read(context, encoder, rows, true, gr_buffers, error);
+}
+
+bool encode_mtp_feed_forward_read(
+    Context& context, CommandBuffer& command_buffer,
+    const MtpFeedForwardReadBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "MTP feed-forward read",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_mtp_feed_forward_read(context, encoder, buffers,
+                                                encode_error);
+        },
+        error);
+}
+
 }  // namespace strata::metal
