@@ -8884,7 +8884,8 @@ measuring L-15 remain open.
   Xcode 27.0 build 27A266a). The fixtures cover isolated projections only;
   production `MtpRuntimeStorage` binding and model-backed parity remain open.
 - **Review required:** Recheck the Stage 22 composition's use of the map token,
-  and continue with production MTP runtime binding and drafter parity.
+  and continue production MTP runtime binding beyond stages 1–5, scheduler
+  integration and drafter parity.
 
 ### D-IMPL-337: Compose MTP drafter stage 22 greedy sampling
 
@@ -8941,9 +8942,74 @@ measuring L-15 remain open.
   `check_drift.py` and `git diff --check` also passed. These fixtures validate
   isolated encoder behavior and do not establish production runtime binding,
   scheduler integration or model-backed parity.
-- **Review required:** Implement or explicitly disposition the remaining
-  L11 work: MTP stages 1–5, `MtpRuntimeStorage` view binding, scheduler
-  integration and inspected-model parity.
+- **Review required:** Continue the remaining L11 work: bind MTP stages 6–22,
+  integrate the drafter scheduler and establish inspected-model parity.
+
+### D-IMPL-339: Bind MTP input projection views from runtime storage
+
+- **Decision:** Add `MtpRuntimeStorage::bind_input_projection` to resolve the
+  selected MTP parameter slot, stage-1–5 dense weights and named bind-scratch
+  regions into `MtpInputProjectionBuffers`. The main token-embedding table and
+  current residual remain caller-supplied Context-owned views because their
+  source depends on the active model mode and input step. A successful bind
+  means the views were resolved from live storage; the encoder remains the
+  authority for tensor extents, formats, alignment, `hid` counts, token values
+  and alias validation.
+- **Reason:** This provides a small storage-to-dispatch seam without duplicating
+  the encoder's payload validation or assuming one source for the main-model
+  token table and residual. For T<8, stage 4's mat-vec sink can reuse the
+  inactive `e2` tail after the active T rows. At T=8, `e2` has no padding
+  rows, so the one-float minimum sink uses the first float of `bo`; the stages
+  that produce meaningful `bo` data run later in the ordered MTP sequence.
+  Stage 10 may also use that word as a sink before stage 14 writes meaningful
+  `bo` output. Both choices avoid a new allocation and keep the planned bind
+  layout intact.
+- **Validation:** `metal_mtp_storage_test` resolves and dispatches the bound
+  T=5 and T=8 views, exercising both sink choices. Its T=1 selected-token case
+  writes a stale out-of-range token first, then dispatches a GPU copy from
+  `MtpParams::tokens` to `out_ids` before the projection in the same ordered
+  Encoder segment. It also checks both norm-weight mappings and that a failed
+  slot lookup clears the output views. The synthetic storage fixture is a
+  binding/dispatch smoke test; it does not establish numerical or
+  inspected-model parity.
+- **Build and tests:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the `mac-dev` build succeeded, the current focused
+  `metal_mtp_storage_test` passed 1/1, and the complete `mac-metal` suite
+  passed 80/80. These checks do not establish scheduler integration or
+  end-to-end inference.
+- **Review:** REV-136 records the hostile-review findings, test improvements
+  and final disposition. Runtime bindings for later MTP stages, scheduler
+  integration and inspected-model drafter parity remain open.
+
+### REV-136: Hostile review of MTP input projection runtime binding
+
+- **Scope:** The new `MtpRuntimeStorage::bind_input_projection` API, ownership
+  and validation contract, scratch/sink choices, and the binding-to-encoder
+  integration test.
+- **Initial findings and fixes:** The first review found that a successful
+  bind could be mistaken for complete input validation. The API comment now
+  states that binding resolves live Context-owned views while the encoder
+  retains format, extent, alignment, `hid`, token-value and alias validation.
+  The review also found that the initial test checked view identities without
+  dispatching those bound views. The test now checks both norm-weight mappings,
+  runs T=5 and T=8 through the encoder with their respective e2-tail and
+  bo[0] sinks, and verifies failed parameter-slot binding clears the outputs.
+- **Follow-up findings and fixes:** The second review found that the sink
+  branches were not both exercised through the encoder and that the selected
+  token was CPU initialized despite the GPU-producer contract. The final test
+  runs the T=5 and T=8 encoder cases while each corresponding parameter block
+  is active. For T=1, it starts `out_ids` with a stale out-of-range value,
+  copies `MtpParams::tokens` into it with `strata_selftest_copy_u32_one`, then
+  runs the projection in the same ordered Encoder segment.
+- **Final review:** The reviewer confirmed both sink cases pass encoder
+  validation and the selected-token producer precedes its consumer in the
+  same segment. No further actionable findings remain.
+- **Disposition:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the latest `mac-dev` build succeeded, the expanded focused
+  `metal_mtp_storage_test` passed 1/1, and `mac-metal` passed 80/80. The
+  storage fixture confirms binding and dispatch only; it does not provide
+  numerical oracle coverage, scheduler integration or inspected-model
+  drafter parity.
 
 ### D-IMPL-338: Compose MTP drafter stages 1–5
 
@@ -8990,9 +9056,9 @@ measuring L-15 remain open.
   establish runtime-storage binding, scheduler integration or inspected-model
   drafter parity.
 - **Review:** REV-135 records the hostile review findings and their fixes; the
-  follow-up review found no additional issue. Then bind stages 1–22 to
-  `MtpRuntimeStorage`, implement scheduler integration and establish inspected-
-  model drafter parity.
+  follow-up review found no additional issue. D-IMPL-339 binds the stage-1–5
+  views. Continue runtime binding for stages 6–22, scheduler integration and
+  inspected-model drafter parity.
 
 ### REV-135: Hostile review of MTP input projection stages 1–5
 
