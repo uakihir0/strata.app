@@ -73,12 +73,19 @@ static inline float decode_iq4_xs(device const block_iq4_xs* row, uint v) {
         device const block_q3_K* table [[buffer(0)]], \
         device const uint* tokens [[buffer(1)]], \
         device float* emb [[buffer(2)]], \
+        constant uint& vocabulary_size [[buffer(3)]], \
+        constant uint& tokens_are_gpu_written [[buffer(4)]], \
         uint3 tid3 [[thread_position_in_threadgroup]], \
         uint3 group [[threadgroup_position_in_grid]]) { \
         const uint token = tokens[group.y]; \
-        if ((token & 0x80000000u) != 0u) return; \
-        const device block_q3_K* row = table + ulong(token) * 10ul; \
+        if ((token & 0x80000000u) != 0u && \
+            tokens_are_gpu_written == 0u) return; \
         const uint value = 256u * group.x + tid3.x; \
+        if (token >= vocabulary_size) { \
+            emb[N_EMBD * group.y + value] = as_type<float>(0x7fc00000u); \
+            return; \
+        } \
+        const device block_q3_K* row = table + ulong(token) * 10ul; \
         emb[N_EMBD * group.y + value] = \
             decode_q3_k(row + group.x, value % 256u); \
     }
@@ -89,12 +96,19 @@ static inline float decode_iq4_xs(device const block_iq4_xs* row, uint v) {
         device const block_iq3_s* table [[buffer(0)]], \
         device const uint* tokens [[buffer(1)]], \
         device float* emb [[buffer(2)]], \
+        constant uint& vocabulary_size [[buffer(3)]], \
+        constant uint& tokens_are_gpu_written [[buffer(4)]], \
         uint3 tid3 [[thread_position_in_threadgroup]], \
         uint3 group [[threadgroup_position_in_grid]]) { \
         const uint token = tokens[group.y]; \
-        if ((token & 0x80000000u) != 0u) return; \
-        const device block_iq3_s* row = table + ulong(token) * 10ul; \
+        if ((token & 0x80000000u) != 0u && \
+            tokens_are_gpu_written == 0u) return; \
         const uint value = 256u * group.x + tid3.x; \
+        if (token >= vocabulary_size) { \
+            emb[N_EMBD * group.y + value] = as_type<float>(0x7fc00000u); \
+            return; \
+        } \
+        const device block_iq3_s* row = table + ulong(token) * 10ul; \
         emb[N_EMBD * group.y + value] = \
             decode_iq3_s(row + group.x, value % 256u); \
     }
@@ -105,12 +119,19 @@ static inline float decode_iq4_xs(device const block_iq4_xs* row, uint v) {
         device const block_iq4_xs* table [[buffer(0)]], \
         device const uint* tokens [[buffer(1)]], \
         device float* emb [[buffer(2)]], \
+        constant uint& vocabulary_size [[buffer(3)]], \
+        constant uint& tokens_are_gpu_written [[buffer(4)]], \
         uint3 tid3 [[thread_position_in_threadgroup]], \
         uint3 group [[threadgroup_position_in_grid]]) { \
         const uint token = tokens[group.y]; \
-        if ((token & 0x80000000u) != 0u) return; \
-        const device block_iq4_xs* row = table + ulong(token) * 10ul; \
+        if ((token & 0x80000000u) != 0u && \
+            tokens_are_gpu_written == 0u) return; \
         const uint value = 256u * group.x + tid3.x; \
+        if (token >= vocabulary_size) { \
+            emb[N_EMBD * group.y + value] = as_type<float>(0x7fc00000u); \
+            return; \
+        } \
+        const device block_iq4_xs* row = table + ulong(token) * 10ul; \
         emb[N_EMBD * group.y + value] = \
             decode_iq4_xs(row + group.x, value % 256u); \
     }
@@ -123,12 +144,19 @@ STRATA_EMBED_ROWS_IQ4_XS
 kernel void strata_embed_rows_bf16(device const ushort* table [[buffer(0)]],
                                    device const uint* tokens [[buffer(1)]],
                                    device float* emb [[buffer(2)]],
+                                   constant uint& vocabulary_size [[buffer(3)]],
+                                   constant uint& tokens_are_gpu_written [[buffer(4)]],
                                    uint3 tid3 [[thread_position_in_threadgroup]],
                                    uint3 group [[threadgroup_position_in_grid]]) {
     const uint token = tokens[group.y];
-    if ((token & 0x80000000u) != 0u) return;
-    const device ushort* row = table + ulong(token) * ulong(N_EMBD);
+    if ((token & 0x80000000u) != 0u &&
+        tokens_are_gpu_written == 0u) return;
     const uint value = 256u * group.x + tid3.x;
+    if (token >= vocabulary_size) {
+        emb[N_EMBD * group.y + value] = as_type<float>(0x7fc00000u);
+        return;
+    }
+    const device ushort* row = table + ulong(token) * ulong(N_EMBD);
     emb[N_EMBD * group.y + value] = bf16_to_f32(row[value]);
 }
 

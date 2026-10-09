@@ -322,7 +322,8 @@ bool prepare_embed_rows(Context& context, std::uint32_t rows,
         }
     }
 
-    dispatch = {rows, buffers, info.kernel_name, info.format_name};
+    dispatch = {rows, vocabulary_size, 0u, buffers, info.kernel_name,
+                info.format_name};
     error.clear();
     return true;
 }
@@ -343,6 +344,12 @@ void encode_embed_rows(Context& context,
     [encoder setBuffer:(__bridge id<MTLBuffer>)dispatch.buffers.embedding.handle
                 offset:dispatch.buffers.embedding.offset
                atIndex:2u];
+    [encoder setBytes:&dispatch.vocabulary_size
+               length:sizeof(dispatch.vocabulary_size)
+              atIndex:3u];
+    [encoder setBytes:&dispatch.tokens_are_gpu_written
+               length:sizeof(dispatch.tokens_are_gpu_written)
+              atIndex:4u];
     [encoder dispatchThreadgroups:
                  MTLSizeMake(kEmbedRowsGroupsX, dispatch.rows, 1u)
               threadsPerThreadgroup:
@@ -475,7 +482,12 @@ bool encode_embed_rows(Context& context, Encoder& encoder,
         EncoderBufferBinding{buffers.embedding, 2u, buffers.embedding.length,
                              alignof(float)},
     };
-    constexpr std::array<EncoderBytesBinding, 0> bytes{};
+    const std::array bytes{
+        EncoderBytesBinding{&dispatch.vocabulary_size,
+                            sizeof(dispatch.vocabulary_size), 3u},
+        EncoderBytesBinding{&dispatch.tokens_are_gpu_written,
+                            sizeof(dispatch.tokens_are_gpu_written), 4u},
+    };
     constexpr std::array<EncoderThreadgroupMemory, 0> threadgroup_memory{};
     return encoder.dispatch(
         dispatch.kernel_name, {N_EMBD / kEmbedRowsThreads, rows, 1u},
@@ -538,14 +550,18 @@ bool encode_embed_rows(Context& context, Encoder& encoder,
         return false;
     }
 
-    const auto* const token_data =
-        static_cast<const std::uint32_t*>(buffers.tokens.contents());
-    for (std::uint32_t row = 0u; row < rows; ++row) {
-        const std::uint32_t token = token_data[row];
-        if ((token & kImageTokenFlag) == 0u && token >= vocabulary_size) {
-            error = "embedding rows token id at row " + std::to_string(row) +
-                    " is outside the vocabulary";
-            return false;
+    if (!buffers.tokens_are_gpu_written) {
+        const auto* const token_data =
+            static_cast<const std::uint32_t*>(buffers.tokens.contents());
+        for (std::uint32_t row = 0u; row < rows; ++row) {
+            const std::uint32_t token = token_data[row];
+            if ((token & kImageTokenFlag) == 0u &&
+                token >= vocabulary_size) {
+                error =
+                    "embedding rows token id at row " +
+                    std::to_string(row) + " is outside the vocabulary";
+                return false;
+            }
         }
     }
 
@@ -559,7 +575,13 @@ bool encode_embed_rows(Context& context, Encoder& encoder,
         EncoderReadOnlyBufferBinding{buffers.tokens, 1u, token_bytes,
                                     alignof(std::uint32_t)},
     };
-    constexpr std::array<EncoderBytesBinding, 0> bytes{};
+    const std::uint32_t tokens_are_gpu_written =
+        buffers.tokens_are_gpu_written ? 1u : 0u;
+    const std::array bytes{
+        EncoderBytesBinding{&vocabulary_size, sizeof(vocabulary_size), 3u},
+        EncoderBytesBinding{&tokens_are_gpu_written,
+                            sizeof(tokens_are_gpu_written), 4u},
+    };
     constexpr std::array<EncoderThreadgroupMemory, 0> threadgroup_memory{};
     return encoder.dispatch(
         info.kernel_name, {N_EMBD / kEmbedRowsThreads, rows, 1u},

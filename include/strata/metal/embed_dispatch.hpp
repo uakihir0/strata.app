@@ -29,6 +29,10 @@ struct EmbedRowsReadOnlyBuffers {
     ReadOnlyBufferRef table;
     ReadOnlyBufferRef tokens;
     BufferRef embedding;
+    /// The token values are produced by GPU work earlier in the same ordered
+    /// command buffer and are not valid to inspect on the CPU before submit.
+    /// The gather shader bounds-checks them and writes a quiet NaN on OOV.
+    bool tokens_are_gpu_written = false;
 };
 
 struct EmbedImageBuffers {
@@ -39,7 +43,10 @@ struct EmbedImageBuffers {
 
 /// Encode text-token embedding gathers for a positive, shader-index-safe row
 /// count. Non-image token ids must be below `vocabulary_size`; image-marked
-/// rows are left untouched. The output must not overlap either input, while
+/// rows are left untouched when `tokens_are_gpu_written` is false. In the
+/// GPU-written mode, every value is treated as a token ID (including a
+/// high-bit value), and an out-of-vocabulary ID writes a quiet NaN without
+/// reading past the table. The output must not overlap either input, while
 /// the read-only table and token views may overlap. The caller must keep the
 /// input views alive, and token values unchanged, until command completion.
 bool encode_embed_rows(Context& context, CommandBuffer& command_buffer,

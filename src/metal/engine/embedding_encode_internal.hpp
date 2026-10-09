@@ -10,6 +10,8 @@ namespace strata::metal::detail {
 
 struct EmbedRowsDispatch {
     std::uint32_t rows = 0u;
+    std::uint32_t vocabulary_size = 0u;
+    std::uint32_t tokens_are_gpu_written = 0u;
     EmbedRowsBuffers buffers{};
     const char* kernel_name = nullptr;
     const char* format_name = nullptr;
