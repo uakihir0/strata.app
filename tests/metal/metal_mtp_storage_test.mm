@@ -593,16 +593,116 @@ int main(int argc, char** argv) {
                             provisional_runtime->dense_weight(
                                 "fc_hidden.weight").contents,
                     "MTP stage-1–5 weights, parameter and T=5 scratch views are resolved");
+            MtpAddStreamsBuffers t5_add_streams_buffers;
+            MtpAttentionReadBuffers t5_attention_read_buffers;
+            MtpAttentionKvProjectionBuffers t5_kv_projection_buffers;
+            require(provisional_runtime->bind_add_streams(
+                        *rollback_context, 9u, t5_add_streams_buffers,
+                        error) &&
+                        provisional_runtime->bind_attention_read(
+                            *rollback_context, 9u,
+                            t5_attention_read_buffers, error) &&
+                        provisional_runtime->bind_attention_kv_projection(
+                            *rollback_context, 9u,
+                            t5_kv_projection_buffers, error),
+                    "bind MTP stages 6–8 at T=5: " + error);
+            const BufferRef attention_h2 =
+                provisional_runtime->bind_region(MtpBindRegionId::h2);
+            const BufferRef attention_bo =
+                provisional_runtime->bind_region(MtpBindRegionId::bo);
+            const auto same_view = [](const BufferRef& actual,
+                                      const BufferRef& expected) {
+                return actual && expected &&
+                       actual.handle == expected.handle &&
+                       actual.offset == expected.offset &&
+                       actual.length == expected.length &&
+                       actual.contents == expected.contents &&
+                       actual.gpu_address == expected.gpu_address;
+            };
+            require(same_view(
+                            t5_add_streams_buffers.output,
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::mtp_rin)) &&
+                        same_view(t5_attention_read_buffers.residual,
+                                  t5_add_streams_buffers.output) &&
+                        same_view(t5_attention_read_buffers.dead_h2_scratch,
+                                  attention_h2) &&
+                        same_view(t5_attention_read_buffers.normalized,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::xn)) &&
+                        same_view(t5_attention_read_buffers.rs,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::rs)) &&
+                        same_view(t5_attention_read_buffers.lo,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::lo)) &&
+                        same_view(t5_attention_read_buffers.inject_out,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::inj)) &&
+                        t5_attention_read_buffers.norm.contents ==
+                            provisional_runtime->dense_weight(
+                                "attn_hyper_connection.hc_norm.weight").contents &&
+                        t5_attention_read_buffers.hc_down.contents ==
+                            provisional_runtime->dense_weight(
+                                "attn_hyper_connection.input_mix_weight_down.weight").contents &&
+                        t5_attention_read_buffers.hc_inject.contents ==
+                            provisional_runtime->dense_weight(
+                                "attn_hyper_connection.block_inject_weight.weight").contents &&
+                        t5_attention_read_buffers.hc_up.contents ==
+                            provisional_runtime->dense_weight(
+                                "attn_hyper_connection.input_mix_weight_up.weight").contents &&
+                        same_view(t5_attention_read_buffers.mixed,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::mixed)) &&
+                        same_view(t5_kv_projection_buffers.mixed,
+                                  t5_attention_read_buffers.mixed) &&
+                        same_view(t5_kv_projection_buffers.xq,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::xq)) &&
+                        t5_kv_projection_buffers.key_weights.contents() ==
+                            provisional_runtime->dense_weight(
+                                "self_attn.k_proj.weight").contents &&
+                        t5_kv_projection_buffers.value_weights.contents() ==
+                            provisional_runtime->dense_weight(
+                                "self_attn.v_proj.weight").contents &&
+                        same_view(t5_kv_projection_buffers.kcur,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::kcur)) &&
+                        same_view(t5_kv_projection_buffers.vcur,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::vcur)) &&
+                        same_view(t5_kv_projection_buffers.sink,
+                                  attention_bo),
+                    "MTP stages 6–8 resolve the planned weights and T=5 scratch views");
             auto t5_projection_command =
                 rollback_context->make_command_buffer(
-                    "MTP runtime-bound T=5 input projection", error);
+                    "MTP runtime-bound T=5 stages 1–8", error);
             require(t5_projection_command != nullptr &&
-                        encode_mtp_input_projection(
+                        Encoder::encode(
                             *rollback_context, *t5_projection_command,
-                            projection_buffers, error) &&
+                            "MTP runtime-bound T=5 input-to-KV chain",
+                            [&](Encoder& encoder,
+                                std::string& encode_error) {
+                                return encode_mtp_input_projection(
+                                           *rollback_context, encoder,
+                                           projection_buffers, encode_error) &&
+                                       encode_mtp_add_streams(
+                                           *rollback_context, encoder,
+                                           t5_add_streams_buffers,
+                                           encode_error) &&
+                                       encode_mtp_attention_read(
+                                           *rollback_context, encoder,
+                                           t5_attention_read_buffers,
+                                           encode_error) &&
+                                       encode_mtp_attention_kv_projection(
+                                           *rollback_context, encoder,
+                                           t5_kv_projection_buffers,
+                                           encode_error);
+                            },
+                            error) &&
                         t5_projection_command->commit(error) &&
                         t5_projection_command->wait_until_completed(error),
-                    "dispatch MTP T=5 projection with its padded e2-tail sink: " +
+                    "dispatch MTP T=5 stages 1–8 with their planned scratch views: " +
                         error);
 
             projection_params = {};
@@ -626,16 +726,68 @@ int main(int argc, char** argv) {
                         projection_buffers.matvec_sink.length ==
                             sizeof(float),
                     "T=8 MTP projection uses the later-dead bo word as its required sink");
+            MtpAddStreamsBuffers t8_add_streams_buffers;
+            MtpAttentionReadBuffers t8_attention_read_buffers;
+            MtpAttentionKvProjectionBuffers t8_kv_projection_buffers;
+            require(provisional_runtime->bind_add_streams(
+                        *rollback_context, 9u, t8_add_streams_buffers,
+                        error) &&
+                        provisional_runtime->bind_attention_read(
+                            *rollback_context, 9u,
+                            t8_attention_read_buffers, error) &&
+                        provisional_runtime->bind_attention_kv_projection(
+                            *rollback_context, 9u,
+                            t8_kv_projection_buffers, error) &&
+                        same_view(
+                            t8_add_streams_buffers.output,
+                            provisional_runtime->bind_region(
+                                MtpBindRegionId::mtp_rin)) &&
+                        same_view(t8_attention_read_buffers.dead_h2_scratch,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::h2)) &&
+                        same_view(t8_attention_read_buffers.mixed,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::mixed)) &&
+                        same_view(t8_kv_projection_buffers.kcur,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::kcur)) &&
+                        same_view(t8_kv_projection_buffers.vcur,
+                                  provisional_runtime->bind_region(
+                                      MtpBindRegionId::vcur)) &&
+                        same_view(t8_kv_projection_buffers.sink,
+                                  projection_bo),
+                    "T=8 MTP stage-6–8 bindings use full planned active regions: " +
+                        error);
             auto t8_projection_command =
                 rollback_context->make_command_buffer(
-                    "MTP runtime-bound T=8 input projection", error);
+                    "MTP runtime-bound T=8 stages 1–8", error);
             require(t8_projection_command != nullptr &&
-                        encode_mtp_input_projection(
+                        Encoder::encode(
                             *rollback_context, *t8_projection_command,
-                            projection_buffers, error) &&
+                            "MTP runtime-bound T=8 input-to-KV chain",
+                            [&](Encoder& encoder,
+                                std::string& encode_error) {
+                                return encode_mtp_input_projection(
+                                           *rollback_context, encoder,
+                                           projection_buffers, encode_error) &&
+                                       encode_mtp_add_streams(
+                                           *rollback_context, encoder,
+                                           t8_add_streams_buffers,
+                                           encode_error) &&
+                                       encode_mtp_attention_read(
+                                           *rollback_context, encoder,
+                                           t8_attention_read_buffers,
+                                           encode_error) &&
+                                       encode_mtp_attention_kv_projection(
+                                           *rollback_context, encoder,
+                                           t8_kv_projection_buffers,
+                                           encode_error);
+                            },
+                            error) &&
                         t8_projection_command->commit(error) &&
                         t8_projection_command->wait_until_completed(error),
-                    "dispatch MTP T=8 projection with its bo sink: " + error);
+                    "dispatch MTP stages 1–8 at the maximum T=8 active extent: " +
+                        error);
 
             projection_params = {};
             projection_params.T = 1u;
@@ -673,6 +825,15 @@ int main(int argc, char** argv) {
                             provisional_runtime->bind_region(
                                 MtpBindRegionId::mtp_rin).handle,
                     "MTP runtime binding resolves stage-6 input and residual views");
+            MtpAttentionReadBuffers attention_read_buffers;
+            MtpAttentionKvProjectionBuffers kv_projection_buffers;
+            require(provisional_runtime->bind_attention_read(
+                        *rollback_context, 9u, attention_read_buffers,
+                        error) &&
+                        provisional_runtime->bind_attention_kv_projection(
+                            *rollback_context, 9u, kv_projection_buffers,
+                            error),
+                    "bind MTP runtime views for stages 7–8: " + error);
             const ReadOnlyBufferRef projection_token_source =
                 rollback_context->buffers().read_only(
                     provisional_params_slot.slice(
@@ -709,12 +870,20 @@ int main(int argc, char** argv) {
                                            projection_buffers, encode_error) &&
                                        encode_mtp_add_streams(
                                            *rollback_context, encoder,
-                                           add_streams_buffers, encode_error);
+                                           add_streams_buffers, encode_error) &&
+                                       encode_mtp_attention_read(
+                                           *rollback_context, encoder,
+                                           attention_read_buffers,
+                                           encode_error) &&
+                                       encode_mtp_attention_kv_projection(
+                                           *rollback_context, encoder,
+                                           kv_projection_buffers,
+                                           encode_error);
                             },
                             error) &&
                         projection_command->commit(error) &&
                         projection_command->wait_until_completed(error),
-                    "dispatch MTP stages 1–6 after a GPU-produced selected token: " +
+                    "dispatch MTP stages 1–8 after a GPU-produced selected token: " +
                         error);
             MtpInputProjectionSources invalid_projection_sources =
                 projection_sources;
