@@ -32,7 +32,7 @@ namespace {
 
 constexpr std::uint32_t kTopK = 10u;
 constexpr std::array<std::int32_t, kTopK> kRouteIds{
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 511};
+    0, 1, 9, 3, 4, 5, 6, 7, 8, 511};
 constexpr std::uint32_t kExpertInputWidth = 2'560u;
 constexpr std::uint32_t kExpertHiddenWidth = 640u;
 constexpr std::uint32_t kQuantBlock = 32u;
@@ -249,6 +249,7 @@ struct Fixture {
     twin::GuardedBuffer mixed;
     twin::GuardedBuffer ids;
     std::array<twin::GuardedBuffer, kOutputCount> outputs;
+    std::array<std::int32_t, kTopK> route_ids = kRouteIds;
     BufferRef expert_blob;
     std::vector<BufferRef> expert_window_buffers;
     std::vector<MtpExpertBlobWindow> expert_windows;
@@ -313,6 +314,75 @@ struct Fixture {
                 {context.buffers().read_only(window), first, count});
         }
         return result;
+    }
+
+    bool set_routes(const std::array<std::int32_t, kTopK>& next_route_ids) {
+        route_ids = next_route_ids;
+        auto route_id_values = typed<std::int32_t>(ids);
+        for (std::size_t index = 0u; index < route_ids.size(); ++index) {
+            const std::int32_t route_id = route_ids[index];
+            if (route_id < 0 ||
+                static_cast<std::uint32_t>(route_id) >= kMtpExpertCount) {
+                check(false, "MTP stage-17 test route ID",
+                      "route ID is outside the expert table");
+                return false;
+            }
+            route_id_values[index] = route_id;
+        }
+
+        selected_experts_before.resize(kTopK * kExpertBlobBytes);
+        for (std::uint32_t rank = 0u; rank < kTopK; ++rank) {
+            const std::uint32_t expert_id =
+                static_cast<std::uint32_t>(route_ids[rank]);
+            std::vector<std::uint8_t>& expert_data =
+                selected_expert_data[rank];
+            expert_data.resize(kExpertBlobBytes);
+            for (std::size_t index = 0u; index < kExpertBlobBytes; ++index) {
+                expert_data[index] = static_cast<std::uint8_t>(
+                    (index * 13u + expert_id * 29u + index / 640u * 3u) &
+                    0xffu);
+            }
+            for (std::uint32_t slot = 0u;
+                 slot < 2u * kExpertHiddenWidth; ++slot) {
+                for (std::uint32_t pair = 0u; pair < 40u; ++pair) {
+                    const float scale =
+                        0.012f + static_cast<float>(expert_id % 7u) * 0.0007f +
+                        static_cast<float>(slot % 13u) * 0.00021f +
+                        static_cast<float>(pair % 3u) * 0.00008f;
+                    set_half(expert_data.data() + kExpertGateUpScalesOffset +
+                                 static_cast<std::size_t>(slot) * 80u +
+                                 static_cast<std::size_t>(pair) * 2u,
+                             scale);
+                }
+            }
+            for (std::uint32_t row = 0u; row < kExpertInputWidth; ++row) {
+                for (std::uint32_t pair = 0u; pair < 10u; ++pair) {
+                    const float scale =
+                        0.004f + static_cast<float>(expert_id % 7u) * 0.0003f +
+                        static_cast<float>(row % 9u) * 0.00007f +
+                        static_cast<float>(pair % 2u) * 0.00004f;
+                    set_half(expert_data.data() + kExpertDownScalesOffset +
+                                 static_cast<std::size_t>(row) * 20u +
+                                 static_cast<std::size_t>(pair) * 2u,
+                             scale);
+                }
+            }
+            std::memcpy(selected_experts_before.data() +
+                            static_cast<std::size_t>(rank) *
+                                kExpertBlobBytes,
+                        expert_data.data(), kExpertBlobBytes);
+            const BufferRef expert_gpu_view = expert_view(expert_id);
+            if (!expert_gpu_view || expert_gpu_view.contents == nullptr) {
+                check(false, "MTP stage-17 selected expert window",
+                      "selected expert is outside runtime test windows");
+                return false;
+            }
+            std::memcpy(expert_gpu_view.contents, expert_data.data(),
+                        kExpertBlobBytes);
+        }
+
+        oracle.build(typed<float>(mixed), selected_expert_data);
+        return true;
     }
 
     bool allocate(Context& context) {
@@ -385,63 +455,7 @@ struct Fixture {
                 static_cast<std::int32_t>((index * 31u + 11u) % 251u) - 125;
             mixed_values[index] = static_cast<float>(centered) * 0.004f;
         }
-        auto route_ids = typed<std::int32_t>(ids);
-        for (std::size_t index = 0u; index < route_ids.size(); ++index) {
-            route_ids[index] = kRouteIds[index];
-        }
-
-        selected_experts_before.resize(kTopK * kExpertBlobBytes);
-        for (std::uint32_t expert = 0u; expert < kTopK; ++expert) {
-            const std::uint32_t expert_id =
-                static_cast<std::uint32_t>(kRouteIds[expert]);
-            std::vector<std::uint8_t>& expert_data =
-                selected_expert_data[expert];
-            expert_data.resize(kExpertBlobBytes);
-            for (std::size_t index = 0u; index < kExpertBlobBytes; ++index) {
-                expert_data[index] = static_cast<std::uint8_t>(
-                    (index * 13u + expert_id * 29u + index / 640u * 3u) &
-                    0xffu);
-            }
-            for (std::uint32_t slot = 0u;
-                 slot < 2u * kExpertHiddenWidth; ++slot) {
-                for (std::uint32_t pair = 0u; pair < 40u; ++pair) {
-                    const float scale =
-                        0.012f + static_cast<float>(expert_id % 7u) * 0.0007f +
-                        static_cast<float>(slot % 13u) * 0.00021f +
-                        static_cast<float>(pair % 3u) * 0.00008f;
-                    set_half(expert_data.data() + kExpertGateUpScalesOffset +
-                                 static_cast<std::size_t>(slot) * 80u +
-                                 static_cast<std::size_t>(pair) * 2u,
-                             scale);
-                }
-            }
-            for (std::uint32_t row = 0u; row < kExpertInputWidth; ++row) {
-                for (std::uint32_t pair = 0u; pair < 10u; ++pair) {
-                    const float scale =
-                        0.004f + static_cast<float>(expert_id % 7u) * 0.0003f +
-                        static_cast<float>(row % 9u) * 0.00007f +
-                        static_cast<float>(pair % 2u) * 0.00004f;
-                    set_half(expert_data.data() + kExpertDownScalesOffset +
-                                 static_cast<std::size_t>(row) * 20u +
-                                 static_cast<std::size_t>(pair) * 2u,
-                             scale);
-                }
-            }
-            std::memcpy(selected_experts_before.data() +
-                            static_cast<std::size_t>(expert) *
-                                kExpertBlobBytes,
-                        expert_data.data(), kExpertBlobBytes);
-            BufferRef expert_gpu_view = expert_view(expert_id);
-            if (!expert_gpu_view || expert_gpu_view.contents == nullptr) {
-                check(false, "MTP stage-17 selected expert window",
-                      "selected expert is outside runtime test windows");
-                return false;
-            }
-            std::memcpy(expert_gpu_view.contents, expert_data.data(),
-                        kExpertBlobBytes);
-        }
-
-        oracle.build(mixed_values, selected_expert_data);
+        if (!set_routes(route_ids)) return false;
         reset_outputs();
         return true;
     }
@@ -473,7 +487,7 @@ struct Fixture {
         }
         for (std::size_t rank = 0u; rank < kTopK; ++rank) {
             const BufferRef expert_gpu_view =
-                expert_view(static_cast<std::uint32_t>(kRouteIds[rank]));
+                expert_view(static_cast<std::uint32_t>(route_ids[rank]));
             const std::size_t snapshot_base = rank * kExpertBlobBytes;
             if (!expert_gpu_view || expert_gpu_view.contents == nullptr ||
                 std::memcmp(expert_gpu_view.contents,
@@ -692,6 +706,79 @@ bool verify_oracle(Fixture& fixture) {
     passed &= compare_close_floats(
         output_floats(fixture, kParts), fixture.oracle.parts,
         "MTP stage-17 S2 down parts", 2.0e-9, 1.0e-6);
+    return passed;
+}
+
+bool test_window_boundaries(Context& context, Fixture& fixture) {
+    const MtpRoutedExpertsBuffers windowed =
+        fixture.windowed_buffers(context);
+    std::vector<std::int32_t> boundary_experts;
+    for (const MtpExpertBlobWindow& window : windowed.expert_windows) {
+        if (window.expert_count == 0u) {
+            check(false, "MTP stage-17 boundary fixture",
+                  "window has no experts");
+            return false;
+        }
+        boundary_experts.push_back(
+            static_cast<std::int32_t>(window.first_expert));
+        const std::uint32_t last_expert =
+            window.first_expert + window.expert_count - 1u;
+        if (last_expert != window.first_expert) {
+            boundary_experts.push_back(
+                static_cast<std::int32_t>(last_expert));
+        }
+    }
+    if (boundary_experts.empty()) {
+        check(false, "MTP stage-17 boundary fixture",
+              "windowed binding has no expert ranges");
+        return false;
+    }
+
+    bool passed = true;
+    for (std::size_t begin = 0u; begin < boundary_experts.size();
+         begin += kTopK) {
+        std::array<std::int32_t, kTopK> route_ids{};
+        std::array<bool, kMtpExpertCount> used{};
+        std::size_t route_count = 0u;
+        const std::size_t end =
+            std::min(boundary_experts.size(), begin + kTopK);
+        for (std::size_t index = begin; index < end; ++index) {
+            const std::int32_t expert = boundary_experts[index];
+            if (expert < 0 ||
+                static_cast<std::uint32_t>(expert) >= kMtpExpertCount ||
+                used[static_cast<std::size_t>(expert)]) {
+                check(false, "MTP stage-17 boundary fixture",
+                      "window boundaries contain an invalid or duplicate expert");
+                return false;
+            }
+            used[static_cast<std::size_t>(expert)] = true;
+            route_ids[route_count++] = expert;
+        }
+        for (std::uint32_t expert = 0u;
+             route_count < kTopK && expert < kMtpExpertCount; ++expert) {
+            if (used[expert]) continue;
+            used[expert] = true;
+            route_ids[route_count++] =
+                static_cast<std::int32_t>(expert);
+        }
+        if (route_count != kTopK ||
+            !fixture.set_routes(route_ids)) {
+            check(false, "MTP stage-17 boundary route batch",
+                  "could not build ten unique boundary and filler IDs");
+            return false;
+        }
+
+        std::array<std::vector<std::uint8_t>, kOutputCount> outputs;
+        if (!run(context, fixture, false, outputs, true)) return false;
+        passed &= verify_oracle(fixture);
+        const bool immutable = fixture.inputs_unchanged();
+        const bool guards = fixture.output_guards_unchanged();
+        check(immutable && guards,
+              "MTP stage-17 boundary batch preserves inputs and guards");
+        passed &= immutable && guards;
+    }
+    check(passed,
+          "MTP stage 17 matches the scalar oracle at every active window boundary");
     return passed;
 }
 
@@ -940,6 +1027,7 @@ int main(int argc, char** argv) {
     check(parity,
           "MTP stage-17 standalone and caller-owned outputs are byte-identical");
     passed &= parity;
+    passed &= test_window_boundaries(*context, fixture);
     passed &= test_validation(*context, *foreign_context, fixture);
     passed &= test_group_boundary(*context, fixture);
     passed &= test_late_rollback(*context, fixture);

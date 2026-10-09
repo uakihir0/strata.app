@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1063,6 +1064,62 @@ int main(int argc, char** argv) {
                                   provisional_runtime->bind_region(
                                       MtpBindRegionId::parts)),
                     "MTP stages 15–17 resolve the R, routing, expert-window and scratch views");
+            const auto& runtime_expert_ranges =
+                provisional_runtime->layout().expert_windows;
+            for (std::size_t index = 0;
+                 index < runtime_expert_ranges.size(); ++index) {
+                const FileWindow& range = runtime_expert_ranges[index];
+                const MtpExpertBlobWindow& window =
+                    routed_expert_buffers.expert_windows[index];
+                require(range.end > range.start &&
+                            range.start % kMtpExpertBlobBytes == 0 &&
+                            (range.end - range.start) %
+                                    kMtpExpertBlobBytes ==
+                                0,
+                        "MTP routed-expert runtime range is not expert aligned");
+                const std::uint64_t first_expert =
+                    range.start / kMtpExpertBlobBytes;
+                const std::uint64_t expert_count =
+                    (range.end - range.start) / kMtpExpertBlobBytes;
+                require(expert_count > 0 &&
+                            first_expert + expert_count <= kMtpExpertCount &&
+                            first_expert <=
+                                std::numeric_limits<std::uint32_t>::max() &&
+                            expert_count <=
+                                std::numeric_limits<std::uint32_t>::max() &&
+                            window.first_expert == first_expert &&
+                            window.expert_count == expert_count &&
+                            window.bytes.length() == range.end - range.start &&
+                            rollback_context->buffers().owns(window.bytes),
+                        "MTP routed-expert window metadata, extent or ownership differs from its runtime range");
+                const BufferRef first =
+                    provisional_runtime->expert(window.first_expert);
+                const BufferRef last = provisional_runtime->expert(
+                    window.first_expert + window.expert_count - 1u);
+                const std::size_t last_relative_offset =
+                    static_cast<std::size_t>(window.expert_count - 1u) *
+                    static_cast<std::size_t>(kMtpExpertBlobBytes);
+                require(first && last &&
+                            first.offset == window.bytes.offset() &&
+                            first.gpu_address == window.bytes.gpu_address() &&
+                            first.contents == window.bytes.contents() &&
+                            last.offset ==
+                                window.bytes.offset() + last_relative_offset &&
+                            last.gpu_address ==
+                                window.bytes.gpu_address() +
+                                    last_relative_offset &&
+                            last.contents ==
+                                static_cast<const std::uint8_t*>(
+                                    window.bytes.contents()) +
+                                    last_relative_offset &&
+                            read_u32_le(window.bytes.contents()) ==
+                                (0x4d540000u | window.first_expert) &&
+                            read_u32_le(last.contents) ==
+                                (0x4d540000u |
+                                 (window.first_expert +
+                                  window.expert_count - 1u)),
+                        "MTP routed-expert window does not map its expected first and last expert blobs");
+            }
 
             MtpSharedFFNWriteBuffers shared_ffn_buffers;
             MtpFinalMixerBuffers final_mixer_buffers;
