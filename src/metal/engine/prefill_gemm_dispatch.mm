@@ -1,4 +1,4 @@
-// Validated encoders for isolated Prefill F16/BF16 MPP GEMM components.
+// Validated encoders for isolated Prefill F16/BF16 GEMM components.
 #include "strata/metal/prefill_gemm_dispatch.hpp"
 
 #include "strata/metal/encoder.hpp"
@@ -17,6 +17,7 @@ namespace strata::metal {
 namespace {
 
 constexpr std::uint32_t kTile = 64u;
+constexpr std::uint32_t kSimdRows = 32u;
 constexpr std::uint32_t kThreads = 128u;
 constexpr std::size_t kHalfBytes = 2u;
 constexpr std::size_t kFloatBytes = 4u;
@@ -109,10 +110,11 @@ bool validate_dispatch(Context& context,
                        const PrefillGemmMPPParams& params,
                        const PrefillGemmMPPBuffers& buffers,
                        std::string_view component,
+                       bool require_apple10,
                        std::size_t input_element_bytes,
                        std::size_t& x_bytes, std::size_t& w_bytes,
                        std::size_t& y_bytes, std::string& error) {
-    if (!supports_apple10(context)) {
+    if (require_apple10 && !supports_apple10(context)) {
         error = std::string(component) + " requires an Apple10 GPU";
         return false;
     }
@@ -171,11 +173,12 @@ bool validate_dispatch(Context& context,
     return true;
 }
 
-bool encode_prefill_gemm_mpp(
+bool encode_prefill_gemm_component(
     Context& context, Encoder& encoder,
     const PrefillGemmMPPParams& params,
     const PrefillGemmMPPBuffers& buffers, std::string_view component,
-    std::string_view pipeline, std::size_t input_element_bytes,
+    std::string_view pipeline, bool require_apple10,
+    std::size_t input_element_bytes, std::uint32_t tile_rows,
     std::string& error) {
     if (encoder.concurrent_group_open()) {
         error = std::string(component) +
@@ -187,8 +190,8 @@ bool encode_prefill_gemm_mpp(
     std::size_t w_bytes = 0u;
     std::size_t y_bytes = 0u;
     if (!validate_dispatch(context, params, buffers, component,
-                           input_element_bytes, x_bytes, w_bytes, y_bytes,
-                           error)) {
+                           require_apple10, input_element_bytes, x_bytes,
+                           w_bytes, y_bytes, error)) {
         return false;
     }
 
@@ -209,26 +212,27 @@ bool encode_prefill_gemm_mpp(
     const std::size_t grid_x =
         params.n / kTile + static_cast<std::size_t>(params.n % kTile != 0u);
     const std::size_t grid_y =
-        params.rows / kTile +
-        static_cast<std::size_t>(params.rows % kTile != 0u);
+        params.rows / tile_rows +
+        static_cast<std::size_t>(params.rows % tile_rows != 0u);
     return encoder.dispatch(
         pipeline, {grid_x, grid_y, 1u}, {kThreads, 1u, 1u},
         std::span<const EncoderBufferBinding>(&output, 1u), inputs,
         scalar_bindings, {}, error);
 }
 
-bool encode_prefill_gemm_mpp(
+bool encode_prefill_gemm_component(
     Context& context, CommandBuffer& command_buffer,
     const PrefillGemmMPPParams& params,
     const PrefillGemmMPPBuffers& buffers, std::string_view component,
-    std::string_view pipeline, std::size_t input_element_bytes,
+    std::string_view pipeline, bool require_apple10,
+    std::size_t input_element_bytes, std::uint32_t tile_rows,
     std::string& error) {
     return Encoder::encode(
         context, command_buffer, component,
         [&](Encoder& encoder, std::string& encode_error) {
-            return encode_prefill_gemm_mpp(
+            return encode_prefill_gemm_component(
                 context, encoder, params, buffers, component, pipeline,
-                input_element_bytes, encode_error);
+                require_apple10, input_element_bytes, tile_rows, encode_error);
         },
         error);
 }
@@ -240,9 +244,9 @@ bool encode_prefill_gemm_bf16_mpp(
     const PrefillGemmMPPParams& params,
     const PrefillGemmMPPBuffers& buffers, std::string& error) {
     error.clear();
-    return encode_prefill_gemm_mpp(
+    return encode_prefill_gemm_component(
         context, encoder, params, buffers, "Prefill BF16 MPP GEMM",
-        "strata_pf_gemm_bf16_mpp", kHalfBytes, error);
+        "strata_pf_gemm_bf16_mpp", true, kHalfBytes, kTile, error);
 }
 
 bool encode_prefill_gemm_bf16_mpp(
@@ -250,10 +254,10 @@ bool encode_prefill_gemm_bf16_mpp(
     const PrefillGemmMPPParams& params,
     const PrefillGemmMPPBuffers& buffers, std::string& error) {
     error.clear();
-    return encode_prefill_gemm_mpp(
+    return encode_prefill_gemm_component(
         context, command_buffer, params, buffers,
-        "Prefill BF16 MPP GEMM", "strata_pf_gemm_bf16_mpp", kHalfBytes,
-        error);
+        "Prefill BF16 MPP GEMM", "strata_pf_gemm_bf16_mpp", true,
+        kHalfBytes, kTile, error);
 }
 
 bool encode_prefill_gemm_f16_mpp(
@@ -261,9 +265,9 @@ bool encode_prefill_gemm_f16_mpp(
     const PrefillGemmMPPParams& params,
     const PrefillGemmMPPBuffers& buffers, std::string& error) {
     error.clear();
-    return encode_prefill_gemm_mpp(
+    return encode_prefill_gemm_component(
         context, encoder, params, buffers, "Prefill F16 MPP GEMM",
-        "strata_pf_gemm_f16_mpp", kHalfBytes, error);
+        "strata_pf_gemm_f16_mpp", true, kHalfBytes, kTile, error);
 }
 
 bool encode_prefill_gemm_f16_mpp(
@@ -271,9 +275,49 @@ bool encode_prefill_gemm_f16_mpp(
     const PrefillGemmMPPParams& params,
     const PrefillGemmMPPBuffers& buffers, std::string& error) {
     error.clear();
-    return encode_prefill_gemm_mpp(
+    return encode_prefill_gemm_component(
         context, command_buffer, params, buffers, "Prefill F16 MPP GEMM",
-        "strata_pf_gemm_f16_mpp", kHalfBytes, error);
+        "strata_pf_gemm_f16_mpp", true, kHalfBytes, kTile, error);
+}
+
+bool encode_prefill_gemm_f16_simd(
+    Context& context, Encoder& encoder,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, std::string& error) {
+    error.clear();
+    return encode_prefill_gemm_component(
+        context, encoder, params, buffers, "Prefill F16 SIMD GEMM",
+        "strata_pf_gemm_f16_simd", false, kHalfBytes, kSimdRows, error);
+}
+
+bool encode_prefill_gemm_f16_simd(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, std::string& error) {
+    error.clear();
+    return encode_prefill_gemm_component(
+        context, command_buffer, params, buffers, "Prefill F16 SIMD GEMM",
+        "strata_pf_gemm_f16_simd", false, kHalfBytes, kSimdRows, error);
+}
+
+bool encode_prefill_gemm_bf16_simd(
+    Context& context, Encoder& encoder,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, std::string& error) {
+    error.clear();
+    return encode_prefill_gemm_component(
+        context, encoder, params, buffers, "Prefill BF16 SIMD GEMM",
+        "strata_pf_gemm_bf16_simd", false, kHalfBytes, kSimdRows, error);
+}
+
+bool encode_prefill_gemm_bf16_simd(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, std::string& error) {
+    error.clear();
+    return encode_prefill_gemm_component(
+        context, command_buffer, params, buffers, "Prefill BF16 SIMD GEMM",
+        "strata_pf_gemm_bf16_simd", false, kHalfBytes, kSimdRows, error);
 }
 
 }  // namespace strata::metal

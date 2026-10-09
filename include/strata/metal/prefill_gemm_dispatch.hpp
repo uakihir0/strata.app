@@ -58,4 +58,25 @@ bool encode_prefill_gemm_f16_mpp(
     const PrefillGemmMPPParams& params,
     const PrefillGemmMPPBuffers& buffers, std::string& error);
 
+/// Encode the F16/F32-accumulate SIMD-group matrix path on Apple Silicon.
+/// F16 uses K-major scratch weights; the call is independent of the MPP path.
+bool encode_prefill_gemm_f16_simd(
+    Context& context, Encoder& encoder, const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, std::string& error);
+bool encode_prefill_gemm_f16_simd(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, std::string& error);
+
+/// Encode the BF16/F32-accumulate SIMD-group matrix path on Apple Silicon.
+/// BF16 X and W use file layout; W is widened exactly to F32 in threadgroup
+/// memory before the matrix operations.
+bool encode_prefill_gemm_bf16_simd(
+    Context& context, Encoder& encoder, const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, std::string& error);
+bool encode_prefill_gemm_bf16_simd(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillGemmMPPParams& params,
+    const PrefillGemmMPPBuffers& buffers, std::string& error);
+
 }  // namespace strata::metal
