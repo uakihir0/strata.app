@@ -210,3 +210,40 @@ kernel void strata_mtp_down_s2(
         if (lane == 0u) parts[rank * 2'560u + row] = result;
     }
 }
+
+[[max_total_threads_per_threadgroup(1024)]]
+kernel void strata_mtp_row_top_prob(
+    device const float* logits [[buffer(0)]],
+    device const int* output_ids [[buffer(1)]],
+    constant uint& n_out [[buffer(2)]],
+    device float* probabilities [[buffer(3)]],
+    threadgroup float* partial [[threadgroup(0)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const float maximum = logits[output_ids[0]];
+    float sum = 0.0f;
+    for (uint index = tid; index < n_out; index += 1024u) {
+        sum += exp(logits[index] - maximum);
+    }
+    sum = bfly_sum(sum);
+    if (lane == 0u) partial[simdgroup] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float total = partial[0];
+        for (uint group = 1u; group < 32u; ++group) {
+            total += partial[group];
+        }
+        probabilities[0] = 1.0f / total;
+    }
+}
+
+[[max_total_threads_per_threadgroup(32)]]
+kernel void strata_mtp_map_ids(
+    device int* output_ids [[buffer(0)]],
+    device const int* draft_vocab_ids [[buffer(1)]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    if (tid == 0u) {
+        output_ids[0] = draft_vocab_ids[output_ids[0]];
+    }
+}
