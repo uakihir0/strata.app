@@ -51,6 +51,7 @@ strata_pf_dequant_q5_k safe 256 1 1
 strata_pf_dequant_q6_k safe 256 1 1
 strata_pf_dequant_q3_k safe 256 1 1
 strata_pf_dequant_iq4_xs safe 256 1 1
+strata_pf_dequant_iq3_s safe 256 1 1
 strata_pf_dequant_q5_0 safe 256 1 1
 strata_pf_dequant_q8_0 safe 256 1 1
 strata_pf_gr_mix safe 256 1 1

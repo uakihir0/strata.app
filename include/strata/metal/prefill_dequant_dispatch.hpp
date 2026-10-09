@@ -131,4 +131,14 @@ bool encode_prefill_dequant_iq4_xs(
     const PrefillDequantParams& params, const PrefillDequantBuffers& buffers,
     std::string& error);
 
+/// Expand row-major IQ3_S blocks to F16 K-major scratch `[k][n_out]`.
+bool encode_prefill_dequant_iq3_s(Context& context, Encoder& encoder,
+                                  const PrefillDequantParams& params,
+                                  const PrefillDequantBuffers& buffers,
+                                  std::string& error);
+bool encode_prefill_dequant_iq3_s(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillDequantParams& params, const PrefillDequantBuffers& buffers,
+    std::string& error);
+
 }  // namespace strata::metal
