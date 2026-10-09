@@ -66,6 +66,8 @@ struct WindowT1MoeRouterPrefixBuffers {
     BufferRef route_weights;
     BufferRef router_matvec_sink;
 };
+/// Same buffer roles for the generic speculative T=1..8 router prefix.
+using WindowMoeRouterPrefixBuffers = WindowT1MoeRouterPrefixBuffers;
 
 /// Extend the T=1 router prefix with the GPU plan stage. The route ID output
 /// is the plan input; `resident`, `usage` and `plans` are layer-0 tables.
@@ -190,6 +192,22 @@ bool encode_window_t1_moe_router_prefix(
     Context& context, CommandBuffer& command_buffer,
     std::uint32_t vocabulary_size, std::uint32_t experts,
     const WindowT1MoeRouterPrefixBuffers& buffers, std::string& error);
+
+/// Multi-row speculative layer-0 prefix through BF16 router, top-10 routing
+/// and Q8_1 activation production. Infer T/nc from validated WindowParams;
+/// scratch views must cover every active row and padded router column. Caller
+/// must keep the parameter block, router tensor and scratch views alive and
+/// unchanged until command completion, and propagate false from the enclosing
+/// Encoder::encode body on failure.
+bool encode_window_moe_router_prefix(
+    Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
+    std::uint32_t experts, const WindowMoeRouterPrefixBuffers& buffers,
+    std::string& error);
+/// Standalone transactional form. A late failure discards all prior stages.
+bool encode_window_moe_router_prefix(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size, std::uint32_t experts,
+    const WindowMoeRouterPrefixBuffers& buffers, std::string& error);
 
 /// Encode the T=1 layer-0 attention/GDN/FFN-read/router/route/Q8_1 prefix,
 /// then build its full-mode or tiered GPU plan in the same ordered segment.

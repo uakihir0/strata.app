@@ -121,11 +121,12 @@ bool same_buffer_start(BufferRef left, BufferRef right) {
 
 bool validate_prefix_buffer(Context& context, BufferRef buffer,
                             std::size_t required_bytes,
-                            std::size_t alignment, std::string_view name,
-                            std::string& error) {
+                            std::size_t alignment,
+                            std::string_view prefix_label,
+                            std::string_view name, std::string& error) {
     if (!buffer || !context.buffers().owns(buffer) ||
         buffer.length < required_bytes || buffer.offset % alignment != 0u) {
-        error = "Window T=1 MoE prefix " + std::string(name) +
+        error = std::string(prefix_label) + " " + std::string(name) +
                 " is stale, foreign, undersized or misaligned";
         return false;
     }
@@ -134,11 +135,12 @@ bool validate_prefix_buffer(Context& context, BufferRef buffer,
 
 bool validate_prefix_buffer(Context& context, ReadOnlyBufferRef buffer,
                             std::size_t required_bytes,
-                            std::size_t alignment, std::string_view name,
-                            std::string& error) {
+                            std::size_t alignment,
+                            std::string_view prefix_label,
+                            std::string_view name, std::string& error) {
     if (!buffer || !context.buffers().owns(buffer) ||
         buffer.length() < required_bytes || buffer.offset() % alignment != 0u) {
-        error = "Window T=1 MoE prefix " + std::string(name) +
+        error = std::string(prefix_label) + " " + std::string(name) +
                 " is stale, foreign, undersized or misaligned";
         return false;
     }
@@ -602,42 +604,49 @@ bool validate_window_attention_gdn(
         error);
 }
 
-bool validate_window_t1_moe_router_prefix(
-    Context& context, std::uint32_t vocabulary_size, std::uint32_t experts,
-    const WindowT1MoeRouterPrefixBuffers& buffers, std::string& error) {
+bool validate_window_moe_router_prefix_views(
+    Context& context, std::uint32_t experts,
+    const WindowMoeRouterPrefixBuffers& buffers,
+    const WindowParams& params, std::string_view prefix_label,
+    std::string& error) {
     if (experts != 256u && experts != 512u) {
-        error = "Window T=1 MoE prefix requires 256 or 512 experts";
-        return false;
-    }
-    if (!validate_window_t1_attention_gdn_ffn(
-            context, vocabulary_size, buffers.layer0, error)) {
+        error = "Window MoE prefix requires 256 or 512 experts";
         return false;
     }
 
     constexpr std::size_t kRouterInputWidth = N_EMBD;
     constexpr std::size_t kRouteTopK = 10u;
+    const std::size_t rows = params.T;
+    const std::size_t padded_columns = params.nc - params.T;
     const std::size_t router_weight_bytes =
         static_cast<std::size_t>(experts) * kRouterInputWidth *
         sizeof(std::uint16_t);
     const std::size_t router_logit_bytes =
-        static_cast<std::size_t>(experts) * sizeof(float);
-    const std::size_t route_id_bytes = kRouteTopK * sizeof(std::int32_t);
-    const std::size_t route_weight_bytes = kRouteTopK * sizeof(float);
+        rows * static_cast<std::size_t>(experts) * sizeof(float);
+    const std::size_t route_id_bytes =
+        rows * kRouteTopK * sizeof(std::int32_t);
+    const std::size_t route_weight_bytes =
+        rows * kRouteTopK * sizeof(float);
+    const std::size_t router_sink_bytes =
+        std::max<std::size_t>(
+            1u, padded_columns * static_cast<std::size_t>(experts)) *
+        sizeof(float);
 
     if (!validate_prefix_buffer(context, buffers.router_tensor,
                                 router_weight_bytes, alignof(std::uint32_t),
-                                "BF16 router tensor", error) ||
+                                prefix_label, "BF16 router tensor", error) ||
         !validate_prefix_buffer(context, buffers.router_logits,
                                 router_logit_bytes, alignof(float),
-                                "router logits", error) ||
+                                prefix_label, "router logits", error) ||
         !validate_prefix_buffer(context, buffers.route_ids, route_id_bytes,
-                                alignof(std::int32_t), "route IDs", error) ||
+                                alignof(std::int32_t), prefix_label,
+                                "route IDs", error) ||
         !validate_prefix_buffer(context, buffers.route_weights,
                                 route_weight_bytes, alignof(float),
-                                "route weights", error) ||
+                                prefix_label, "route weights", error) ||
         !validate_prefix_buffer(context, buffers.router_matvec_sink,
-                                sizeof(float), alignof(float),
-                                "router mat-vec sink", error)) {
+                                router_sink_bytes, alignof(float),
+                                prefix_label, "router mat-vec sink", error)) {
         return false;
     }
 
@@ -649,7 +658,7 @@ bool validate_window_t1_moe_router_prefix(
              ++right) {
             if (buffer_views_overlap(prefix_outputs[left],
                                      prefix_outputs[right])) {
-                error = "Window T=1 MoE prefix scratch outputs overlap";
+                error = "Window MoE prefix scratch outputs overlap";
                 return false;
             }
         }
@@ -658,16 +667,16 @@ bool validate_window_t1_moe_router_prefix(
     const auto disjoint_from_prefix = [&](const auto& views) {
         for (const BufferRef& view : views) {
             if (buffer_views_overlap(buffers.layer0.params, view)) {
-                error = "Window T=1 MoE prefix scratch overlaps its parameters";
+                error = "Window MoE prefix scratch overlaps its parameters";
                 return false;
             }
             if (buffer_views_overlap(buffers.router_tensor, view)) {
-                error = "Window T=1 MoE prefix scratch overlaps the router tensor";
+                error = "Window MoE prefix scratch overlaps the router tensor";
                 return false;
             }
             for (const BufferRef& output : prefix_outputs) {
                 if (buffer_views_overlap(view, output)) {
-                    error = "Window T=1 MoE prefix scratch overlaps a layer-0 stage buffer";
+                    error = "Window MoE prefix scratch overlaps a layer-0 stage buffer";
                     return false;
                 }
             }
@@ -686,26 +695,51 @@ bool validate_window_t1_moe_router_prefix(
     for (const BufferRef& output : prefix_outputs) {
         if (buffer_views_overlap(buffers.layer0.params, output) ||
             buffer_views_overlap(buffers.router_tensor, output)) {
-            error = "Window T=1 MoE prefix output overlaps parameters or router weights";
+            error = "Window MoE prefix output overlaps parameters or router weights";
             return false;
         }
     }
     if (buffer_views_overlap(buffers.router_tensor,
                              buffers.layer0.params)) {
-        error = "Window T=1 MoE router tensor overlaps its parameters";
+        error = "Window MoE router tensor overlaps its parameters";
         return false;
     }
     const ReadOnlyBufferRef read_only_params =
         context.buffers().read_only(buffers.layer0.params);
     const ReadOnlyBufferRef active_rows = read_only_params.slice(
-        offsetof(WindowParams, nc), sizeof(std::uint32_t));
+        offsetof(WindowParams, T), sizeof(std::uint32_t));
     if (!active_rows) {
-        error = "Window T=1 active-row count is not a live read-only parameter view";
+        error = "Window MoE active-row count is not a live read-only parameter view";
         return false;
     }
 
     error.clear();
     return true;
+}
+
+bool validate_window_t1_moe_router_prefix(
+    Context& context, std::uint32_t vocabulary_size, std::uint32_t experts,
+    const WindowT1MoeRouterPrefixBuffers& buffers, std::string& error) {
+    if (!validate_window_t1_attention_gdn_ffn(
+            context, vocabulary_size, buffers.layer0, error)) {
+        return false;
+    }
+    WindowParams params{};
+    std::memcpy(&params, buffers.layer0.params.contents, sizeof(params));
+    return validate_window_moe_router_prefix_views(
+        context, experts, buffers, params, "Window T=1 MoE prefix", error);
+}
+
+bool validate_window_moe_router_prefix(
+    Context& context, std::uint32_t vocabulary_size, std::uint32_t experts,
+    const WindowMoeRouterPrefixBuffers& buffers, WindowParams& params,
+    std::string& error) {
+    if (!validate_window_attention_gdn_ffn(
+            context, vocabulary_size, buffers.layer0, params, error)) {
+        return false;
+    }
+    return validate_window_moe_router_prefix_views(
+        context, experts, buffers, params, "Window MoE prefix", error);
 }
 
 bool validate_window_t1_moe_plan_prefix(
@@ -721,13 +755,16 @@ bool validate_window_t1_moe_plan_prefix(
     const std::size_t usage_bytes =
         static_cast<std::size_t>(experts) * sizeof(float);
     if (!validate_prefix_buffer(context, buffers.resident, resident_bytes,
-                                alignof(std::int32_t), "resident table",
+                                alignof(std::int32_t),
+                                "Window T=1 MoE prefix", "resident table",
                                 error) ||
         !validate_prefix_buffer(context, buffers.usage, usage_bytes,
-                                alignof(float), "usage table", error) ||
+                                alignof(float), "Window T=1 MoE prefix",
+                                "usage table", error) ||
         !validate_prefix_buffer(context, buffers.plans,
                                 sizeof(TieredMoePlan),
-                                alignof(TieredMoePlan), "plan output",
+                                alignof(TieredMoePlan),
+                                "Window T=1 MoE prefix", "plan output",
                                 error)) {
         return false;
     }
@@ -1213,6 +1250,73 @@ bool encode_window_t1_moe_router_prefix(
         context, command_buffer, "Window T=1 layer-0 MoE router prefix",
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_window_t1_moe_router_prefix(
+                context, encoder, vocabulary_size, experts, buffers,
+                encode_error);
+        },
+        error);
+}
+
+bool encode_window_moe_router_prefix(
+    Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
+    std::uint32_t experts, const WindowMoeRouterPrefixBuffers& buffers,
+    std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "Window MoE router prefix requires ordered dispatch boundaries";
+        return false;
+    }
+    WindowParams params{};
+    if (!validate_window_moe_router_prefix(
+            context, vocabulary_size, experts, buffers, params, error)) {
+        return false;
+    }
+
+    const ReadOnlyBufferRef read_only_params =
+        context.buffers().read_only(buffers.layer0.params);
+    const ReadOnlyBufferRef active_rows = read_only_params.slice(
+        offsetof(WindowParams, T), sizeof(std::uint32_t));
+    const ReadOnlyBufferRef router_activations =
+        context.buffers().read_only(buffers.layer0.ffn.mixed);
+    const ReadOnlyBufferRef router_logits =
+        context.buffers().read_only(buffers.router_logits);
+    if (!active_rows || !router_activations || !router_logits) {
+        error = "Window MoE router prefix could not form live read-only input views";
+        return false;
+    }
+
+    if (!encode_window_attention_gdn_ffn(
+            context, encoder, vocabulary_size, buffers.layer0, error)) {
+        return false;
+    }
+
+    const ReadOnlyBF16MatVecBuffers router_buffers{
+        router_activations, buffers.router_tensor, active_rows,
+        buffers.router_logits, buffers.router_matvec_sink};
+    if (!encode_bf16_matvec(context, encoder, N_EMBD, experts, params.T,
+                            params.nc, router_buffers, error)) {
+        return false;
+    }
+
+    const MoeRouteBuffers route_buffers{
+        router_logits, buffers.route_ids, buffers.route_weights};
+    if (!encode_moe_route(context, encoder, params.T, experts, false,
+                          route_buffers, error)) {
+        return false;
+    }
+
+    return encode_q8_1(context, encoder, params.T, N_EMBD,
+                       {buffers.layer0.ffn.mixed, buffers.layer0.gdn.xq},
+                       error);
+}
+
+bool encode_window_moe_router_prefix(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size, std::uint32_t experts,
+    const WindowMoeRouterPrefixBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Window layer-0 MoE router prefix",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_moe_router_prefix(
                 context, encoder, vocabulary_size, experts, buffers,
                 encode_error);
         },
