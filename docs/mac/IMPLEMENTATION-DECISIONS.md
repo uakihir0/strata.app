@@ -9604,3 +9604,52 @@ measuring L-15 remain open.
   `check_drift.py` found no upstream changes and valid golden files; and
   `git diff --check` passed. Inputs were synthetic; Prefill GEMMs, chunk
   scheduling and model-backed inference remain open.
+
+### D-IMPL-350: Implement Prefill post-projection GDN gates
+
+- **Decision:** Add the isolated `strata_pf_gdn_gates` kernel and validated
+  `encode_prefill_gdn_gates` host API. Read the T×96 F32 alpha/beta
+  projection and the 48-element `dt_bias` and `A` vectors; write T×48
+  `softplus_k(alpha + dt_bias) * A` and `sigmoid_k(beta)` outputs. Keep all
+  three inputs read-only, allow their views to overlap, and reject every
+  output/input or output/output overlap. Provide standalone transactional and
+  caller-owned Encoder forms; validate shader-safe rows, extents, alignment
+  and Context ownership; reject calls from an open concurrent group so
+  producer/consumer ordering remains explicit.
+- **Reason:** Section 6.4 specifies the transform after the BF16 alpha/beta
+  GEMMs. Keeping it as a separate elementwise kernel matches the documented
+  one-dimensional work assignment and lets output lanes execute
+  independently. The post-projection arithmetic reuses the same `softplus_k`
+  and `sigmoid_k` helpers as the decode GDN implementation. This component
+  does not imply Prefill GEMM or chunk-loop integration.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `cmake --build --preset mac-dev` succeeded and focused
+  `metal_prefill_test` and `metal_prefill_test_concurrent` CTests passed 2/2.
+  Synthetic T=1/3/8 fixtures compare both outputs to scalar transform
+  oracles and check tail lanes, immutable inputs, overlapping read-only
+  inputs, guards, aliases, invalid extents/rows, foreign Context rejection,
+  rollback and open-group refusal. The hostile-review findings and fixes are
+  recorded in REV-147.
+
+### REV-147: Hostile review of Prefill post-projection GDN gates
+
+- **Scope:** `strata_pf_gdn_gates`, the validated host dispatch, row and
+  alias validation, serial/concurrent fixtures, and synchronized status
+  documentation.
+- **Findings:** The reviewer identified a missing rejection for calls inside
+  an open concurrent group, where automatic inter-dispatch buffer barriers
+  are suppressed. It also found that the initial fixtures did not cross
+  standalone/caller-owned APIs with every row count, and the initial decision
+  log referenced this review before its entry existed. A second review
+  confirmed the synchronization and fixture fixes and found no additional
+  code issue; it caught one temporary inconsistency between the pending test
+  status and the D-IMPL-350 reference, which was corrected.
+- **Disposition:** Added open-group rejection and a concurrent-mode
+  regression test, expanded both API forms to T=1/3/8, and recorded this
+  review. On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a),
+  `cmake --build --preset mac-dev` succeeded, focused Prefill serial and
+  concurrent CTests passed 2/2, and the full `mac-metal` suite passed 80/80.
+  `test_map.py` passed with its existing planned-work notices,
+  `check_drift.py` found no upstream changes and valid golden files, and
+  `git diff --check` passed. The fixtures use synthetic inputs and do not
+  establish model-backed inference.
