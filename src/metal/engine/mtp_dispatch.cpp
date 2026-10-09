@@ -43,6 +43,7 @@ constexpr std::uint32_t kMtpRoutedExpertThreads = 256u;
 constexpr std::uint32_t kMtpRoutedExpertChunkValues = 32u;
 constexpr std::uint32_t kMtpQ8BlockValues = 32u;
 constexpr std::uint32_t kMtpQ81BlockBytes = 36u;
+constexpr std::uint32_t kMtpReservedImageTokenFlag = 0x80000000u;
 constexpr std::uint32_t kMtpAddStreamsThreads = 256u;
 constexpr std::uint32_t kMtpAddStreamsGroupsX =
     HC_DIM / kMtpAddStreamsThreads;
@@ -60,6 +61,7 @@ static_assert(HC_DIM % kMtpAddStreamsThreads == 0u);
 static_assert(sizeof(MtpParams) == 236u);
 static_assert(offsetof(MtpParams, T) == 0u);
 static_assert(sizeof(Q81) == kMtpQ81BlockBytes);
+static_assert(sizeof(block_q8_0) == 34u);
 static_assert(kMtpQueryProjectionWidth == 12'288u);
 static_assert(kMtpQueryHeadWidth == 6'144u);
 static_assert(kMtpOutputProjectionInputWidth == 6'144u);
@@ -333,6 +335,310 @@ bool read_mtp_rows(Context& context, ReadOnlyBufferRef params,
         error = std::string(operation) + " T must be in 1..8";
         return false;
     }
+    return true;
+}
+
+std::uint32_t compiled_mtp_columns(std::uint32_t rows);
+
+struct MtpInputProjectionPlan {
+    std::uint32_t rows = 0u;
+    std::uint32_t hidden_rows = 0u;
+    std::uint32_t embedding_columns = 0u;
+    std::uint32_t hidden_passes = 0u;
+    ReadOnlyBufferRef tokens;
+    ReadOnlyBufferRef embedding_active_rows;
+    std::array<ReadOnlyBufferRef, 4> hidden_active_rows{};
+};
+
+bool mtp_embed_row_bytes(EmbedRowsFormat format, std::size_t& row_bytes) {
+    switch (format) {
+        case EmbedRowsFormat::q3_k:
+        case EmbedRowsFormat::iq3_s:
+            row_bytes = 1100u;
+            return true;
+        case EmbedRowsFormat::iq4_xs:
+            row_bytes = 1360u;
+            return true;
+        case EmbedRowsFormat::bf16:
+            row_bytes = N_EMBD * sizeof(std::uint16_t);
+            return true;
+    }
+    return false;
+}
+
+bool exact_same_range(BufferRef left, std::size_t left_bytes,
+                      BufferRef right, std::size_t right_bytes) {
+    if (left_bytes != right_bytes || left.length != right.length) {
+        return false;
+    }
+    if (left.handle != nullptr && left.handle == right.handle &&
+        left.offset == right.offset) {
+        return true;
+    }
+    if (left.contents != nullptr && left.contents == right.contents) {
+        return true;
+    }
+    return left.gpu_address != 0u &&
+           left.gpu_address == right.gpu_address;
+}
+
+bool validate_mtp_input_projection(
+    Context& context, const MtpInputProjectionBuffers& buffers,
+    MtpInputProjectionPlan& plan, std::string& error) {
+    constexpr char operation[] = "MTP input projection";
+    if (!read_mtp_rows(context, buffers.params, operation, plan.rows,
+                       error)) {
+        return false;
+    }
+
+    MtpParams params_value{};
+    std::memcpy(&params_value, buffers.params.contents(),
+                sizeof(params_value));
+    plan.hidden_rows = plan.rows * 4u;
+    plan.embedding_columns = compiled_mtp_columns(plan.rows);
+    plan.hidden_passes = (plan.hidden_rows + 7u) / 8u;
+    for (std::uint32_t pass = 0u; pass < 4u; ++pass) {
+        const std::uint32_t row_offset = pass * 8u;
+        const std::uint32_t expected =
+            row_offset < plan.hidden_rows
+                ? std::min(8u, plan.hidden_rows - row_offset)
+                : 0u;
+        if (params_value.hid[pass] != expected) {
+            error = std::string(operation) +
+                    " MtpParams::hid does not match the 4T projection rows";
+            return false;
+        }
+    }
+
+    switch (buffers.token_source) {
+        case MtpInputTokenSource::params_tokens:
+            if (buffers.selected_token) {
+                error = std::string(operation) +
+                        " selected_token must be empty for params_tokens";
+                return false;
+            }
+            plan.tokens = buffers.params.slice(
+                offsetof(MtpParams, tokens),
+                static_cast<std::size_t>(plan.rows) *
+                    sizeof(std::uint32_t));
+            break;
+        case MtpInputTokenSource::selected_token:
+            if (plan.rows != 1u) {
+                error = std::string(operation) +
+                        " selected_token source requires T=1";
+                return false;
+            }
+            if (!buffers.selected_token ||
+                buffers.selected_token.length() != sizeof(std::uint32_t) ||
+                !validate_read_only_buffer(
+                    context, buffers.selected_token, sizeof(std::uint32_t),
+                    alignof(std::uint32_t), "selected token", operation,
+                    error)) {
+                if (error.empty()) {
+                    error = std::string(operation) +
+                            " selected token must contain exactly one token ID";
+                }
+                return false;
+            }
+            if (overlaps(buffers.params, sizeof(MtpParams),
+                         buffers.selected_token, sizeof(std::uint32_t))) {
+                error = std::string(operation) +
+                        " selected token overlaps the MtpParams block";
+                return false;
+            }
+            plan.tokens = buffers.selected_token;
+            break;
+        default:
+            error = std::string(operation) + " token source is unsupported";
+            return false;
+    }
+    if (!plan.tokens) {
+        error = std::string(operation) +
+                " cannot form its active token view";
+        return false;
+    }
+
+    if (buffers.vocabulary_size == 0u ||
+        buffers.vocabulary_size > (std::uint32_t{1u} << 31u)) {
+        error = std::string(operation) +
+                " vocabulary size must be in 1..2^31";
+        return false;
+    }
+    if (buffers.token_source == MtpInputTokenSource::params_tokens) {
+        const auto* const token_data =
+            static_cast<const std::uint32_t*>(plan.tokens.contents());
+        for (std::uint32_t row = 0u; row < plan.rows; ++row) {
+            if ((token_data[row] & kMtpReservedImageTokenFlag) != 0u) {
+                error = std::string(operation) +
+                        " MtpParams token uses the reserved image-token flag";
+                return false;
+            }
+        }
+    }
+    std::size_t embedding_row_bytes = 0u;
+    std::size_t table_bytes = 0u;
+    if (!mtp_embed_row_bytes(buffers.embedding_format,
+                             embedding_row_bytes) ||
+        !checked_size_multiply(buffers.vocabulary_size,
+                               embedding_row_bytes, table_bytes)) {
+        error = std::string(operation) +
+                " token embedding format or extent is unsupported";
+        return false;
+    }
+
+    const std::size_t embedding_bytes =
+        static_cast<std::size_t>(plan.rows) * N_EMBD * sizeof(float);
+    const std::size_t residual_bytes =
+        static_cast<std::size_t>(plan.rows) * HC_DIM * sizeof(float);
+    const std::size_t hidden_output_bytes =
+        static_cast<std::size_t>(plan.hidden_rows) * N_EMBD * sizeof(float);
+    const std::size_t q8_row_bytes =
+        static_cast<std::size_t>(N_EMBD / kMtpQ8BlockValues) *
+        sizeof(Q81);
+    const std::size_t q8_workspace_bytes =
+        static_cast<std::size_t>(plan.hidden_rows) * q8_row_bytes;
+    const std::size_t sink_floats = std::max<std::size_t>(
+        1u, static_cast<std::size_t>(plan.embedding_columns - plan.rows) *
+                N_EMBD);
+    const std::size_t sink_bytes = sink_floats * sizeof(float);
+    const std::size_t embedding_norm_bytes =
+        static_cast<std::size_t>(N_EMBD) * sizeof(float);
+    const std::size_t hidden_norm_gamma_bytes =
+        static_cast<std::size_t>(HC_DIM) * sizeof(float);
+    const std::size_t fc_embedding_bytes =
+        static_cast<std::size_t>(N_EMBD) * (N_EMBD / kMtpQ8BlockValues) *
+        sizeof(block_q8_0);
+    const std::size_t fc_hidden_bytes =
+        static_cast<std::size_t>(N_EMBD) * (N_EMBD / kMtpQ8BlockValues) *
+        sizeof(block_q8_0);
+
+    if (!validate_read_only_buffer(
+            context, buffers.token_embedding_table, table_bytes,
+            alignof(std::uint16_t), "token embedding table", operation,
+            error) ||
+        !validate_read_only_buffer(
+            context, buffers.embedding_norm_gamma, embedding_norm_bytes,
+            alignof(float), "embedding norm gamma", operation, error) ||
+        !validate_read_only_buffer(
+            context, buffers.fc_embedding_weights, fc_embedding_bytes,
+            alignof(std::uint16_t), "fc_embedding weights", operation,
+            error) ||
+        !validate_buffer_view(context, buffers.residual, residual_bytes,
+                              alignof(float), operation, "residual", error) ||
+        !validate_read_only_buffer(
+            context, buffers.hidden_norm_gamma, hidden_norm_gamma_bytes,
+            alignof(float), "hidden norm gamma", operation, error) ||
+        !validate_read_only_buffer(
+            context, buffers.fc_hidden_weights, fc_hidden_bytes,
+            alignof(std::uint16_t), "fc_hidden weights", operation,
+            error) ||
+        !validate_output_buffer(context, buffers.embedding, embedding_bytes,
+                                operation, "embedding", error) ||
+        !validate_output_buffer(context, buffers.embedding_norm,
+                                embedding_bytes, operation,
+                                "embedding norm", error) ||
+        !validate_output_buffer(context, buffers.xq, q8_workspace_bytes,
+                                operation, "Q8_1 workspace", error) ||
+        !validate_output_buffer(context, buffers.e2, embedding_bytes,
+                                operation, "e2", error) ||
+        !validate_output_buffer(context, buffers.hidden_norm, residual_bytes,
+                                operation, "hidden norm", error) ||
+        !validate_output_buffer(context, buffers.h2, hidden_output_bytes,
+                                operation, "h2", error) ||
+        !validate_output_buffer(context, buffers.matvec_sink, sink_bytes,
+                                operation, "mat-vec sink", error)) {
+        return false;
+    }
+
+    plan.embedding_active_rows = buffers.params.slice(
+        offsetof(MtpParams, T), sizeof(std::uint32_t));
+    if (!plan.embedding_active_rows) {
+        error = std::string(operation) +
+                " cannot form its embedding active-row view";
+        return false;
+    }
+    for (std::uint32_t pass = 0u; pass < plan.hidden_passes; ++pass) {
+        plan.hidden_active_rows[pass] = buffers.params.slice(
+            offsetof(MtpParams, hid) +
+                static_cast<std::size_t>(pass) * sizeof(std::uint32_t),
+            sizeof(std::uint32_t));
+        if (!plan.hidden_active_rows[pass]) {
+            error = std::string(operation) +
+                    " cannot form a hidden active-row view";
+            return false;
+        }
+    }
+
+    struct InputView {
+        const char* name;
+        ReadOnlyBufferRef view;
+        std::size_t bytes;
+    };
+    const std::array<InputView, 8> inputs{{
+        {"params", buffers.params, sizeof(MtpParams)},
+        {"token embedding table", buffers.token_embedding_table,
+         table_bytes},
+        {"embedding norm gamma", buffers.embedding_norm_gamma,
+         embedding_norm_bytes},
+        {"fc_embedding weights", buffers.fc_embedding_weights,
+         fc_embedding_bytes},
+        {"residual", context.buffers().read_only(buffers.residual),
+         residual_bytes},
+        {"hidden norm gamma", buffers.hidden_norm_gamma,
+         hidden_norm_gamma_bytes},
+        {"fc_hidden weights", buffers.fc_hidden_weights, fc_hidden_bytes},
+        {"selected token",
+         buffers.token_source == MtpInputTokenSource::selected_token
+             ? buffers.selected_token
+             : ReadOnlyBufferRef{},
+         buffers.token_source == MtpInputTokenSource::selected_token
+             ? sizeof(std::uint32_t)
+             : 0u},
+    }};
+    const std::array<std::pair<const char*, BufferRef>, 7> outputs{{
+        {"embedding", buffers.embedding},
+        {"embedding norm", buffers.embedding_norm},
+        {"Q8_1 workspace", buffers.xq},
+        {"e2", buffers.e2},
+        {"hidden norm", buffers.hidden_norm},
+        {"h2", buffers.h2},
+        {"mat-vec sink", buffers.matvec_sink},
+    }};
+    const std::array<std::size_t, outputs.size()> output_bytes{{
+        embedding_bytes, embedding_bytes, q8_workspace_bytes, embedding_bytes,
+        residual_bytes, hidden_output_bytes, sink_bytes,
+    }};
+    for (std::size_t output = 0u; output < outputs.size(); ++output) {
+        for (const auto& input : inputs) {
+            if (input.bytes != 0u &&
+                overlaps(input.view, input.bytes, outputs[output].second,
+                         output_bytes[output])) {
+                error = std::string(operation) + " " + outputs[output].first +
+                        " overlaps input " + input.name;
+                return false;
+            }
+        }
+        for (std::size_t other = output + 1u; other < outputs.size();
+             ++other) {
+            if (!overlaps(outputs[output].second, output_bytes[output],
+                          outputs[other].second, output_bytes[other])) {
+                continue;
+            }
+            const bool allowed_in_place_norm =
+                output == 0u && other == 1u &&
+                exact_same_range(outputs[output].second,
+                                 output_bytes[output],
+                                 outputs[other].second,
+                                 output_bytes[other]);
+            if (!allowed_in_place_norm) {
+                error = std::string(operation) + " outputs " +
+                        outputs[output].first + " and " +
+                        outputs[other].first + " overlap";
+                return false;
+            }
+        }
+    }
+    error.clear();
     return true;
 }
 
@@ -1182,6 +1488,122 @@ bool validate_mtp_attention_output_projection(
 }
 
 }  // namespace
+
+bool encode_mtp_input_projection(
+    Context& context, Encoder& encoder,
+    const MtpInputProjectionBuffers& buffers, std::string& error) {
+    constexpr float kMtpRmsEpsilon = 1.0e-6f;
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error =
+            "MTP input projection requires an ordered concurrent-group boundary";
+        return false;
+    }
+    MtpInputProjectionPlan plan{};
+    if (!validate_mtp_input_projection(context, buffers, plan, error)) {
+        return false;
+    }
+
+    const EmbedRowsReadOnlyBuffers embed_buffers{
+        buffers.token_embedding_table, plan.tokens, buffers.embedding,
+        buffers.token_source == MtpInputTokenSource::selected_token};
+    if (!encode_embed_rows(context, encoder, plan.rows,
+                          buffers.vocabulary_size,
+                          buffers.embedding_format, embed_buffers, error)) {
+        return false;
+    }
+    const ReadOnlyWeightedRMSNormBuffers embedding_norm_buffers{
+        buffers.embedding, buffers.embedding_norm_gamma,
+        buffers.embedding_norm};
+    if (!encode_weighted_rms_norm(
+            context, encoder, plan.rows, N_EMBD, 1u, kMtpRmsEpsilon,
+            embedding_norm_buffers, error)) {
+        return false;
+    }
+    if (!encode_q8_1(context, encoder, plan.rows, N_EMBD,
+                     {buffers.embedding_norm, buffers.xq}, error)) {
+        return false;
+    }
+
+    const ReadOnlyBufferRef embedding_activations =
+        context.buffers().read_only(buffers.xq);
+    if (!embedding_activations) {
+        error =
+            "MTP input projection could not bind Q8_1 activations read-only";
+        return false;
+    }
+    const ReadOnlyMatVecBuffers embedding_matvec{
+        embedding_activations,
+        buffers.fc_embedding_weights,
+        plan.embedding_active_rows,
+        buffers.e2,
+        buffers.matvec_sink,
+    };
+    if (!encode_read_only_matvec(
+            context, encoder, MatVecWeightFormat::q8_0, N_EMBD, N_EMBD,
+            plan.rows, plan.embedding_columns, embedding_matvec, error)) {
+        return false;
+    }
+
+    const ReadOnlyWeightedRMSNormBuffers hidden_norm_buffers{
+        buffers.residual, buffers.hidden_norm_gamma, buffers.hidden_norm};
+    if (!encode_weighted_rms_norm(
+            context, encoder, plan.rows, HC_DIM, 1u, kMtpRmsEpsilon,
+            hidden_norm_buffers, error) ||
+        !encode_q8_1(context, encoder, plan.hidden_rows, N_EMBD,
+                     {buffers.hidden_norm, buffers.xq}, error)) {
+        return false;
+    }
+
+    constexpr std::size_t kQ8RowBytes =
+        static_cast<std::size_t>(N_EMBD / kMtpQ8BlockValues) * sizeof(Q81);
+    constexpr std::size_t kFloatRowBytes =
+        static_cast<std::size_t>(N_EMBD) * sizeof(float);
+    for (std::uint32_t pass = 0u; pass < plan.hidden_passes; ++pass) {
+        const std::uint32_t row_offset = pass * 8u;
+        const std::uint32_t active_rows =
+            (row_offset < plan.hidden_rows)
+                ? std::min(8u, plan.hidden_rows - row_offset)
+                : 0u;
+        const ReadOnlyBufferRef active_activations =
+            context.buffers().read_only(buffers.xq.slice(
+                static_cast<std::size_t>(row_offset) * kQ8RowBytes,
+                static_cast<std::size_t>(active_rows) * kQ8RowBytes));
+        const BufferRef active_output = buffers.h2.slice(
+            static_cast<std::size_t>(row_offset) * kFloatRowBytes,
+            static_cast<std::size_t>(active_rows) * kFloatRowBytes);
+        if (!active_activations || !active_output) {
+            error = "MTP input projection could not form a hidden pass view";
+            return false;
+        }
+        const ReadOnlyMatVecBuffers hidden_matvec{
+            active_activations,
+            buffers.fc_hidden_weights,
+            plan.hidden_active_rows[pass],
+            active_output,
+            buffers.matvec_sink,
+        };
+        if (!encode_read_only_matvec(
+                context, encoder, MatVecWeightFormat::q8_0, N_EMBD, N_EMBD,
+                active_rows, active_rows, hidden_matvec, error)) {
+            return false;
+        }
+    }
+    error.clear();
+    return true;
+}
+
+bool encode_mtp_input_projection(
+    Context& context, CommandBuffer& command_buffer,
+    const MtpInputProjectionBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "MTP input projection",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_mtp_input_projection(
+                context, encoder, buffers, encode_error);
+        },
+        error);
+}
 
 bool encode_mtp_add_streams(Context& context, Encoder& encoder,
                             const MtpAddStreamsBuffers& buffers,

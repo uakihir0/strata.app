@@ -2,6 +2,7 @@
 #pragma once
 
 #include "strata/metal/context.hpp"
+#include "strata/metal/embed_dispatch.hpp"
 #include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/mv_dispatch.hpp"
 #include "strata/metal/mtp_kv.hpp"
@@ -14,6 +15,60 @@
 namespace strata::metal {
 
 class Encoder;
+
+enum class MtpInputTokenSource : std::uint8_t {
+    params_tokens,
+    selected_token,
+};
+
+/// Inputs and scratch for MTP stages 1–5. `params_tokens` gathers T token IDs
+/// from `MtpParams::tokens` for the K/V-only pass. `selected_token` is the
+/// GPU-produced scalar token used by a full-layer pass and requires T=1. It
+/// must be written earlier in the same ordered command buffer. Its value is
+/// not inspected on the CPU; the gather kernel bounds-checks it and writes a
+/// quiet NaN if it is outside the vocabulary. The residual is a read-only
+/// T×10240 tensor. `embedding` and
+/// `embedding_norm` may be the same exact view because stage 2 permits
+/// in-place normalization. `xq` is reused after stage 3 for stage 5. All
+/// buffers must remain alive through GPU completion. Do not read, modify or
+/// reuse any active view before completion; keep read-only inputs, including
+/// the residual and MtpParams, unchanged. Writable regions must be disjoint
+/// except for the exact embedding/in-place-norm alias.
+struct MtpInputProjectionBuffers {
+    ReadOnlyBufferRef params;
+    MtpInputTokenSource token_source = MtpInputTokenSource::params_tokens;
+    ReadOnlyBufferRef selected_token;
+    EmbedRowsFormat embedding_format = EmbedRowsFormat::bf16;
+    std::uint32_t vocabulary_size = 0u;
+    ReadOnlyBufferRef token_embedding_table;
+    ReadOnlyBufferRef embedding_norm_gamma;
+    ReadOnlyBufferRef fc_embedding_weights;
+    BufferRef residual;
+    ReadOnlyBufferRef hidden_norm_gamma;
+    ReadOnlyBufferRef fc_hidden_weights;
+
+    BufferRef embedding;
+    BufferRef embedding_norm;
+    BufferRef xq;
+    BufferRef e2;
+    BufferRef hidden_norm;
+    BufferRef h2;
+    BufferRef matvec_sink;
+};
+
+/// Encode MTP stages 1–5: gather/normalize the token embedding, project it
+/// through Q8_0, normalize the T×10240 residual, quantize its 4T streams, and
+/// project the active rows selected by MtpParams::hid. The caller-owned form
+/// requires an ordered concurrent-group boundary. If a later stage fails,
+/// propagate false from the enclosing Encoder::encode body so its segment is
+/// discarded.
+bool encode_mtp_input_projection(Context& context, Encoder& encoder,
+                                 const MtpInputProjectionBuffers& buffers,
+                                 std::string& error);
+/// Transactional command-buffer form of MTP stages 1–5.
+bool encode_mtp_input_projection(
+    Context& context, CommandBuffer& command_buffer,
+    const MtpInputProjectionBuffers& buffers, std::string& error);
 
 /// Inputs for stage 6 of one MTP pass. `params` must be a CPU-visible,
 /// immutable MtpParams block whose T is in 1..8. All views must remain alive
