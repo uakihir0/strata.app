@@ -516,6 +516,90 @@ bool MtpRuntimeStorage::bind_add_streams(
     return true;
 }
 
+bool MtpRuntimeStorage::bind_attention_read(
+    Context& context, std::uint32_t params_slot_index,
+    MtpAttentionReadBuffers& buffers, std::string& error) const {
+    error.clear();
+    buffers = {};
+    if (!is_valid() || impl_->buffers != &context.buffers()) {
+        error = "MTP attention-read binding needs live runtime storage from this Context";
+        return false;
+    }
+    const BufferRef params_slot = mtp_params_slot(params_slot_index);
+    if (!params_slot || params_slot.length < sizeof(MtpParams) ||
+        params_slot.contents == nullptr) {
+        error = "MTP attention-read parameter slot is unavailable";
+        return false;
+    }
+
+    const ReadOnlyBufferRef params =
+        context.buffers().read_only(params_slot);
+    const BufferRef norm =
+        dense_weight("attn_hyper_connection.hc_norm.weight");
+    const BufferRef hc_down =
+        dense_weight("attn_hyper_connection.input_mix_weight_down.weight");
+    const BufferRef hc_inject =
+        dense_weight("attn_hyper_connection.block_inject_weight.weight");
+    const BufferRef hc_up =
+        dense_weight("attn_hyper_connection.input_mix_weight_up.weight");
+    const BufferRef residual = bind_region(MtpBindRegionId::mtp_rin);
+    const BufferRef dead_h2_scratch = bind_region(MtpBindRegionId::h2);
+    const BufferRef normalized = bind_region(MtpBindRegionId::xn);
+    const BufferRef rs = bind_region(MtpBindRegionId::rs);
+    const BufferRef lo = bind_region(MtpBindRegionId::lo);
+    const BufferRef inject_out = bind_region(MtpBindRegionId::inj);
+    const BufferRef mixed = bind_region(MtpBindRegionId::mixed);
+    if (!params || !norm || !hc_down || !hc_inject || !hc_up ||
+        !residual || !dead_h2_scratch || !normalized || !rs || !lo ||
+        !inject_out || !mixed) {
+        error = "MTP attention-read runtime weights or bind regions are unavailable";
+        return false;
+    }
+    buffers = {params, residual, dead_h2_scratch, norm, normalized, rs,
+               hc_down, hc_inject, lo, inject_out, hc_up, mixed};
+    error.clear();
+    return true;
+}
+
+bool MtpRuntimeStorage::bind_attention_kv_projection(
+    Context& context, std::uint32_t params_slot_index,
+    MtpAttentionKvProjectionBuffers& buffers,
+    std::string& error) const {
+    error.clear();
+    buffers = {};
+    if (!is_valid() || impl_->buffers != &context.buffers()) {
+        error = "MTP K/V projection binding needs live runtime storage from this Context";
+        return false;
+    }
+    const BufferRef params_slot = mtp_params_slot(params_slot_index);
+    if (!params_slot || params_slot.length < sizeof(MtpParams) ||
+        params_slot.contents == nullptr) {
+        error = "MTP K/V projection parameter slot is unavailable";
+        return false;
+    }
+
+    const ReadOnlyBufferRef params =
+        context.buffers().read_only(params_slot);
+    const ReadOnlyBufferRef key_weights = context.buffers().read_only(
+        dense_weight("self_attn.k_proj.weight"));
+    const ReadOnlyBufferRef value_weights = context.buffers().read_only(
+        dense_weight("self_attn.v_proj.weight"));
+    const BufferRef mixed = bind_region(MtpBindRegionId::mixed);
+    const BufferRef xq = bind_region(MtpBindRegionId::xq);
+    const BufferRef kcur = bind_region(MtpBindRegionId::kcur);
+    const BufferRef vcur = bind_region(MtpBindRegionId::vcur);
+    const BufferRef sink = bind_region(MtpBindRegionId::bo);
+    if (!params || !key_weights || !value_weights || !mixed || !xq ||
+        !kcur || !vcur || !sink) {
+        error = "MTP K/V projection runtime weights or bind regions are unavailable";
+        return false;
+    }
+    buffers = {params, mixed, xq, key_weights, value_weights,
+               kcur, vcur, sink};
+    error.clear();
+    return true;
+}
+
 BufferRef MtpRuntimeStorage::shared_rope() const noexcept {
     if (impl_ == nullptr || impl_->buffers == nullptr ||
         !impl_->shared_rope_bound ||

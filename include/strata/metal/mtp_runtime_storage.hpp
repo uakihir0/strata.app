@@ -84,6 +84,15 @@ public:
     bool bind_add_streams(Context& context, std::uint32_t params_slot,
                           MtpAddStreamsBuffers& buffers,
                           std::string& error) const;
+    /// Resolve the MTP weights and scratch views for stages 7–8. The encoder
+    /// validates active extents and aliases before dispatch.
+    bool bind_attention_read(Context& context, std::uint32_t params_slot,
+                             MtpAttentionReadBuffers& buffers,
+                             std::string& error) const;
+    bool bind_attention_kv_projection(
+        Context& context, std::uint32_t params_slot,
+        MtpAttentionKvProjectionBuffers& buffers,
+        std::string& error) const;
     /// Borrowed main RoPE view, or empty when unbound or this owner is invalid.
     BufferRef shared_rope() const noexcept;
     bool kv_views(MtpKvViews& views, std::string& error) const;
