@@ -21,6 +21,7 @@ constexpr std::uint32_t kValuesPerQ4KBlock = 256u;
 constexpr std::uint32_t kValuesPerQ5KBlock = 256u;
 constexpr std::uint32_t kValuesPerQ6KBlock = 256u;
 constexpr std::uint32_t kValuesPerQ3KBlock = 256u;
+constexpr std::uint32_t kValuesPerIQ4XSBlock = 256u;
 constexpr std::uint32_t kThreads = 256u;
 constexpr std::size_t kHalfBytes = sizeof(std::uint16_t);
 constexpr std::uint32_t kMaxSignedExtent =
@@ -34,6 +35,7 @@ static_assert(sizeof(block_q4_K) == 144u);
 static_assert(sizeof(block_q5_K) == 176u);
 static_assert(sizeof(block_q6_K) == 210u);
 static_assert(sizeof(block_q3_K) == 110u);
+static_assert(sizeof(block_iq4_xs) == 136u);
 static_assert(sizeof(PrefillDequantParams) == 2u * sizeof(std::uint32_t));
 
 bool checked_multiply(std::size_t left, std::size_t right,
@@ -361,6 +363,28 @@ bool encode_prefill_dequant_q3_k(Context& context,
         context, command_buffer, "Prefill Q3_K dequantization",
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_prefill_dequant_q3_k(
+                context, encoder, params, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_prefill_dequant_iq4_xs(Context& context, Encoder& encoder,
+                                   const PrefillDequantParams& params,
+                                   const PrefillDequantBuffers& buffers,
+                                   std::string& error) {
+    return encode_dequant_dispatch<block_iq4_xs>(
+        context, encoder, params, buffers, "IQ4_XS",
+        "strata_pf_dequant_iq4_xs", kValuesPerIQ4XSBlock, error);
+}
+
+bool encode_prefill_dequant_iq4_xs(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillDequantParams& params, const PrefillDequantBuffers& buffers,
+    std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Prefill IQ4_XS dequantization",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_dequant_iq4_xs(
                 context, encoder, params, buffers, encode_error);
         },
         error);

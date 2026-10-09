@@ -206,6 +206,47 @@ kernel void strata_pf_dequant_q3_k(
     }
 }
 
+static_assert(sizeof(block_iq4_xs) == 136,
+              "IQ4_XS Prefill dequantization requires 136-byte blocks");
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void strata_pf_dequant_iq4_xs(
+    device const block_iq4_xs* weights [[buffer(0)]],
+    device half* k_major_f16 [[buffer(1)]],
+    constant PrefillDequantParams& params [[buffer(2)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    const uint column = 256u * group.x + tid;
+    if (column >= params.n_out) return;
+
+    constexpr uint values_per_block = 256u;
+    const uint blocks_per_row = params.k / values_per_block;
+    const device block_iq4_xs* row =
+        weights + ulong(column) * blocks_per_row + group.y;
+    const float d = float(row->d);
+    for (uint value = 0u; value < values_per_block; ++value) {
+        const uint k = values_per_block * group.y + value;
+        const uint scale_group = value / 32u;
+        const uint within_group = value % 32u;
+        const uint qs_index =
+            16u * scale_group + (within_group < 16u ? within_group
+                                                     : within_group - 16u);
+        const uint packed = uint(row->qs[qs_index]);
+        const uint code =
+            within_group < 16u ? packed & 0x0fu : packed >> 4u;
+        const uint scale_low =
+            (uint(row->scales_l[scale_group / 2u]) >>
+             (4u * (scale_group % 2u))) &
+            0x0fu;
+        const uint scale_high =
+            (uint(row->scales_h) >> (2u * scale_group)) & 0x03u;
+        const int scale = int(scale_low | (scale_high << 4u)) - 32;
+        const float scaled_d = d * float(scale);
+        const float expanded = scaled_d * float(kvalues_iq4nl[code]);
+        k_major_f16[ulong(k) * params.n_out + column] = half(expanded);
+    }
+}
+
 [[max_total_threads_per_threadgroup(256)]]
 kernel void strata_pf_dequant_q2_0(
     device const block_q2_0* weights [[buffer(0)]],
