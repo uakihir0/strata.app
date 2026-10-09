@@ -9239,6 +9239,56 @@ measuring L-15 remain open.
   `metal_mtp_storage_test` passed with seeded K/V, finite/full output
   comparison and direct stage-13 identity-ID oracle.
 
+### D-IMPL-347: Implement the isolated Prefill GR SiLU stage
+
+- **Decision:** Implement the documented 320-wide low-rank SiLU kernel as
+  separate mode-0/2 and mode-1 pipelines, plus a validated standalone and
+  caller-owned Encoder API. Bind the F32 activation as `ReadOnlyBufferRef`;
+  require the BF16 remainder output exactly in mode 1; preserve the `lo / 4`
+  scaling, SiLU operation order and RNE residual calculation. Keep the
+  existing Prefill row limit, Context ownership checks, aligned bounded views,
+  writable-output disjointness and ordered concurrent-group boundary.
+- **Reason:** This kernel is a self-contained, directly testable Prefill
+  component in the documented implementation plan. Completing it advances
+  the GR read path without claiming or prematurely assembling the still-open
+  GEMM, mixer, layer scheduler or chunk loop. A const input API and separate
+  mode pipeline make read-only and unused-remainder contracts explicit.
+- **Validation:** The `mac-dev` build compiled both Metal entry points and
+  the new Objective-C++ encoder. `metal_prefill_test` and
+  `metal_prefill_test_concurrent` passed 2/2, and the complete `mac-metal`
+  CTest preset passed 80/80 on Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0
+  build 27A266a). Tests use synthetic inputs; no model input was available or
+  used. They cover T=1/3/8, all BF16X2 modes, negative/zero/positive and tail
+  values, high/low BF16 scalar oracles, exact RNE ties for high outputs in all
+  modes and positive/negative low-remainder ties in mode 1, guards, input
+  immutability, invalid rows/modes/views/ownership and aliases, late-failure
+  discard and concurrent-group rejection. This is kernel-level evidence only;
+  it does not establish Prefill integration or model inference.
+- **Review:** REV-144 hostile review of shader indexing, bindings,
+  validation and test coverage closed the BF16 rounding-coverage finding
+  with exact high and low midpoint fixtures. No actionable findings remain.
+  Production Prefill GEMM/layer/chunk scheduling and inspected-model parity
+  remain open.
+
+### REV-144: Hostile review of the Prefill GR SiLU stage
+
+- **Scope:** `strata_pf_gr_silu` and `_lo`, the validated dispatch API, the
+  serial/concurrent BF16 oracle fixtures, buffer contracts, and synchronized
+  status documentation.
+- **Findings and disposition:** Initial review found that the general ULP
+  allowances could admit truncating BF16 conversion. Exact high-output
+  halfway inputs now assert the expected even BF16 bits in all modes, while
+  mode 1 asserts exact positive and negative BF16 remainder halfway results.
+  The first low-remainder candidate crossed the high-output midpoint; the
+  failing GPU bits exposed it, and the corrected values keep the high output
+  at 64 or 65 while exercising even-neighbor ties. The follow-up verified
+  those values and found no actionable issue.
+- **Validation:** `cmake --build --preset mac-dev` succeeded and the focused
+  Prefill serial/concurrent CTests passed 2/2 after the final fixture
+  correction; the complete `mac-metal` CTest preset passed 80/80 on Mac17,9
+  (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a). The tests use synthetic
+  inputs and do not establish model-backed behavior.
+
 ### D-IMPL-341: Bind MTP attention runtime views for stages 7–8
 
 - **Decision:** Add runtime-storage adapters for stage 7's attention read and
