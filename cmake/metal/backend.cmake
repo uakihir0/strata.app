@@ -140,6 +140,7 @@ set(STRATA_METAL_ENGINE_SOURCES
   src/metal/engine/mtp_bind_layout.cpp
   src/metal/engine/mtp_params_layout.cpp
   src/metal/engine/mtp_runtime_storage.cpp
+  src/metal/engine/mtp_dispatch.cpp
   src/metal/engine/prefill.cpp
   src/metal/engine/snapshot.cpp)
 add_library(strata_metal_engine STATIC ${STRATA_METAL_ENGINE_SOURCES})

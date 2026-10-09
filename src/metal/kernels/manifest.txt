@@ -20,6 +20,7 @@ strata_embed_rows_iq3_s safe 256 1 1
 strata_embed_rows_iq4_xs safe 256 1 1
 strata_embed_rows_bf16 safe 256 1 1
 strata_gr_broadcast safe 256 1 1
+strata_mtp_add_streams safe 256 1 1
 strata_embed_image safe 256 1 1
 strata_pf_gr_norm safe 256 1 1
 strata_pf_gr_norm_lo safe 256 1 1

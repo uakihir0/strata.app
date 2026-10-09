@@ -322,8 +322,7 @@
     },
     "metal_mtp_test": {
       "label": "metal",
-      "origin": "09 9.1",
-      "planned": "L11"
+      "origin": "09 9.1, 04 §5.11, D-IMPL-322, REV-119"
     },
     "metal_mv_test": {
       "label": "metal",
