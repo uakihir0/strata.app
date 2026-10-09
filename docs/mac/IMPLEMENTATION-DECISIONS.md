@@ -8944,3 +8944,78 @@ measuring L-15 remain open.
 - **Review required:** Implement or explicitly disposition the remaining
   L11 work: MTP stages 1–5, `MtpRuntimeStorage` view binding, scheduler
   integration and inspected-model parity.
+
+### D-IMPL-338: Compose MTP drafter stages 1–5
+
+- **Decision:** Add `encode_mtp_input_projection` as the ordered stages 1–5
+  coordinator. It reads K/V-only token IDs from `MtpParams::tokens` or accepts
+  exactly one GPU-produced selected token for a T=1 full-layer pass, validates
+  all four `hid` counts against the 4T projection rows, gathers the configured
+  token embedding format, applies both documented weighted RMS norms, and
+  reuses the Q8_1 scratch for `fc_embedding` and `fc_hidden`. Stage 4 remains
+  T rows wide at 10240 values; stage 5 quantizes the same contiguous data as
+  4T rows of width 2560 and uses the documented 8/4-row `hid` passes. The
+  `fc_hidden` weight matrix remains 2560→2560 and is reused per stream.
+- **Reason:** The K/V-only pass and full layer use different token sources but
+  share the same projection math. The enum makes that distinction explicit,
+  while the T=1 boundary prevents a scalar selected token from being treated
+  as a batch. Reusing existing embedding, norm, Q8_1 and read-only Q8_0
+  encoders avoids duplicating kernel arithmetic. Exact `emb`/`en` aliasing is
+  allowed because stage 2 supports in-place normalization; other writable
+  overlaps are rejected. K/V token IDs cannot carry the image-row marker,
+  because this path does not have an image producer. A singular selected-token
+  view must be exactly one 32-bit ID, is written earlier in the same ordered
+  command buffer, and must be disjoint from the full `MtpParams` block so its
+  producer cannot corrupt T or hid metadata. Its potentially stale CPU mapping
+  is not read; the gather shader checks the ID before table access and writes
+  a quiet NaN for an invalid GPU-produced token. Host-visible token inputs keep
+  their early rejection behavior.
+- **Validation:** Serial and concurrent fixtures exercise K/V-only T=1,2,3,8
+  and full-layer selected-token T=1, whose CPU mapping starts OOV and is
+  overwritten by an earlier GPU dispatch in the same Encoder segment,
+  covering NC=1/2/4/8, a partial final
+  hidden pass and all four hidden passes. They compare embedding gather and
+  both norms to scalar expectations, feed each GPU norm result into the
+  independent Q8_1 and Q8_0 stage oracles, and check guards, immutable inputs,
+  malformed `hid`, host-visible out-of-vocabulary and image-marker tokens,
+  invalid selected-token T, selected-token/parameter overlap, output alias
+  rejection, exact in-place embedding norm, group refusal and caller-owned
+  rollback.
+- **Build and tests:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `cmake --build --preset mac-dev` succeeded; focused embedding/MTP
+  serial and concurrent tests passed 4/4; the full `mac-metal` suite passed
+  80/80; `mac-host` passed 43 tests with one unavailable real-input test
+  skipped; and the Python runner passed 35/35 modules in `.venv`. `test_map`,
+  `check_drift.py` and `git diff --check` passed. These synthetic tests do not
+  establish runtime-storage binding, scheduler integration or inspected-model
+  drafter parity.
+- **Review:** REV-135 records the hostile review findings and their fixes; the
+  follow-up review found no additional issue. Then bind stages 1–22 to
+  `MtpRuntimeStorage`, implement scheduler integration and establish inspected-
+  model drafter parity.
+
+### REV-135: Hostile review of MTP input projection stages 1–5
+
+- **Scope:** The stage-1–5 encoder and token-source contracts, GPU-produced
+  selected-token ordering, validation, output extents, regression fixtures and
+  current implementation/test status in the Mac documentation.
+- **Findings and fixes:** The first review found that `selected_token` could
+  alias `MtpParams::T`; an earlier GPU write could then change the active-row
+  count used by the mat-vec while the sink was sized for the original T. The
+  encoder now rejects any overlap with the full parameter block before it
+  appends work, and a T=1 regression checks that exact rejection. The review
+  also found that high-bit K/V tokens were interpreted as image rows by the
+  shared embedding gather, leaving the embedding output unwritten; MTP
+  validation now rejects the reserved image-row bit, with a dedicated
+  regression. A stale validation paragraph was corrected to distinguish the
+  focused run from the full suite.
+- **Follow-up:** A second read-only hostile review checked the alias detection,
+  validation order and both new fixtures and found no further issue.
+- **Disposition:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a),
+  the `mac-dev` build succeeded, focused embedding/MTP serial and concurrent
+  tests passed 4/4, the full `mac-metal` suite passed 80/80, and `mac-host`
+  passed 43 tests with one unavailable real-input test skipped. The Python
+  runner passed 35/35 modules in `.venv`. Documentation map, upstream drift
+  and whitespace checks are recorded after the final doc update. The tests
+  cover isolated encoder behavior; MTP runtime binding, scheduler integration
+  and inspected-model drafter parity remain open.
