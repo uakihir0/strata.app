@@ -2318,6 +2318,13 @@ usage and plan views. `encode_window_t1_moe_layer0_full_mode` takes the `FullMod
 uses its expert address/resident/usage tables, and composes the actual router/route/plan prefix
 with routed expert FFN, shared expert and combine in one ordered transaction. It leaves the
 combined output pending in `ffn.shared.output`; it does not write the GR residual.
+The separate `encode_window_moe_layer0_full_mode` producer accepts T=1..8 from validated
+`WindowParams`, requires `n_keep == 0`, uses `WindowParams.T` for active router, route, Q8_1,
+plan and shared-FFN rows, and treats `WindowParams.nc` only as the padded compiled-column width.
+It preserves the same FullMode table ownership and pending-output policy. This producer can be
+followed by the generic pending-consumer selector in a caller-owned Encoder segment, but does not
+compose token embedding, GR broadcast or the consumer itself; the integrated FullMode token step
+remains T=1.
 The generic speculative router prefix supports T=1..8 and uses `WindowParams.T` for active router,
 route and Q8_1 rows while `nc` determines padded BF16 mat-vec columns. Its plan-prefix companion
 continues through the layer-0 `strata_moe_plan` kernel for either full or tiered mode. Full mode
@@ -2335,7 +2342,8 @@ view, and encodes that read with `apply=true`. Its standalone form has the same 
 dependency and producer-completion requirement. The Window scheduler must select exactly one
 consumer. The full-mode MoE coordinator validates the consumer's address/resident tables, Q8_1
 activations, plan, route weights and mixed input against the producer views, including the same
-`WindowParams.nc`. Consumer
+`WindowParams.nc`. Its generic speculative path binds active rows to `WindowParams.T`; the existing
+T=1 path preserves its `WindowParams.nc` view. Consumer
 reads may overlap producer storage only in the specific input roles declared for each handoff.
 Router weights and the resident table are checked as producer inputs, and consumer outputs and
 sinks cannot overlap them. In tiered mode the plan prefix ends at plan production; a caller must
@@ -2346,7 +2354,14 @@ draft-head API, and Prefill dispatch remain pending.
 `metal_fullmode_handoff_test` exercises the full-mode producer and the no-PLE attention consumer
 in one ordered segment using a sparse 256-expert GGUF fixture. It checks the produced route,
 nonzero routed/shared output, consumer outputs against a direct GR-read reference, and exactly-once
-residual application. `metal_fullmode_ple_handoff_test` exercises that producer with the typed PLE
+residual application. Its generic FullMode layer-0 producer cases cover T=1, T=2, T=3 with
+`nc=4`, and T=8, including a same-segment T=8 no-PLE consumer. Independent router, route, Q2_0 routed-expert,
+Q8_0 shared-expert, combine, pending-output and GR-consumer oracles check the active outputs.
+T=3 cases verify active rows are distinct from compiled columns and reject undersized padded sinks.
+Late shared-FFN validation failures in caller-owned T=2 and standalone T=3 forms discard earlier
+producer work and preserve every writable view. The fixture checks active-row output guards and
+unchanged FullMode usage. These synthetic multirow fixtures validate composition and transaction
+behavior; they do not establish real-model parity or production scheduling. `metal_fullmode_ple_handoff_test` exercises the T=1 producer with the typed PLE
 entry in one ordered segment, then compares its PLE outputs and residual against a direct GR-post
 plus PLE-entry reference. `prepare_window_t1_input` builds the T=1 `WindowParams` ring slot and, for
 PLE, builds row IDs from the test token and committed history, then stages the sixteen IQ4_NL rows

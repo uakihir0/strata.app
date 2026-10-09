@@ -864,30 +864,39 @@ bool validate_window_moe_plan_prefix(
         context, experts, buffers, "Window MoE prefix", error);
 }
 
-bool validate_window_t1_moe_layer0_consumer_handoffs(
+bool validate_window_moe_layer0_consumer_handoffs(
     Context& context, std::uint32_t vocabulary_size, std::uint32_t experts,
-    const WindowT1MoeLayer0FullBuffers& buffers, std::string& error) {
-    if (!validate_window_t1_moe_plan_prefix(
-            context, vocabulary_size, experts, buffers.producer, error)) {
+    const WindowMoeLayer0FullBuffers& buffers, bool require_t1,
+    WindowParams& params, std::string& error) {
+    if (require_t1) {
+        if (!validate_window_t1_moe_plan_prefix(
+                context, vocabulary_size, experts, buffers.producer, error) ||
+            !validate_window_params(
+                context, buffers.producer.router.layer0.params,
+                vocabulary_size, params, error)) {
+            return false;
+        }
+    } else if (!validate_window_moe_plan_prefix(
+                   context, vocabulary_size, experts, buffers.producer,
+                   params, error)) {
         return false;
     }
     if (experts != 256u && experts != 512u) {
-        error = "Window T=1 MoE FFN requires 256 or 512 experts";
+        error = require_t1 ? "Window T=1 MoE FFN requires 256 or 512 experts"
+                           : "Window MoE FFN requires 256 or 512 experts";
         return false;
     }
 
     const WindowT1MoeRouterPrefixBuffers& producer =
         buffers.producer.router;
     const WindowT1AttentionGDNFFNBuffers& layer0 = producer.layer0;
-    WindowParams params{};
-    if (!validate_window_params(context, layer0.params, vocabulary_size,
-                                params, error)) {
-        return false;
-    }
     if (params.n_keep != 0u) {
-        error = "Window T=1 MoE FFN requires an ordinary decode step";
+        error = require_t1 ? "Window T=1 MoE FFN requires an ordinary decode step"
+                           : "Window MoE FFN requires an ordinary speculative window";
         return false;
     }
+    const std::string prefix =
+        require_t1 ? "Window T=1 MoE FFN" : "Window MoE FFN";
 
     const ReadOnlyBufferRef producer_input =
         context.buffers().read_only(layer0.gdn.xq);
@@ -898,33 +907,35 @@ bool validate_window_t1_moe_layer0_consumer_handoffs(
     const ReadOnlyBufferRef params_read_only =
         context.buffers().read_only(layer0.params);
     const ReadOnlyBufferRef active_rows = params_read_only.slice(
-        offsetof(WindowParams, nc), sizeof(std::uint32_t));
+        require_t1 ? offsetof(WindowParams, nc) : offsetof(WindowParams, T),
+        sizeof(std::uint32_t));
     const MoeRoutedFFNBuffers& routed = buffers.ffn.routed;
     const MoeSharedFFNBuffers& shared = buffers.ffn.shared;
     if (!producer_input || !producer_plan || !producer_route_weights ||
         !active_rows) {
-        error = "Window T=1 MoE FFN could not form producer views";
+        error = prefix + " could not form producer views";
         return false;
     }
     if (!same_buffer_start(producer_input, routed.input_activations) ||
         !same_buffer_start(producer_input, shared.input_activations)) {
-        error = "Window T=1 MoE FFN activations must use the producer Q8_1 input";
+        error = prefix + " activations must use the producer Q8_1 input";
         return false;
     }
     if (!same_buffer_start(producer_plan, routed.plans)) {
-        error = "Window T=1 MoE FFN plan must use the producer plan output";
+        error = prefix + " plan must use the producer plan output";
         return false;
     }
     if (!same_buffer_start(producer_route_weights, shared.route_weights)) {
-        error = "Window T=1 MoE FFN route weights must use the producer output";
+        error = prefix + " route weights must use the producer output";
         return false;
     }
     if (!same_buffer_start(layer0.ffn.mixed, shared.mixed)) {
-        error = "Window T=1 MoE FFN mixed input must use the producer output";
+        error = prefix + " mixed input must use the producer output";
         return false;
     }
     if (!same_buffer_start(active_rows, shared.active_rows)) {
-        error = "Window T=1 MoE FFN live rows must use WindowParams.nc";
+        error = prefix + " live rows must use " +
+                (require_t1 ? "WindowParams.nc" : "WindowParams.T");
         return false;
     }
 
@@ -980,7 +991,7 @@ bool validate_window_t1_moe_layer0_consumer_handoffs(
                      [&](BufferRef view) {
                          return !buffer_views_overlap(layer0.params, view);
                      })) {
-        error = "Window T=1 MoE FFN consumer overlaps its parameters";
+        error = prefix + " consumer overlaps its parameters";
         return false;
     }
 
@@ -1044,7 +1055,8 @@ bool validate_window_t1_moe_layer0_consumer_handoffs(
         !consumer_disjoint_from(producer_gdn) ||
         !consumer_disjoint_from(producer_ffn) ||
         !consumer_disjoint_from(route_plan_outputs)) {
-        error = "Window T=1 MoE consumer views overlap producer storage outside a declared handoff";
+        error = prefix +
+                " consumer views overlap producer storage outside a declared handoff";
         return false;
     }
 
@@ -1052,10 +1064,19 @@ bool validate_window_t1_moe_layer0_consumer_handoffs(
     return true;
 }
 
-bool validate_window_t1_moe_layer0_full_mode(
+bool validate_window_t1_moe_layer0_consumer_handoffs(
+    Context& context, std::uint32_t vocabulary_size, std::uint32_t experts,
+    const WindowT1MoeLayer0FullBuffers& buffers, std::string& error) {
+    WindowParams params{};
+    return validate_window_moe_layer0_consumer_handoffs(
+        context, vocabulary_size, experts, buffers, true, params, error);
+}
+
+bool validate_window_moe_layer0_full_mode(
     Context& context, const FullModeStorage& full_mode,
     std::uint32_t vocabulary_size, std::uint32_t experts,
-    const WindowT1MoeLayer0FullBuffers& buffers, std::string& error) {
+    const WindowMoeLayer0FullBuffers& buffers, bool require_t1,
+    WindowParams& params, std::string& error) {
     const ReadOnlyBufferRef full_addresses =
         full_mode.expert_address_table();
     const ReadOnlyBufferRef full_resident = full_mode.resident_table();
@@ -1066,11 +1087,23 @@ bool validate_window_t1_moe_layer0_full_mode(
         !same_buffer_start(full_addresses, buffers.ffn.routed.addresses) ||
         !same_buffer_start(full_resident, buffers.producer.resident) ||
         !same_buffer_start(full_usage, buffers.producer.usage)) {
-        error = "Window T=1 full-mode MoE must use its FullModeStorage address, resident and usage tables";
+        error = require_t1
+                    ? "Window T=1 full-mode MoE must use its FullModeStorage address, resident and usage tables"
+                    : "Window full-mode MoE must use its FullModeStorage address, resident and usage tables";
         return false;
     }
-    return validate_window_t1_moe_layer0_consumer_handoffs(
-        context, vocabulary_size, experts, buffers, error);
+    return validate_window_moe_layer0_consumer_handoffs(
+        context, vocabulary_size, experts, buffers, require_t1, params, error);
+}
+
+bool validate_window_t1_moe_layer0_full_mode(
+    Context& context, const FullModeStorage& full_mode,
+    std::uint32_t vocabulary_size, std::uint32_t experts,
+    const WindowT1MoeLayer0FullBuffers& buffers, std::string& error) {
+    WindowParams params{};
+    return validate_window_moe_layer0_full_mode(
+        context, full_mode, vocabulary_size, experts, buffers, true, params,
+        error);
 }
 
 }  // namespace
@@ -1475,6 +1508,49 @@ bool encode_window_t1_moe_layer0_full_mode(
         context, command_buffer, "Window T=1 layer-0 full-mode MoE",
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_window_t1_moe_layer0_full_mode(
+                context, full_mode, encoder, vocabulary_size, experts,
+                gate_up_format, down_format, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_window_moe_layer0_full_mode(
+    Context& context, const FullModeStorage& full_mode, Encoder& encoder,
+    std::uint32_t vocabulary_size, std::uint32_t experts,
+    MoeExpertFormat gate_up_format, MoeDownFormat down_format,
+    const WindowMoeLayer0FullBuffers& buffers, std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "Window MoE layer requires ordered dispatch boundaries";
+        return false;
+    }
+
+    WindowParams params{};
+    if (!validate_window_moe_layer0_full_mode(
+            context, full_mode, vocabulary_size, experts, buffers, false,
+            params, error)) {
+        return false;
+    }
+    if (!encode_window_moe_plan_prefix(
+            context, encoder, vocabulary_size, experts, false,
+            buffers.producer, error)) {
+        return false;
+    }
+    return encode_moe_routed_shared_ffn(
+        context, encoder, params.T, experts, 0u, gate_up_format, down_format,
+        buffers.ffn, error);
+}
+
+bool encode_window_moe_layer0_full_mode(
+    Context& context, const FullModeStorage& full_mode,
+    CommandBuffer& command_buffer, std::uint32_t vocabulary_size,
+    std::uint32_t experts, MoeExpertFormat gate_up_format,
+    MoeDownFormat down_format, const WindowMoeLayer0FullBuffers& buffers,
+    std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Window speculative layer-0 full-mode MoE",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_moe_layer0_full_mode(
                 context, full_mode, encoder, vocabulary_size, experts,
                 gate_up_format, down_format, buffers, encode_error);
         },

@@ -90,6 +90,8 @@ struct WindowT1MoeLayer0FullBuffers {
     WindowT1MoePlanPrefixBuffers producer;
     MoeRoutedSharedFFNBuffers ffn;
 };
+/// Same layer-0 buffer roles for the generic speculative T=1..8 producer.
+using WindowMoeLayer0FullBuffers = WindowT1MoeLayer0FullBuffers;
 
 /// Bind a pending layer-0 MoE write to the next layer's GR attention read.
 /// The read reuses the producer residual, combined MoE output and FFN
@@ -269,6 +271,26 @@ bool encode_window_t1_moe_layer0_full_mode(
     std::uint32_t vocabulary_size, std::uint32_t experts,
     MoeExpertFormat gate_up_format, MoeDownFormat down_format,
     const WindowT1MoeLayer0FullBuffers& buffers, std::string& error);
+
+/// Encode the speculative T=1..8 FullMode layer-0 router/route/plan prefix
+/// followed by routed experts and the shared expert/combine. Derive T from
+/// the validated WindowParams, require an ordinary speculative window
+/// (`n_keep == 0`), and leave the combined result in `ffn.shared.output` for
+/// a later pending consumer. The address, resident and usage tables must be
+/// the exact FullModeStorage views. Keep that owner alive through GPU
+/// completion, and propagate false from a caller-owned Encoder body.
+bool encode_window_moe_layer0_full_mode(
+    Context& context, const FullModeStorage& full_mode, Encoder& encoder,
+    std::uint32_t vocabulary_size, std::uint32_t experts,
+    MoeExpertFormat gate_up_format, MoeDownFormat down_format,
+    const WindowMoeLayer0FullBuffers& buffers, std::string& error);
+/// Standalone transactional form; any validation failure discards the segment.
+bool encode_window_moe_layer0_full_mode(
+    Context& context, const FullModeStorage& full_mode,
+    CommandBuffer& command_buffer, std::uint32_t vocabulary_size,
+    std::uint32_t experts, MoeExpertFormat gate_up_format,
+    MoeDownFormat down_format, const WindowMoeLayer0FullBuffers& buffers,
+    std::string& error);
 
 /// Encode the no-PLE consumer of a pending layer-0 MoE write. The next
 /// attention read must reuse the previous GR residual view. Call after the

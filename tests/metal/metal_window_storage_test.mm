@@ -24,7 +24,16 @@
 #include "strata/kernels/ngram.hpp"
 #include "window_source_lock_test_access.hpp"
 #include "oracles/iq4_xs_mv.hpp"
+#include "oracles/bf16_mv.hpp"
+#include "oracles/moe_plan.hpp"
+#include "oracles/moe_route.hpp"
+#include "oracles/moe_gu_q2_0.hpp"
+#include "oracles/moe_down_q2_0.hpp"
+#include "oracles/moe_swiglu.hpp"
+#include "oracles/moe_combine.hpp"
+#include "oracles/q8_0_mv.hpp"
 #include "oracles/q8_1.hpp"
+#include "twin.hpp"
 #include "../../src/metal/kernels/common/params.h"
 #include "../../src/metal/kernels/common/types.h"
 
@@ -3296,7 +3305,8 @@ void run_fullmode_handoff_test(Context& context,
         require_scratch_view(context, *scratch, layout.gdn_y, "GDN Y");
     const BufferRef gdn_yq = allocate_zeroed_buffer(
         context, "full-mode handoff GDN Y Q8_1",
-        (static_cast<std::size_t>(GDN_VALUE_DIM) / 32u) * sizeof(Q81));
+        8u * (static_cast<std::size_t>(GDN_VALUE_DIM) / 32u) *
+            sizeof(Q81));
     const BufferRef router_logits =
         require_scratch_view(context, *scratch, layout.router_logits,
                               "router logits");
@@ -3353,18 +3363,21 @@ void run_fullmode_handoff_test(Context& context,
                               "attention injection decoy");
     const BufferRef gdn_sink =
         allocate_zeroed_buffer(context, "full-mode handoff GDN sink",
-                               sizeof(float));
+                               3u * static_cast<std::size_t>(
+                                        GDN_CONV_CHANNELS) *
+                                   sizeof(float));
     const BufferRef gdn_active_rows = allocate_zeroed_buffer(
         context, "full-mode handoff GDN active rows", sizeof(std::uint32_t));
     const BufferRef router_sink =
         allocate_zeroed_buffer(context, "full-mode handoff router sink",
-                               sizeof(float));
+                               static_cast<std::size_t>(kExperts) * 3u *
+                                   sizeof(float));
     const ReadOnlyBufferRef active_rows =
         context.buffers().read_only(params).slice(
             offsetof(strata::metal::WindowParams, nc),
             sizeof(std::uint32_t));
     require(static_cast<bool>(active_rows),
-            "form the WindowParams.nc live-row input");
+            "form the legacy WindowParams.nc live-row input");
     std::memcpy(gdn_active_rows.contents, &kRows, sizeof(kRows));
 
     auto allocate = [&](const std::string& label, std::size_t bytes) {
@@ -3450,14 +3463,16 @@ void run_fullmode_handoff_test(Context& context,
         "full-mode handoff shared gate-input weights",
         2'560u * sizeof(std::uint16_t));
     auto shared_gate_sink = allocate(
-        "full-mode handoff shared gate sink", sizeof(float));
+        "full-mode handoff shared gate sink", 3u * sizeof(float));
     auto shared_gate_projection_sink =
         allocate("full-mode handoff shared gate projection sink",
-                 sizeof(float));
+                 3u * 640u * sizeof(float));
     auto shared_up_sink =
-        allocate("full-mode handoff shared up sink", sizeof(float));
+        allocate("full-mode handoff shared up sink",
+                 3u * 640u * sizeof(float));
     auto shared_down_sink =
-        allocate("full-mode handoff shared down sink", sizeof(float));
+        allocate("full-mode handoff shared down sink",
+                 3u * N_EMBD * sizeof(float));
 
     std::fill_n(static_cast<float*>(attention_norm.contents),
                 attention_norm.length / sizeof(float), 1.0f);
@@ -3579,6 +3594,783 @@ void run_fullmode_handoff_test(Context& context,
         {producer, full_mode->resident_table(), full_mode->usage_table(),
          moe_plans},
         {routed, shared}};
+
+    if (!use_ple_entry) {
+        const auto exercise_generic_fullmode_producer =
+            [&](std::uint32_t rows, bool caller_owned,
+                bool induce_late_failure, bool consume_pending) {
+                std::vector<std::uint32_t> generic_tokens(rows, 0u);
+                std::vector<WindowSamplerSettings> generic_samplers(
+                    rows, sampler_settings);
+                const BufferRef generic_params = params_ring->build_slot(
+                    1u, 1u, generic_tokens, generic_samplers, 0u,
+                    0x11223344u, 0x55667788u, error);
+                require(static_cast<bool>(generic_params),
+                        "build generic FullMode producer parameters: " +
+                            error);
+                strata::metal::WindowParams generic_parameter_values{};
+                std::memcpy(&generic_parameter_values,
+                            generic_params.contents,
+                            sizeof(generic_parameter_values));
+                std::uint32_t expected_compiled_columns = 1u;
+                while (expected_compiled_columns < rows) {
+                    expected_compiled_columns <<= 1u;
+                }
+                require(generic_parameter_values.T == rows &&
+                            generic_parameter_values.nc ==
+                                expected_compiled_columns,
+                        "generic FullMode parameters separate active rows from compiled columns");
+                std::memcpy(gdn_active_rows.contents, &rows, sizeof(rows));
+
+                WindowMoeLayer0FullBuffers generic_buffers = full_buffers;
+                generic_buffers.producer.router.layer0.params =
+                    generic_params;
+                const ReadOnlyBufferRef generic_params_read_only =
+                    context.buffers().read_only(generic_params);
+                generic_buffers.ffn.shared.active_rows =
+                    generic_params_read_only.slice(
+                        offsetof(strata::metal::WindowParams, T),
+                        sizeof(std::uint32_t));
+                require(static_cast<bool>(
+                            generic_buffers.ffn.shared.active_rows),
+                        "bind shared expert active rows to WindowParams.T");
+                const GRReadBuffers generic_attention{
+                    residual, next_attention_block_decoy,
+                    next_attention_inject_decoy, next_attention_norm,
+                    gr_xn, gr_rs, next_attention_down,
+                    next_attention_inject_weights, gr_lo, inject,
+                    next_attention_up, attention_entry_mixed};
+                GRReadBuffers generic_previous_gr{};
+                generic_previous_gr.residual = residual;
+                generic_previous_gr.inject_out = inject2;
+                const WindowMoeAttentionEntryBuffers generic_attention_entry{
+                    generic_buffers.ffn, generic_previous_gr,
+                    generic_attention};
+                const WindowMoePendingConsumer generic_pending_consumer{
+                    generic_attention_entry};
+                auto* const generic_residual =
+                    static_cast<float*>(residual.contents);
+                for (std::uint32_t row = 0u; row < rows; ++row) {
+                    for (std::size_t index = 0u;
+                         index < 4u * N_EMBD; ++index) {
+                        generic_residual[
+                            static_cast<std::size_t>(row) * 4u * N_EMBD +
+                            index] =
+                            static_cast<float>((row + 1u) *
+                                               (index % 13u + 1u)) *
+                            0.001f;
+                    }
+                }
+                const std::size_t generic_residual_bytes =
+                    static_cast<std::size_t>(rows) * 4u * N_EMBD *
+                    sizeof(float);
+                std::vector<std::uint8_t> generic_residual_before(
+                    static_cast<const std::uint8_t*>(residual.contents),
+                    static_cast<const std::uint8_t*>(residual.contents) +
+                        generic_residual_bytes);
+                std::vector<std::uint8_t> params_before(
+                    static_cast<const std::uint8_t*>(generic_params.contents),
+                    static_cast<const std::uint8_t*>(generic_params.contents) +
+                        sizeof(strata::metal::WindowParams));
+                std::vector<std::int32_t> resident(kExperts);
+                std::vector<float> usage(kExperts);
+                const ReadOnlyBufferRef resident_view =
+                    full_mode->resident_table();
+                const BufferRef usage_view = full_mode->usage_table();
+                std::memcpy(resident.data(), resident_view.contents(),
+                            resident.size() * sizeof(std::int32_t));
+                std::memcpy(usage.data(), usage_view.contents,
+                            usage.size() * sizeof(float));
+
+                std::vector<BufferRef> mutation_views;
+                const auto append_gr_mutations =
+                    [&](const GRReadBuffers& gr) {
+                        mutation_views.insert(
+                            mutation_views.end(),
+                            {gr.residual, gr.norm, gr.normalized, gr.rs,
+                             gr.hc_down, gr.hc_inject, gr.lo, gr.inject_out,
+                             gr.hc_up, gr.mixed});
+                    };
+                append_gr_mutations(generic_buffers.producer.router.layer0
+                                        .attention);
+                const WindowGDNBlockBuffers& generic_gdn =
+                    generic_buffers.producer.router.layer0.gdn;
+                mutation_views.insert(
+                    mutation_views.end(),
+                    {generic_gdn.history, generic_gdn.state, generic_gdn.xq,
+                     generic_gdn.qkv, generic_gdn.h, generic_gdn.gate,
+                     generic_gdn.beta, generic_gdn.z, generic_gdn.y,
+                     generic_gdn.yq, generic_gdn.block_out,
+                     generic_gdn.sink, generic_gdn.active_rows});
+                append_gr_mutations(
+                    generic_buffers.producer.router.layer0.ffn);
+                mutation_views.insert(
+                    mutation_views.end(),
+                    {generic_buffers.producer.router.router_logits,
+                     generic_buffers.producer.router.route_ids,
+                     generic_buffers.producer.router.route_weights,
+                     generic_buffers.producer.router.router_matvec_sink,
+                     generic_buffers.producer.usage,
+                     generic_buffers.producer.plans,
+                     generic_buffers.ffn.routed.gate,
+                     generic_buffers.ffn.routed.up,
+                     generic_buffers.ffn.routed.hidden,
+                     generic_buffers.ffn.routed.down_activations,
+                     generic_buffers.ffn.routed.parts,
+                     generic_buffers.ffn.shared.gate,
+                     generic_buffers.ffn.shared.up,
+                     generic_buffers.ffn.shared.hidden,
+                     generic_buffers.ffn.shared.down_activations,
+                     generic_buffers.ffn.shared.shared_output,
+                     generic_buffers.ffn.shared.shared_gate_logits,
+                     generic_buffers.ffn.shared.output,
+                     generic_buffers.ffn.shared.gate_sink,
+                     generic_buffers.ffn.shared.up_sink,
+                     generic_buffers.ffn.shared.down_sink,
+                     generic_buffers.ffn.shared.shared_gate_sink});
+
+                struct BufferSnapshot {
+                    BufferRef view;
+                    std::vector<std::uint8_t> bytes;
+                };
+                std::vector<BufferSnapshot> before;
+                before.reserve(mutation_views.size());
+                if (induce_late_failure) {
+                    for (BufferRef view : mutation_views) {
+                        require(view && view.contents != nullptr,
+                                "snapshot generic producer mutation view");
+                        const auto* const begin =
+                            static_cast<const std::uint8_t*>(view.contents);
+                        before.push_back(
+                            {view, std::vector<std::uint8_t>(
+                                       begin, begin + view.length)});
+                    }
+                } else {
+                    std::memset(generic_buffers.producer.router.router_logits
+                                    .contents,
+                                0xa5,
+                                generic_buffers.producer.router.router_logits
+                                    .length);
+                    std::memset(generic_buffers.producer.router.route_ids
+                                    .contents,
+                                0xa5,
+                                generic_buffers.producer.router.route_ids
+                                    .length);
+                    std::memset(generic_buffers.producer.router.route_weights
+                                    .contents,
+                                0xa5,
+                                generic_buffers.producer.router.route_weights
+                                    .length);
+                    std::memset(generic_buffers.producer.plans.contents, 0xa5,
+                                generic_buffers.producer.plans.length);
+                    std::memset(generic_buffers.ffn.routed.parts.contents,
+                                0xa5,
+                                generic_buffers.ffn.routed.parts.length);
+                    std::memset(generic_buffers.ffn.shared.output.contents,
+                                0xa5,
+                                generic_buffers.ffn.shared.output.length);
+                    std::memset(pending_output.contents, 0xa5,
+                                pending_output.length);
+                    if (consume_pending) {
+                        std::memset(attention_entry_mixed.contents, 0xa5,
+                                    attention_entry_mixed.length);
+                    }
+                }
+
+                WindowMoeLayer0FullBuffers dispatched_buffers =
+                    generic_buffers;
+                if (induce_late_failure) {
+                    dispatched_buffers.ffn.shared.down_sink =
+                        dispatched_buffers.ffn.shared.down_sink.slice(0u, 0u);
+                    require(static_cast<bool>(
+                                dispatched_buffers.ffn.shared.down_sink),
+                            "form an owned empty late-failure sink view");
+                }
+                auto command = context.make_command_buffer(
+                    "generic FullMode layer-0 producer T=" +
+                        std::to_string(rows),
+                    error);
+                require(command != nullptr,
+                        "create generic FullMode producer command: " + error);
+                require(session->track_use(*command, error),
+                        "track GDN state through generic FullMode producer: " +
+                            error);
+                const bool encoded = caller_owned
+                    ? Encoder::encode(
+                          context, *command,
+                          "caller-owned generic FullMode producer",
+                          [&](Encoder& encoder, std::string& encode_error) {
+                              if (!encode_window_moe_layer0_full_mode(
+                                  context, *full_mode, encoder, kVocabulary,
+                                  kExperts, MoeExpertFormat::q2_0,
+                                  MoeDownFormat::q2_0, dispatched_buffers,
+                                  encode_error)) {
+                                  return false;
+                              }
+                              return !consume_pending ||
+                                     encode_window_moe_pending_consumer(
+                                         context, encoder, rows, false,
+                                         generic_pending_consumer,
+                                         encode_error);
+                          },
+                          error)
+                    : encode_window_moe_layer0_full_mode(
+                          context, *full_mode, *command, kVocabulary,
+                          kExperts, MoeExpertFormat::q2_0,
+                          MoeDownFormat::q2_0, dispatched_buffers, error);
+                if (induce_late_failure) {
+                    bool unchanged = before.size() == mutation_views.size();
+                    for (const BufferSnapshot& snapshot : before) {
+                        const auto* const current =
+                            static_cast<const std::uint8_t*>(
+                                snapshot.view.contents);
+                        unchanged &=
+                            std::equal(snapshot.bytes.begin(),
+                                       snapshot.bytes.end(), current);
+                    }
+                    require(!encoded &&
+                                command->unsafe_native_handle() == nullptr &&
+                                error.find("undersized") != std::string::npos &&
+                                unchanged,
+                            "late shared-MoE validation failure discards the generic producer transaction and preserves all views");
+                    std::memcpy(gdn_active_rows.contents, &kRows,
+                                sizeof(kRows));
+                    return;
+                }
+                require(encoded,
+                        "encode generic FullMode layer-0 producer: " + error);
+                require(command->commit(error),
+                        "commit generic FullMode layer-0 producer: " + error);
+                require(command->wait_until_completed(error),
+                        "wait for generic FullMode layer-0 producer: " +
+                            error);
+
+                std::uint32_t columns = 1u;
+                while (columns < rows) columns <<= 1u;
+                const std::span<const float> mixed_rows(
+                    static_cast<const float*>(mixed.contents),
+                    static_cast<std::size_t>(rows) * N_EMBD);
+                std::vector<float> compiled_mixed(
+                    static_cast<std::size_t>(columns) * N_EMBD, 0.0f);
+                std::copy(mixed_rows.begin(), mixed_rows.end(),
+                          compiled_mixed.begin());
+                for (std::uint32_t row = rows; row < columns; ++row) {
+                    std::copy_n(mixed_rows.begin(), N_EMBD,
+                                compiled_mixed.begin() +
+                                    static_cast<std::size_t>(row) * N_EMBD);
+                }
+                const auto* const router_weight_data =
+                    static_cast<const std::uint16_t*>(
+                        router_tensor.contents());
+                std::vector<float> expected_logits;
+                require(twin::bf16_matvec_reference(
+                            std::span<const std::uint16_t>(
+                                router_weight_data,
+                                static_cast<std::size_t>(kExperts) * N_EMBD),
+                            compiled_mixed, N_EMBD, kExperts, columns, rows,
+                            256u, expected_logits, error),
+                        "compute generic FullMode router oracle: " + error);
+                const std::size_t active_logits_count =
+                    static_cast<std::size_t>(rows) * kExperts;
+                const auto* const actual_logits =
+                    static_cast<const float*>(
+                        generic_buffers.producer.router.router_logits
+                            .contents);
+                require(std::memcmp(actual_logits, expected_logits.data(),
+                                    active_logits_count * sizeof(float)) == 0,
+                        "generic FullMode router logits match the BF16 scalar oracle");
+
+                std::vector<std::int32_t> expected_ids;
+                std::vector<twin::tf> expected_route_weights;
+                require(twin::moe_route_reference(
+                            std::span<const float>(expected_logits.data(),
+                                                   active_logits_count),
+                            rows, kExperts, false, expected_ids,
+                            expected_route_weights, error),
+                        "compute generic FullMode route oracle: " + error);
+                const std::size_t active_routes =
+                    static_cast<std::size_t>(rows) * 10u;
+                const std::size_t active_route_id_bytes =
+                    active_routes * sizeof(std::int32_t);
+                const auto* const actual_ids =
+                    static_cast<const std::int32_t*>(
+                        generic_buffers.producer.router.route_ids.contents);
+                require(std::memcmp(actual_ids, expected_ids.data(),
+                                    active_route_id_bytes) == 0,
+                        "generic FullMode route IDs match the stable top-10 oracle");
+                const auto* const actual_weights =
+                    static_cast<const float*>(
+                        generic_buffers.producer.router.route_weights
+                            .contents);
+                bool route_weights_match = true;
+                for (std::size_t route = 0u; route < active_routes; ++route) {
+                    route_weights_match &=
+                        std::isfinite(actual_weights[route]) &&
+                        std::abs(actual_weights[route] -
+                                 expected_route_weights[route].value) <=
+                            1.0e-6f;
+                }
+                require(route_weights_match,
+                        "generic FullMode route weights match the reciprocal oracle");
+
+                TieredMoePlan expected_plan{};
+                std::vector<float> expected_usage;
+                require(twin::moe_plan_reference(
+                            expected_ids, rows, kExperts, false, 0u,
+                            resident, usage, expected_plan, expected_usage,
+                            error),
+                        "compute generic FullMode plan oracle: " + error);
+                require(std::memcmp(
+                            generic_buffers.producer.plans.contents,
+                            &expected_plan, sizeof(expected_plan)) == 0,
+                        "generic FullMode plan consumes every active route row");
+                require(std::memcmp(usage_view.contents, usage.data(),
+                                    usage.size() * sizeof(float)) == 0,
+                        "full-mode speculative planning leaves usage unchanged");
+
+                for (std::uint32_t row = 0u; row < rows; ++row) {
+                    for (std::uint32_t rank = 0u; rank < 10u; ++rank) {
+                        require(expected_ids[static_cast<std::size_t>(row) *
+                                                 10u +
+                                             rank] ==
+                                    static_cast<std::int32_t>(rank),
+                                "synthetic FullMode route selects seeded experts 0..9");
+                    }
+                }
+                constexpr std::size_t kGateUpBlocksPerExpert =
+                    640u * (N_EMBD / 64u);
+                constexpr std::size_t kDownBlocksPerExpert =
+                    N_EMBD * (640u / 64u);
+                std::vector<block_q2_0> oracle_gate_weights(
+                    10u * kGateUpBlocksPerExpert);
+                std::vector<block_q2_0> oracle_up_weights(
+                    10u * kGateUpBlocksPerExpert);
+                std::vector<block_q2_0> oracle_down_weights(
+                    10u * kDownBlocksPerExpert);
+                const auto fill_q2_0_expert_weights =
+                    [](std::vector<block_q2_0>& weights) {
+                        for (block_q2_0& block : weights) {
+                            block.d = 0x1000u;
+                            std::fill_n(block.qs, std::size(block.qs),
+                                        0xaau);
+                        }
+                    };
+                fill_q2_0_expert_weights(oracle_gate_weights);
+                fill_q2_0_expert_weights(oracle_up_weights);
+                fill_q2_0_expert_weights(oracle_down_weights);
+                std::vector<std::int32_t> oracle_expert_slots(kExperts, -1);
+                for (std::uint32_t expert = 0u; expert < 10u; ++expert) {
+                    oracle_expert_slots[expert] =
+                        static_cast<std::int32_t>(expert);
+                }
+                const std::span<const Q81> input_activations(
+                    static_cast<const Q81*>(xq.contents),
+                    static_cast<std::size_t>(rows) * (N_EMBD / 32u));
+                std::vector<twin::tf> expected_routed_gate;
+                std::vector<twin::tf> expected_routed_up;
+                require(twin::moe_gu_q2_0_reference(
+                            oracle_gate_weights, oracle_up_weights,
+                            input_activations, oracle_expert_slots,
+                            expected_plan, rows, expected_routed_gate,
+                            expected_routed_up, error),
+                        "compute generic FullMode routed gate/up scalar oracle: " +
+                            error);
+                const std::size_t routed_hidden_count =
+                    static_cast<std::size_t>(rows) * 10u * 640u;
+                std::vector<float> routed_gate_values(routed_hidden_count);
+                std::vector<float> routed_up_values(routed_hidden_count);
+                std::transform(expected_routed_gate.begin(),
+                               expected_routed_gate.end(),
+                               routed_gate_values.begin(),
+                               [](const twin::tf& value) {
+                                   return value.value;
+                               });
+                std::transform(expected_routed_up.begin(),
+                               expected_routed_up.end(),
+                               routed_up_values.begin(),
+                               [](const twin::tf& value) {
+                                   return value.value;
+                               });
+                std::vector<twin::tf> expected_routed_hidden;
+                require(twin::moe_swiglu_reference(
+                            routed_gate_values, routed_up_values,
+                            expected_routed_hidden, error),
+                        "compute generic FullMode routed SwiGLU oracle: " +
+                            error);
+                std::vector<float> routed_hidden_values(routed_hidden_count);
+                std::transform(expected_routed_hidden.begin(),
+                               expected_routed_hidden.end(),
+                               routed_hidden_values.begin(),
+                               [](const twin::tf& value) {
+                                   return value.value;
+                               });
+                std::vector<Q81> routed_hidden_q8_1;
+                require(twin::quantize_q8_1_reference(
+                            routed_hidden_values, 640u, rows * 10u,
+                            routed_hidden_q8_1, error),
+                        "quantize generic FullMode routed SwiGLU oracle: " +
+                            error);
+                std::vector<twin::tf> expected_routed_parts;
+                require(twin::moe_down_q2_0_reference(
+                            oracle_down_weights, routed_hidden_q8_1,
+                            oracle_expert_slots, expected_plan, rows,
+                            expected_routed_parts, error),
+                        "compute generic FullMode routed down scalar oracle: " +
+                            error);
+
+                const std::size_t gate_weight_count =
+                    640u * (N_EMBD / 32u);
+                const std::size_t down_weight_count =
+                    N_EMBD * (640u / 32u);
+                std::vector<block_q8_0> oracle_shared_gate_weights(
+                    gate_weight_count);
+                std::vector<block_q8_0> oracle_shared_up_weights(
+                    gate_weight_count);
+                std::vector<block_q8_0> oracle_shared_down_weights(
+                    down_weight_count);
+                const auto fill_q8_0_shared_weights =
+                    [](std::vector<block_q8_0>& weights) {
+                        for (block_q8_0& block : weights) {
+                            block.d = 0x1c00u;
+                            std::fill_n(block.qs, std::size(block.qs),
+                                        1);
+                        }
+                    };
+                fill_q8_0_shared_weights(oracle_shared_gate_weights);
+                fill_q8_0_shared_weights(oracle_shared_up_weights);
+                fill_q8_0_shared_weights(oracle_shared_down_weights);
+                const std::size_t compiled_input_count =
+                    static_cast<std::size_t>(columns) * (N_EMBD / 32u);
+                std::vector<Q81> compiled_input_activations(
+                    compiled_input_count);
+                std::copy(input_activations.begin(),
+                          input_activations.end(),
+                          compiled_input_activations.begin());
+                const std::size_t compiled_mixed_count =
+                    static_cast<std::size_t>(columns) * N_EMBD;
+                std::vector<float> compiled_mixed_for_oracle(
+                    compiled_mixed_count, 0.0f);
+                std::copy(mixed_rows.begin(), mixed_rows.end(),
+                          compiled_mixed_for_oracle.begin());
+                for (std::uint32_t row = rows; row < columns; ++row) {
+                    std::copy_n(
+                        input_activations.begin(), N_EMBD / 32u,
+                        compiled_input_activations.begin() +
+                            static_cast<std::size_t>(row) *
+                                (N_EMBD / 32u));
+                    std::copy_n(
+                        mixed_rows.begin(), N_EMBD,
+                        compiled_mixed_for_oracle.begin() +
+                            static_cast<std::size_t>(row) * N_EMBD);
+                }
+                std::vector<float> expected_shared_gate_full;
+                std::vector<float> expected_shared_up_full;
+                require(twin::q8_0_matvec_reference(
+                            oracle_shared_gate_weights,
+                            compiled_input_activations, N_EMBD, 640u,
+                            columns, rows, expected_shared_gate_full, error) &&
+                            twin::q8_0_matvec_reference(
+                                oracle_shared_up_weights,
+                                compiled_input_activations, N_EMBD, 640u,
+                                columns, rows, expected_shared_up_full,
+                                error),
+                        "compute generic FullMode shared gate/up scalar oracle: " +
+                            error);
+                std::vector<twin::tf> expected_shared_hidden;
+                require(twin::moe_swiglu_reference(
+                            std::span<const float>(
+                                expected_shared_gate_full.data(),
+                                static_cast<std::size_t>(rows) * 640u),
+                            std::span<const float>(
+                                expected_shared_up_full.data(),
+                                static_cast<std::size_t>(rows) * 640u),
+                            expected_shared_hidden, error),
+                        "compute generic FullMode shared SwiGLU oracle: " +
+                            error);
+                std::vector<float> shared_hidden_padded(
+                    static_cast<std::size_t>(columns) * 640u, 0.0f);
+                for (std::size_t row = 0u; row < rows; ++row) {
+                    shared_hidden_padded[row * 640u] =
+                        expected_shared_hidden[row * 640u].value;
+                    for (std::size_t column = 1u; column < 640u; ++column) {
+                        shared_hidden_padded[row * 640u + column] =
+                            expected_shared_hidden[row * 640u + column].value;
+                    }
+                }
+                for (std::uint32_t row = rows; row < columns; ++row) {
+                    std::copy_n(shared_hidden_padded.begin(), 640u,
+                                shared_hidden_padded.begin() +
+                                    static_cast<std::size_t>(row) * 640u);
+                }
+                std::vector<Q81> shared_hidden_q8_1;
+                require(twin::quantize_q8_1_reference(
+                            shared_hidden_padded, 640u, columns,
+                            shared_hidden_q8_1, error),
+                        "quantize generic FullMode shared SwiGLU oracle: " +
+                            error);
+                std::vector<float> expected_shared_output_full;
+                require(twin::q8_0_matvec_reference(
+                            oracle_shared_down_weights, shared_hidden_q8_1,
+                            640u, N_EMBD, columns, rows,
+                            expected_shared_output_full, error),
+                        "compute generic FullMode shared down scalar oracle: " +
+                            error);
+                std::vector<std::uint16_t> oracle_shared_gate_input_weights(
+                    N_EMBD, strata::kernels::bf16_from_f32(0.01f));
+                std::vector<float> expected_shared_gate_logits_full;
+                require(twin::bf16_matvec_reference(
+                            oracle_shared_gate_input_weights,
+                            compiled_mixed_for_oracle, N_EMBD, 1u, columns,
+                            rows, 256u, expected_shared_gate_logits_full,
+                            error),
+                        "compute generic FullMode shared gate scalar oracle: " +
+                            error);
+
+                std::vector<float> expected_routed_parts_values(
+                    expected_routed_parts.size());
+                std::transform(expected_routed_parts.begin(),
+                               expected_routed_parts.end(),
+                               expected_routed_parts_values.begin(),
+                               [](const twin::tf& value) {
+                                   return value.value;
+                               });
+                std::vector<float> route_weight_values(active_routes);
+                std::transform(expected_route_weights.begin(),
+                               expected_route_weights.end(),
+                               route_weight_values.begin(),
+                               [](const twin::tf& value) {
+                                   return value.value;
+                               });
+                std::vector<float> expected_shared_output_values(
+                    expected_shared_output_full.begin(),
+                    expected_shared_output_full.begin() +
+                        static_cast<std::size_t>(rows) * N_EMBD);
+                std::vector<float> expected_shared_gate_logits_values(
+                    expected_shared_gate_logits_full.begin(),
+                    expected_shared_gate_logits_full.begin() + rows);
+                std::vector<twin::tf> expected_pending_values;
+                require(twin::moe_combine_reference(
+                            expected_routed_parts_values, route_weight_values,
+                            expected_shared_output_values,
+                            expected_shared_gate_logits_values, rows,
+                            expected_pending_values, error),
+                        "compute generic FullMode routed/shared combine oracle: " +
+                            error);
+                const auto compare_expected = [&](BufferRef actual_view,
+                                                  std::size_t count,
+                                                  std::span<const twin::tf> expected,
+                                                  const std::string& label) {
+                    if (count != expected.size() ||
+                        actual_view.length < count * sizeof(float)) {
+                        require(false, label + " oracle extent matches output");
+                    }
+                    const std::span<const float> actual(
+                        static_cast<const float*>(actual_view.contents),
+                        count);
+                    bool matches = true;
+                    for (std::size_t index = 0u; index < count; ++index) {
+                        const double tolerance =
+                            64.0 * std::numeric_limits<float>::epsilon() *
+                            std::max(1.0, expected[index].magnitude);
+                        matches &= std::isfinite(actual[index]) &&
+                                   std::abs(
+                                       static_cast<double>(actual[index]) -
+                                       expected[index].value) <= tolerance;
+                    }
+                    require(matches,
+                            label +
+                                " matches the independent scalar oracle within scaled float tolerance");
+                };
+                compare_expected(
+                    generic_buffers.ffn.routed.parts,
+                    active_routes * N_EMBD,
+                    expected_routed_parts,
+                    "generic FullMode routed down outputs");
+                std::vector<twin::tf> expected_shared_outputs(
+                    expected_shared_output_values.size());
+                std::transform(
+                    expected_shared_output_values.begin(),
+                    expected_shared_output_values.end(),
+                    expected_shared_outputs.begin(),
+                    [](float value) { return twin::tf{value}; });
+                compare_expected(
+                    generic_buffers.ffn.shared.shared_output,
+                    static_cast<std::size_t>(rows) * N_EMBD,
+                    expected_shared_outputs,
+                    "generic FullMode shared expert outputs");
+                std::vector<twin::tf> expected_pending_logits(
+                    expected_shared_gate_logits_values.size());
+                std::transform(
+                    expected_shared_gate_logits_values.begin(),
+                    expected_shared_gate_logits_values.end(),
+                    expected_pending_logits.begin(),
+                    [](float value) { return twin::tf{value}; });
+                compare_expected(
+                    generic_buffers.ffn.shared.shared_gate_logits, rows,
+                    expected_pending_logits,
+                    "generic FullMode shared gate logits");
+                compare_expected(
+                    generic_buffers.ffn.shared.output,
+                    static_cast<std::size_t>(rows) * N_EMBD,
+                    expected_pending_values,
+                    "generic FullMode combined pending output");
+
+                const auto check_active_output =
+                    [&](BufferRef view, std::size_t active_bytes,
+                        const std::string& label) {
+                        const auto* const bytes =
+                            static_cast<const std::uint8_t*>(view.contents);
+                        const bool tail_unchanged =
+                            active_bytes <= view.length &&
+                            std::all_of(bytes + active_bytes,
+                                        bytes + view.length,
+                                        [](std::uint8_t byte) {
+                                            return byte == 0xa5u;
+                                        });
+                        require(tail_unchanged,
+                                label +
+                                    " writes only its active multi-row extent");
+                    };
+                check_active_output(
+                    generic_buffers.producer.router.router_logits,
+                    active_logits_count * sizeof(float),
+                    "generic FullMode router logits");
+                check_active_output(
+                    generic_buffers.producer.router.route_ids,
+                    active_route_id_bytes,
+                    "generic FullMode route IDs");
+                check_active_output(
+                    generic_buffers.producer.router.route_weights,
+                    active_routes * sizeof(float),
+                    "generic FullMode route weights");
+                check_active_output(
+                    generic_buffers.producer.plans,
+                    sizeof(TieredMoePlan),
+                    "generic FullMode plan");
+                check_active_output(
+                    generic_buffers.ffn.routed.parts,
+                    active_routes * N_EMBD * sizeof(float),
+                    "generic FullMode routed parts");
+                check_active_output(
+                    generic_buffers.ffn.shared.output,
+                    static_cast<std::size_t>(rows) * N_EMBD *
+                        sizeof(float),
+                    "generic FullMode pending output");
+                const auto* const pending_values =
+                    static_cast<const float*>(
+                        generic_buffers.ffn.shared.output.contents);
+                for (std::uint32_t row = 0u; row < rows; ++row) {
+                    const auto begin =
+                        pending_values + static_cast<std::size_t>(row) *
+                                             N_EMBD;
+                    require(std::all_of(begin, begin + N_EMBD,
+                                        [](float value) {
+                                            return std::isfinite(value);
+                                        }) &&
+                                std::any_of(begin, begin + N_EMBD,
+                                            [](float value) {
+                                                return std::abs(value) >
+                                                       1.0e-7f;
+                                            }),
+                            "generic FullMode consumer output is finite and nonzero for every row");
+                }
+                if (consume_pending) {
+                    const BufferRef oracle_pending = allocate(
+                        "generic FullMode expected pending output",
+                        expected_pending_values.size() * sizeof(float));
+                    std::vector<float> expected_pending_floats(
+                        expected_pending_values.size());
+                    std::transform(
+                        expected_pending_values.begin(),
+                        expected_pending_values.end(),
+                        expected_pending_floats.begin(),
+                        [](const twin::tf& value) { return value.value; });
+                    std::memcpy(oracle_pending.contents,
+                                expected_pending_floats.data(),
+                                expected_pending_floats.size() *
+                                    sizeof(float));
+                    const BufferRef oracle_residual = allocate(
+                        "generic FullMode expected consumer residual",
+                        generic_residual_bytes);
+                    std::memcpy(oracle_residual.contents,
+                                generic_residual_before.data(),
+                                generic_residual_bytes);
+                    const BufferRef oracle_inject_out = allocate(
+                        "generic FullMode expected consumer injection",
+                        static_cast<std::size_t>(rows) * 4u *
+                            sizeof(float));
+                    const BufferRef oracle_mixed_out = allocate(
+                        "generic FullMode expected consumer mixed output",
+                        static_cast<std::size_t>(rows) * N_EMBD *
+                            sizeof(float));
+                    GRReadBuffers direct_attention = generic_attention;
+                    direct_attention.residual = oracle_residual;
+                    direct_attention.block_out = oracle_pending;
+                    direct_attention.inject_prev = inject2;
+                    direct_attention.inject_out = oracle_inject_out;
+                    direct_attention.mixed = oracle_mixed_out;
+                    auto direct_attention_command =
+                        context.make_command_buffer(
+                            "generic FullMode scalar-result GR consumer",
+                            error);
+                    require(direct_attention_command != nullptr &&
+                                encode_gr_read(
+                                    context, *direct_attention_command, rows,
+                                    true, direct_attention, error) &&
+                                direct_attention_command->commit(error) &&
+                                direct_attention_command->wait_until_completed(
+                                    error),
+                            "encode and complete direct GR consumer over the scalar MoE output: " +
+                                error);
+                    require(std::memcmp(
+                                attention_entry_mixed.contents,
+                                oracle_mixed_out.contents,
+                                static_cast<std::size_t>(rows) * N_EMBD *
+                                    sizeof(float)) == 0,
+                            "T=8 pending consumer matches direct apply=true GR output for the independently computed MoE result");
+                    require(std::memcmp(
+                                residual.contents, oracle_residual.contents,
+                                generic_residual_bytes) == 0,
+                            "T=8 pending consumer residual matches the direct GR reference");
+                    const auto* const consumed_values =
+                        static_cast<const float*>(
+                            attention_entry_mixed.contents);
+                    for (std::uint32_t row = 0u; row < rows; ++row) {
+                        const auto begin =
+                            consumed_values +
+                            static_cast<std::size_t>(row) * N_EMBD;
+                        require(std::all_of(begin, begin + N_EMBD,
+                                            [](float value) {
+                                                return std::isfinite(value);
+                                            }) &&
+                                    std::any_of(begin, begin + N_EMBD,
+                                                [](float value) {
+                                                    return std::abs(value) >
+                                                           1.0e-7f;
+                                                }),
+                                "generic T=8 pending selector computes nonzero next-attention rows");
+                    }
+                    check_active_output(
+                        attention_entry_mixed,
+                        static_cast<std::size_t>(rows) * N_EMBD *
+                            sizeof(float),
+                        "generic pending consumer mixed output");
+                }
+                require(std::equal(
+                            params_before.begin(), params_before.end(),
+                            static_cast<const std::uint8_t*>(
+                                generic_params.contents)),
+                        "generic FullMode producer preserves its parameters");
+                std::memcpy(gdn_active_rows.contents, &kRows,
+                            sizeof(kRows));
+            };
+        exercise_generic_fullmode_producer(1u, false, false, false);
+        exercise_generic_fullmode_producer(2u, false, false, false);
+        exercise_generic_fullmode_producer(3u, false, false, false);
+        exercise_generic_fullmode_producer(8u, true, false, true);
+        exercise_generic_fullmode_producer(2u, true, true, false);
+        exercise_generic_fullmode_producer(3u, false, true, false);
+    }
 
     PLEBlockBuffers ple_block{};
     WindowMoePLEEntryBuffers ple_entry{};
@@ -3943,6 +4735,8 @@ void run_fullmode_handoff_test(Context& context,
                         initial_residual.begin() + kActiveEmbeddingBytes,
                         embedding_sentinel.begin()),
             "the reference token embedding differs from the integrated embedding sentinel");
+    std::memcpy(residual.contents, initial_residual.data(),
+                initial_residual.size());
     std::vector<std::uint8_t> residual_sentinel(
         kActiveResidualBytes, 0x3cu);
     std::memcpy(residual.contents, residual_sentinel.data(),
