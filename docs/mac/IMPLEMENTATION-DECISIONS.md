@@ -10693,3 +10693,31 @@ measuring L-15 remain open.
   repairs, the complete mac-metal suite passed 90/90, mac-host passed 44 tests
   with one unavailable-input test skipped, and the Python runner passed 35/35
   modules with declared skips. `git diff --check` passes.
+
+### D-IMPL-372: Add the IQ4_XS Prefill dequantizer
+
+- **Decision:** Add `strata_pf_dequant_iq4_xs` and caller-owned/standalone
+  `encode_prefill_dequant_iq4_xs` APIs. Decode native 256-value, 136-byte
+  blocks as eight 32-value groups. Each group reads 16 bytes of low/high
+  nonlinear codes and combines its four-bit low scale with the matching
+  two-bit high scale, then subtracts 32. Compute
+  `(d * float(scale_code - 32)) * float(kvalues_iq4nl[code])` in F32, round
+  once to F16 and write K-major `[k][n_out]` scratch. Use the shared checked
+  dispatch with IQ4_XS-specific block geometry.
+- **Reason:** IQ4_XS is the last remaining dense format in the current
+  dequantization inventory and already has native embedding and CUDA
+  reference decoders. Isolating the conversion advances Prefill components
+  without claiming production `Prefill::run` scheduling.
+- **Review and fixes:** Hostile review matched the six-bit scale assembly,
+  low/high nibble order, canonical codebook, F32 multiplication order and
+  block layout against both the Metal embedding decoder and CUDA
+  `group32` path. It checked that the eight literal 16-byte code segments
+  differ, the logical-code oracle does not unpack them, per-row scales vary,
+  and the test covers the dispatch and buffer contracts. No fix was required.
+- **Disposition:** No actionable findings; all components matched the
+  reference contracts.
+- **Validation:** The mac-dev build succeeded, focused serial/concurrent
+  dequant tests passed 2/2, and the complete mac-metal suite passed 90/90.
+  mac-host passed 44 tests and skipped one real-input test because its model
+  inputs are unavailable; `test_map` passed with the updated D-IMPL-372 and
+  REV-169 references.
