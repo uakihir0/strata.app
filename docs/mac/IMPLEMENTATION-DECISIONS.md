@@ -10511,3 +10511,56 @@ measuring L-15 remain open.
   and concurrent dequant coverage. `mac-host` passed 44/45 with one
   unavailable-real-input test skipped; `test_map`, `check_drift.py` and
   `git diff --check` passed.
+
+### D-IMPL-368: Add the Q4_K Prefill dequantizer
+
+- **Decision:** Add `strata_pf_dequant_q4_k` and caller-owned/standalone
+  `encode_prefill_dequant_q4_k` APIs. Treat the native block as 256 values
+  and 144 bytes, unpack the eight groups of six-bit scale/min values, select
+  the low or high nibble for each 32-value group, evaluate `d1*q - m1` in
+  F32, and round once to F16 into K-major `[k][n_out]` scratch. Reuse the
+  shared checked dispatch with a Q4_K-specific block extent.
+- **Reason:** Q4_K is a catalogue format whose block structure and packed
+  scale/min decode are already specified and exercised by the native
+  mat-vec. Adding its own values-per-block geometry preserves the common
+  ownership, extent, overlap and rollback guarantees without implying that
+  production Prefill scheduling is complete.
+- **Review items:** Cross-check all eight scale/min groups and both upper-bit
+  reconstruction paths against the Q4_K layout and native decoder; verify
+  nibble order across all 256 values, block boundaries, the N tail, F32
+  arithmetic and one-round F16 RNE. Check the literal packed fixture against
+  its independent code and scale/min tables, host sizes/alignment/ownership/
+  overlap checks, immutable input, guards, invalid geometry and caller-owned
+  rollback after a successful prefix dispatch; check manifest and status
+  documentation.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the build passed and `mac-metal` passed 90/90 with the Q4_K
+  kernel. After review strengthened the final packed fixture, the rebuilt
+  serial/concurrent dequant tests passed 2/2. `mac-host` passed 44/45 with
+  the unavailable-real-input test skipped; `test_map`, the 183-kernel
+  metallib/manifest check, upstream drift check and `git diff --check`
+  passed. Review findings and disposition are in REV-165.
+
+### REV-165: Hostile review of Q4_K Prefill dequantization
+
+- **Scope:** Q4_K's 256-value/144-byte block layout; all eight six-bit
+  scale/min groups and their packed upper bits; `qs` chunk and nibble order;
+  packed F16 `dm`, F32 arithmetic and one-round F16 output; host validation,
+  independent test fixtures, manifest and documentation.
+- **Findings and fixes:** The first review found that repeated `qs` chunks
+  could hide a wrong chunk base. The fixture now uses a distinct literal
+  pattern and an independent logical-code table for every chunk. Follow-up
+  review found that repeating each 16-byte pattern could hide an error at
+  the half-chunk boundary. The fixture now gives all eight 16-byte halves
+  distinct literal patterns and separate low/high expected-code tables.
+- **Follow-up:** The reviewer confirmed that both chunk selection and
+  within-chunk half selection errors are detected, and found no further
+  actionable implementation, test or documentation issue.
+- **Disposition:** No actionable findings remain. Q4_K is an isolated
+  Prefill dequantizer; production Prefill scheduling and model-backed
+  inference remain open.
+- **Validation:** The full `mac-metal` suite passed 90/90 before the final
+  fixture strengthening. The rebuilt serial/concurrent dequant tests passed
+  2/2 afterwards. `mac-host` passed 44/45 with one unavailable-real-input
+  test skipped, and `test_map`, the metallib/manifest check, `check_drift.py`
+  and `git diff --check` passed.
