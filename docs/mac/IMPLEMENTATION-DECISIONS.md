@@ -10321,3 +10321,49 @@ measuring L-15 remain open.
 - **Validation:** `prefill_chunk_test` passed 1/1, `mac-host` passed 45/45
   with one unavailable-real-input test skipped, `test_map` passed, and
   `git diff --check` passed.
+
+### D-IMPL-364: Add a standalone Q8_0 Prefill dequantizer
+
+- **Decision:** Implement only `strata_pf_dequant_q8_0` as the first isolated
+  dense Prefill dequantizer. Read 34-byte row-major Q8_0 blocks, calculate
+  `float(q) * float(d)` in F32 and convert once to F16 RNE in K-major
+  `[k][n_out]` scratch. Expose the operation through caller-owned `Encoder`
+  and transactional `CommandBuffer` APIs. Accept positive signed N, K≥32
+  divisible by 32, and reject overflowed extents, undersized or misaligned
+  views, foreign Context buffers and any input/output overlap before dispatch.
+- **Reason:** This gives the F16 Prefill GEMM path a directly consumable weight
+  layout and establishes the block decoding, conversion, validation and
+  transaction contracts on a format whose scalar dequant expression is
+  simple to verify. Implementing one format as an isolated component keeps
+  test evidence scoped to what exists while leaving the other format ports
+  and production Prefill scheduling as explicit follow-up work.
+- **Review items:** Verify the 34-byte block stride and signed code/scale
+  interpretation; exact F32 product and one-round F16 RNE behavior; K-major
+  indexing at block and output-column tails; dispatch bounds; complete
+  overflow, alignment, extent, ownership and alias rejection; input
+  immutability, output guards, and rollback after encoded work; and accurate
+  documentation of the remaining formats and production wiring.
+- **Validation:** Focused serial and concurrent GPU tests pass; complete
+  preset validation and adversarial-review disposition are recorded in
+  REV-161.
+
+### REV-161: Hostile review of Q8_0 Prefill dequantization
+
+- **Scope:** Q8_0 block decoding, one-round F16 conversion, K-major output
+  indexing, host validation and transaction semantics, GPU edge/guard tests,
+  test registration and documentation.
+- **Findings and fixes:** The first independent review found no clear kernel
+  or encoder correctness defect. It identified missing coverage for foreign
+  output ownership, partial input/output overlap and the signed upper bound
+  on K, plus the absent review-log record despite references to REV-161.
+  Added those three rejection cases with command-buffer discard assertions and
+  added this review record. Follow-up hostile review confirmed each case,
+  checked all REV-161 references and found no further actionable issue.
+- **Disposition:** No actionable kernel, encoder, test or documentation
+  findings remain. The feature remains an isolated Q8_0 component; the other
+  ten format ports and production Prefill wiring are still open.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), the full `mac-metal` preset passed 90/90 and the expanded
+  Q8_0 serial/concurrent tests passed 2/2. `mac-host` passed 45/45 with one
+  unavailable-real-input test skipped; its `test_map` check passed.
+  `git diff --check` passed.
