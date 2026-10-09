@@ -79,3 +79,36 @@ kernel void strata_pf_gr_norm_lo(device const float* residual [[buffer(0)]],
     prefill_gr_norm(residual, norm, rs_out, xn16, xn16_lo, partials, true,
                     tid, lane, simdgroup, row);
 }
+
+static inline void prefill_gr_silu(device const float* low_rank,
+                                   device ushort* high_bf16,
+                                   device ushort* low_bf16,
+                                   uint rows, uint index,
+                                   bool write_low_remainder) {
+    const uint count = rows * 320u;
+    if (index >= count) return;
+    const float x = low_rank[index] / 4.0f;
+    const float value = silu_k(x);
+    const ushort high = f32_to_bf16_rne(value);
+    high_bf16[index] = high;
+    if (write_low_remainder) {
+        low_bf16[index] = f32_to_bf16_rne(value - bf16_to_f32(high));
+    }
+}
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void strata_pf_gr_silu(device const float* low_rank [[buffer(0)]],
+                              device ushort* high_bf16 [[buffer(1)]],
+                              constant uint& rows [[buffer(3)]],
+                              uint index [[thread_position_in_grid]]) {
+    prefill_gr_silu(low_rank, high_bf16, nullptr, rows, index, false);
+}
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void strata_pf_gr_silu_lo(device const float* low_rank [[buffer(0)]],
+                                 device ushort* high_bf16 [[buffer(1)]],
+                                 device ushort* low_bf16 [[buffer(2)]],
+                                 constant uint& rows [[buffer(3)]],
+                                 uint index [[thread_position_in_grid]]) {
+    prefill_gr_silu(low_rank, high_bf16, low_bf16, rows, index, true);
+}

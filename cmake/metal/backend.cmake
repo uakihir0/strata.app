@@ -120,6 +120,7 @@ set(STRATA_METAL_ENGINE_SOURCES
   src/metal/engine/embed_dispatch.mm
   src/metal/engine/prefill_dispatch.mm
   src/metal/engine/prefill_gr_norm_dispatch.mm
+  src/metal/engine/prefill_gr_silu_dispatch.mm
   src/metal/engine/gr_dispatch.mm
   src/metal/engine/ple_dispatch.mm
   src/metal/engine/window_ple_dispatch.mm

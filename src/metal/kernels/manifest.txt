@@ -32,6 +32,8 @@ strata_mtp_down_s2 safe 256 1 1
 strata_embed_image safe 256 1 1
 strata_pf_gr_norm safe 256 1 1
 strata_pf_gr_norm_lo safe 256 1 1
+strata_pf_gr_silu safe 256 1 1
+strata_pf_gr_silu_lo safe 256 1 1
 strata_gr_norm safe 256 1 1
 strata_gr_down safe 256 1 1
 strata_gr_up safe 256 1 1

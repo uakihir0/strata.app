@@ -5,6 +5,7 @@
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/prefill_dispatch.hpp"
 #include "strata/metal/prefill_gr_norm_dispatch.hpp"
+#include "strata/metal/prefill_gr_silu_dispatch.hpp"
 #include "twin.hpp"
 
 #import <Metal/Metal.h>
@@ -676,6 +677,441 @@ bool test_failure_discards_prior_prefill_dispatch(Context& context) {
     return unchanged;
 }
 
+struct SiluOracle {
+    std::vector<std::uint16_t> high;
+    std::vector<std::uint16_t> low;
+};
+
+SiluOracle prefill_gr_silu_oracle(std::span<const float> low_rank,
+                                  bool write_low) {
+    SiluOracle result;
+    result.high.resize(low_rank.size());
+    if (write_low) result.low.resize(low_rank.size());
+    for (std::size_t index = 0u; index < low_rank.size(); ++index) {
+        const float x = low_rank[index] / 4.0f;
+        const float value = x / (1.0f + std::exp(-x));
+        const std::uint16_t high =
+            strata::kernels::bf16_from_f32(value);
+        result.high[index] = high;
+        if (write_low) {
+            result.low[index] = strata::kernels::bf16_from_f32(
+                value - strata::kernels::f32_from_bf16(high));
+        }
+    }
+    return result;
+}
+
+bool run_silu_case(Context& context, std::uint32_t rows,
+                   PrefillBF16X2Mode mode, bool shared_encoder) {
+    constexpr std::array<float, 19> edge_values{
+        -2048.0f, -160.0f, -80.0f, -40.0f, -12.0f, -4.0f, -1.0f,
+        -0.5f, -0.001f, -0.0f, 0.0f, 0.001f, 0.5f, 1.0f, 4.0f,
+        12.0f, 40.0f, 80.0f, 2048.0f};
+    const bool write_low = mode == PrefillBF16X2Mode::all_projections;
+    const std::string label = "Prefill GR SiLU T=" + std::to_string(rows) +
+        " mode=" + std::to_string(static_cast<std::uint32_t>(mode)) +
+        (shared_encoder ? " shared" : " standalone");
+    const std::size_t values = static_cast<std::size_t>(rows) * 320u;
+    const std::size_t input_bytes = values * sizeof(float);
+    const std::size_t output_bytes = values * sizeof(std::uint16_t);
+    std::vector<float> low_rank(values);
+    for (std::size_t index = 0u; index < values; ++index) {
+        low_rank[index] = edge_values[(index * 7u + rows * 3u) %
+                                      edge_values.size()];
+    }
+    const SiluOracle expected = prefill_gr_silu_oracle(low_rank, write_low);
+
+    TestBuffer input, high, low;
+    std::string error;
+    const bool allocated =
+        input.allocate(context, label + " low-rank input", input_bytes, error) &&
+        high.allocate(context, label + " high output", output_bytes, error) &&
+        (!write_low ||
+         low.allocate(context, label + " low output", output_bytes, error));
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    std::memcpy(input.payload().data(), low_rank.data(), input_bytes);
+    const std::vector<std::uint8_t> input_before(
+        input.allocation().begin(), input.allocation().end());
+
+    auto command = context.make_command_buffer(label, error);
+    check(command != nullptr, label + " command buffer", error);
+    if (!command) return false;
+    const PrefillGRSiluBuffers buffers{
+        context.buffers().read_only(input.view()), high.view(),
+        write_low ? low.view() : BufferRef{}};
+    const bool encoded = shared_encoder
+        ? Encoder::encode(
+              context, *command, "shared Prefill GR SiLU",
+              [&](Encoder& encoder, std::string& encode_error) {
+                  return encode_prefill_gr_silu(context, encoder, rows, mode,
+                                                buffers, encode_error);
+              },
+              error)
+        : encode_prefill_gr_silu(context, *command, rows, mode, buffers, error);
+    check(encoded, label + " production encode", error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    const bool dispatched = submit_and_wait(command, label, error);
+    check(dispatched, label + " Metal dispatch", error);
+    if (!dispatched) return false;
+
+    const auto actual_high = std::span<const std::uint16_t>(
+        reinterpret_cast<const std::uint16_t*>(high.payload().data()), values);
+    std::uint16_t max_high_ulp = 0u;
+    for (std::size_t index = 0u; index < values; ++index) {
+        max_high_ulp = std::max(
+            max_high_ulp,
+            bf16_ulp_distance(actual_high[index], expected.high[index]));
+    }
+    check(max_high_ulp <= 1u,
+          label + " high BF16 matches SiLU/RNE oracle",
+          "max ULP=" + std::to_string(max_high_ulp) + ", limit=1");
+
+    bool low_matches = true;
+    if (write_low) {
+        const auto actual_low = std::span<const std::uint16_t>(
+            reinterpret_cast<const std::uint16_t*>(low.payload().data()),
+            values);
+        std::uint16_t max_low_ulp = 0u;
+        for (std::size_t index = 0u; index < values; ++index) {
+            max_low_ulp = std::max(
+                max_low_ulp,
+                bf16_ulp_distance(actual_low[index], expected.low[index]));
+        }
+        low_matches = max_low_ulp <= 2u;
+        check(low_matches,
+              label + " low BF16 remainder matches SiLU/RNE oracle",
+              "max ULP=" + std::to_string(max_low_ulp) + ", limit=2");
+        check(low.guards_intact(), label + " low output guards");
+    }
+    const bool input_unchanged =
+        std::equal(input_before.begin(), input_before.end(),
+                   input.allocation().begin());
+    check(input_unchanged, label + " low-rank input remains read-only");
+    check(input.guards_intact(), label + " input guards");
+    check(high.guards_intact(), label + " high output guards");
+    return max_high_ulp <= 1u && low_matches && input_unchanged;
+}
+
+bool test_silu_rne_boundaries(Context& context,
+                              PrefillBF16X2Mode mode) {
+    constexpr std::array<float, 8> midpoint_inputs{
+        257.0f, 259.0f, 261.0f, 263.0f,
+        256.501953125f, 256.505859375f,
+        259.498046875f, 259.494140625f};
+    constexpr std::array<std::uint16_t, 8> expected_high{
+        0x4280u, 0x4282u, 0x4282u, 0x4284u,
+        0x4280u, 0x4280u, 0x4282u, 0x4282u};
+    constexpr std::array<std::uint16_t, 8> expected_low{
+        0x3e80u, 0xbe80u, 0x3e80u, 0xbe80u,
+        0x3e00u, 0x3e02u, 0xbe00u, 0xbe02u};
+    const bool write_low = mode == PrefillBF16X2Mode::all_projections;
+    const std::string label =
+        "Prefill GR SiLU exact BF16 RNE midpoint mode=" +
+        std::to_string(static_cast<std::uint32_t>(mode));
+    constexpr std::size_t kValues = 320u;
+    const std::size_t input_bytes = kValues * sizeof(float);
+    const std::size_t output_bytes = kValues * sizeof(std::uint16_t);
+    std::vector<float> low_rank(kValues);
+    for (std::size_t index = 0u; index < kValues; ++index) {
+        low_rank[index] = midpoint_inputs[index % midpoint_inputs.size()];
+    }
+    const bool oracle_bits_match =
+        strata::kernels::bf16_from_f32(64.25f) == expected_high[0] &&
+        strata::kernels::bf16_from_f32(64.75f) == expected_high[1] &&
+        strata::kernels::bf16_from_f32(65.25f) == expected_high[2] &&
+        strata::kernels::bf16_from_f32(65.75f) == expected_high[3] &&
+        strata::kernels::bf16_from_f32(0.25f) == expected_low[0] &&
+        strata::kernels::bf16_from_f32(-0.25f) == expected_low[1] &&
+        strata::kernels::bf16_from_f32(0.12548828125f) == expected_low[4] &&
+        strata::kernels::bf16_from_f32(0.12646484375f) == expected_low[5] &&
+        strata::kernels::bf16_from_f32(-0.12548828125f) ==
+            expected_low[6] &&
+        strata::kernels::bf16_from_f32(-0.12646484375f) ==
+            expected_low[7];
+    check(oracle_bits_match, label + " fixed RNE expectations");
+    if (!oracle_bits_match) return false;
+
+    TestBuffer input, high, low;
+    std::string error;
+    const bool allocated =
+        input.allocate(context, label + " input", input_bytes, error) &&
+        high.allocate(context, label + " high", output_bytes, error) &&
+        (!write_low ||
+         low.allocate(context, label + " low", output_bytes, error));
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    std::memcpy(input.payload().data(), low_rank.data(), input_bytes);
+    const PrefillGRSiluBuffers buffers{
+        context.buffers().read_only(input.view()), high.view(),
+        write_low ? low.view() : BufferRef{}};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = encode_prefill_gr_silu(
+        context, *command, 1u, mode, buffers, error);
+    check(encoded, label + " production encode", error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    const bool dispatched = submit_and_wait(command, label, error);
+    check(dispatched, label + " Metal dispatch", error);
+    if (!dispatched) return false;
+
+    const auto actual_high = std::span<const std::uint16_t>(
+        reinterpret_cast<const std::uint16_t*>(high.payload().data()),
+        kValues);
+    bool high_matches = true;
+    bool low_matches = true;
+    std::string high_mismatch;
+    for (std::size_t index = 0u; index < kValues; ++index) {
+        const std::size_t tie = index % expected_high.size();
+        if (actual_high[index] != expected_high[tie]) {
+            high_matches = false;
+            if (high_mismatch.empty()) {
+                char detail[96]{};
+                std::snprintf(detail, sizeof(detail),
+                              "index=%zu actual=0x%04x expected=0x%04x",
+                              index, actual_high[index], expected_high[tie]);
+                high_mismatch = detail;
+            }
+        }
+    }
+    check(high_matches, label + " high BF16 bits match RNE ties exactly",
+          high_mismatch);
+    if (write_low) {
+        const auto actual_low = std::span<const std::uint16_t>(
+            reinterpret_cast<const std::uint16_t*>(low.payload().data()),
+            kValues);
+        std::string low_mismatch;
+        for (std::size_t index = 0u; index < kValues; ++index) {
+            const std::size_t tie = index % expected_low.size();
+            if (actual_low[index] != expected_low[tie]) {
+                low_matches = false;
+                if (low_mismatch.empty()) {
+                    char detail[96]{};
+                    std::snprintf(detail, sizeof(detail),
+                                  "index=%zu actual=0x%04x expected=0x%04x",
+                                  index, actual_low[index],
+                                  expected_low[tie]);
+                    low_mismatch = detail;
+                }
+            }
+        }
+        check(low_matches, label + " low BF16 remainder bits match exactly",
+              low_mismatch);
+        check(low.guards_intact(), label + " low output guards");
+    }
+    check(input.guards_intact() && high.guards_intact(),
+          label + " input and high output guards");
+    return high_matches && low_matches;
+}
+
+bool reject_silu_call(Context& context, std::uint32_t rows,
+                      PrefillBF16X2Mode mode,
+                      const PrefillGRSiluBuffers& buffers,
+                      std::string_view expected_error,
+                      const std::string& label) {
+    std::string error;
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = encode_prefill_gr_silu(context, *command, rows, mode,
+                                                buffers, error);
+    const bool right_error =
+        !encoded && error.find(expected_error) != std::string::npos;
+    check(right_error, label, error);
+    return right_error;
+}
+
+bool test_silu_encoder_validation(Context& context,
+                                  Context& foreign_context) {
+    const std::string label = "Prefill GR SiLU validation";
+    std::string error;
+    TestBuffer input, high, low, foreign_input;
+    constexpr std::size_t kInputBytes = 320u * sizeof(float);
+    constexpr std::size_t kOutputBytes = 320u * sizeof(std::uint16_t);
+    constexpr std::size_t kOutputStorageBytes =
+        kOutputBytes + sizeof(std::uint16_t);
+    const bool allocated =
+        input.allocate(context, label + " input", kInputBytes, error) &&
+        high.allocate(context, label + " high", kOutputStorageBytes, error) &&
+        low.allocate(context, label + " low", kOutputStorageBytes, error) &&
+        foreign_input.allocate(foreign_context, label + " foreign input",
+                               kInputBytes, error);
+    check(allocated, label + " allocate validation buffers", error);
+    if (!allocated) return false;
+
+    const ReadOnlyBufferRef input_read_only =
+        context.buffers().read_only(input.view());
+    const PrefillGRSiluBuffers valid{
+        input_read_only, high.view(), low.view()};
+    bool passed = true;
+    passed &= reject_silu_call(
+        context, 0u, PrefillBF16X2Mode::off,
+        {input_read_only, high.view(), {}}, "row count",
+        label + " rejects zero rows");
+    passed &= reject_silu_call(
+        context, kPrefillMaxShaderRows + 1u, PrefillBF16X2Mode::off,
+        {input_read_only, high.view(), {}}, "row count",
+        label + " rejects rows beyond shader range");
+    passed &= reject_silu_call(
+        context, 1u, static_cast<PrefillBF16X2Mode>(3u),
+        {input_read_only, high.view(), {}}, "mode is invalid",
+        label + " rejects unknown mode");
+    passed &= reject_silu_call(
+        context, 1u, PrefillBF16X2Mode::all_projections,
+        {input_read_only, high.view(), {}}, "requires low_bf16",
+        label + " requires mode-1 remainder");
+    passed &= reject_silu_call(
+        context, 1u, PrefillBF16X2Mode::off, valid,
+        "only valid in mode 1", label + " rejects unused mode-0 remainder");
+    passed &= reject_silu_call(
+        context, 1u, PrefillBF16X2Mode::except_gr, valid,
+        "only valid in mode 1", label + " rejects unused mode-2 remainder");
+    passed &= reject_silu_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {context.buffers().read_only(
+             input.view().slice(0u, kInputBytes - sizeof(float))),
+         high.view(), {}},
+        "undersized", label + " rejects short low-rank input");
+    passed &= reject_silu_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {context.buffers().read_only(
+             input.view().slice(sizeof(std::uint16_t),
+                                kInputBytes - sizeof(std::uint16_t))),
+         high.view(), {}},
+        "misaligned", label + " rejects misaligned low-rank input");
+    passed &= reject_silu_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {input_read_only,
+         high.view().slice(0u, kOutputBytes - sizeof(std::uint16_t)), {}},
+        "undersized", label + " rejects short high output");
+    passed &= reject_silu_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {input_read_only, high.view().slice(1u, kOutputBytes), {}},
+        "misaligned", label + " rejects misaligned high output");
+    passed &= reject_silu_call(
+        context, 1u, PrefillBF16X2Mode::all_projections,
+        {input_read_only, high.view(),
+         low.view().slice(0u, kOutputBytes - sizeof(std::uint16_t))},
+        "undersized", label + " rejects short low output");
+    passed &= reject_silu_call(
+        context, 1u, PrefillBF16X2Mode::all_projections,
+        {input_read_only, high.view(), low.view().slice(1u, kOutputBytes)},
+        "misaligned", label + " rejects misaligned low output");
+    passed &= reject_silu_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {foreign_context.buffers().read_only(foreign_input.view()),
+         high.view(), {}},
+        "not owned by this Context",
+        label + " rejects a foreign read-only view");
+    passed &= reject_silu_call(
+        context, 1u, PrefillBF16X2Mode::all_projections,
+        {input_read_only, high.view(), high.view()},
+        "output buffer views overlap",
+        label + " rejects overlapping outputs");
+    passed &= reject_silu_call(
+        context, 1u, PrefillBF16X2Mode::off,
+        {context.buffers().read_only(input.view()),
+         input.view().slice(0u, kOutputBytes), {}},
+        "overlaps a writable buffer view",
+        label + " rejects input/output overlap");
+    return passed;
+}
+
+bool test_silu_failure_discards_prior_dispatch(Context& context) {
+    const std::string label = "Prefill GR SiLU failure discards earlier dispatch";
+    std::string error;
+    TestBuffer input, high;
+    const bool allocated =
+        input.allocate(context, label + " input", 320u * sizeof(float), error) &&
+        high.allocate(context, label + " high", 320u * sizeof(std::uint16_t),
+                      error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    std::fill(input.payload().begin(), input.payload().end(), 0u);
+    const std::vector<std::uint8_t> high_before(
+        high.allocation().begin(), high.allocation().end());
+    const PrefillGRSiluBuffers valid{
+        context.buffers().read_only(input.view()), high.view(), {}};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, "Prefill GR SiLU rollback fixture",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_prefill_gr_silu(context, encoder, 1u,
+                                        PrefillBF16X2Mode::off, valid,
+                                        encode_error)) {
+                return false;
+            }
+            return encode_prefill_gr_silu(
+                context, encoder, 0u, PrefillBF16X2Mode::off, valid,
+                encode_error);
+        },
+        error);
+    const bool discarded = command->unsafe_native_handle() == nullptr;
+    const bool unchanged =
+        !encoded && discarded &&
+        error.find("row count") != std::string::npos &&
+        std::equal(high_before.begin(), high_before.end(),
+                   high.allocation().begin());
+    check(unchanged, label,
+          error + (discarded ? " (command buffer discarded)"
+                             : " (command buffer remained submit-capable)"));
+    return unchanged;
+}
+
+bool test_silu_open_concurrent_group_rejected(Context& context) {
+    const char* const dispatch = std::getenv("STRATA_METAL_DISPATCH");
+    if (dispatch == nullptr || std::string_view(dispatch) != "concurrent") {
+        return true;
+    }
+    const std::string label = "Prefill GR SiLU rejects open concurrent group";
+    std::string error;
+    TestBuffer input, high;
+    const bool allocated =
+        input.allocate(context, label + " input", 320u * sizeof(float), error) &&
+        high.allocate(context, label + " high",
+                      320u * sizeof(std::uint16_t), error);
+    if (!allocated) {
+        check(false, label + " allocate buffers", error);
+        return false;
+    }
+    const PrefillGRSiluBuffers buffers{
+        context.buffers().read_only(input.view()), high.view(), {}};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, "open concurrent Prefill GR SiLU",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encoder.group_begin(encode_error)) return false;
+            return encode_prefill_gr_silu(context, encoder, 1u,
+                                          PrefillBF16X2Mode::off, buffers,
+                                          encode_error);
+        },
+        error);
+    const bool rejected =
+        !encoded && error.find("ordered concurrent-group boundary") !=
+                        std::string::npos;
+    check(rejected, label, error);
+    return rejected;
+}
+
 bool test_open_concurrent_group_rejected(Context& context) {
     const char* const dispatch = std::getenv("STRATA_METAL_DISPATCH");
     if (dispatch == nullptr || std::string_view(dispatch) != "concurrent") {
@@ -753,6 +1189,7 @@ int main(int argc, char** argv) {
     if (!foreign_context) return 1;
 
     bool passed = test_encoder_validation(*context, *foreign_context);
+    passed &= test_silu_encoder_validation(*context, *foreign_context);
     const std::array<std::uint32_t, 3> rows{1u, 3u, 8u};
     const std::array<PrefillBF16X2Mode, 3> modes{
         PrefillBF16X2Mode::off,
@@ -767,14 +1204,22 @@ int main(int argc, char** argv) {
     }
     passed &= run_case(*context, 3u, PrefillBF16X2Mode::all_projections,
                        options.input_set, options.seed ^ 0x50464752u, true);
+    for (std::size_t index = 0u; index < modes.size(); ++index) {
+        passed &= run_silu_case(*context, rows[index], modes[index], false);
+        passed &= test_silu_rne_boundaries(*context, modes[index]);
+    }
+    passed &= run_silu_case(*context, 3u,
+                            PrefillBF16X2Mode::all_projections, true);
     passed &= test_prefill_embedding_chain(*context);
     passed &= test_failure_discards_prior_prefill_dispatch(*context);
+    passed &= test_silu_failure_discards_prior_dispatch(*context);
     passed &= test_open_concurrent_group_rejected(*context);
+    passed &= test_silu_open_concurrent_group_rejected(*context);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d Prefill Metal test(s) failed\n", g_failures);
         return 1;
     }
     if (!passed) return 1;
-    std::puts("all Prefill GR normalization tests passed");
+    std::puts("all Prefill GR normalization and SiLU tests passed");
     return 0;
 }
