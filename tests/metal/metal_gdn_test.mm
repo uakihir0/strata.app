@@ -4112,7 +4112,330 @@ bool test_window_t1_attention_gdn(Context& context, std::uint32_t rows) {
     const bool standard_router_prefix = exercise_router_prefix(512u);
     const bool coder_router_prefix = exercise_router_prefix(256u);
 
+    const auto exercise_generic_plan_prefix = [&](bool tiered) {
+        constexpr std::uint32_t experts = 512u;
+        std::string plan_error;
+        std::vector<float> mixed_columns(
+            static_cast<std::size_t>(columns) * kRouterInputWidth);
+        std::copy(expected_mixed.begin(), expected_mixed.end(),
+                  mixed_columns.begin());
+        for (std::uint32_t padding = rows; padding < columns; ++padding) {
+            std::copy_n(expected_mixed.begin(), kRouterInputWidth,
+                        mixed_columns.begin() +
+                            static_cast<std::size_t>(padding) *
+                                kRouterInputWidth);
+        }
+        const auto expert_weights =
+            std::span<const std::uint16_t>(router_weight_values).first(
+                static_cast<std::size_t>(experts) * kRouterInputWidth);
+        std::vector<float> expected_logits;
+        const bool logits_oracle = twin::bf16_matvec_reference(
+            expert_weights, mixed_columns, kRouterInputWidth, experts,
+            columns, rows, 256u, expected_logits, plan_error);
+        check(logits_oracle,
+              label + " generic plan router oracle tiered=" +
+                  std::to_string(tiered ? 1 : 0),
+              plan_error);
+        if (!logits_oracle) return false;
+
+        std::vector<std::int32_t> expected_ids;
+        std::vector<twin::tf> expected_route_weights;
+        const std::span<const float> active_logits(
+            expected_logits.data(),
+            static_cast<std::size_t>(rows) * experts);
+        const bool route_oracle = twin::moe_route_reference(
+            active_logits, rows, experts, false, expected_ids,
+            expected_route_weights, plan_error);
+        check(route_oracle,
+              label + " generic plan route oracle tiered=" +
+                  std::to_string(tiered ? 1 : 0),
+              plan_error);
+        if (!route_oracle) return false;
+
+        std::vector<std::int32_t> resident(experts, -1);
+        if (tiered && !expected_ids.empty()) {
+            resident[static_cast<std::uint32_t>(expected_ids.front())] = 0;
+        }
+        std::vector<float> initial_usage(experts);
+        for (std::uint32_t expert = 0u; expert < experts; ++expert) {
+            initial_usage[expert] =
+                static_cast<float>(expert % 17u) * 0.125f;
+        }
+        std::memcpy(resident_table_storage.payload().data(), resident.data(),
+                    resident.size() * sizeof(std::int32_t));
+        std::memcpy(usage_table_storage.payload().data(),
+                    initial_usage.data(),
+                    initial_usage.size() * sizeof(float));
+
+        TieredMoePlan expected_plan{};
+        std::vector<float> expected_usage;
+        const bool plan_oracle = twin::moe_plan_reference(
+            expected_ids, rows, experts, tiered, 0u, resident, initial_usage,
+            expected_plan, expected_usage, plan_error);
+        check(plan_oracle,
+              label + " generic plan oracle tiered=" +
+                  std::to_string(tiered ? 1 : 0),
+              plan_error);
+        if (!plan_oracle) return false;
+        const bool tiered_hit_and_miss =
+            !tiered || (expected_plan.n_miss > 0u &&
+                        expected_plan.n_miss < expected_plan.n_groups);
+        check(tiered_hit_and_miss,
+              label + " generic tiered plan has resident and missing groups",
+              "groups=" + std::to_string(expected_plan.n_groups) +
+                  " misses=" + std::to_string(expected_plan.n_miss));
+        if (!tiered_hit_and_miss) return false;
+
+        prepare_layer0_chain(true);
+        for (twin::GuardedBuffer* output :
+             {&router_logits_storage, &route_ids_storage,
+              &route_weights_storage, &router_matvec_sink_storage,
+              &moe_plan_storage}) {
+            std::fill(output->payload().begin(), output->payload().end(),
+                      poison);
+            output->capture_before_dispatch();
+        }
+        usage_table_storage.capture_before_dispatch();
+        resident_table_storage.capture_before_dispatch();
+        router_tensor_storage.capture_before_dispatch();
+
+        const bool completed = run_command(
+            context, label + " generic router and plan tiered=" +
+                         std::to_string(tiered ? 1 : 0),
+            [&](CommandBuffer& command, std::string& command_error) {
+                if (rows == 2u) {
+                    return Encoder::encode(
+                        context, command,
+                        "Window multi-row caller-owned MoE plan prefix",
+                        [&](Encoder& encoder, std::string& encode_error) {
+                            return encode_window_moe_plan_prefix(
+                                context, encoder, vocabulary_size, experts,
+                                tiered, plan_prefix_buffers, encode_error);
+                        },
+                        command_error);
+                }
+                return encode_window_moe_plan_prefix(
+                    context, command, vocabulary_size, experts, tiered,
+                    plan_prefix_buffers, command_error);
+            },
+            plan_error);
+        check(completed,
+              label + " generic router-to-plan prefix tiered=" +
+                  std::to_string(tiered ? 1 : 0),
+              plan_error);
+        if (!completed) return false;
+
+        const auto expected_plan_bytes = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(&expected_plan),
+            sizeof(expected_plan));
+        const auto plan_mismatch = twin::compare_bytes(
+            moe_plan_storage.payload(), expected_plan_bytes);
+        check(!plan_mismatch,
+              label + " exact generic GPU plan tiered=" +
+                  std::to_string(tiered ? 1 : 0),
+              plan_mismatch ? plan_mismatch->reason : std::string{});
+
+        const auto expected_usage_bytes = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(expected_usage.data()),
+            expected_usage.size() * sizeof(float));
+        const auto usage_mismatch = twin::compare_bytes(
+            usage_table_storage.payload().first(expected_usage_bytes.size()),
+            expected_usage_bytes);
+        check(!usage_mismatch,
+              label + " exact generic plan usage tiered=" +
+                  std::to_string(tiered ? 1 : 0),
+              usage_mismatch ? usage_mismatch->reason : std::string{});
+
+        const auto expected_ids_bytes = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(expected_ids.data()),
+            expected_ids.size() * sizeof(std::int32_t));
+        const auto ids_mismatch = twin::compare_bytes(
+            route_ids_storage.payload(), expected_ids_bytes);
+        check(!ids_mismatch,
+              label + " generic plan consumes every routed row",
+              ids_mismatch ? ids_mismatch->reason : std::string{});
+
+        const std::array<twin::ByteRange, 1u> plan_written{{
+            {0u, sizeof(TieredMoePlan)}}};
+        const auto plan_guard =
+            moe_plan_storage.first_unwritten_change(plan_written);
+        const std::array<twin::ByteRange, 1u> usage_written{{
+            {0u, expected_usage_bytes.size()}}};
+        const auto usage_guard =
+            usage_table_storage.first_unwritten_change(usage_written);
+        const auto resident_guard =
+            resident_table_storage.first_unwritten_change({});
+        const auto router_guard =
+            router_tensor_storage.first_unwritten_change({});
+        const bool guards_ok = !plan_guard && !usage_guard &&
+                               !resident_guard && !router_guard;
+        check(guards_ok,
+              label + " generic plan guards and read-only inputs",
+              plan_guard ? plan_guard->reason :
+              usage_guard ? usage_guard->reason :
+              resident_guard ? resident_guard->reason :
+              router_guard ? router_guard->reason : std::string{});
+        return !plan_mismatch && !usage_mismatch && !ids_mismatch &&
+               guards_ok;
+    };
+    const bool generic_full_plan = exercise_generic_plan_prefix(false);
+    const bool generic_tiered_plan = exercise_generic_plan_prefix(true);
+
+    if (rows == 3u) {
+        WindowMoePlanPrefixBuffers short_generic_plan =
+            plan_prefix_buffers;
+        short_generic_plan.plans =
+            moe_plan_storage.view().slice(0u, sizeof(TieredMoePlan) - 1u);
+        const std::vector<std::uint8_t> resident_before(
+            resident_table_storage.payload().begin(),
+            resident_table_storage.payload().end());
+        const std::vector<std::uint8_t> usage_before(
+            usage_table_storage.payload().begin(),
+            usage_table_storage.payload().end());
+        prepare_layer0_chain(true);
+        for (twin::GuardedBuffer* output :
+             {&router_logits_storage, &route_ids_storage,
+              &route_weights_storage, &router_matvec_sink_storage,
+              &moe_plan_storage}) {
+            std::fill(output->payload().begin(), output->payload().end(),
+                      poison);
+        }
+        auto short_plan_command = context.make_command_buffer(
+            label + " generic short MoE plan", error);
+        check(short_plan_command != nullptr,
+              label + " generic short-plan command buffer", error);
+        if (!short_plan_command) return false;
+        const bool short_plan_rejected = !encode_window_moe_plan_prefix(
+            context, *short_plan_command, vocabulary_size, kRouterExperts,
+            true, short_generic_plan, error);
+        const bool short_plan_discarded =
+            short_plan_command->unsafe_native_handle() == nullptr;
+        const bool short_plan_untouched = outputs_are_poisoned() &&
+            std::all_of(router_logits_storage.payload().begin(),
+                        router_logits_storage.payload().end(),
+                        [=](std::uint8_t value) { return value == poison; }) &&
+            std::all_of(route_ids_storage.payload().begin(),
+                        route_ids_storage.payload().end(),
+                        [=](std::uint8_t value) { return value == poison; }) &&
+            std::all_of(route_weights_storage.payload().begin(),
+                        route_weights_storage.payload().end(),
+                        [=](std::uint8_t value) { return value == poison; }) &&
+            std::all_of(router_matvec_sink_storage.payload().begin(),
+                        router_matvec_sink_storage.payload().end(),
+                        [=](std::uint8_t value) { return value == poison; }) &&
+            std::all_of(moe_plan_storage.payload().begin(),
+                        moe_plan_storage.payload().end(),
+                        [=](std::uint8_t value) { return value == poison; }) &&
+            std::equal(resident_before.begin(), resident_before.end(),
+                       resident_table_storage.payload().begin(),
+                       resident_table_storage.payload().end()) &&
+            std::equal(usage_before.begin(), usage_before.end(),
+                       usage_table_storage.payload().begin(),
+                       usage_table_storage.payload().end()) &&
+            std::equal(history_before.begin(), history_before.end(),
+                       storage[kHistory].payload().begin(),
+                       storage[kHistory].payload().end()) &&
+            std::equal(state_before.begin(), state_before.end(),
+                       storage[kState].payload().begin(),
+                       storage[kState].payload().end());
+        check(short_plan_rejected && short_plan_discarded &&
+                  short_plan_untouched &&
+                  error.find("Window MoE prefix plan output") !=
+                      std::string::npos &&
+                  error.find("undersized") != std::string::npos,
+              label +
+                  " generic T=3 API rejects a short plan before dispatch",
+              error);
+    }
+
     if (rows == 2u) {
+        const std::vector<std::uint8_t> resident_before(
+            resident_table_storage.payload().begin(),
+            resident_table_storage.payload().end());
+        const std::vector<std::uint8_t> usage_before(
+            usage_table_storage.payload().begin(),
+            usage_table_storage.payload().end());
+        prepare_layer0_chain(true);
+        for (twin::GuardedBuffer* output :
+             {&router_logits_storage, &route_ids_storage,
+              &route_weights_storage, &router_matvec_sink_storage,
+              &moe_plan_storage}) {
+            std::fill(output->payload().begin(), output->payload().end(),
+                      poison);
+        }
+        auto late_plan_failure_command = context.make_command_buffer(
+            label + " caller-owned generic late plan failure", error);
+        check(late_plan_failure_command != nullptr,
+              label + " generic late-plan-failure command buffer", error);
+        if (!late_plan_failure_command) return false;
+        constexpr std::string_view kInjectedGenericPlanFailure =
+            "injected failure after generic Window plan prefix";
+        bool generic_plan_encoded_before_failure = false;
+        const bool late_plan_failure_rejected = !Encoder::encode(
+            context, *late_plan_failure_command,
+            "Window generic late plan-prefix failure",
+            [&](Encoder& encoder, std::string& encode_error) {
+                if (!encode_window_moe_plan_prefix(
+                        context, encoder, vocabulary_size, kRouterExperts,
+                        true, plan_prefix_buffers, encode_error)) {
+                    return false;
+                }
+                generic_plan_encoded_before_failure = true;
+                encode_error = kInjectedGenericPlanFailure;
+                return false;
+            },
+            error);
+        const bool late_plan_failure_discarded =
+            late_plan_failure_command->unsafe_native_handle() == nullptr;
+        const bool late_plan_failure_untouched = outputs_are_poisoned() &&
+            std::all_of(router_logits_storage.payload().begin(),
+                        router_logits_storage.payload().end(),
+                        [=](std::uint8_t value) { return value == poison; }) &&
+            std::all_of(route_ids_storage.payload().begin(),
+                        route_ids_storage.payload().end(),
+                        [=](std::uint8_t value) { return value == poison; }) &&
+            std::all_of(route_weights_storage.payload().begin(),
+                        route_weights_storage.payload().end(),
+                        [=](std::uint8_t value) { return value == poison; }) &&
+            std::all_of(router_matvec_sink_storage.payload().begin(),
+                        router_matvec_sink_storage.payload().end(),
+                        [=](std::uint8_t value) { return value == poison; }) &&
+            std::all_of(moe_plan_storage.payload().begin(),
+                        moe_plan_storage.payload().end(),
+                        [=](std::uint8_t value) { return value == poison; }) &&
+            std::equal(resident_before.begin(), resident_before.end(),
+                       resident_table_storage.payload().begin(),
+                       resident_table_storage.payload().end()) &&
+            std::equal(usage_before.begin(), usage_before.end(),
+                       usage_table_storage.payload().begin(),
+                       usage_table_storage.payload().end()) &&
+            std::equal(gr_residual_before.begin(), gr_residual_before.end(),
+                       storage[kGrResidual].payload().begin(),
+                       storage[kGrResidual].payload().end()) &&
+            std::all_of(storage[kGrInjectPrev].payload().begin(),
+                        storage[kGrInjectPrev].payload().end(),
+                        [=](std::uint8_t value) { return value == poison; }) &&
+            std::equal(history_before.begin(), history_before.end(),
+                       storage[kHistory].payload().begin(),
+                       storage[kHistory].payload().end()) &&
+            std::equal(state_before.begin(), state_before.end(),
+                       storage[kState].payload().begin(),
+                       storage[kState].payload().end());
+        check(late_plan_failure_rejected &&
+                  generic_plan_encoded_before_failure &&
+                  late_plan_failure_discarded &&
+                  late_plan_failure_untouched &&
+                  error == kInjectedGenericPlanFailure,
+              label +
+                  " caller-owned generic plan rolls back a later failure",
+              error);
+        if (!late_plan_failure_rejected ||
+            !generic_plan_encoded_before_failure ||
+            !late_plan_failure_discarded ||
+            !late_plan_failure_untouched) {
+            return false;
+        }
+
         prepare_layer0_chain(true);
         for (twin::GuardedBuffer* output :
              {&router_logits_storage, &route_ids_storage,
@@ -4234,7 +4557,10 @@ bool test_window_t1_attention_gdn(Context& context, std::uint32_t rows) {
         }
     }
 
-    if (rows != 1u) return standard_router_prefix && coder_router_prefix;
+    if (rows != 1u) {
+        return standard_router_prefix && coder_router_prefix &&
+               generic_full_plan && generic_tiered_plan;
+    }
 
     const auto exercise_plan_prefix = [&](std::uint32_t experts, bool tiered,
                                           bool caller_owned) {
@@ -4975,7 +5301,8 @@ bool test_window_t1_attention_gdn(Context& context, std::uint32_t rows) {
            layer0_outputs_match && layer0_residual_matches &&
            layer0_inject2_matches && !residual_guard && !inject2_guard &&
            layer0_state_unchanged && standard_router_prefix &&
-           coder_router_prefix && standard_tiered_plan && coder_full_plan &&
+           coder_router_prefix && generic_full_plan && generic_tiered_plan &&
+           standard_tiered_plan && coder_full_plan &&
            short_plan_rejected && short_plan_discarded &&
            short_plan_untouched && late_plan_failure_rejected &&
            plan_prefix_encoded_before_failure &&

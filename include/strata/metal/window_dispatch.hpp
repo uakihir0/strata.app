@@ -79,6 +79,8 @@ struct WindowT1MoePlanPrefixBuffers {
     BufferRef usage;
     BufferRef plans;
 };
+/// Same buffer roles for a generic speculative T=1..8 plan prefix.
+using WindowMoePlanPrefixBuffers = WindowT1MoePlanPrefixBuffers;
 
 /// Full-mode layer-0 T=1 Window buffers. The exact producer structure is
 /// passed with its consumer so the coordinator can bind the route, plan and
@@ -224,6 +226,24 @@ bool encode_window_t1_moe_plan_prefix(
     Context& context, CommandBuffer& command_buffer,
     std::uint32_t vocabulary_size, std::uint32_t experts, bool tiered,
     const WindowT1MoePlanPrefixBuffers& buffers, std::string& error);
+
+/// Multi-row speculative layer-0 prefix through route production and MoePlan.
+/// Infers T from validated WindowParams and keeps the plan at layer zero.
+/// Tiered mode updates its usage table for every routed entry and stops here
+/// so the caller can resolve missing experts before any expert consumer runs.
+/// Keep all views alive through completion and do not alter read-only inputs
+/// while the command is in flight.
+/// Caller-owned failures must propagate through Encoder::encode.
+bool encode_window_moe_plan_prefix(
+    Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
+    std::uint32_t experts, bool tiered,
+    const WindowMoePlanPrefixBuffers& buffers, std::string& error);
+/// Standalone transactional form. A late plan failure discards the router
+/// prefix and all earlier layer-0 stages.
+bool encode_window_moe_plan_prefix(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size, std::uint32_t experts, bool tiered,
+    const WindowMoePlanPrefixBuffers& buffers, std::string& error);
 
 /// Encode the full-mode T=1 layer-0 Window router/route/plan prefix followed
 /// by routed expert FFN and shared expert/combine in one ordered transaction.

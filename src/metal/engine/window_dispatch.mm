@@ -742,30 +742,24 @@ bool validate_window_moe_router_prefix(
         context, experts, buffers, params, "Window MoE prefix", error);
 }
 
-bool validate_window_t1_moe_plan_prefix(
-    Context& context, std::uint32_t vocabulary_size, std::uint32_t experts,
-    const WindowT1MoePlanPrefixBuffers& buffers, std::string& error) {
-    if (!validate_window_t1_moe_router_prefix(
-            context, vocabulary_size, experts, buffers.router, error)) {
-        return false;
-    }
-
+bool validate_window_moe_plan_prefix_views(
+    Context& context, std::uint32_t experts,
+    const WindowMoePlanPrefixBuffers& buffers,
+    std::string_view prefix_label, std::string& error) {
     const std::size_t resident_bytes =
         static_cast<std::size_t>(experts) * sizeof(std::int32_t);
     const std::size_t usage_bytes =
         static_cast<std::size_t>(experts) * sizeof(float);
     if (!validate_prefix_buffer(context, buffers.resident, resident_bytes,
                                 alignof(std::int32_t),
-                                "Window T=1 MoE prefix", "resident table",
-                                error) ||
+                                prefix_label, "resident table", error) ||
         !validate_prefix_buffer(context, buffers.usage, usage_bytes,
-                                alignof(float), "Window T=1 MoE prefix",
-                                "usage table", error) ||
+                                alignof(float), prefix_label, "usage table",
+                                error) ||
         !validate_prefix_buffer(context, buffers.plans,
                                 sizeof(TieredMoePlan),
-                                alignof(TieredMoePlan),
-                                "Window T=1 MoE prefix", "plan output",
-                                error)) {
+                                alignof(TieredMoePlan), prefix_label,
+                                "plan output", error)) {
         return false;
     }
 
@@ -776,45 +770,52 @@ bool validate_window_t1_moe_plan_prefix(
              ++right) {
             if (buffer_views_overlap(plan_outputs[left],
                                      plan_outputs[right])) {
-                error = "Window T=1 MoE plan outputs overlap";
+                error = std::string(prefix_label) + " outputs overlap";
                 return false;
             }
         }
         if (buffer_views_overlap(buffers.resident, plan_outputs[left])) {
-            error = "Window T=1 MoE plan output overlaps its resident table";
+            error = std::string(prefix_label) +
+                    " output overlaps its resident table";
             return false;
         }
         if (buffer_views_overlap(buffers.router.router_tensor,
                                  plan_outputs[left])) {
-            error = "Window T=1 MoE plan output overlaps the router tensor";
+            error = std::string(prefix_label) +
+                    " output overlaps the router tensor";
             return false;
         }
         if (buffer_views_overlap(buffers.router.layer0.params,
                                  plan_outputs[left])) {
-            error = "Window T=1 MoE plan output overlaps its parameters";
+            error = std::string(prefix_label) +
+                    " output overlaps its parameters";
             return false;
         }
     }
     if (buffer_views_overlap(buffers.resident,
                              buffers.router.router_tensor)) {
-        error = "Window T=1 MoE resident table overlaps the router tensor";
+        error = std::string(prefix_label) +
+                " resident table overlaps the router tensor";
         return false;
     }
     if (buffer_views_overlap(buffers.resident,
                              buffers.router.layer0.params)) {
-        error = "Window T=1 MoE resident table overlaps its parameters";
+        error = std::string(prefix_label) +
+                " resident table overlaps its parameters";
         return false;
     }
 
     const auto disjoint_from_prefix = [&](const auto& views) {
         for (const BufferRef& view : views) {
             if (buffer_views_overlap(buffers.resident, view)) {
-                error = "Window T=1 MoE resident table overlaps a prefix buffer";
+                error = std::string(prefix_label) +
+                        " resident table overlaps a prefix buffer";
                 return false;
             }
             for (const BufferRef& output : plan_outputs) {
                 if (buffer_views_overlap(view, output)) {
-                    error = "Window T=1 MoE plan storage overlaps a prefix buffer";
+                    error = std::string(prefix_label) +
+                            " storage overlaps a prefix buffer";
                     return false;
                 }
             }
@@ -837,6 +838,30 @@ bool validate_window_t1_moe_plan_prefix(
 
     error.clear();
     return true;
+}
+
+bool validate_window_t1_moe_plan_prefix(
+    Context& context, std::uint32_t vocabulary_size, std::uint32_t experts,
+    const WindowT1MoePlanPrefixBuffers& buffers, std::string& error) {
+    if (!validate_window_t1_moe_router_prefix(
+            context, vocabulary_size, experts, buffers.router, error)) {
+        return false;
+    }
+    return validate_window_moe_plan_prefix_views(
+        context, experts, buffers, "Window T=1 MoE prefix", error);
+}
+
+bool validate_window_moe_plan_prefix(
+    Context& context, std::uint32_t vocabulary_size, std::uint32_t experts,
+    const WindowMoePlanPrefixBuffers& buffers, WindowParams& params,
+    std::string& error) {
+    if (!validate_window_moe_router_prefix(
+            context, vocabulary_size, experts, buffers.router, params,
+            error)) {
+        return false;
+    }
+    return validate_window_moe_plan_prefix_views(
+        context, experts, buffers, "Window MoE prefix", error);
 }
 
 bool validate_window_t1_moe_layer0_consumer_handoffs(
@@ -1362,6 +1387,52 @@ bool encode_window_t1_moe_plan_prefix(
         context, command_buffer, "Window T=1 layer-0 MoE plan prefix",
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_window_t1_moe_plan_prefix(
+                context, encoder, vocabulary_size, experts, tiered, buffers,
+                encode_error);
+        },
+        error);
+}
+
+bool encode_window_moe_plan_prefix(
+    Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
+    std::uint32_t experts, bool tiered,
+    const WindowMoePlanPrefixBuffers& buffers, std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "Window MoE plan prefix requires ordered dispatch boundaries";
+        return false;
+    }
+    WindowParams params{};
+    if (!validate_window_moe_plan_prefix(
+            context, vocabulary_size, experts, buffers, params, error)) {
+        return false;
+    }
+    const ReadOnlyBufferRef route_ids =
+        context.buffers().read_only(buffers.router.route_ids);
+    if (!route_ids) {
+        error = "Window MoE plan could not form a live route ID input view";
+        return false;
+    }
+    if (!encode_window_moe_router_prefix(
+            context, encoder, vocabulary_size, experts, buffers.router,
+            error)) {
+        return false;
+    }
+
+    const MoePlanBuffers plan_buffers{route_ids, buffers.resident,
+                                      buffers.usage, buffers.plans};
+    return encode_moe_plan(context, encoder, params.T, experts, tiered, 0u,
+                           plan_buffers, error);
+}
+
+bool encode_window_moe_plan_prefix(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size, std::uint32_t experts, bool tiered,
+    const WindowMoePlanPrefixBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Window layer-0 MoE plan prefix",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_moe_plan_prefix(
                 context, encoder, vocabulary_size, experts, tiered, buffers,
                 encode_error);
         },
