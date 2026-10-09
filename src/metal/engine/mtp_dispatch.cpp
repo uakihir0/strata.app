@@ -37,6 +37,8 @@ constexpr std::uint32_t kMtpWindowIdsThreads = 256u;
 constexpr std::uint32_t kMtpWindowIdsGroups = 8u;
 constexpr std::uint32_t kMtpWindowIdsStride =
     kMtpWindowIdsThreads * kMtpWindowIdsGroups;
+constexpr std::uint32_t kMtpAttentionChunkCells = 64u;
+constexpr std::size_t kMtpAttentionReservedScratchFloats = 64u;
 constexpr std::uint32_t kMtpMaxRows =
     static_cast<std::uint32_t>(sizeof(MtpParams{}.tokens) /
                                sizeof(MtpParams{}.tokens[0]));
@@ -180,11 +182,29 @@ bool same_mtp_kv_layout(const MtpKvLayout& left,
            same_region(left.v_scale, right.v_scale);
 }
 
+bool checked_size_multiply(std::size_t left, std::size_t right,
+                           std::size_t& result) {
+    if (left != 0u &&
+        right > std::numeric_limits<std::size_t>::max() / left) {
+        return false;
+    }
+    result = left * right;
+    return true;
+}
+
+bool checked_size_add(std::size_t left, std::size_t right,
+                      std::size_t& result) {
+    if (right > std::numeric_limits<std::size_t>::max() - left) return false;
+    result = left + right;
+    return true;
+}
+
 bool mtp_kv_views_match_layout(Context& context,
                               const MtpKvLayout& layout,
                               const MtpKvViews& views,
-                              std::string& error) {
-    constexpr char operation[] = "MTP attention K/V append";
+                              std::string& error,
+                              const char* operation =
+                                  "MTP attention K/V append") {
     const std::array<std::pair<const char*, BufferRef>, 4> named_views{{
         {"K cache", views.k},
         {"K scales", views.k_scale},
@@ -813,6 +833,219 @@ bool validate_mtp_window_ids(Context& context,
     return true;
 }
 
+bool validate_mtp_attention(Context& context,
+                            const MtpAttentionBuffers& buffers,
+                            QsaAttentionMode& mode, BufferRef& steps,
+                            QsaAttentionScratch& scratch,
+                            std::size_t& scratch_active_bytes,
+                            std::size_t& attention_bytes,
+                            std::string& error) {
+    constexpr char operation[] = "MTP attention";
+    const ReadOnlyBufferRef params =
+        context.buffers().read_only(buffers.params);
+    std::uint32_t rows = 0u;
+    if (!read_mtp_rows(context, params, operation, rows, error)) {
+        return false;
+    }
+    if (rows != 1u) {
+        error = std::string(operation) +
+                " requires T=1 for the full-layer pass";
+        return false;
+    }
+    if (!validate_buffer_view(context, buffers.params, sizeof(MtpParams),
+                              alignof(MtpParams), operation, "params",
+                              error)) {
+        return false;
+    }
+
+    MtpKvLayout canonical_layout;
+    std::string layout_error;
+    if (!make_mtp_kv_layout(buffers.kv_layout.requested_cells,
+                            buffers.kv_layout.requested_format,
+                            canonical_layout, layout_error) ||
+        !same_mtp_kv_layout(buffers.kv_layout, canonical_layout)) {
+        error = std::string(operation) +
+                " KV layout is invalid or not canonical";
+        if (!layout_error.empty()) error += ": " + layout_error;
+        return false;
+    }
+    if ((canonical_layout.storage_format == KvFormat::Fp16 &&
+         buffers.kv_rot) ||
+        (canonical_layout.storage_format == KvFormat::Q4_0 &&
+         !buffers.kv_rot)) {
+        error = std::string(operation) +
+                " kv_rot does not match the selected MTP KV format";
+        return false;
+    }
+    switch (canonical_layout.storage_format) {
+        case KvFormat::Fp16:
+            mode = QsaAttentionMode::f16;
+            break;
+        case KvFormat::Int8:
+            // MTP K8v4 requests are represented by the canonical int8 store.
+            mode = QsaAttentionMode::i8;
+            break;
+        case KvFormat::Q4_0:
+            mode = QsaAttentionMode::q4;
+            break;
+        case KvFormat::K8v4:
+            error = std::string(operation) +
+                    " storage format is not supported by the MTP cache";
+            return false;
+    }
+    if (!mtp_kv_views_match_layout(context, canonical_layout,
+                                   buffers.kv_views, error, operation)) {
+        return false;
+    }
+
+    if (buffers.id_row_stride == 0u ||
+        buffers.id_row_stride > kKvMaximumCells ||
+        buffers.id_row_stride % kMtpAttentionChunkCells != 0u) {
+        error = std::string(operation) +
+                " ID row stride must be a positive multiple of 64 within "
+                "the MTP KV cell limit";
+        return false;
+    }
+
+    constexpr std::size_t query_bytes =
+        static_cast<std::size_t>(N_HEAD_Q) * HEAD_DIM * sizeof(float);
+    const std::size_t id_bytes =
+        static_cast<std::size_t>(buffers.id_row_stride) *
+        sizeof(std::int32_t);
+    const std::size_t chunk_count =
+        buffers.id_row_stride / kMtpAttentionChunkCells;
+    std::size_t accumulator_floats = 0u;
+    std::size_t stats_floats = 0u;
+    std::size_t accumulator_bytes = 0u;
+    std::size_t stats_bytes = 0u;
+    std::size_t both_stats_bytes = 0u;
+    std::size_t required_scratch_bytes = 0u;
+    std::size_t reserved_tail_bytes = 0u;
+    if (!checked_size_multiply(
+            chunk_count,
+            static_cast<std::size_t>(N_HEAD_KV) *
+                (N_HEAD_Q / N_HEAD_KV) * HEAD_DIM,
+            accumulator_floats) ||
+        !checked_size_multiply(
+            chunk_count,
+            static_cast<std::size_t>(N_HEAD_KV) *
+                (N_HEAD_Q / N_HEAD_KV),
+            stats_floats) ||
+        !checked_size_multiply(accumulator_floats, sizeof(float),
+                               accumulator_bytes) ||
+        !checked_size_multiply(stats_floats, sizeof(float), stats_bytes) ||
+        !checked_size_multiply(stats_bytes, 2u, both_stats_bytes) ||
+        !checked_size_multiply(kMtpAttentionReservedScratchFloats,
+                               sizeof(float), reserved_tail_bytes) ||
+        !checked_size_add(accumulator_bytes, both_stats_bytes,
+                          scratch_active_bytes) ||
+        !checked_size_add(scratch_active_bytes, reserved_tail_bytes,
+                          required_scratch_bytes) ||
+        !checked_size_multiply(
+            static_cast<std::size_t>(N_HEAD_Q) * HEAD_DIM, sizeof(float),
+            attention_bytes)) {
+        error = std::string(operation) +
+                " active buffer extent overflows host address space";
+        return false;
+    }
+
+    if (!validate_buffer_view(context, buffers.qcur, query_bytes,
+                              alignof(float), operation, "qcur", error) ||
+        !validate_buffer_view(context, buffers.mtp_ids, id_bytes,
+                              alignof(std::int32_t), operation, "mtp_ids",
+                              error) ||
+        !validate_buffer_view(context, buffers.att_scratch,
+                              required_scratch_bytes, alignof(float),
+                              operation, "att_scratch", error) ||
+        !validate_buffer_view(context, buffers.attn, attention_bytes,
+                              alignof(float), operation, "attn", error)) {
+        return false;
+    }
+
+    steps = buffers.params.slice(offsetof(MtpParams, step), sizeof(StepRow));
+    if (!steps) {
+        error = std::string(operation) +
+                " cannot form its active StepRow view";
+        return false;
+    }
+    scratch.partial_acc =
+        buffers.att_scratch.slice(0u, accumulator_bytes);
+    scratch.partial_m =
+        buffers.att_scratch.slice(accumulator_bytes, stats_bytes);
+    scratch.partial_l =
+        buffers.att_scratch.slice(accumulator_bytes + stats_bytes,
+                                  stats_bytes);
+    if (!scratch.partial_acc || !scratch.partial_m || !scratch.partial_l) {
+        error = std::string(operation) +
+                " cannot form the chunk scratch views";
+        return false;
+    }
+
+    struct ActiveView {
+        const char* name;
+        BufferRef view;
+        std::size_t bytes;
+    };
+    const std::array<ActiveView, 7> inputs{{
+        {"params", buffers.params, sizeof(MtpParams)},
+        {"qcur", buffers.qcur, query_bytes},
+        {"mtp_ids", buffers.mtp_ids, id_bytes},
+        {"K cache", buffers.kv_views.k, canonical_layout.k.bytes},
+        {"K scales", buffers.kv_views.k_scale,
+         canonical_layout.k_scale.bytes},
+        {"V cache", buffers.kv_views.v, canonical_layout.v.bytes},
+        {"V scales", buffers.kv_views.v_scale,
+         canonical_layout.v_scale.bytes},
+    }};
+    const std::array<ActiveView, 2> outputs{{
+        {"attention scratch", buffers.att_scratch, required_scratch_bytes},
+        {"attn", buffers.attn, attention_bytes},
+    }};
+    if (overlaps(buffers.att_scratch, required_scratch_bytes,
+                 buffers.attn, attention_bytes)) {
+        error = std::string(operation) +
+                " attn output overlaps the attention scratch region";
+        return false;
+    }
+    for (std::size_t write = 0u; write < outputs.size(); ++write) {
+        for (std::size_t read = 0u; read < inputs.size(); ++read) {
+            if (overlaps(inputs[read].view, inputs[read].bytes,
+                         outputs[write].view, outputs[write].bytes)) {
+                error = std::string(operation) + " " + outputs[write].name +
+                        " overlaps input " + inputs[read].name;
+                return false;
+            }
+        }
+    }
+    const std::array<std::pair<BufferRef, std::size_t>, 3> active_scratch{{
+        {scratch.partial_acc, accumulator_bytes},
+        {scratch.partial_m, stats_bytes},
+        {scratch.partial_l, stats_bytes},
+    }};
+    for (std::size_t left = 0u; left < active_scratch.size(); ++left) {
+        if (overlaps(buffers.attn, attention_bytes,
+                     active_scratch[left].first,
+                     active_scratch[left].second)) {
+            error = std::string(operation) +
+                    " attn output overlaps chunk scratch";
+            return false;
+        }
+        for (std::size_t right = left + 1u;
+             right < active_scratch.size(); ++right) {
+            if (overlaps(active_scratch[left].first,
+                         active_scratch[left].second,
+                         active_scratch[right].first,
+                         active_scratch[right].second)) {
+                error = std::string(operation) +
+                        " chunk scratch views overlap";
+                return false;
+            }
+        }
+    }
+    error.clear();
+    return true;
+}
+
 }  // namespace
 
 bool encode_mtp_add_streams(Context& context, Encoder& encoder,
@@ -1224,6 +1457,65 @@ bool encode_mtp_window_ids(Context& context, CommandBuffer& command_buffer,
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_mtp_window_ids(context, encoder, buffers,
                                          encode_error);
+        },
+        error);
+}
+
+bool encode_mtp_attention(Context& context, Encoder& encoder,
+                          const MtpAttentionBuffers& buffers,
+                          std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error =
+            "MTP attention requires an ordered concurrent-group boundary";
+        return false;
+    }
+
+    QsaAttentionMode mode{};
+    BufferRef steps;
+    QsaAttentionScratch scratch;
+    std::size_t scratch_active_bytes = 0u;
+    std::size_t attention_bytes = 0u;
+    if (!validate_mtp_attention(context, buffers, mode, steps, scratch,
+                                scratch_active_bytes, attention_bytes,
+                                error)) {
+        return false;
+    }
+    (void)scratch_active_bytes;
+    (void)attention_bytes;
+
+    const QsaAttentionChunkBuffers chunk_buffers{
+        buffers.qcur, steps, buffers.mtp_ids,
+        buffers.kv_views.k, buffers.kv_views.k_scale,
+        buffers.kv_views.v, buffers.kv_views.v_scale, scratch};
+    if (!encode_qsa_attention_chunk(
+            context, encoder, mode, 1u, buffers.kv_layout.cell_capacity,
+            buffers.id_row_stride, chunk_buffers, error)) {
+        return false;
+    }
+    const QsaAttentionMergeBuffers merge_buffers{scratch, buffers.attn};
+    if (!encode_qsa_attention_merge(context, encoder, 1u,
+                                    buffers.id_row_stride, merge_buffers,
+                                    error)) {
+        return false;
+    }
+    if (buffers.kv_rot &&
+        !encode_qsa_fwht256(context, encoder, N_HEAD_Q, buffers.attn,
+                            error)) {
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
+bool encode_mtp_attention(Context& context, CommandBuffer& command_buffer,
+                          const MtpAttentionBuffers& buffers,
+                          std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "MTP attention",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_mtp_attention(context, encoder, buffers,
+                                        encode_error);
         },
         error);
 }

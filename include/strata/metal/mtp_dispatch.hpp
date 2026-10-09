@@ -120,6 +120,28 @@ struct MtpWindowIdsBuffers {
     std::uint32_t window = 0;
 };
 
+/// Inputs and outputs for MTP stage 13's dense finite-window attention.
+/// `id_row_stride` is the bind-layout capacity (a positive multiple of 64),
+/// while the active StepRow width limits the IDs consumed by attention.
+/// `att_scratch` is the complete named bind region, including its reserved
+/// 64-float tail; only the chunk accumulator/max/denominator prefix is used.
+/// The canonical MTP KV storage format selects the QSA attention mode;
+/// K8v4 requests use the MTP store's documented int8 representation.
+/// `kv_rot` must match the stage-9/11 rotation choice. Keep all views alive
+/// through GPU completion, and keep params, qcur, mtp_ids, and KV views
+/// unchanged until the encoder has consumed them.
+struct MtpAttentionBuffers {
+    BufferRef params;
+    BufferRef qcur;
+    BufferRef mtp_ids;
+    MtpKvLayout kv_layout;
+    MtpKvViews kv_views;
+    BufferRef att_scratch;
+    BufferRef attn;
+    std::uint32_t id_row_stride = 0;
+    bool kv_rot = false;
+};
+
 /// Add MTP hidden and embedding streams to the caller-owned Encoder segment.
 /// On failure, the enclosing Encoder::encode body must return false so prior
 /// work in that segment is discarded.
@@ -202,5 +224,18 @@ bool encode_mtp_window_ids(Context& context, Encoder& encoder,
 bool encode_mtp_window_ids(Context& context, CommandBuffer& command_buffer,
                            const MtpWindowIdsBuffers& buffers,
                            std::string& error);
+
+/// Encode MTP stage 13: chunk attention, ordered merge, and optional O-class
+/// output FWHT. Requires T=1, the canonical MTP KV layout/views and an ordered
+/// concurrent-group boundary. The standalone form is transactional; callers
+/// of the Encoder form must propagate failure from their enclosing
+/// `Encoder::encode` body.
+bool encode_mtp_attention(Context& context, Encoder& encoder,
+                          const MtpAttentionBuffers& buffers,
+                          std::string& error);
+bool encode_mtp_attention(Context& context,
+                          CommandBuffer& command_buffer,
+                          const MtpAttentionBuffers& buffers,
+                          std::string& error);
 
 }  // namespace strata::metal

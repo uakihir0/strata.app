@@ -590,6 +590,24 @@ strata_metal_test(metal_mtp_window_ids_test_concurrent metal
 set_tests_properties(metal_mtp_window_ids_test_concurrent
                      PROPERTIES TIMEOUT 180)
 
+add_executable(metal_mtp_attention_test
+  tests/metal/metal_mtp_attention_test.mm)
+target_include_directories(metal_mtp_attention_test PRIVATE
+  ${STRATA_METAL_GENERATED_DIR})
+target_link_libraries(metal_mtp_attention_test PRIVATE
+  strata_metal_twins strata_metal_engine strata_metal_options)
+set_source_files_properties(tests/metal/metal_mtp_attention_test.mm
+                            PROPERTIES OBJECT_DEPENDS ${STRATA_METALLIB_SHA256_INC})
+add_dependencies(metal_mtp_attention_test strata_metallib)
+strata_metal_test(metal_mtp_attention_test metal
+  metal_mtp_attention_test ${STRATA_METALLIB})
+set_tests_properties(metal_mtp_attention_test PROPERTIES TIMEOUT 180)
+strata_metal_test(metal_mtp_attention_test_concurrent metal
+  ${CMAKE_COMMAND} -E env STRATA_METAL_DISPATCH=concurrent
+  $<TARGET_FILE:metal_mtp_attention_test> ${STRATA_METALLIB})
+set_tests_properties(metal_mtp_attention_test_concurrent
+                     PROPERTIES TIMEOUT 180)
+
 add_executable(metal_weight_store_test tests/metal/metal_weight_store_test.cpp
                src/metal/engine/weights.cpp src/metal/engine/geometry.cpp
                src/metal/engine/window_plan.cpp src/metal/engine/mtp.cpp
