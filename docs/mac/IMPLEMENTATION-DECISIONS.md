@@ -9653,3 +9653,57 @@ measuring L-15 remain open.
   `check_drift.py` found no upstream changes and valid golden files, and
   `git diff --check` passed. The fixtures use synthetic inputs and do not
   establish model-backed inference.
+
+### D-IMPL-351: Implement Prefill GDN tiled convolution
+
+- **Decision:** Add the isolated `strata_pf_gdn_conv_tiled` kernel and
+  validated `encode_prefill_gdn_conv_tiled` API. Give each thread one
+  convolution channel and process at most 64 consecutive rows per tile.
+  Read the old three-row history, QKV rows and F32 convolution weights;
+  write only the unnormalized SiLU convolution output. Keep the history
+  update as a separate following stage. Validate row bounds, extents,
+  alignment, Context ownership and output/input overlap; permit overlapping
+  read-only inputs and reject calls in open concurrent groups.
+- **Reason:** Section 6.4 defines independent input-tap tiles of 64 rows and
+  requires history advancement only after every tile has read the old
+  history. Keeping history immutable in this stage makes that dependency
+  explicit and lets the following history encoder establish the required
+  order. The standalone output stops before `strata_pf_gdn_l2`, as specified.
+  Neither stage is integrated into the Prefill chunk loop.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `cmake --build --preset mac-dev` succeeded and focused
+  `metal_prefill_test` and `metal_prefill_test_concurrent` CTests passed 2/2.
+  The full `mac-metal` suite passed 80/80; `mac-host` passed 43 tests and
+  skipped one model-input case because its assets are unavailable. The pinned
+  Python runner passed all 35/35 modules. Both standalone and caller-owned
+  Encoder fixtures at T=1/3/64/65/129 compare to a scalar four-tap FMA/SiLU
+  oracle, including a cancellation-sensitive non-dyadic fixture whose negative
+  control distinguishes reversed FMA order. Validation includes read-only
+  input overlap, invalid rows, short views, output/input overlap, foreign
+  Context, rollback, input immutability, guards and open-group rejection. The
+  hostile-review outcome is recorded in REV-148.
+
+### REV-148: Hostile review of Prefill GDN tiled convolution
+
+- **Scope:** `strata_pf_gdn_conv_tiled`, its validated standalone and
+  caller-owned Encoder APIs, 64-row tile/history indexing, FMA order,
+  validation/alias contracts, regression fixtures and test inventories.
+- **Findings:** The first pass found that the original dyadic scalar fixtures
+  could not distinguish a reordered accumulation and that the 64-ULP oracle
+  bound would admit the wrong order. The second pass verified that the
+  cancellation-sensitive sentinel distinguishes the specified result
+  (`31.999998f`, bits `0x41ffffff`) from reversed-order output (`32.0f`,
+  bits `0x42000000`) and that the GPU output is checked exactly at that
+  element. It also found that the two Prefill test-inventory rows in section
+  10.5 had not listed the new kernel.
+- **Disposition:** Added non-dyadic `1.0001f` × `255.9744f` cancellation
+  inputs, a reversed-order negative control, and exact GPU sentinel
+  equality; synchronized both 10.5 rows and the testing/host status tables.
+  Read-only review found no indexing, tile-boundary, host-validation,
+  synchronization or registration defect. On Mac17,9 (64 GB, macOS 27.0.1,
+  Xcode 27.0 build 27A266a), `cmake --build --preset mac-dev` succeeded, the
+  focused Prefill serial/concurrent CTests passed 2/2 after the sentinel was
+  added, and the full `mac-metal` suite passed 80/80. The `mac-host` suite
+  passed 43 tests with one unavailable-model-input case skipped. The pinned
+  Python runner passed all 35/35 modules. The fixtures are synthetic and do
+  not establish integrated Prefill or model-backed behavior.
