@@ -303,7 +303,7 @@ column points to the specification. "Threads" is the manifest value.
 | `strata_pf_gdn_gates`, `strata_pf_gdn_conv_tiled`, `strata_pf_gdn_conv_hist`, `strata_pf_gdn_l2`, `strata_pf_gdn_rec`, `strata_pf_gdn_out_norm` | | 6.4 |
 | `strata_pf_gate_attn` | | 6.5 |
 | `strata_idx_append_first`, `strata_idx_append_blocks`, `strata_idx_append_tail` | | 6.5 |
-| `strata_pf_dequant_{q2_0,q4_0,q5_0,q8_0}` | these four of the 11 dense formats; the other seven are planned | 6.2 |
+| `strata_pf_dequant_{iq4_nl,q2_0,q4_0,q5_0,q8_0}` | these five of the 11 dense formats; the other six are planned | 6.2 |
 | `strata_pf_gemm_f16` | `mpp`, `simd` | 6.2 |
 | `strata_pf_gemm_bf16` | `mpp`, `simd` | 6.2 |
 | `strata_pf_gemm_bf16_mpp` | isolated Apple10 MPP component; not the production selector | 6.2 |
@@ -3879,17 +3879,18 @@ Mac runs its own tiles. The projections:
   upstream does, this happens again for every layer of every chunk.
 - **The routed experts** do not use these kernels. They dequantise inside their own tiles (section 6.6).
 
-The repository implements standalone Q2_0, Q4_0, Q5_0 and Q8_0 variants as
-`strata_pf_dequant_{q2_0,q4_0,q5_0,q8_0}`, exposed by matching
-`encode_prefill_dequant_*` functions. Q2_0 expands 64-value blocks by
+The repository implements standalone IQ4_NL, Q2_0, Q4_0, Q5_0 and Q8_0
+variants as `strata_pf_dequant_{iq4_nl,q2_0,q4_0,q5_0,q8_0}`, exposed by
+matching `encode_prefill_dequant_*` functions. IQ4_NL maps low/high nibbles
+through the 16-entry nonlinear codebook; Q2_0 expands 64-value blocks by
 extracting four two-bit codes per byte and subtracting one; Q4_0 extracts
 low/high nibbles from each 16-byte code array; Q5_0 additionally reads the
 fourth-bit plane from `qh`; Q8_0 reads signed bytes. Each computes the
-format's centered integer times the half scale in F32, converts once to F16,
-and writes K-major scratch. The serial and concurrent GPU tests compare exact
-F16 bits from logical codes independent of the packed-block decoder, preserve
-the source, and check guards, invalid extents, aliases, Context ownership and
-transactional discard. The other seven format pipelines and all production
+format's value times the half scale in F32, converts once to F16, and writes
+K-major scratch. The serial and concurrent GPU tests compare exact F16 bits
+from logical codes independent of the packed-block decoder, preserve the
+source, and check guards, invalid extents, aliases, Context ownership and
+transactional discard. The other six format pipelines and all production
 `Prefill::run` wiring remain open; these component tests do not establish
 end-to-end prefill or model inference.
 
@@ -5669,7 +5670,7 @@ and foreign Context ownership.
 | `metal_prefill_test_concurrent` | metal | `strata_pf_gr_norm`, `strata_pf_gr_norm_lo`, `strata_pf_gr_write_norm`, `strata_pf_gr_write_norm_lo`, `strata_pf_gdn_gates`, `strata_pf_gdn_conv_tiled`, `strata_pf_gdn_conv_hist`, `strata_pf_gdn_l2`, `strata_pf_gdn_rec`, `strata_pf_gdn_out_norm`, `strata_pf_gr_silu`, `strata_pf_gr_silu_lo`, `strata_pf_gr_mix`, `strata_pf_gr_mix_lo`, and the kernels listed for `metal_embed_test` | Runs Prefill GR normalization, fused GR write/next-read normalization, GDN gates, tiled convolution, history update and q/k L2 normalization, SiLU and mix with concurrent dispatch, plus embedding → broadcast → normalization composition; checks stage-chain bit parity, scalar gate and convolution oracles including tile-boundary and FMA-order controls, history oracles at T=1/2/3/8/65, old-history convolution→update ordering and rollback for both APIs, q/k L2 oracles at T=1/2/3/8/65 with order- and epsilon-sensitive sentinels, unchanged v heads, and L2 rollback, reduction and conversion oracles, BF16X2 ties, invalid-group rejection and discard after late validation failure. The concurrent Prefill tests also compare recurrence raw outputs and final state to a scalar oracle at T=1/2/3/8/65, exercise L2→recurrence at T=1/3/8 and check ordered reduction, input immutability, view validation, rollback and open-group refusal. Output normalization checks scalar F16 parity and epsilon at T=1/2/3/8/65, a four-partial-order sentinel with an F16-distinguishing regrouping control, exact halfway RNE bits, unsaturated signed overflow, both Encoder forms, L2→recurrence→out-normalization composition, validation, guards, immutability and rollback. |
 | `metal_prefill_gemm_test`, `metal_prefill_gemm_test_concurrent` | metal | `strata_pf_gemm_{f16,bf16}_mpp` and the selected BF16X2 pair | Apple10-only standalone MPP coverage. T and n = 1/63/65 at K=32 plus 65×65×2560 production-shaped inputs exercise overwrite and accumulate against FP64 products under U(2K) and R(2^-16); the BF16X2 coordinator also covers T=1/3/8, n=1/63/65, both output modes, backend reporting and rollback after a late low-input failure. Output stride/padding, input immutability, guards, read/write aliases, short/misaligned/foreign buffers, rollback and concurrent-group rejection are checked. Returns CTest skip on other GPU families. |
 | `metal_prefill_gemm_simd_test`, `metal_prefill_gemm_simd_test_concurrent` | metal | `strata_pf_gemm_{f16,bf16}_simd` and BF16X2 pair | Runs the SIMD-group matrix fallback on Apple Silicon. Same T,n/K shapes, FP64 oracle, overwrite/accumulate, output padding, input immutability, guards, read/write aliases, invalid views, rollback and open-group checks as the MPP tests. BF16X2 also checks two-pass FP64 parity at T=1/3/8 and n=1/63/65. Tested on Apple10; other GPU families remain unverified. |
-| `metal_prefill_dequant_test`, `metal_prefill_dequant_test_concurrent` | metal | `strata_pf_dequant_{q2_0,q4_0,q5_0,q8_0}` | Expands 257×128 weights into K-major F16. Independent logical-code oracles check exact RNE half bits across block and output-column edges; Q2_0 covers its 64-value packed blocks and the others cover 32-value blocks. Each format checks source immutability, output guards, malformed extents/alignment, signed limits, exact and partial aliases, foreign input/output Contexts and transactional discard. The isolated format tests do not establish production Prefill wiring or model inference. |
+| `metal_prefill_dequant_test`, `metal_prefill_dequant_test_concurrent` | metal | `strata_pf_dequant_{iq4_nl,q2_0,q4_0,q5_0,q8_0}` | Expands 257×128 weights into K-major F16. Independent logical-code oracles check exact RNE half bits across block and output-column edges; Q2_0 covers its 64-value packed blocks and the others cover 32-value blocks. IQ4_NL uses literal low/high nibble fixtures and a separate nonlinear-codebook oracle. Each format checks source immutability, output guards, malformed extents/alignment, signed limits, exact and partial aliases, foreign input/output Contexts and transactional discard. The isolated format tests do not establish production Prefill wiring or model inference. |
 | `metal_mv_test_concurrent` | metal | `strata_q_q8_1`, `strata_mv_<fmt>_n<NC>` (Q5_K, Q6_K and IQ4_XS read-only head formats), Q2_0 and BF16 mat-vec | Runs the mat-vec test binary with concurrent dispatch; the shared Encoder Q8_1 → Q2_0/BF16 projection checks retain bitwise oracle parity, and immutable Q5_K, Q6_K and IQ4_XS mat-vecs match the scalar oracles |
 | `metal_math_test` | metal | The helpers of section 3.6 over dense grids (2^24 points on their ranges), `butterfly`, the conversions of section 3.5, `strata_selftest_*` | Helpers U(n), with n = 2 × A.10's bound in ulps where measured; `silu_k` uses U(8) by analogy with `sigmoid_k`. Butterfly and conversions B |
 | `codebooks` | host | `common/codebooks.h` against upstream's copy and ggml-common.h (section 3.7) | Bytes equal |
