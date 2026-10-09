@@ -314,6 +314,104 @@ void gdn_step_norm(std::vector<float>& state, std::span<const float> h,
     }
 }
 
+void gdn_rec(std::vector<float>& state, std::span<const float> h,
+             std::span<const float> gate, std::span<const float> beta,
+             std::uint32_t rows, std::vector<tf>& output,
+             std::vector<tf>& final_state) {
+    output.resize(static_cast<std::size_t>(rows) * kValueDim);
+    final_state.resize(state.size());
+    for (std::size_t i = 0u; i < state.size(); ++i) {
+        final_state[i] = tf{state[i]};
+    }
+    for (std::uint32_t head = 0u; head < kVHeads; ++head) {
+        const std::uint32_t qk_head = head % kQKHeads;
+        std::array<std::array<std::array<tf, 32>, 4>, kHeadDim> s{};
+        for (std::uint32_t column = 0u; column < kHeadDim; ++column) {
+            for (std::uint32_t row_group = 0u; row_group < 4u;
+                 ++row_group) {
+                for (std::uint32_t r = 0u; r < 32u; ++r) {
+                    const std::uint32_t state_row = 32u * row_group + r;
+                    const std::size_t index =
+                        (static_cast<std::size_t>(state_row) * kVHeads +
+                         head) *
+                            kHeadDim +
+                        column;
+                    s[column][row_group][r] = tf{state[index]};
+                }
+            }
+        }
+
+        for (std::uint32_t t = 0u; t < rows; ++t) {
+            const std::size_t hbase =
+                static_cast<std::size_t>(t) * kChannels;
+            const std::size_t head_index =
+                static_cast<std::size_t>(t) * kVHeads + head;
+            const tf decay = twin::accurate_exp(tf{gate[head_index]});
+            for (std::uint32_t column = 0u; column < kHeadDim; ++column) {
+                std::array<tf, 4> red_k{};
+                for (std::uint32_t row_group = 0u; row_group < 4u;
+                     ++row_group) {
+                    tf kv{};
+                    for (std::uint32_t r = 0u; r < 32u; ++r) {
+                        const std::uint32_t state_row = 32u * row_group + r;
+                        const tf k{h[hbase + kQKHeads * kHeadDim +
+                                     qk_head * kHeadDim + state_row]};
+                        kv = twin::fma(s[column][row_group][r], k, kv);
+                    }
+                    red_k[row_group] = kv;
+                }
+                const tf kv_column =
+                    ((red_k[0] + red_k[1]) + red_k[2]) + red_k[3];
+                const tf value{
+                    h[hbase + 2u * kQKHeads * kHeadDim +
+                      head * kHeadDim + column]};
+                const tf delta =
+                    twin::fma(-decay, kv_column, value) *
+                    tf{beta[head_index]};
+
+                std::array<tf, 4> red_o{};
+                for (std::uint32_t row_group = 0u; row_group < 4u;
+                     ++row_group) {
+                    tf accum{};
+                    for (std::uint32_t r = 0u; r < 32u; ++r) {
+                        const std::uint32_t state_row = 32u * row_group + r;
+                        const tf k{h[hbase + kQKHeads * kHeadDim +
+                                     qk_head * kHeadDim + state_row]};
+                        const tf q{h[hbase + qk_head * kHeadDim + state_row]};
+                        s[column][row_group][r] =
+                            twin::fma(decay, s[column][row_group][r],
+                                      k * delta);
+                        accum = twin::fma(s[column][row_group][r], q, accum);
+                    }
+                    red_o[row_group] = accum;
+                }
+                const tf recurrent =
+                    (((red_o[0] + red_o[1]) + red_o[2]) + red_o[3]) *
+                    rsqrt_accurate(tf{static_cast<float>(kHeadDim)});
+                const std::size_t output_index =
+                    static_cast<std::size_t>(t) * kValueDim +
+                    static_cast<std::size_t>(head) * kHeadDim + column;
+                output[output_index] = recurrent;
+            }
+        }
+
+        for (std::uint32_t column = 0u; column < kHeadDim; ++column) {
+            for (std::uint32_t row_group = 0u; row_group < 4u; ++row_group) {
+                for (std::uint32_t r = 0u; r < 32u; ++r) {
+                    const std::uint32_t state_row = 32u * row_group + r;
+                    const std::size_t index =
+                        (static_cast<std::size_t>(state_row) * kVHeads +
+                         head) *
+                        kHeadDim +
+                        column;
+                    state[index] = s[column][row_group][r].value;
+                    final_state[index] = s[column][row_group][r];
+                }
+            }
+        }
+    }
+}
+
 void gdn_conv_commit(std::vector<float>& history,
                      std::span<const float> qkv, std::uint32_t rows) {
     if (rows == 0u) return;

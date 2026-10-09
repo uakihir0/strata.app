@@ -1,5 +1,6 @@
 // Metal twins for Prefill's hyper-connection normalization (docs/mac/04 §6.3).
 #include "metallib_sha256.inc"
+#include "oracles/gdn.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/metal/context.hpp"
@@ -12,8 +13,11 @@
 #include "strata/metal/prefill_gdn_gates_dispatch.hpp"
 #include "strata/metal/prefill_gdn_conv_dispatch.hpp"
 #include "strata/metal/prefill_gdn_l2_dispatch.hpp"
+#include "strata/metal/prefill_gdn_rec_dispatch.hpp"
 #include "strata/metal/prefill_gr_write_norm_dispatch.hpp"
 #include "twin.hpp"
+
+#include "../../src/metal/kernels/common/params.h"
 
 #import <Metal/Metal.h>
 
@@ -42,6 +46,8 @@ constexpr std::uint32_t kStreams = 4u;
 constexpr std::uint32_t kGdnHeads = 48u;
 constexpr std::uint32_t kGdnConvChannels = 10240u;
 constexpr std::uint32_t kGdnConvKernel = 4u;
+constexpr std::uint32_t kGdnValueDim = GDN_VALUE_DIM;
+constexpr std::uint32_t kGdnStateElements = GDN_STATE_ELEMENTS;
 constexpr std::uint32_t kThreads = 256u;
 constexpr float kEpsilon = 1.0e-6f;
 constexpr std::size_t kGuardBytes = 4096u;
@@ -3070,6 +3076,594 @@ bool test_prefill_gdn_l2_epsilon_sentinel(Context& context) {
     return passed;
 }
 
+bool run_prefill_gdn_rec_case(Context& context, std::uint32_t rows,
+                              bool shared_encoder,
+                              bool compose_with_l2) {
+    const std::string label =
+        "Prefill GDN recurrence T=" + std::to_string(rows) +
+        (compose_with_l2
+             ? " L2→recurrence"
+             : (shared_encoder ? " caller-owned" : " standalone"));
+    constexpr std::size_t state_bytes =
+        static_cast<std::size_t>(kGdnStateElements) * sizeof(float);
+    const std::size_t h_bytes =
+        static_cast<std::size_t>(rows) * kGdnConvChannels * sizeof(float);
+    const std::size_t head_bytes =
+        static_cast<std::size_t>(rows) * kGdnHeads * sizeof(float);
+    const std::size_t output_bytes =
+        static_cast<std::size_t>(rows) * kGdnValueDim * sizeof(float);
+    std::vector<float> initial_state(kGdnStateElements);
+    std::vector<float> h(static_cast<std::size_t>(rows) * kGdnConvChannels);
+    std::vector<float> gate(static_cast<std::size_t>(rows) * kGdnHeads);
+    std::vector<float> beta(static_cast<std::size_t>(rows) * kGdnHeads);
+    for (std::size_t i = 0u; i < initial_state.size(); ++i) {
+        const int centered =
+            static_cast<int>((i * 29u + 17u) % 101u) - 50;
+        initial_state[i] = static_cast<float>(centered) * 0.0002f;
+    }
+    for (std::size_t i = 0u; i < h.size(); ++i) {
+        const int centered =
+            static_cast<int>((i * 37u + 43u) % 509u) - 254;
+        h[i] = static_cast<float>(centered) * 0.0003f;
+    }
+    for (std::size_t i = 0u; i < gate.size(); ++i) {
+        const int centered =
+            static_cast<int>((i * 13u + 5u) % 101u) - 50;
+        gate[i] = -2.0f + static_cast<float>(centered) * 0.001f;
+        beta[i] = 0.4f + static_cast<float>((i * 7u + 3u) % 101u) *
+                             0.0005f;
+    }
+
+    const std::vector<float> expected_h =
+        compose_with_l2 ? prefill_gdn_l2_oracle(h, rows) : h;
+    std::vector<float> expected_state = initial_state;
+    std::vector<twin::tf> expected_output;
+    std::vector<twin::tf> expected_state_oracle;
+    oracle::gdn_rec(expected_state, expected_h, gate, beta, rows,
+                    expected_output, expected_state_oracle);
+
+    TestBuffer state_buffer, h_buffer, gate_buffer, beta_buffer, output_buffer;
+    std::string error;
+    const bool allocated =
+        state_buffer.allocate(context, label + " state", state_bytes, error) &&
+        h_buffer.allocate(context, label + " h", h_bytes, error) &&
+        gate_buffer.allocate(context, label + " gate", head_bytes, error) &&
+        beta_buffer.allocate(context, label + " beta", head_bytes, error) &&
+        output_buffer.allocate(context, label + " output", output_bytes, error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    std::memcpy(state_buffer.payload().data(), initial_state.data(),
+                state_bytes);
+    std::memcpy(h_buffer.payload().data(), h.data(), h_bytes);
+    std::memcpy(gate_buffer.payload().data(), gate.data(), head_bytes);
+    std::memcpy(beta_buffer.payload().data(), beta.data(), head_bytes);
+
+    const auto gate_before = std::vector<std::uint8_t>(
+        gate_buffer.payload().begin(), gate_buffer.payload().end());
+    const auto beta_before = std::vector<std::uint8_t>(
+        beta_buffer.payload().begin(), beta_buffer.payload().end());
+    const ReadOnlyBufferRef h_ro =
+        context.buffers().read_only(h_buffer.view());
+    const ReadOnlyBufferRef gate_ro =
+        context.buffers().read_only(gate_buffer.view());
+    const ReadOnlyBufferRef beta_ro =
+        context.buffers().read_only(beta_buffer.view());
+    const PrefillGDNRecBuffers buffers{
+        state_buffer.view(), h_ro, gate_ro, beta_ro, output_buffer.view()};
+    auto command = context.make_command_buffer(label, error);
+    check(command != nullptr, label + " command buffer", error);
+    if (!command) return false;
+    bool encoded = false;
+    if (shared_encoder) {
+        encoded = Encoder::encode(
+            context, *command, label,
+            [&](Encoder& encoder, std::string& encode_error) {
+                if (compose_with_l2 &&
+                    !encode_prefill_gdn_l2(context, encoder, rows,
+                                            h_buffer.view(), encode_error)) {
+                    return false;
+                }
+                return encode_prefill_gdn_rec(context, encoder, rows, buffers,
+                                              encode_error);
+            },
+            error);
+    } else {
+        encoded = encode_prefill_gdn_rec(context, *command, rows, buffers,
+                                         error);
+    }
+    check(encoded, label + " production encode", error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    if (!submit_and_wait(command, label, error)) {
+        check(false, label + " Metal dispatch", error);
+        return false;
+    }
+
+    const auto actual_output = std::span<const float>(
+        reinterpret_cast<const float*>(output_buffer.payload().data()),
+        expected_output.size());
+    const auto output_mismatch = twin::compare_floats(
+        actual_output, expected_output,
+        {twin::Comparison::units, 512.0, 0.0, 0u});
+    check(!output_mismatch, label + " raw recurrent-output oracle",
+          output_mismatch ? output_mismatch->reason : "");
+    const auto actual_state = std::span<const float>(
+        reinterpret_cast<const float*>(state_buffer.payload().data()),
+        kGdnStateElements);
+    const auto state_mismatch = twin::compare_floats(
+        actual_state, expected_state_oracle,
+        {twin::Comparison::units, 512.0, 0.0, 0u});
+    check(!state_mismatch, label + " recurrent-state oracle",
+          state_mismatch ? state_mismatch->reason : "");
+
+    const auto actual_h = std::span<const float>(
+        reinterpret_cast<const float*>(h_buffer.payload().data()), h.size());
+    bool h_matches = true;
+    const std::size_t qk_values =
+        static_cast<std::size_t>(2u * GDN_QK_HEADS * GDN_HEAD_DIM);
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        const std::size_t row_base =
+            static_cast<std::size_t>(row) * kGdnConvChannels;
+        for (std::size_t i = 0u; i < qk_values; ++i) {
+            const std::uint64_t ulp =
+                float_ulp_distance(actual_h[row_base + i],
+                                   expected_h[row_base + i]);
+            h_matches &= compose_with_l2 ? ulp <= 32u : ulp == 0u;
+        }
+        for (std::size_t i = qk_values; i < kGdnConvChannels; ++i) {
+            h_matches &=
+                std::memcmp(h_buffer.payload().data() +
+                                (row_base + i) * sizeof(float),
+                            h.data() + row_base + i, sizeof(float)) == 0;
+        }
+    }
+    check(h_matches, label + " q/k L2 input and unchanged v heads");
+    const bool read_only_inputs_unchanged =
+        std::equal(gate_before.begin(), gate_before.end(),
+                   gate_buffer.payload().begin()) &&
+        std::equal(beta_before.begin(), beta_before.end(),
+                   beta_buffer.payload().begin());
+    check(read_only_inputs_unchanged, label + " gate/beta remain unchanged");
+    const bool guards = state_buffer.guards_intact() &&
+                        h_buffer.guards_intact() &&
+                        gate_buffer.guards_intact() &&
+                        beta_buffer.guards_intact() &&
+                        output_buffer.guards_intact();
+    check(guards, label + " guard regions");
+    return !output_mismatch && !state_mismatch && h_matches &&
+           read_only_inputs_unchanged && guards;
+}
+
+bool test_prefill_gdn_rec_reduction_sentinel(Context& context) {
+    const std::string label = "Prefill GDN recurrence reduction sentinel";
+    constexpr std::size_t state_bytes =
+        static_cast<std::size_t>(kGdnStateElements) * sizeof(float);
+    constexpr std::size_t h_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) * sizeof(float);
+    constexpr std::size_t head_bytes = kGdnHeads * sizeof(float);
+    constexpr std::size_t output_bytes = kGdnValueDim * sizeof(float);
+    std::vector<float> initial_state(kGdnStateElements, 0.0f);
+    std::vector<float> h(kGdnConvChannels, 0.0f);
+    std::vector<float> gate(kGdnHeads, 0.0f);
+    std::vector<float> beta(kGdnHeads, 0.0f);
+    const std::array<float, 4u> partials{
+        0x1p-16f, 0x1p-16f, 0x1p-16f, 256.0f};
+    const float ordered_sum =
+        ((partials[0] + partials[1]) + partials[2]) + partials[3];
+    const float regrouped_sum =
+        (partials[0] + partials[2]) + (partials[1] + partials[3]);
+    h[2u * GDN_QK_HEADS * GDN_HEAD_DIM] = ordered_sum;
+    beta[0u] = 1.0f;
+    for (std::uint32_t row_group = 0u; row_group < 4u; ++row_group) {
+        const std::uint32_t state_row = row_group * 32u;
+        const std::size_t state_index =
+            (static_cast<std::size_t>(state_row) * GDN_V_HEADS) *
+            GDN_HEAD_DIM;
+        initial_state[state_index] = partials[row_group];
+        const std::size_t q_index = state_row;
+        const std::size_t k_index =
+            GDN_QK_HEADS * GDN_HEAD_DIM + state_row;
+        h[q_index] = 1.0f;
+        h[k_index] = 1.0f;
+    }
+    const float scale = 1.0f / std::sqrt(static_cast<float>(GDN_HEAD_DIM));
+    const float ordered_output = ordered_sum * scale;
+    const float regrouped_output = regrouped_sum * scale;
+    const bool order_control =
+        float_ulp_distance(ordered_output, regrouped_output) >= 2u;
+    check(order_control, label + " distinguishes regrouped reduction",
+          "ordered=" + std::to_string(ordered_output) +
+              ", regrouped=" + std::to_string(regrouped_output));
+
+    std::vector<float> expected_state = initial_state;
+    std::vector<twin::tf> expected_output;
+    std::vector<twin::tf> expected_state_oracle;
+    oracle::gdn_rec(expected_state, h, gate, beta, 1u, expected_output,
+                    expected_state_oracle);
+    TestBuffer state_buffer, h_buffer, gate_buffer, beta_buffer, output_buffer;
+    std::string error;
+    const bool allocated =
+        state_buffer.allocate(context, label + " state", state_bytes, error) &&
+        h_buffer.allocate(context, label + " h", h_bytes, error) &&
+        gate_buffer.allocate(context, label + " gate", head_bytes, error) &&
+        beta_buffer.allocate(context, label + " beta", head_bytes, error) &&
+        output_buffer.allocate(context, label + " output", output_bytes, error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    std::memcpy(state_buffer.payload().data(), initial_state.data(),
+                state_bytes);
+    std::memcpy(h_buffer.payload().data(), h.data(), h_bytes);
+    std::memcpy(gate_buffer.payload().data(), gate.data(), head_bytes);
+    std::memcpy(beta_buffer.payload().data(), beta.data(), head_bytes);
+    const PrefillGDNRecBuffers buffers{
+        state_buffer.view(), context.buffers().read_only(h_buffer.view()),
+        context.buffers().read_only(gate_buffer.view()),
+        context.buffers().read_only(beta_buffer.view()),
+        output_buffer.view()};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded =
+        encode_prefill_gdn_rec(context, *command, 1u, buffers, error);
+    check(encoded, label + " production encode", error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    if (!submit_and_wait(command, label, error)) {
+        check(false, label + " Metal dispatch", error);
+        return false;
+    }
+    const auto actual_output = std::span<const float>(
+        reinterpret_cast<const float*>(output_buffer.payload().data()),
+        expected_output.size());
+    const auto output_mismatch = twin::compare_floats(
+        actual_output, expected_output,
+        {twin::Comparison::units, 512.0, 0.0, 0u});
+    check(!output_mismatch, label + " output oracle",
+          output_mismatch ? output_mismatch->reason : "");
+    const std::uint64_t output_ulp =
+        float_ulp_distance(actual_output[0u], expected_output[0u].value);
+    const bool ordered_output_matches = output_ulp <= 1u;
+    check(ordered_output_matches, label + " preserves ordered reduction",
+          "ULP=" + std::to_string(output_ulp) + ", limit=1");
+    const bool state_unchanged =
+        std::memcmp(state_buffer.payload().data(), initial_state.data(),
+                    state_bytes) == 0;
+    check(state_unchanged, label + " exact zero-delta state");
+    const bool guards = state_buffer.guards_intact() &&
+                        h_buffer.guards_intact() &&
+                        gate_buffer.guards_intact() &&
+                        beta_buffer.guards_intact() &&
+                        output_buffer.guards_intact();
+    check(guards, label + " guard regions");
+    return order_control && !output_mismatch && ordered_output_matches &&
+           state_unchanged && guards;
+}
+
+bool reject_prefill_gdn_rec_call(
+    Context& context, std::uint32_t rows,
+    const PrefillGDNRecBuffers& buffers,
+    std::string_view expected_error, const std::string& label) {
+    std::string error;
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, "rejected Prefill GDN recurrence",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_gdn_rec(context, encoder, rows, buffers,
+                                          encode_error);
+        },
+        error);
+    const bool right_error =
+        !encoded && error.find(expected_error) != std::string::npos;
+    check(right_error, label, error);
+    return right_error;
+}
+
+bool test_prefill_gdn_rec_validation(Context& context,
+                                     Context& foreign_context) {
+    const std::string label = "Prefill GDN recurrence validation";
+    constexpr std::size_t state_bytes =
+        static_cast<std::size_t>(kGdnStateElements) * sizeof(float);
+    constexpr std::size_t h_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) * sizeof(float);
+    constexpr std::size_t head_bytes = kGdnHeads * sizeof(float);
+    constexpr std::size_t output_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(float);
+    TestBuffer state, h, gate, beta, output, foreign_state, foreign_h,
+        input_overlap, output_alias;
+    std::string error;
+    const bool allocated =
+        state.allocate(context, label + " state", state_bytes, error) &&
+        h.allocate(context, label + " h", h_bytes, error) &&
+        gate.allocate(context, label + " gate", head_bytes, error) &&
+        beta.allocate(context, label + " beta", head_bytes, error) &&
+        output.allocate(context, label + " output", output_bytes, error) &&
+        foreign_state.allocate(foreign_context, label + " foreign state",
+                               state_bytes, error) &&
+        foreign_h.allocate(foreign_context, label + " foreign h", h_bytes,
+                           error) &&
+        input_overlap.allocate(context, label + " overlapping inputs",
+                               h_bytes, error) &&
+        output_alias.allocate(context, label + " output/input alias",
+                              h_bytes, error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+
+    const ReadOnlyBufferRef h_ro = context.buffers().read_only(h.view());
+    const ReadOnlyBufferRef gate_ro =
+        context.buffers().read_only(gate.view());
+    const ReadOnlyBufferRef beta_ro =
+        context.buffers().read_only(beta.view());
+    const PrefillGDNRecBuffers valid{
+        state.view(), h_ro, gate_ro, beta_ro, output.view()};
+    bool passed = true;
+    passed &= reject_prefill_gdn_rec_call(
+        context, 0u, valid, "row count", label + " rejects zero rows");
+    passed &= reject_prefill_gdn_rec_call(
+        context, kPrefillMaxShaderRows + 1u, {},
+        "row count", label + " rejects shader-unsafe rows");
+    passed &= reject_prefill_gdn_rec_call(
+        context, 1u,
+        {state.view().slice(0u, state_bytes - sizeof(float)), h_ro, gate_ro,
+         beta_ro, output.view()},
+        "undersized or misaligned", label + " rejects short state");
+    passed &= reject_prefill_gdn_rec_call(
+        context, 1u,
+        {state.view(), h_ro.slice(0u, h_bytes - sizeof(float)), gate_ro,
+         beta_ro, output.view()},
+        "undersized or misaligned", label + " rejects short h");
+    passed &= reject_prefill_gdn_rec_call(
+        context, 1u,
+        {state.view(), h_ro, gate_ro.slice(0u, head_bytes - sizeof(float)),
+         beta_ro, output.view()},
+        "undersized or misaligned", label + " rejects short gate");
+    passed &= reject_prefill_gdn_rec_call(
+        context, 1u,
+        {state.view(), h_ro, gate_ro,
+         beta_ro.slice(0u, head_bytes - sizeof(float)), output.view()},
+        "undersized or misaligned", label + " rejects short beta");
+    passed &= reject_prefill_gdn_rec_call(
+        context, 1u,
+        {state.view(), h_ro, gate_ro, beta_ro,
+         output.view().slice(0u, output_bytes - sizeof(float))},
+        "undersized or misaligned", label + " rejects short output");
+
+    BufferRef raw_misaligned_state = context.buffers().allocate(
+        label + " misaligned state backing", state_bytes + 1u, error);
+    BufferRef raw_misaligned_h = context.buffers().allocate(
+        label + " misaligned h backing", h_bytes + 1u, error);
+    if (!raw_misaligned_state || !raw_misaligned_h) {
+        check(false, label + " allocate misaligned backings", error);
+        return false;
+    }
+    passed &= reject_prefill_gdn_rec_call(
+        context, 1u,
+        {raw_misaligned_state.slice(1u, state_bytes), h_ro, gate_ro, beta_ro,
+         output.view()},
+        "undersized or misaligned", label + " rejects misaligned state");
+    passed &= reject_prefill_gdn_rec_call(
+        context, 1u,
+        {state.view(),
+         context.buffers().read_only(raw_misaligned_h.slice(1u, h_bytes)),
+         gate_ro, beta_ro, output.view()},
+        "undersized or misaligned", label + " rejects misaligned h");
+
+    passed &= reject_prefill_gdn_rec_call(
+        context, 1u,
+        {foreign_state.view(), h_ro, gate_ro, beta_ro, output.view()},
+        "not owned by this Context",
+        label + " rejects foreign Context state");
+    passed &= reject_prefill_gdn_rec_call(
+        context, 1u,
+        {state.view(),
+         foreign_context.buffers().read_only(foreign_h.view()), gate_ro,
+         beta_ro, output.view()},
+        "not owned by this Context",
+        label + " rejects foreign Context h");
+
+    const ReadOnlyBufferRef state_as_h =
+        context.buffers().read_only(state.view().slice(0u, h_bytes));
+    passed &= reject_prefill_gdn_rec_call(
+        context, 1u,
+        {state.view(), state_as_h, gate_ro, beta_ro, output.view()},
+        "overlaps a read-only input",
+        label + " rejects state/h overlap");
+    passed &= reject_prefill_gdn_rec_call(
+        context, 1u,
+        {state.view(), h_ro, gate_ro, beta_ro,
+         state.view().slice(0u, output_bytes)},
+        "writable views overlap",
+        label + " rejects state/output overlap");
+    const ReadOnlyBufferRef alias_as_h =
+        context.buffers().read_only(output_alias.view());
+    passed &= reject_prefill_gdn_rec_call(
+        context, 1u,
+        {state.view(), alias_as_h, gate_ro, beta_ro, output_alias.view()},
+        "overlaps a read-only input",
+        label + " rejects output/h overlap");
+
+    const ReadOnlyBufferRef shared_input =
+        context.buffers().read_only(input_overlap.view());
+    auto overlap_command =
+        context.make_command_buffer(label + " read-only overlap", error);
+    if (!overlap_command) {
+        check(false, label + " overlap command buffer", error);
+        return false;
+    }
+    const bool readonly_overlap_accepted = Encoder::encode(
+        context, *overlap_command, "Prefill GDN overlapping read-only inputs",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_gdn_rec(
+                context, encoder, 1u,
+                {state.view(), shared_input.slice(0u, h_bytes),
+                 shared_input.slice(0u, head_bytes),
+                 shared_input.slice(0u, head_bytes), output.view()},
+                encode_error);
+        },
+        error);
+    overlap_command->discard();
+    check(readonly_overlap_accepted,
+          label + " accepts overlapping read-only inputs", error);
+    passed &= readonly_overlap_accepted;
+    return passed;
+}
+
+bool test_prefill_gdn_rec_open_concurrent_group_rejected(Context& context) {
+    const char* const dispatch = std::getenv("STRATA_METAL_DISPATCH");
+    if (dispatch == nullptr || std::string_view(dispatch) != "concurrent") {
+        return true;
+    }
+    const std::string label =
+        "Prefill GDN recurrence rejects open concurrent group";
+    constexpr std::size_t state_bytes =
+        static_cast<std::size_t>(kGdnStateElements) * sizeof(float);
+    constexpr std::size_t h_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) * sizeof(float);
+    constexpr std::size_t head_bytes = kGdnHeads * sizeof(float);
+    constexpr std::size_t output_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(float);
+    TestBuffer state, h, gate, beta, output;
+    std::string error;
+    const bool allocated =
+        state.allocate(context, label + " state", state_bytes, error) &&
+        h.allocate(context, label + " h", h_bytes, error) &&
+        gate.allocate(context, label + " gate", head_bytes, error) &&
+        beta.allocate(context, label + " beta", head_bytes, error) &&
+        output.allocate(context, label + " output", output_bytes, error);
+    if (!allocated) {
+        check(false, label + " allocate buffers", error);
+        return false;
+    }
+    const PrefillGDNRecBuffers buffers{
+        state.view(), context.buffers().read_only(h.view()),
+        context.buffers().read_only(gate.view()),
+        context.buffers().read_only(beta.view()), output.view()};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, "open concurrent Prefill GDN recurrence",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encoder.group_begin(encode_error)) return false;
+            return encode_prefill_gdn_rec(context, encoder, 1u, buffers,
+                                          encode_error);
+        },
+        error);
+    const bool rejected =
+        !encoded && error.find("ordered concurrent-group boundary") !=
+                        std::string::npos;
+    check(rejected, label, error);
+    return rejected;
+}
+
+bool test_prefill_gdn_rec_failure_discards_prior_dispatch(Context& context) {
+    const std::string label =
+        "Prefill GDN recurrence late failure discards prior dispatch";
+    constexpr std::size_t state_bytes =
+        static_cast<std::size_t>(kGdnStateElements) * sizeof(float);
+    constexpr std::size_t h_bytes =
+        static_cast<std::size_t>(kGdnConvChannels) * sizeof(float);
+    constexpr std::size_t head_bytes = kGdnHeads * sizeof(float);
+    constexpr std::size_t output_bytes =
+        static_cast<std::size_t>(kGdnValueDim) * sizeof(float);
+    TestBuffer state, h, gate, beta, output;
+    std::string error;
+    const bool allocated =
+        state.allocate(context, label + " state", state_bytes, error) &&
+        h.allocate(context, label + " h", h_bytes, error) &&
+        gate.allocate(context, label + " gate", head_bytes, error) &&
+        beta.allocate(context, label + " beta", head_bytes, error) &&
+        output.allocate(context, label + " output", output_bytes, error);
+    if (!allocated) {
+        check(false, label + " allocate buffers", error);
+        return false;
+    }
+    std::vector<float> state_values(kGdnStateElements, 0.0001f);
+    std::vector<float> h_values(kGdnConvChannels, 0.002f);
+    std::vector<float> gate_values(kGdnHeads, -2.0f);
+    std::vector<float> beta_values(kGdnHeads, 0.5f);
+    std::memcpy(state.payload().data(), state_values.data(), state_bytes);
+    std::memcpy(h.payload().data(), h_values.data(), h_bytes);
+    std::memcpy(gate.payload().data(), gate_values.data(), head_bytes);
+    std::memcpy(beta.payload().data(), beta_values.data(), head_bytes);
+    const std::array<std::span<const std::uint8_t>, 5u> before{
+        std::span<const std::uint8_t>(state.allocation()),
+        std::span<const std::uint8_t>(h.allocation()),
+        std::span<const std::uint8_t>(gate.allocation()),
+        std::span<const std::uint8_t>(beta.allocation()),
+        std::span<const std::uint8_t>(output.allocation())};
+    const auto unchanged = [&] {
+        const std::array<std::span<const std::uint8_t>, 5u> after{
+            std::span<const std::uint8_t>(state.allocation()),
+            std::span<const std::uint8_t>(h.allocation()),
+            std::span<const std::uint8_t>(gate.allocation()),
+            std::span<const std::uint8_t>(beta.allocation()),
+            std::span<const std::uint8_t>(output.allocation())};
+        for (std::size_t i = 0u; i < before.size(); ++i) {
+            if (!std::equal(before[i].begin(), before[i].end(),
+                            after[i].begin())) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const PrefillGDNRecBuffers buffers{
+        state.view(), context.buffers().read_only(h.view()),
+        context.buffers().read_only(gate.view()),
+        context.buffers().read_only(beta.view()), output.view()};
+
+    auto caller_command = context.make_command_buffer(label + " shared", error);
+    if (!caller_command) {
+        check(false, label + " shared command buffer", error);
+        return false;
+    }
+    const bool caller_encoded = Encoder::encode(
+        context, *caller_command, "Prefill GDN recurrence shared rollback",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_prefill_gdn_rec(context, encoder, 1u, buffers,
+                                        encode_error)) {
+                return false;
+            }
+            return encode_prefill_gdn_l2(context, encoder, 0u, {},
+                                         encode_error);
+        },
+        error);
+    const bool caller_rolled_back =
+        !caller_encoded && caller_command->unsafe_native_handle() == nullptr &&
+        error.find("row count") != std::string::npos && unchanged();
+    check(caller_rolled_back, label + " caller-owned rollback", error);
+
+    auto standalone_command =
+        context.make_command_buffer(label + " standalone", error);
+    if (!standalone_command) {
+        check(false, label + " standalone command buffer", error);
+        return false;
+    }
+    const bool first =
+        encode_prefill_gdn_rec(context, *standalone_command, 1u, buffers,
+                               error);
+    const bool second =
+        first && encode_prefill_gdn_l2(context, *standalone_command, 0u, {},
+                                       error);
+    const bool standalone_rolled_back =
+        first && !second &&
+        standalone_command->unsafe_native_handle() == nullptr &&
+        error.find("row count") != std::string::npos && unchanged();
+    check(standalone_rolled_back, label + " standalone rollback", error);
+    return caller_rolled_back && standalone_rolled_back;
+}
+
 bool reject_prefill_gdn_conv_tiled_call(
     Context& context, std::uint32_t rows,
     const PrefillGDNConvTiledBuffers& buffers,
@@ -3989,6 +4583,8 @@ int main(int argc, char** argv) {
                                                         *foreign_context);
     passed &= test_prefill_gdn_l2_validation(*context, *foreign_context);
     passed &= test_prefill_gdn_l2_epsilon_sentinel(*context);
+    passed &= test_prefill_gdn_rec_validation(*context, *foreign_context);
+    passed &= test_prefill_gdn_rec_reduction_sentinel(*context);
     const std::array<std::uint32_t, 3> rows{1u, 3u, 8u};
     const std::array<PrefillBF16X2Mode, 3> modes{
         PrefillBF16X2Mode::off,
@@ -4032,6 +4628,8 @@ int main(int argc, char** argv) {
     passed &= test_prefill_gdn_conv_history_failure_discards_prior_dispatch(
         *context);
     passed &= test_prefill_gdn_l2_failure_discards_prior_dispatch(*context);
+    passed &=
+        test_prefill_gdn_rec_failure_discards_prior_dispatch(*context);
     passed &= test_open_concurrent_group_rejected(*context);
     passed &= test_silu_open_concurrent_group_rejected(*context);
     passed &= test_gr_mix_open_concurrent_group_rejected(*context);
@@ -4051,6 +4649,8 @@ int main(int argc, char** argv) {
     passed &=
         test_prefill_gdn_conv_history_open_concurrent_group_rejected(*context);
     passed &= test_prefill_gdn_l2_open_concurrent_group_rejected(*context);
+    passed &=
+        test_prefill_gdn_rec_open_concurrent_group_rejected(*context);
     for (const std::uint32_t gate_rows : {1u, 3u, 8u}) {
         passed &= run_prefill_gdn_gates_case(*context, gate_rows, false);
         passed &= run_prefill_gdn_gates_case(*context, gate_rows, true);
@@ -4079,6 +4679,16 @@ int main(int argc, char** argv) {
     for (const std::uint32_t composed_rows : {1u, 2u, 8u, 65u}) {
         passed &=
             run_prefill_gdn_l2_case(*context, composed_rows, true, true);
+    }
+    for (const std::uint32_t rec_rows : {1u, 2u, 3u, 8u, 65u}) {
+        passed &= run_prefill_gdn_rec_case(*context, rec_rows, false, false);
+    }
+    for (const std::uint32_t rec_rows : {1u, 8u}) {
+        passed &= run_prefill_gdn_rec_case(*context, rec_rows, true, false);
+    }
+    for (const std::uint32_t composed_rows : {1u, 3u, 8u}) {
+        passed &=
+            run_prefill_gdn_rec_case(*context, composed_rows, true, true);
     }
     if (g_failures != 0) {
         std::fprintf(stderr, "%d Prefill Metal test(s) failed\n", g_failures);

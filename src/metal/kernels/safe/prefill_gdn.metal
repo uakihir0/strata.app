@@ -115,6 +115,89 @@ kernel void strata_pf_gdn_l2(
     h[index] = value * rsqrt(sum + RMS_EPSILON);
 }
 
+[[max_total_threads_per_threadgroup(128)]]
+kernel void strata_pf_gdn_rec(
+    device float* state [[buffer(0)]],
+    device const float* h [[buffer(1)]],
+    device const float* gate [[buffer(2)]],
+    device const float* beta [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    threadgroup float* sk [[threadgroup(0)]],
+    threadgroup float* sq [[threadgroup(1)]],
+    threadgroup float* red [[threadgroup(2)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    const uint head = group.x / 4u;
+    const uint column_group = group.x % 4u;
+    const uint column = 32u * column_group + tid % 32u;
+    const uint row_group = tid / 32u;
+    const uint lane = tid % 32u;
+    const uint qk_head = head % GDN_QK_HEADS;
+    const ulong state_stride = ulong(GDN_V_HEADS) * GDN_HEAD_DIM;
+    device float* base =
+        state + (ulong(32u * row_group) * GDN_V_HEADS + head) *
+                    GDN_HEAD_DIM +
+                column;
+    float s[32];
+    for (uint r = 0u; r < 32u; ++r) {
+        s[r] = base[ulong(r) * state_stride];
+    }
+
+    for (uint t = 0u; t < rows; ++t) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        sk[tid] = h[ulong(t) * GDN_CONV_CHANNELS +
+                    GDN_QK_HEADS * GDN_HEAD_DIM +
+                    qk_head * GDN_HEAD_DIM + tid];
+        sq[tid] = h[ulong(t) * GDN_CONV_CHANNELS +
+                    qk_head * GDN_HEAD_DIM + tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float decay = exp(gate[ulong(t) * GDN_V_HEADS + head]);
+        float kv = 0.0f;
+        for (uint r = 0u; r < 32u; ++r) {
+            kv = fma(s[r], sk[32u * row_group + r], kv);
+        }
+        red[row_group * 32u + lane] = kv;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float kv_column =
+            ((red[lane] + red[32u + lane]) + red[64u + lane]) +
+            red[96u + lane];
+        const float value =
+            h[ulong(t) * GDN_CONV_CHANNELS +
+              2u * GDN_QK_HEADS * GDN_HEAD_DIM +
+              head * GDN_HEAD_DIM + column];
+        const float delta =
+            fma(-decay, kv_column, value) *
+            beta[ulong(t) * GDN_V_HEADS + head];
+
+        float o = 0.0f;
+        for (uint r = 0u; r < 32u; ++r) {
+            const float k_value = sk[32u * row_group + r];
+            const float q_value = sq[32u * row_group + r];
+            s[r] = fma(decay, s[r], k_value * delta);
+            o = fma(s[r], q_value, o);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        red[row_group * 32u + lane] = o;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (row_group == 0u) {
+            const float recurrent_output =
+                (((red[lane] + red[32u + lane]) + red[64u + lane]) +
+                 red[96u + lane]) *
+                rsqrt(float(GDN_HEAD_DIM));
+            output[ulong(t) * GDN_VALUE_DIM +
+                   head * GDN_HEAD_DIM + column] = recurrent_output;
+        }
+    }
+
+    for (uint r = 0u; r < 32u; ++r) {
+        base[ulong(r) * state_stride] = s[r];
+    }
+}
+
 [[max_total_threads_per_threadgroup(256)]]
 kernel void strata_pf_gdn_gates(
     device const float* alpha_beta [[buffer(0)]],

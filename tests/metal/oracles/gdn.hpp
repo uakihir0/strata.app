@@ -33,6 +33,14 @@ void gdn_step_norm(std::vector<float>& state,
                    std::vector<twin::tf>& output,
                    std::vector<twin::tf>& final_state);
 
+void gdn_rec(std::vector<float>& state,
+             std::span<const float> h,
+             std::span<const float> gate,
+             std::span<const float> beta,
+             std::uint32_t rows,
+             std::vector<twin::tf>& output,
+             std::vector<twin::tf>& final_state);
+
 void gdn_conv_commit(std::vector<float>& history,
                      std::span<const float> qkv,
                      std::uint32_t rows);
