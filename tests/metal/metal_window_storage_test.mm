@@ -3875,20 +3875,55 @@ void run_fullmode_handoff_test(Context& context,
             "late consumer failure must discard the input stem and producer segment");
 
     auto row_count_command = context.make_command_buffer(
-        "Reject multi-row Window pending consumer", error);
+        "Reject undersized multi-row Window pending consumer views", error);
     require(row_count_command != nullptr,
             "create multi-row Window consumer command: " + error);
+    WindowMoePendingConsumer undersized_consumer = pending_consumer;
+    std::string expected_short_view_diagnostic = "undersized";
+    if (use_ple_entry) {
+        auto& ple_consumer =
+            std::get<WindowMoePendingPLEConsumer>(undersized_consumer);
+        ple_consumer.compiled_columns = 2u;
+        BufferRef active_rows_t2 = allocate(
+            "multi-row PLE active columns", sizeof(std::uint32_t));
+        require(static_cast<bool>(active_rows_t2),
+                "allocate multi-row PLE active-column metadata");
+        *static_cast<std::uint32_t*>(active_rows_t2.contents) = 2u;
+        ple_consumer.buffers.ple.active_rows =
+            context.buffers().read_only(active_rows_t2);
+        require(static_cast<bool>(ple_consumer.buffers.ple.active_rows),
+                "bind matching T=2 PLE active-column metadata");
+        ple_consumer.buffers.ple.input_f32 =
+            ple_consumer.buffers.ple.input_f32.slice(
+                0u, static_cast<std::size_t>(N_EMBD) * sizeof(float));
+        expected_short_view_diagnostic =
+            ple_consumer.key_format == MatVecWeightFormat::bf16
+                ? "activations buffer is undersized"
+                : "Q8_1 input buffer is undersized";
+    } else {
+        auto& attention_consumer =
+            std::get<WindowMoeAttentionEntryBuffers>(undersized_consumer);
+        const std::size_t one_row_bytes =
+            static_cast<std::size_t>(4u) * N_EMBD * sizeof(float);
+        const BufferRef one_row_residual =
+            attention_consumer.attention.residual.slice(0u, one_row_bytes);
+        attention_consumer.attention.residual = one_row_residual;
+        attention_consumer.previous_gr_read.residual = one_row_residual;
+    }
     const bool row_count_encoded = Encoder::encode(
-        context, *row_count_command, "multi-row Window pending consumer",
+        context, *row_count_command,
+        "undersized multi-row Window pending consumer views",
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_window_moe_pending_consumer(
-                context, encoder, 2u, use_ple_entry, pending_consumer,
+                context, encoder, 2u, use_ple_entry, undersized_consumer,
                 encode_error);
         },
         error);
     require(!row_count_encoded &&
-                error.find("requires exactly one row") != std::string::npos,
-            "T=1 pending consumer must reject rows that its FullMode producer did not write");
+                row_count_command->unsafe_native_handle() == nullptr &&
+                error.find(expected_short_view_diagnostic) !=
+                    std::string::npos,
+            "multi-row pending consumer must reject views sized only for its T=1 producer");
 
     auto command = context.make_command_buffer(
         "FullMode layer-0 MoE to no-PLE attention handoff", error);

@@ -19,6 +19,7 @@ constexpr std::uint32_t kGgmlTypeF16 = 1u;
 constexpr std::uint32_t kGgmlTypeQ8_0 = 8u;
 constexpr std::uint32_t kGgmlTypeBf16 = 30u;
 constexpr std::uint32_t kGgmlTypeQ2_0 = 42u;
+constexpr std::uint32_t kMaxWindowRows = 8u;
 
 bool same_view(BufferRef left, BufferRef right) {
     return left && right && left.handle == right.handle &&
@@ -325,8 +326,8 @@ bool encode_window_moe_pending_consumer(
     bool ple_enabled, const WindowMoePendingConsumer& consumer,
     std::string& error) {
     error.clear();
-    if (rows != 1u) {
-        error = "T=1 Window pending-MoE consumer requires exactly one row";
+    if (rows == 0u || rows > kMaxWindowRows) {
+        error = "Window pending-MoE consumer rows must be in 1..8";
         return false;
     }
 

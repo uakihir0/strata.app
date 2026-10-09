@@ -7,6 +7,7 @@
 #include "strata/metal/gr_dispatch.hpp"
 #include "strata/metal/mv_dispatch.hpp"
 #include "strata/metal/ple_dispatch.hpp"
+#include "strata/metal/window_pending_dispatch.hpp"
 #include "strata/metal/window_ple_dispatch.hpp"
 #include "twin.hpp"
 #include "oracles/bf16_mv.hpp"
@@ -2150,6 +2151,10 @@ bool run_ple_block_projection_case(Context& context,
     previous_gr_read.inject_out = guarded[previous_inject_buffer].view();
     const WindowMoePLEEntryBuffers window_entry{
         previous_ffn, previous_gr_read, block};
+    const WindowMoePendingConsumer pending_consumer{
+        WindowMoePendingPLEConsumer{
+            window_entry, key_format, compiled_columns,
+            PLEHistoryUpdate::defer}};
 
     if (check_late_failure) {
         std::array<std::vector<std::uint8_t>, buffer_count> before;
@@ -2216,10 +2221,20 @@ bool run_ple_block_projection_case(Context& context,
                 return false;
             }
             const bool wrong_residual_rejected =
-                !encode_window_moe_ple_entry(
-                    context, *wrong_residual_command, rows, key_format,
-                    compiled_columns, PLEHistoryUpdate::defer,
-                    wrong_residual_entry, error);
+                !Encoder::encode(
+                    context, *wrong_residual_command,
+                    "Window pending-MoE PLE residual rejection",
+                    [&](Encoder& encoder, std::string& encode_error) {
+                        return encode_window_moe_pending_consumer(
+                            context, encoder, rows, true,
+                            WindowMoePendingConsumer{
+                                WindowMoePendingPLEConsumer{
+                                    wrong_residual_entry, key_format,
+                                    compiled_columns,
+                                    PLEHistoryUpdate::defer}},
+                            encode_error);
+                    },
+                    error);
             const bool wrong_residual_discarded =
                 wrong_residual_rejected &&
                 wrong_residual_command->unsafe_native_handle() == nullptr &&
@@ -2248,10 +2263,21 @@ bool run_ple_block_projection_case(Context& context,
         WindowMoePLEEntryBuffers invalid_entry = window_entry;
         invalid_entry.ple = invalid_block;
         const bool accepted = prepend_gr_post
-                                  ? encode_window_moe_ple_entry(
-                                        context, *rejected, rows, key_format,
-                                        compiled_columns,
-                                        PLEHistoryUpdate::defer, invalid_entry,
+                                  ? Encoder::encode(
+                                        context, *rejected,
+                                        "Window pending-MoE PLE late failure",
+                                        [&](Encoder& encoder,
+                                            std::string& encode_error) {
+                                            return encode_window_moe_pending_consumer(
+                                                context, encoder, rows, true,
+                                                WindowMoePendingConsumer{
+                                                    WindowMoePendingPLEConsumer{
+                                                        invalid_entry,
+                                                        key_format,
+                                                        compiled_columns,
+                                                        PLEHistoryUpdate::defer}},
+                                                encode_error);
+                                        },
                                         error)
                                   : encode_ple_block(
                                         context, *rejected, rows, key_format,
@@ -2285,9 +2311,13 @@ bool run_ple_block_projection_case(Context& context,
                 context, *caller_owned_rejection,
                 "Window PLE caller-owned late failure",
                 [&](Encoder& encoder, std::string& encode_error) {
-                    return encode_window_moe_ple_entry(
-                        context, encoder, rows, key_format, compiled_columns,
-                        PLEHistoryUpdate::defer, invalid_entry, encode_error);
+                    return encode_window_moe_pending_consumer(
+                        context, encoder, rows, true,
+                        WindowMoePendingConsumer{
+                            WindowMoePendingPLEConsumer{
+                                invalid_entry, key_format, compiled_columns,
+                                PLEHistoryUpdate::defer}},
+                        encode_error);
                 },
                 error);
             const bool caller_owned_discarded =
@@ -2319,9 +2349,10 @@ bool run_ple_block_projection_case(Context& context,
                 context, *grouped, "Window PLE open-group rejection",
                 [&](Encoder& encoder, std::string& encode_error) {
                     if (!encoder.group_begin(encode_error)) return false;
-                    const bool stage_accepted = encode_window_moe_ple_entry(
-                        context, encoder, rows, key_format, compiled_columns,
-                        PLEHistoryUpdate::defer, window_entry, stage_error);
+                    const bool stage_accepted =
+                        encode_window_moe_pending_consumer(
+                            context, encoder, rows, true, pending_consumer,
+                            stage_error);
                     if (!encoder.group_end(encode_error)) return false;
                     return !stage_accepted;
                 },
@@ -2359,12 +2390,10 @@ bool run_ple_block_projection_case(Context& context,
                                [&](Encoder& encoder,
                                    std::string& encode_error) {
                                    return prepend_gr_post
-                                              ? encode_window_moe_ple_entry(
+                                              ? encode_window_moe_pending_consumer(
                                                     context, encoder, rows,
-                                                    key_format,
-                                                    compiled_columns,
-                                                    PLEHistoryUpdate::defer,
-                                                    window_entry, encode_error)
+                                                    true, pending_consumer,
+                                                    encode_error)
                                               : encode_ple_block(
                                                     context, encoder, rows,
                                                     key_format,
@@ -4154,7 +4183,7 @@ bool run_set(Context& context, twin::InputSet set,
         passed &= run_ple_block_projection_case(
             context, options, MatVecWeightFormat::q2_0, 2u, 4u, true, true);
         passed &= run_ple_block_projection_case(
-            context, options, MatVecWeightFormat::q8_0, 8u, 8u, false);
+            context, options, MatVecWeightFormat::q8_0, 8u, 8u, true, true);
         passed &= run_ple_block_projection_case(
             context, options, MatVecWeightFormat::bf16, 1u, 1u, false, true);
     }

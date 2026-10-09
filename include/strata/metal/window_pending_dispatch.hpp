@@ -1,4 +1,4 @@
-// Exclusive selection of the T=1 Window pending-MoE consumer.
+// Exclusive selection of the Window pending-MoE consumer.
 #pragma once
 
 #include "strata/metal/window_dispatch.hpp"
@@ -35,12 +35,15 @@ struct WindowT1FullModeStepBuffers {
     WindowMoePendingConsumer consumer;
 };
 
-/// Encode the one consumer selected by the Window pending-write rule:
+/// Encode the consumer selected by the Window pending-write rule for 1..8
+/// speculative rows:
 /// `ple_enabled` selects PLE, otherwise it selects the next attention read.
-/// The branch tag and buffer variant must agree. The selected typed consumer
-/// runs in this Encoder segment; callers must propagate false from the
-/// enclosing Encoder::encode body so the producer and consumer are discarded
-/// together.
+/// The branch tag and buffer variant must agree. `rows` must equal the active
+/// row count produced by the pending layer. For PLE, `compiled_columns` must
+/// match the producer's `WindowParams.nc`, and the `active_rows` value must
+/// match `rows`/`WindowParams.T`. The selected typed consumer runs in this
+/// Encoder segment; callers must propagate false from the enclosing
+/// Encoder::encode body so the producer and consumer are discarded together.
 bool encode_window_moe_pending_consumer(
     Context& context, Encoder& encoder, std::uint32_t rows,
     bool ple_enabled, const WindowMoePendingConsumer& consumer,

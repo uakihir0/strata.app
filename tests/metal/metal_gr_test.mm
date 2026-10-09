@@ -4,6 +4,7 @@
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/gr_dispatch.hpp"
 #include "strata/metal/window_dispatch.hpp"
+#include "strata/metal/window_pending_dispatch.hpp"
 #include "strata/metal/window_head_mixer.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "twin.hpp"
@@ -2271,7 +2272,7 @@ bool run_gr_read_pipeline_case(Context& context, std::uint32_t rows,
     }
 
     bool pending_moe_entry_matches = true;
-    if (rows == 1u && !apply) {
+    if (!apply) {
         MoeRoutedSharedFFNBuffers previous_ffn{};
         previous_ffn.shared.output = views[kBlockOut];
         GRReadBuffers previous_gr_read{};
@@ -2405,8 +2406,9 @@ bool run_gr_read_pipeline_case(Context& context, std::uint32_t rows,
             shared_pending && Encoder::encode(
                 context, *shared_pending, "typed no-PLE caller-owned segment",
                 [&](Encoder& encoder, std::string& encode_error) {
-                    return encode_window_moe_attention_entry(
-                        context, encoder, rows, pending_entry, encode_error);
+                    return encode_window_moe_pending_consumer(
+                        context, encoder, rows, false,
+                        WindowMoePendingConsumer{pending_entry}, encode_error);
                 },
                 error);
         check(shared_pending_encoded,
@@ -2507,6 +2509,32 @@ bool test_gr_read_encoder_validation(Context& context) {
         const bool rejected = !encode_gr_read(
             context, *command, rows, false, empty, error) &&
             error.find("1..8") != std::string::npos;
+        const bool discarded = command->unsafe_native_handle() == nullptr;
+        check(rejected, label, error);
+        check(discarded, label + " discards its empty encoder segment");
+        if (!discarded) command->discard();
+        passed &= rejected && discarded;
+    }
+    for (const std::uint32_t rows : {0u, 9u}) {
+        const std::string label =
+            "Window pending-MoE consumer rejects T=" +
+            std::to_string(rows);
+        auto command = context.make_command_buffer(label, error);
+        if (!command) {
+            check(false, label + " command buffer", error);
+            passed = false;
+            continue;
+        }
+        const WindowMoePendingConsumer consumer{
+            WindowMoeAttentionEntryBuffers{}};
+        const bool rejected = !Encoder::encode(
+            context, *command, label,
+            [&](Encoder& encoder, std::string& encode_error) {
+                return encode_window_moe_pending_consumer(
+                    context, encoder, rows, false, consumer, encode_error);
+            },
+            error) &&
+            error.find("rows must be in 1..8") != std::string::npos;
         const bool discarded = command->unsafe_native_handle() == nullptr;
         check(rejected, label, error);
         check(discarded, label + " discards its empty encoder segment");
@@ -5173,7 +5201,9 @@ bool run_set(Context& context, twin::InputSet set, const twin::Options& options)
         passed &= run_gr_up_case(context, 8u, true, set, options, true);
         passed &= run_gr_down_case(context, 1u, set, options, true);
         passed &= run_gr_down_case(context, 8u, set, options, true);
-        passed &= run_gr_read_pipeline_case(context, 1u, false, options);
+        for (std::uint32_t rows = 1u; rows <= 8u; ++rows) {
+            passed &= run_gr_read_pipeline_case(context, rows, false, options);
+        }
         passed &= run_gr_read_pipeline_case(context, 8u, true, options);
     }
     if (set == twin::InputSet::fixture) {
