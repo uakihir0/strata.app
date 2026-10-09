@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <utility>
 
@@ -32,6 +33,10 @@ constexpr std::uint32_t kMtpQ81BlockBytes = 36u;
 constexpr std::uint32_t kMtpAddStreamsThreads = 256u;
 constexpr std::uint32_t kMtpAddStreamsGroupsX =
     HC_DIM / kMtpAddStreamsThreads;
+constexpr std::uint32_t kMtpWindowIdsThreads = 256u;
+constexpr std::uint32_t kMtpWindowIdsGroups = 8u;
+constexpr std::uint32_t kMtpWindowIdsStride =
+    kMtpWindowIdsThreads * kMtpWindowIdsGroups;
 constexpr std::uint32_t kMtpMaxRows =
     static_cast<std::uint32_t>(sizeof(MtpParams{}.tokens) /
                                sizeof(MtpParams{}.tokens[0]));
@@ -42,6 +47,7 @@ static_assert(offsetof(MtpParams, T) == 0u);
 static_assert(sizeof(Q81) == kMtpQ81BlockBytes);
 static_assert(kMtpQueryProjectionWidth == 12'288u);
 static_assert(kMtpQueryHeadWidth == 6'144u);
+static_assert(kMtpWindowIdsStride == 2'048u);
 
 template <class Address>
 bool ranges_overlap(Address left, std::size_t left_bytes,
@@ -718,6 +724,95 @@ bool validate_mtp_query_norm(
     return true;
 }
 
+bool validate_mtp_window_ids(Context& context,
+                             const MtpWindowIdsBuffers& buffers,
+                             BufferRef& active_ids,
+                             std::uint32_t& active_width,
+                             std::string& error) {
+    constexpr char operation[] = "MTP window IDs";
+    if (buffers.window == 0u) {
+        error = std::string(operation) +
+                " requires a positive finite window";
+        return false;
+    }
+    if (buffers.window >
+        static_cast<std::uint32_t>(
+            std::numeric_limits<std::int32_t>::max())) {
+        error = std::string(operation) +
+                " window exceeds the StepRow integer range";
+        return false;
+    }
+
+    std::uint32_t rows = 0u;
+    if (!read_mtp_rows(context, buffers.params, operation, rows, error)) {
+        return false;
+    }
+    if (rows != 1u) {
+        error = std::string(operation) +
+                " requires T=1 for the full-layer pass";
+        return false;
+    }
+    if (!validate_read_only_buffer(
+            context, buffers.params, sizeof(MtpParams), alignof(MtpParams),
+            "params", operation, error) ||
+        !validate_output_buffer(context, buffers.mtp_ids,
+                                sizeof(std::int32_t), operation, "mtp_ids",
+                                error)) {
+        return false;
+    }
+    if (buffers.mtp_ids.length % sizeof(std::int32_t) != 0u) {
+        error = std::string(operation) +
+                " mtp_ids length must contain whole int32 elements";
+        return false;
+    }
+    const std::size_t id_capacity =
+        buffers.mtp_ids.length / sizeof(std::int32_t);
+    if (buffers.window > id_capacity) {
+        error = std::string(operation) +
+                " window exceeds the mtp_ids capacity";
+        return false;
+    }
+
+    StepRow step{};
+    const auto* const params_contents =
+        static_cast<const std::byte*>(buffers.params.contents());
+    std::memcpy(&step, params_contents + offsetof(MtpParams, step),
+                sizeof(step));
+    if (step.n_kv <= 0) {
+        error = std::string(operation) +
+                " StepRow n_kv must be positive";
+        return false;
+    }
+    active_width = std::min(static_cast<std::uint32_t>(step.n_kv),
+                            buffers.window);
+    if (step.width < 0 ||
+        static_cast<std::uint32_t>(step.width) != active_width) {
+        error = std::string(operation) +
+                " StepRow width does not match n_kv and the finite window";
+        return false;
+    }
+    if (active_width > id_capacity) {
+        error = std::string(operation) +
+                " active ID prefix exceeds its buffer extent";
+        return false;
+    }
+    const std::size_t active_bytes =
+        static_cast<std::size_t>(active_width) * sizeof(std::int32_t);
+    active_ids = buffers.mtp_ids.slice(0u, active_bytes);
+    if (!active_ids) {
+        error = std::string(operation) +
+                " cannot form the active ID prefix view";
+        return false;
+    }
+    if (overlaps(buffers.params, sizeof(MtpParams), active_ids,
+                 active_bytes)) {
+        error = std::string(operation) +
+                " active ID output overlaps the parameter block";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 bool encode_mtp_add_streams(Context& context, Encoder& encoder,
@@ -1083,6 +1178,52 @@ bool encode_mtp_attention_query_norm(
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_mtp_attention_query_norm(
                 context, encoder, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_mtp_window_ids(Context& context, Encoder& encoder,
+                           const MtpWindowIdsBuffers& buffers,
+                           std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error =
+            "MTP window IDs require an ordered concurrent-group boundary";
+        return false;
+    }
+    BufferRef active_ids;
+    std::uint32_t active_width = 0u;
+    if (!validate_mtp_window_ids(context, buffers, active_ids, active_width,
+                                 error)) {
+        return false;
+    }
+
+    const EncoderReadOnlyBufferBinding params_binding{
+        buffers.params, 0u, sizeof(MtpParams), alignof(MtpParams)};
+    const EncoderBufferBinding ids_binding{
+        active_ids, 1u,
+        static_cast<std::size_t>(active_width) * sizeof(std::int32_t),
+        alignof(std::int32_t)};
+    const EncoderBytesBinding window_binding{
+        &buffers.window, sizeof(buffers.window), 2u};
+    const std::array buffers_binding{ids_binding};
+    const std::array read_only_bindings{params_binding};
+    const std::array bytes_bindings{window_binding};
+    constexpr std::array<EncoderThreadgroupMemory, 0> threadgroup_memory{};
+    return encoder.dispatch(
+        "strata_mtp_window_ids", {kMtpWindowIdsGroups, 1u, 1u},
+        {kMtpWindowIdsThreads, 1u, 1u}, buffers_binding,
+        read_only_bindings, bytes_bindings, threadgroup_memory, error);
+}
+
+bool encode_mtp_window_ids(Context& context, CommandBuffer& command_buffer,
+                           const MtpWindowIdsBuffers& buffers,
+                           std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "MTP window IDs",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_mtp_window_ids(context, encoder, buffers,
+                                         encode_error);
         },
         error);
 }

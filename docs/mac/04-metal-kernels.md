@@ -2886,6 +2886,16 @@ writes, with `row(c) = {c, c + 1, (c + 1) / 4, window > 0 ? min(c + 1, window) :
   Encoder segment. Every view must remain alive through GPU completion;
   `MtpParams`, `q_full`, `q_norm` and RoPE remain unchanged. The isolated API
   does not derive `kv_rot` from runtime configuration or bind MTP storage.
+- Stage 12's `encode_mtp_window_ids` runs only for a positive finite window.
+  It requires T=1, a window within StepRow's signed integer range, positive
+  `step[0].n_kv`, and a host-published
+  `step[0].width == min(n_kv, window)`. The first `width` int32 entries become
+  the absolute KV positions `[max(0, n_kv - window), n_kv)`; the inactive
+  suffix is untouched. The ID region must hold at least `window` entries,
+  though the generated positions may exceed that capacity because they index
+  the drafter's larger KV history. Without a window the IDs stay at the
+  identity mapping initialized during bind. Keep params and the ID view alive
+  through completion, and keep params unchanged while the kernel reads it.
 - Stages 2 and 4 are upstream's `native_qsa_rms_norm_weighted`, whose `norm<1024>` (for rows of 1024 or more) is
   the same arithmetic as `native_gr_rms_norm_weighted`. `strata_rms_norm_w` serves both with `n_cols` and the gamma
   period `gp` as `setBytes` constants (section 5.4).
@@ -5342,6 +5352,8 @@ and foreign Context ownership.
 | `metal_mtp_query_projection_test_concurrent` | metal | Same Q8_0 mat-vec kernel as `metal_mtp_query_projection_test` | Repeats stage 10 with concurrent dispatch and verifies ordered-boundary rejection without changing fixture buffers |
 | `metal_mtp_query_norm_test` | metal | `strata_qsa_norm_rope`, O-class `strata_qsa_fwht256` | MTP stage 11 requires T=1 and compares qcur against scalar QSA normalization/RoPE and optional FWHT oracles in standalone and caller-owned segments. Checks finite outputs, guards, immutable inputs, invalid T/position, short and foreign views, q_full/qcur and params/input aliases, ordered-group rejection, and rollback after a later stage validation failure. Runtime-derived `kv_rot`, MTP storage wiring and drafter parity remain open |
 | `metal_mtp_query_norm_test_concurrent` | metal | Same QSA kernels as `metal_mtp_query_norm_test` | Repeats stage 11 with concurrent dispatch and verifies ordered-boundary rejection without changing fixture buffers |
+| `metal_mtp_window_ids_test` | metal | `strata_mtp_window_ids` | MTP stage 12 compares active IDs for short, exact, truncated and full-history windows against absolute-cell expectations, including IDs greater than the ID-region capacity and a 4,097-ID window that crosses threadgroup and 2,048-thread grid-stride boundaries. Verifies inactive-tail sentinels, guards, immutable params, signed-range edges, malformed T/window/n_kv/StepRow width, short/misaligned/foreign views, active output/params alias rejection, caller-owned rollback and open-group rejection |
+| `metal_mtp_window_ids_test_concurrent` | metal | Same kernel as `metal_mtp_window_ids_test` | Repeats stage 12 with concurrent dispatch and verifies ordered-boundary rejection without changing fixture buffers |
 | `metal_sampler_parity_test`, `metal_sampler_parity_test_concurrent` | metal | Section 5.12's greedy, split-part, split-merge, composite sampled, coupled-penalty and CPU-tail twin on random, edge and fixture inputs for T=1..8 and model/maximum vocabularies; standalone and shared Encoder paths match the scalar references; concurrent tests reject dependent merge/sample calls in an open group and verify segment discard, including discard of a prior split-part dispatch; shared coupled-penalty→sampled composition and 248,320/262,144 vocabulary merge scratch are checked in one Encoder segment; fixtures 16 and 17 are deterministic semantic ports, with host fixture 15 in `sampler_tail_test`; literal upstream fixtures 1-14 and 18 and production sampler integration remain open under REV-028 | Candidate IDs/logit bits and CPU-tail tokens/probabilities exact |
 | `metal_util_test` | metal | `strata_util_*` | B |
 | `metal_prefill_test` | metal | `strata_pf_gr_norm`, `strata_pf_gr_norm_lo`, `strata_embed_rows_{q3_k,iq3_s,iq4_xs,bf16}`, `strata_gr_broadcast` | Prefill GR normalization T=1/3/8 covers BF16X2 modes 0/1/2 and random, edge (including an order-sensitive reduction sentinel) and fixture data against a scalar oracle that reproduces 256-thread FMA accumulation and both XOR reduction stages. Scale is U(4), high BF16 is U(1), and the low remainder is bitwise checked from the GPU scale/high outputs. Standalone and shared Encoder forms check read-only inputs, guards, invalid mode/extent/alignment/alias/ownership, and late-failure discard. The embedding gather → GR broadcast → Prefill normalization chain runs in one segment; a concurrent-group fixture verifies rejection. |

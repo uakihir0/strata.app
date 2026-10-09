@@ -7743,6 +7743,7 @@ measuring L-15 remain open.
 | REV-122 | Compose MTP stage 9 K normalization, RoPE, optional rotation and KV append | Hostile review found two P2 lifetime-contract gaps: the API had to require CPU-validated `MtpParams`/StepRows to stay alive and unchanged while GPU dispatches read them, then also name K norm and RoPE as asynchronous read inputs that must remain unchanged through completion. The public contract and both engine/kernel guides now distinguish stable caller inputs from the stage's in-place K, optional V and cache writes. Final hostile re-review found no remaining actionable P1–P3 findings. The `mac-dev` build passes; the focused stage-9 serial/concurrent pair passes 2/2; `mac-metal` passes 61/61; `mac-host` passes 44/44 with one unavailable real-input test skipped; the documented `.venv` Python suite passes 35/35 modules; `test_map` and `git diff --check` pass. | Verify `kv_rot` against the selected runtime KV configuration and establish stage-8→9 parity through `MtpRuntimeStorage` and an inspected model |
 | REV-123 | Implement MTP drafter stage 10 query projection | Initial hostile review identified two P3 gaps: tests did not exercise output/input overlap through stage-8 `xq` (including partial overlap), and engine/kernel docs omitted output-view lifetime. Regressions now use a same-allocation partial `q_full`/`xq` overlap and a `sink`/`xq` overlap; docs require all views to live through GPU completion. The fixture uses the exact named 24×512 `q_full` bind region. Final review confirmed the aligned 2,816-byte partial overlap reaches the alias validator and found no remaining actionable P1–P3 findings. The complete mac-dev build, focused serial/concurrent pair (2/2), mac-metal (63/63), mac-host (44/44 with the unavailable real-input test skipped), Python suite (35/35 modules), test map and diff check pass. | Keep all views alive through completion, reject unsafe read/write aliases, preserve the exact `q_full` bind extent, and compose runtime storage/model-backed parity only in later work |
 | REV-124 | Implement MTP drafter stage 11 query normalization and RoPE | Hostile review found two P3 documentation issues in sequence: an unfilled placeholder and a stale “Final review is pending” status. Both were replaced; final re-review confirmed the fixes and found no remaining actionable findings or implementation defects. On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a), the full mac-dev build succeeds, focused serial/concurrent CTests pass 2/2, mac-metal passes 65/65, mac-host passes 44/44 with one unavailable real-input test skipped, the Python suite passes 35/35 modules, test_map passes with the existing planned-work/missing-check diagnostics, `check_drift.py` reports no upstream changes and a valid golden set, and `git diff --check` passes. | Preserve T=1 full-layer shape, ordered norm/RoPE→optional FWHT, explicit runtime-boundary `kv_rot`, stable asynchronous input lifetimes and rollback coverage; runtime-storage/model parity remains open |
+| REV-125 | Implement MTP drafter stage 12 finite-window ID generation | Initial hostile review found missing coverage for the 2048-thread grid stride and signed-range boundaries, plus a stale README stage list. Added a 4,097-ID crossing case, the `INT32_MAX` position case and `INT32_MAX+1` window rejection; updated the overview. The first re-review closed those findings and flagged a temporary README/ledger mismatch, now reconciled with the completed run. On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a), the full mac-dev build succeeds, focused serial/concurrent tests pass 2/2, mac-metal passes 67/67, mac-host passes 44/44 with one unavailable real-input test skipped, the Python suite passes 35/35 modules, test_map passes with documented planned-work/missing-check diagnostics, check_drift reports no upstream changes and a valid golden set, and git diff --check passes. Final hostile consistency review found only the stale pending label, now corrected; no implementation findings remain. | Preserve absolute positions and the 2048-thread grid stride, validate host-published StepRow width and signed range, retain identity IDs when no finite window is configured, and keep runtime-storage/model parity open |
 
 ### D-IMPL-313: Add a per-layer GDN write-through Window block
 
@@ -8426,3 +8427,31 @@ measuring L-15 remain open.
 - **Review required:** Bind `kv_rot` to the inspected production KV mode;
   compose stages 6–11 through `MtpRuntimeStorage`, then validate the full
   stage 8→11 handoff and drafter parity against an inspected model.
+
+### D-IMPL-328: Implement MTP drafter stage 12 finite-window IDs
+
+- **Decision:** Add caller-owned Encoder and standalone transactional forms
+  for stage 12. Read the T=1 `StepRow` from the CPU-visible parameter slot,
+  require a positive finite window and matching host-published `width`, then
+  write `max(0, n_kv - window) + j` into only the active `mtp_ids` prefix.
+  Validate the ID region capacity, signed integer range, ownership, alignment
+  and active-prefix aliasing; reject an open concurrent group.
+- **Reason:** The MTP attention path addresses cells by absolute KV position,
+  while its ID region is sized to the configured window. The GPU kernel
+  therefore must select the newest cells from a longer history without
+  reducing those positions modulo the output capacity. The host already
+  publishes the matching StepRow width, so the kernel keeps the parameter
+  block read-only. With no finite window this stage is not encoded and the
+  bind-time identity mapping remains in place.
+- **Validation:** A Metal twin covers short, exact, truncated and long history
+  cases, including 262,144 KV cells with a 64-ID capacity, a 4,097-ID
+  grid-stride boundary case, signed-range edges, active-prefix contents and
+  untouched suffix, malformed rows, view bounds and ownership, active
+  output/params overlap, standalone/caller-owned execution, rollback and
+  concurrent-group rejection. The focused serial/concurrent pair passes 2/2
+  and the full mac-metal suite passes 67/67; full host, Python, map, drift and
+  hostile-review results are recorded in REV-125.
+- **Review required:** Confirm absolute position semantics and capacity/range
+  validation against the runtime bind layout, then wire stage 12 into
+  `MtpRuntimeStorage` and validate the attention handoff with an inspected
+  model.

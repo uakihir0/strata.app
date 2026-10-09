@@ -108,6 +108,18 @@ struct MtpAttentionQueryNormBuffers {
     bool kv_rot = false;
 };
 
+/// Inputs and output for MTP stage 12's finite-window ID generation.
+/// `params` is an immutable CPU-visible T=1 MtpParams block whose first
+/// StepRow contains the host-published `n_kv` and matching `width`. `mtp_ids`
+/// is the named int32 ID region with capacity at least `window`; only its
+/// active prefix is written. Keep both views alive through completion and
+/// keep params unchanged while the GPU reads it.
+struct MtpWindowIdsBuffers {
+    ReadOnlyBufferRef params;
+    BufferRef mtp_ids;
+    std::uint32_t window = 0;
+};
+
 /// Add MTP hidden and embedding streams to the caller-owned Encoder segment.
 /// On failure, the enclosing Encoder::encode body must return false so prior
 /// work in that segment is discarded.
@@ -179,5 +191,16 @@ bool encode_mtp_attention_query_norm(
 bool encode_mtp_attention_query_norm(
     Context& context, CommandBuffer& command_buffer,
     const MtpAttentionQueryNormBuffers& buffers, std::string& error);
+
+/// Encode MTP stage 12 for a finite window. The active ID prefix contains
+/// absolute KV cell positions from max(0, n_kv - window) to n_kv. Both forms
+/// require an ordered concurrent-group boundary; the standalone form is
+/// transactional and caller-owned failures must be propagated.
+bool encode_mtp_window_ids(Context& context, Encoder& encoder,
+                           const MtpWindowIdsBuffers& buffers,
+                           std::string& error);
+bool encode_mtp_window_ids(Context& context, CommandBuffer& command_buffer,
+                           const MtpWindowIdsBuffers& buffers,
+                           std::string& error);
 
 }  // namespace strata::metal
