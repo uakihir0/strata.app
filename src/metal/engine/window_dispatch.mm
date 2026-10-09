@@ -192,6 +192,63 @@ bool validate_window_params(Context& context, BufferRef params_buffer,
     return true;
 }
 
+bool validate_speculative_window_params(
+    Context& context, BufferRef params_buffer, std::uint32_t vocabulary_size,
+    WindowParams& params, std::string& error) {
+    if (!params_buffer || !context.buffers().owns(params_buffer)) {
+        error = "Window speculative parameters are not owned by this Context";
+        return false;
+    }
+    if (params_buffer.length < sizeof(WindowParams) ||
+        params_buffer.offset % alignof(WindowParams) != 0u ||
+        params_buffer.contents == nullptr) {
+        error = "Window speculative parameters are undersized or misaligned";
+        return false;
+    }
+    if (vocabulary_size == 0u || vocabulary_size > 0x80000000u) {
+        error = "Window speculative vocabulary size must be in 1..2^31";
+        return false;
+    }
+
+    std::memcpy(&params, params_buffer.contents, sizeof(params));
+    if (params.T == 0u || params.T > kWindowMaxRows) {
+        error = "Window speculative row count must be in 1..8";
+        return false;
+    }
+    std::uint32_t expected_nc = 1u;
+    while (expected_nc < params.T) expected_nc <<= 1u;
+    if (params.nc != expected_nc) {
+        error = "Window speculative parameter columns do not match T";
+        return false;
+    }
+    if (static_cast<std::uint64_t>(params.pos0) + params.T >
+        static_cast<std::uint64_t>(INT32_MAX)) {
+        error = "Window speculative positions exceed the signed StepRow range";
+        return false;
+    }
+
+    for (std::uint32_t row = 0u; row < params.T; ++row) {
+        if ((params.tokens[row] & 0x80000000u) != 0u ||
+            params.tokens[row] >= vocabulary_size) {
+            error = "Window speculative token id is outside the text vocabulary";
+            return false;
+        }
+        const std::uint32_t position = params.pos0 + row;
+        const std::int32_t n_kv = static_cast<std::int32_t>(position + 1u);
+        const WindowStepRow expected{
+            static_cast<std::int32_t>(position), n_kv, n_kv / 4,
+            std::min(n_kv, static_cast<std::int32_t>(kWindowMaxSelectedCells))};
+        const WindowStepRow& actual = params.step[row];
+        if (actual.pos != expected.pos || actual.n_kv != expected.n_kv ||
+            actual.n_bid != expected.n_bid || actual.width != expected.width) {
+            error = "Window speculative StepRow does not match its position";
+            return false;
+        }
+    }
+    error.clear();
+    return true;
+}
+
 }  // namespace
 
 bool encode_window_embedding(Context& context, Encoder& encoder,
@@ -281,7 +338,7 @@ bool validate_cross_stage_views(
                 same_view(left[left_index], right[right_index])) {
                 continue;
             }
-            error = "Window T=1 layer-0 buffers overlap across " +
+            error = "Window layer-0 buffers overlap across " +
                     std::string(stage_pair) + " outside an exact scratch handoff";
             return false;
         }
@@ -371,6 +428,88 @@ bool validate_window_t1_attention_gdn_ffn(
     return true;
 }
 
+bool validate_window_attention_gdn_ffn(
+    Context& context, std::uint32_t vocabulary_size,
+    const WindowAttentionGDNFFNBuffers& buffers, WindowParams& params,
+    std::string& error) {
+    if (!validate_speculative_window_params(context, buffers.params,
+                                            vocabulary_size, params, error)) {
+        return false;
+    }
+    if (params.n_keep != 0u) {
+        error = "Window speculative attention/GDN/FFN stage requires n_keep=0";
+        return false;
+    }
+
+    const auto attention_views = gr_read_views(buffers.attention);
+    const auto gdn_views = gdn_block_views(buffers.gdn);
+    const auto ffn_views = gr_read_views(buffers.ffn);
+    const GRReadBuffers& attention = buffers.attention;
+    const GRReadBuffers& ffn = buffers.ffn;
+    if (!same_view(attention.mixed, buffers.gdn.mixed) ||
+        !same_view(buffers.gdn.mixed, ffn.mixed) ||
+        !same_view(buffers.gdn.block_out, ffn.block_out)) {
+        error = "Window speculative mixed and GDN block-output handoffs must reuse exact views";
+        return false;
+    }
+    if (!same_view(attention.residual, ffn.residual) ||
+        !same_view(attention.inject_out, ffn.inject_prev) ||
+        !same_view(attention.inject_prev, ffn.inject_out) ||
+        !same_view(attention.normalized, ffn.normalized) ||
+        !same_view(attention.rs, ffn.rs) ||
+        !same_view(attention.lo, ffn.lo)) {
+        error = "Window speculative GR reads must reuse residual, scratch and swapped injection views";
+        return false;
+    }
+
+    const auto parameters_are_disjoint = [&](const auto& views) {
+        for (const BufferRef& view : views) {
+            if (buffer_views_overlap(buffers.params, view)) return false;
+        }
+        return true;
+    };
+    if (!parameters_are_disjoint(attention_views) ||
+        !parameters_are_disjoint(gdn_views) ||
+        !parameters_are_disjoint(ffn_views)) {
+        error = "Window speculative parameters overlap a layer-0 stage buffer";
+        return false;
+    }
+
+    const auto attention_gdn_handoff = [](std::size_t left,
+                                          std::size_t right) {
+        return left == 11u && right == 0u;
+    };
+    const auto gdn_ffn_handoffs = [](std::size_t left, std::size_t right) {
+        return (left == 0u && right == 11u) ||
+               (left == 20u && right == 1u);
+    };
+    const auto attention_ffn_handoffs = [](std::size_t left,
+                                           std::size_t right) {
+        switch (left) {
+            case 0u: return right == 0u;
+            case 2u: return right == 9u;
+            case 4u: return right == 4u;
+            case 5u: return right == 5u;
+            case 8u: return right == 8u;
+            case 9u: return right == 2u;
+            case 11u: return right == 11u;
+            default: return false;
+        }
+    };
+    if (!validate_cross_stage_views(attention_views, gdn_views,
+                                    attention_gdn_handoff, "attention/GDN",
+                                    error) ||
+        !validate_cross_stage_views(gdn_views, ffn_views, gdn_ffn_handoffs,
+                                    "GDN/FFN", error) ||
+        !validate_cross_stage_views(attention_views, ffn_views,
+                                    attention_ffn_handoffs, "attention/FFN",
+                                    error)) {
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
 bool validate_window_t1_attention_gdn(
     Context& context, std::uint32_t vocabulary_size,
     const WindowT1AttentionGDNBuffers& buffers, std::string& error) {
@@ -420,6 +559,47 @@ bool validate_window_t1_attention_gdn(
     }
     error.clear();
     return true;
+}
+
+bool validate_window_attention_gdn(
+    Context& context, std::uint32_t vocabulary_size,
+    const WindowAttentionGDNBuffers& buffers, WindowParams& params,
+    std::string& error) {
+    if (!validate_speculative_window_params(context, buffers.params,
+                                            vocabulary_size, params, error)) {
+        return false;
+    }
+    if (params.n_keep != 0u) {
+        error = "Window speculative attention/GDN stage requires n_keep=0";
+        return false;
+    }
+
+    const auto attention_views = gr_read_views(buffers.attention);
+    const auto gdn_views = gdn_block_views(buffers.gdn);
+    if (!same_view(buffers.attention.mixed, buffers.gdn.mixed)) {
+        error = "Window attention mixed output must be the GDN mixed input";
+        return false;
+    }
+    for (const BufferRef& view : attention_views) {
+        if (buffer_views_overlap(buffers.params, view)) {
+            error = "Window speculative parameters overlap an attention buffer";
+            return false;
+        }
+    }
+    for (const BufferRef& view : gdn_views) {
+        if (buffer_views_overlap(buffers.params, view)) {
+            error = "Window speculative parameters overlap a GDN buffer";
+            return false;
+        }
+    }
+
+    const auto attention_gdn_handoff = [](std::size_t left,
+                                          std::size_t right) {
+        return left == 11u && right == 0u;
+    };
+    return validate_cross_stage_views(
+        attention_views, gdn_views, attention_gdn_handoff, "attention/GDN",
+        error);
 }
 
 bool validate_window_t1_moe_router_prefix(
@@ -872,6 +1052,40 @@ bool encode_window_t1_attention_gdn(
         error);
 }
 
+bool encode_window_attention_gdn(
+    Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
+    const WindowAttentionGDNBuffers& buffers, std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "Window speculative attention/GDN requires an ordered dispatch boundary";
+        return false;
+    }
+    WindowParams params{};
+    if (!validate_window_attention_gdn(context, vocabulary_size, buffers,
+                                       params, error)) {
+        return false;
+    }
+    if (!encode_gr_read(context, encoder, params.T, false, buffers.attention,
+                        error)) {
+        return false;
+    }
+    return encode_window_gdn_block(context, encoder, params.T, buffers.gdn,
+                                   error);
+}
+
+bool encode_window_attention_gdn(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size,
+    const WindowAttentionGDNBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Window speculative attention and GDN",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_attention_gdn(
+                context, encoder, vocabulary_size, buffers, encode_error);
+        },
+        error);
+}
+
 bool encode_window_t1_attention_gdn_ffn(
     Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
     const WindowT1AttentionGDNFFNBuffers& buffers, std::string& error) {
@@ -900,6 +1114,41 @@ bool encode_window_t1_attention_gdn_ffn(
         context, command_buffer, "Window T=1 layer-0 attention, GDN and FFN read",
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_window_t1_attention_gdn_ffn(
+                context, encoder, vocabulary_size, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_window_attention_gdn_ffn(
+    Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
+    const WindowAttentionGDNFFNBuffers& buffers, std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "Window speculative layer-0 GR/GDN chain requires ordered dispatch boundaries";
+        return false;
+    }
+    WindowParams params{};
+    if (!validate_window_attention_gdn_ffn(context, vocabulary_size, buffers,
+                                           params, error)) {
+        return false;
+    }
+    if (!encode_gr_read(context, encoder, params.T, false, buffers.attention,
+                        error) ||
+        !encode_window_gdn_block(context, encoder, params.T, buffers.gdn,
+                                 error)) {
+        return false;
+    }
+    return encode_gr_read(context, encoder, params.T, true, buffers.ffn, error);
+}
+
+bool encode_window_attention_gdn_ffn(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size,
+    const WindowAttentionGDNFFNBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Window speculative attention, GDN and FFN read",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_window_attention_gdn_ffn(
                 context, encoder, vocabulary_size, buffers, encode_error);
         },
         error);

@@ -31,6 +31,7 @@ struct WindowT1AttentionGDNBuffers {
     GRReadBuffers attention;
     WindowGDNBlockBuffers gdn;
 };
+using WindowAttentionGDNBuffers = WindowT1AttentionGDNBuffers;
 
 /// Layer 0's complete attention-read, speculative GDN, then FFN-read chain.
 /// All three `mixed` roles share one exact view. `gdn.block_out` and
@@ -48,6 +49,7 @@ struct WindowT1AttentionGDNFFNBuffers {
     WindowGDNBlockBuffers gdn;
     GRReadBuffers ffn;
 };
+using WindowAttentionGDNFFNBuffers = WindowT1AttentionGDNFFNBuffers;
 
 /// Layer 0 followed by the T=1 router projection, top-10 routing and MoE
 /// input quantization. The router reads the FFN `mixed` output; its logits
@@ -129,6 +131,20 @@ bool encode_window_t1_attention_gdn(
     std::uint32_t vocabulary_size,
     const WindowT1AttentionGDNBuffers& buffers, std::string& error);
 
+/// Multi-row speculative form of the attention/GDN chain. Infer T from the
+/// validated WindowParams block (1..8), require n_keep=0, and encode the
+/// attention read followed by the GDN block in one ordered segment. The
+/// caller must propagate false from an enclosing Encoder::encode body so an
+/// earlier attention dispatch is discarded if the GDN stage fails.
+bool encode_window_attention_gdn(
+    Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
+    const WindowAttentionGDNBuffers& buffers, std::string& error);
+/// Standalone transactional form. A late failure discards the attention read.
+bool encode_window_attention_gdn(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size,
+    const WindowAttentionGDNBuffers& buffers, std::string& error);
+
 /// Encode the layer-0 attention read (`apply=false`), speculative GDN block,
 /// and FFN read (`apply=true`) in one ordered segment. The FFN read consumes
 /// the GDN block output and attention injection, then writes the swapped
@@ -143,6 +159,20 @@ bool encode_window_t1_attention_gdn_ffn(
     Context& context, CommandBuffer& command_buffer,
     std::uint32_t vocabulary_size,
     const WindowT1AttentionGDNFFNBuffers& buffers, std::string& error);
+
+/// Multi-row speculative layer-0 attention/GDN/FFN-read chain, with T inferred
+/// from the validated parameter block. All rows must remain speculative
+/// (`n_keep=0`) so persistent GDN state/history are not advanced. The caller
+/// must propagate false from an enclosing Encoder::encode body so any earlier
+/// stage is discarded if a later stage fails.
+bool encode_window_attention_gdn_ffn(
+    Context& context, Encoder& encoder, std::uint32_t vocabulary_size,
+    const WindowAttentionGDNFFNBuffers& buffers, std::string& error);
+/// Standalone transactional form. A late failure discards all earlier stages.
+bool encode_window_attention_gdn_ffn(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t vocabulary_size,
+    const WindowAttentionGDNFFNBuffers& buffers, std::string& error);
 
 /// Encode the T=1 layer-0 attention/GDN/FFN-read chain, BF16 router, top-10
 /// Window route (`divide_weights=false`), then Q8_1 quantization of `mixed`
