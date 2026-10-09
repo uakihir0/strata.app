@@ -10278,3 +10278,38 @@ measuring L-15 remain open.
   the n=64 MPP rollback and X_lo/Y alias rollback cases, all eight focused
   serial/concurrent MPP, SIMD and automatic selector CTests passed again.
   `test_map.py`, `check_drift.py` and `git diff --check` passed.
+
+### D-IMPL-363: Plan bounded Prefill chunk ranges on the host
+
+- **Decision:** Add `build_prefill_chunk_schedule`, which converts a prompt
+  token count into contiguous ranges containing a token offset, absolute
+  starting position and live row count. Require `1 <= chunk_rows <=
+  kPrefillMaxShaderRows`, leave the final range unpadded, return an empty
+  schedule for an empty prompt, and reject a non-empty prompt whose positions
+  exceed the signed `StepRow` range. Preserve the caller's previous schedule
+  on failure. The caller can pass each token subspan to
+  `build_prefill_chunk_metadata`; the planner does not duplicate token data.
+- **Reason:** The documented `Prefill::run` loop needs exact chunk boundaries
+  and absolute positions before it can prepare each chunk's metadata. A
+  device-free planner gives that loop a testable, bounded host primitive while
+  avoiding token copies and keeping prompt execution explicitly unimplemented.
+- **Review items:** Preserve non-empty contiguous coverage, no padding, the
+  empty-prompt behavior, signed-position rejection and failure atomicity when
+  this planner is wired into `Prefill::run`.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `prefill_chunk_test` passed 1/1 and the full `mac-host` preset
+  passed 45/45, including the existing unavailable-real-input skip.
+
+### REV-160: Hostile review of Prefill chunk scheduling
+
+- **Scope:** Range construction, integer bounds, empty and tail chunks,
+  output preservation, tests, and documentation.
+- **Findings and fixes:** An independent adversarial review found no
+  actionable issues and required no code changes. The tests exercise both
+  chunk ranges and their handoff to `build_prefill_chunk_metadata`.
+- **Disposition:** The host planner is verified independently of GPU
+  execution. Production chunk submission, layer scheduling and model-backed
+  Prefill remain open.
+- **Validation:** `prefill_chunk_test` passed 1/1, `mac-host` passed 45/45
+  with one unavailable-real-input test skipped, `test_map` passed, and
+  `git diff --check` passed.

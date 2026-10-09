@@ -23,7 +23,10 @@ The isolated environment-driven GEMM selector and transactional BF16X2
 high-plus-remainder coordinator are implemented. Host policy and selector
 tests plus GPU dispatch tests cover backend choice, both BF16X2 products,
 rollback and scalar numerical checks. Most Prefill GEMMs, layer scheduling,
-the production chunk loop and model-backed inference remain unimplemented.
+and the production chunk execution loop and model-backed inference remain
+unimplemented. A device-free host planner now partitions prompt token counts
+into bounded, contiguous, unpadded ranges with absolute positions; production
+submission and execution are still pending.
 Neither the selector nor its F16/BF16 MPP/SIMD components is called by
 production Prefill. The tiled convolution
 reads the old history, and the separate history-update encoder runs after it

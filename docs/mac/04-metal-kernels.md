@@ -3709,11 +3709,16 @@ section 6.5, in this order:
   slot needs nothing else.
 - Kernels that run over the whole chunk bind `PrefillParams` itself, whose first field is T.
 
-`build_prefill_chunk_metadata` in `src/metal/engine/prefill.cpp` now constructs these host inputs for one chunk:
-it copies the token words, derives the six slot row counts and `PrefillParams`, builds one signed `StepRow` per token,
-and records whether any token has the image bit set. It rejects empty chunks, rows beyond the GR broadcast
-32-bit-index limit, and positions whose `StepRow` values do not fit `int`; a failed build leaves its output unchanged.
-The helper does not encode or execute the prompt path, which remains the work of `Prefill::run`.
+`build_prefill_chunk_schedule` in `src/metal/engine/prefill.cpp` splits a prompt token count into contiguous,
+non-empty ranges no larger than the configured chunk size. Each range carries its token offset, absolute `p0` and row
+count; the last range is not padded. Empty prompts produce no ranges. Invalid chunk sizes and prompt positions that
+exceed the signed `StepRow` range are rejected without changing the output.
+
+`build_prefill_chunk_metadata` constructs the host inputs for one scheduled range: it copies the token words,
+derives the six slot row counts and `PrefillParams`, builds one signed `StepRow` per token, and records whether any
+token has the image bit set. It rejects empty chunks, rows beyond the GR broadcast 32-bit-index limit, and positions
+whose `StepRow` values do not fit `int`; a failed build leaves its output unchanged. These host helpers do not encode
+or execute the prompt path, which remains the work of `Prefill::run`.
 
 **Per chunk**, the host:
 1. waits for chunk k's PLE rows, and starts decoding chunk k + 1's;

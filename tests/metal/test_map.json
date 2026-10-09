@@ -216,7 +216,7 @@
     },
     "prefill_chunk_test": {
       "label": "host",
-      "origin": "06 1.5"
+      "origin": "04 §6.1 / 06 1.5 / D-IMPL-363 / REV-160"
     },
     "prefill_gemm_selector_test": {
       "label": "host",
