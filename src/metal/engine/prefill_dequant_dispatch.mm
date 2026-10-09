@@ -17,6 +17,7 @@ namespace {
 
 constexpr std::uint32_t kValuesPerQ2Block = 64u;
 constexpr std::uint32_t kValuesPer32ValueBlock = 32u;
+constexpr std::uint32_t kValuesPerQ4KBlock = 256u;
 constexpr std::uint32_t kThreads = 256u;
 constexpr std::size_t kHalfBytes = sizeof(std::uint16_t);
 constexpr std::uint32_t kMaxSignedExtent =
@@ -26,6 +27,7 @@ static_assert(sizeof(block_iq4_nl) == 18u);
 static_assert(sizeof(block_q4_0) == 18u);
 static_assert(sizeof(block_q5_0) == 22u);
 static_assert(sizeof(block_q8_0) == 34u);
+static_assert(sizeof(block_q4_K) == 144u);
 static_assert(sizeof(PrefillDequantParams) == 2u * sizeof(std::uint32_t));
 
 bool checked_multiply(std::size_t left, std::size_t right,
@@ -262,6 +264,29 @@ bool encode_prefill_dequant_q5_0(Context& context,
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_prefill_dequant_q5_0(context, encoder, params,
                                                buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_prefill_dequant_q4_k(Context& context, Encoder& encoder,
+                                 const PrefillDequantParams& params,
+                                 const PrefillDequantBuffers& buffers,
+                                 std::string& error) {
+    return encode_dequant_dispatch<block_q4_K>(
+        context, encoder, params, buffers, "Q4_K",
+        "strata_pf_dequant_q4_k", kValuesPerQ4KBlock, error);
+}
+
+bool encode_prefill_dequant_q4_k(Context& context,
+                                 CommandBuffer& command_buffer,
+                                 const PrefillDequantParams& params,
+                                 const PrefillDequantBuffers& buffers,
+                                 std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Prefill Q4_K dequantization",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_dequant_q4_k(
+                context, encoder, params, buffers, encode_error);
         },
         error);
 }
