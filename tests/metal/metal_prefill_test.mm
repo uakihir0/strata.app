@@ -1372,6 +1372,253 @@ bool test_prefill_gr_read_chain(Context& context) {
                               "mixer BF16 remainder");
         }
 
+        PrefillGRReadTestOutputs reused_read;
+        TestBuffer reused_mixed_bf, reused_mixed_bf_lo, reused_mixed_h;
+        const bool reused_allocated =
+            reused_read.allocate(context, rows, write_low,
+                                 label + " prepared-norm read", error) &&
+            reused_mixed_bf.allocate(
+                context, label + " prepared-norm mixed BF16", mixed_bytes,
+                error) &&
+            (!mix_write_low ||
+             reused_mixed_bf_lo.allocate(
+                 context, label + " prepared-norm mixed BF16 low",
+                 mixed_bytes, error)) &&
+            reused_mixed_h.allocate(
+                context, label + " prepared-norm mixed F16", mixed_bytes,
+                error);
+        check(reused_allocated,
+              label + " allocate prepared-norm read/mix outputs", error);
+        if (!reused_allocated) return false;
+
+        PrefillGRReadBuffers reused_read_buffers = reused_read.bind(
+            residual.view(), norm.view(), down_read, up_read, inject_read,
+            write_low);
+        reused_read_buffers.rs = integrated_read_buffers.rs;
+        reused_read_buffers.xn16 = integrated_read_buffers.xn16;
+        if (write_low) {
+            reused_read_buffers.xn16_lo = integrated_read_buffers.xn16_lo;
+        }
+        const std::vector<std::uint8_t> prepared_rs_before(
+            integrated_read.rs.payload().begin(),
+            integrated_read.rs.payload().end());
+        const std::vector<std::uint8_t> prepared_xn16_before(
+            integrated_read.xn16.payload().begin(),
+            integrated_read.xn16.payload().end());
+        const std::vector<std::uint8_t> prepared_xn16_lo_before =
+            write_low
+                ? std::vector<std::uint8_t>(
+                      integrated_read.xn16_lo.payload().begin(),
+                      integrated_read.xn16_lo.payload().end())
+                : std::vector<std::uint8_t>{};
+        PrefillGRReadBuffers projection_only_buffers = reused_read_buffers;
+        projection_only_buffers.residual = {};
+        projection_only_buffers.norm = {};
+
+        auto reused_read_command =
+            context.make_command_buffer(label + " prepared-norm read", error);
+        if (!reused_read_command) {
+            check(false, label + " prepared-norm read command buffer", error);
+            return false;
+        }
+        const bool reused_read_encoded = Encoder::encode(
+            context, *reused_read_command, "prepared-norm Prefill GR read",
+            [&](Encoder& encoder, std::string& encode_error) {
+                return encode_prefill_gr_read_pre_normalized(
+                    context, encoder, rows, modes[mode_index],
+                    projection_only_buffers, encode_error);
+            },
+            error);
+        check(reused_read_encoded,
+              label + " prepared-norm GR read encode", error);
+        if (!reused_read_encoded) return false;
+        const bool reused_read_completed = submit_and_wait(
+            reused_read_command, label + " prepared-norm read", error);
+        check(reused_read_completed,
+              label + " prepared-norm GR read dispatch", error);
+        if (!reused_read_completed) return false;
+        passed &= compare(reused_read.low_rank, integrated_read.low_rank,
+                          "prepared-norm down projection");
+        passed &= compare(reused_read.low_rank_bf16,
+                          integrated_read.low_rank_bf16,
+                          "prepared-norm SiLU conversion");
+        passed &= compare(reused_read.gated, integrated_read.gated,
+                          "prepared-norm up projection");
+        passed &= compare(reused_read.inject, integrated_read.inject,
+                          "prepared-norm injection projection");
+        if (write_low) {
+            passed &= compare(reused_read.low_rank_bf16_lo,
+                              integrated_read.low_rank_bf16_lo,
+                              "prepared-norm SiLU remainder");
+        }
+
+        const PrefillGRReadMixBuffers reused_mix_buffers{
+            reused_read_buffers,
+            reused_mixed_bf.view(),
+            mix_write_low ? reused_mixed_bf_lo.view() : BufferRef{},
+            reused_mixed_h.view()};
+        auto reused_mix_command =
+            context.make_command_buffer(label + " prepared-norm read/mix",
+                                        error);
+        if (!reused_mix_command) {
+            check(false, label + " prepared-norm read/mix command buffer",
+                  error);
+            return false;
+        }
+        const bool reused_mix_encoded = encode_prefill_gr_read_mix_pre_normalized(
+            context, *reused_mix_command, rows, modes[mode_index],
+            reused_mix_buffers, error);
+        check(reused_mix_encoded,
+              label + " prepared-norm GR read/mix encode", error);
+        if (!reused_mix_encoded) return false;
+        const bool reused_mix_completed = submit_and_wait(
+            reused_mix_command, label + " prepared-norm read/mix", error);
+        check(reused_mix_completed,
+              label + " prepared-norm GR read/mix dispatch", error);
+        if (!reused_mix_completed) return false;
+        passed &= compare(reused_read.low_rank, integrated_read.low_rank,
+                          "prepared-norm read/mix down projection");
+        passed &= compare(reused_read.low_rank_bf16,
+                          integrated_read.low_rank_bf16,
+                          "prepared-norm read/mix SiLU conversion");
+        passed &= compare(reused_read.gated, integrated_read.gated,
+                          "prepared-norm read/mix up projection");
+        passed &= compare(reused_read.inject, integrated_read.inject,
+                          "prepared-norm read/mix injection projection");
+        passed &= compare(reused_mixed_bf, mixed_bf,
+                          "prepared-norm mixer BF16");
+        passed &= compare(reused_mixed_h, mixed_h,
+                          "prepared-norm mixer F16");
+        if (write_low) {
+            passed &= compare(reused_read.low_rank_bf16_lo,
+                              integrated_read.low_rank_bf16_lo,
+                              "prepared-norm read/mix SiLU remainder");
+        }
+        if (mix_write_low) {
+            passed &= compare(reused_mixed_bf_lo, mixed_bf_lo,
+                              "prepared-norm mixer BF16 remainder");
+        }
+        PrefillGRReadMixBuffers missing_mixer_input = reused_mix_buffers;
+        missing_mixer_input.read.residual = {};
+        auto missing_mixer_input_command = context.make_command_buffer(
+            label + " prepared-norm missing residual", error);
+        if (!missing_mixer_input_command) {
+            check(false,
+                  label + " prepared-norm missing-input command buffer",
+                  error);
+            return false;
+        }
+        const bool missing_mixer_input_encoded =
+            encode_prefill_gr_read_mix_pre_normalized(
+                context, *missing_mixer_input_command, rows,
+                modes[mode_index], missing_mixer_input, error);
+        const bool missing_mixer_input_rejected =
+            !missing_mixer_input_encoded &&
+            missing_mixer_input_command->unsafe_native_handle() == nullptr &&
+            error.find("residual buffer is not owned") != std::string::npos;
+        check(missing_mixer_input_rejected,
+              label + " prepared-norm mixer validates residual before dispatch",
+              error);
+        passed &= missing_mixer_input_rejected;
+        enum class ProjectionOutput {
+            gated,
+            inject,
+            low_rank_remainder,
+        };
+        const auto rejects_projection_alias =
+            [&](std::string_view output_name, std::string_view input_name,
+                BufferRef input, ProjectionOutput projection_output) {
+                PrefillGRReadMixBuffers aliased_input = reused_mix_buffers;
+                if (projection_output == ProjectionOutput::inject) {
+                    aliased_input.read.inject = input;
+                } else if (projection_output ==
+                           ProjectionOutput::low_rank_remainder) {
+                    aliased_input.read.low_rank_bf16_lo = input;
+                } else {
+                    aliased_input.read.gated = input;
+                }
+                auto alias_command = context.make_command_buffer(
+                    label + " prepared-norm " + std::string(output_name) +
+                        "/" + std::string(input_name) + " alias",
+                    error);
+                if (!alias_command) {
+                    check(false,
+                          label + " prepared-norm " +
+                              std::string(output_name) + "/" +
+                              std::string(input_name) +
+                              " alias command buffer",
+                          error);
+                    return false;
+                }
+                const bool encoded =
+                    encode_prefill_gr_read_mix_pre_normalized(
+                        context, *alias_command, rows, modes[mode_index],
+                        aliased_input, error);
+                const bool rejected =
+                    !encoded &&
+                    alias_command->unsafe_native_handle() == nullptr &&
+                    error.find(
+                        "GR read projection output overlaps a mixer read input") !=
+                        std::string::npos;
+                check(rejected,
+                      label + " prepared-norm " +
+                          std::string(output_name) + " cannot overwrite " +
+                          std::string(input_name),
+                      error);
+                return rejected;
+            };
+        passed &= rejects_projection_alias(
+            "gated", "residual", residual.view(), ProjectionOutput::gated);
+        passed &= rejects_projection_alias(
+            "inject", "residual", residual.view(), ProjectionOutput::inject);
+        passed &= rejects_projection_alias(
+            "inject", "norm weights", norm.view(), ProjectionOutput::inject);
+        if (write_low) {
+            passed &= rejects_projection_alias(
+                "low-rank remainder", "residual", residual.view(),
+                ProjectionOutput::low_rank_remainder);
+        }
+        if (rows == 1u) {
+            passed &= rejects_projection_alias(
+                "gated", "norm weights", norm.view(), ProjectionOutput::gated);
+        }
+        const bool prepared_norm_unchanged =
+            std::equal(prepared_rs_before.begin(), prepared_rs_before.end(),
+                       integrated_read.rs.payload().begin()) &&
+            std::equal(prepared_xn16_before.begin(),
+                       prepared_xn16_before.end(),
+                       integrated_read.xn16.payload().begin()) &&
+            (!write_low ||
+             std::equal(prepared_xn16_lo_before.begin(),
+                        prepared_xn16_lo_before.end(),
+                        integrated_read.xn16_lo.payload().begin()));
+        check(prepared_norm_unchanged,
+              label + " prepared normalization remains unchanged");
+        passed &= prepared_norm_unchanged;
+
+        PrefillGRReadBuffers reused_alias = reused_read_buffers;
+        reused_alias.low_rank = integrated_read_buffers.xn16;
+        auto reused_alias_command =
+            context.make_command_buffer(label + " prepared-norm alias",
+                                        error);
+        if (!reused_alias_command) {
+            check(false, label + " prepared-norm alias command buffer",
+                  error);
+            return false;
+        }
+        const bool reused_alias_encoded = encode_prefill_gr_read_pre_normalized(
+            context, *reused_alias_command, rows, modes[mode_index],
+            reused_alias, error);
+        const bool reused_alias_rejected =
+            !reused_alias_encoded &&
+            reused_alias_command->unsafe_native_handle() == nullptr &&
+            error.find("writable output overlaps a read-only input") !=
+                std::string::npos;
+        check(reused_alias_rejected,
+              label + " prepared-norm state cannot alias a projection output",
+              error);
+        passed &= reused_alias_rejected;
+
         const bool integrated_guards =
             integrated_read.rs.guards_intact() &&
             integrated_read.xn16.guards_intact() &&
@@ -1386,6 +1633,17 @@ bool test_prefill_gr_read_chain(Context& context) {
               integrated_read.low_rank_bf16_lo.guards_intact()));
         check(integrated_guards, label + " integrated read/mix guards");
         passed &= integrated_guards;
+        const bool reused_guards =
+            reused_read.low_rank.guards_intact() &&
+            reused_read.low_rank_bf16.guards_intact() &&
+            reused_read.gated.guards_intact() &&
+            reused_read.inject.guards_intact() &&
+            reused_mixed_bf.guards_intact() &&
+            reused_mixed_h.guards_intact() &&
+            (!write_low || reused_read.low_rank_bf16_lo.guards_intact()) &&
+            (!mix_write_low || reused_mixed_bf_lo.guards_intact());
+        check(reused_guards, label + " prepared-norm read/mix guards");
+        passed &= reused_guards;
 
         struct ReadInputAlias {
             std::string_view name;
@@ -7729,6 +7987,154 @@ bool run_prefill_attention_gdn_transition_case(Context& context, std::uint32_t r
         return false;
     }
 
+    GDNTransitionTestOutputs prepared_handoff;
+    const bool prepared_handoff_allocated =
+        prepared_handoff.allocate(context, rows, mode,
+                                  label + " prepared handoff", error);
+    check(prepared_handoff_allocated,
+          label + " allocate prepared producer/consumer handoff", error);
+    if (!prepared_handoff_allocated) return false;
+    std::memcpy(prepared_handoff.residual.payload().data(),
+                initial_residual.data(), residual_bytes);
+    prepared_handoff.gdn.initialize_persistent_state();
+    const PrefillAttentionGDNTransitionBuffers prepared_producer =
+        bind_gdn_transition(context, gdn_inputs, prepared_handoff,
+                            norm.view(), down_read, up_read, inject_read,
+                            next_norm_read, mode);
+    const PrefillGRReadMixBuffers prepared_consumer =
+        bind_gdn_layer_read_mix(prepared_handoff, next_norm.view(), down_read,
+                                up_read, inject_read, mode);
+    auto prepared_handoff_command = context.make_command_buffer(
+        label + " prepared producer/consumer handoff", error);
+    if (!prepared_handoff_command) {
+        check(false, label + " prepared handoff command buffer", error);
+        return false;
+    }
+    const bool prepared_handoff_encoded = Encoder::encode(
+        context, *prepared_handoff_command,
+        label + " ordered prepared producer/consumer",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_attention_gdn_transition(
+                       context, encoder, rows, mode, prepared_producer,
+                       encode_error) &&
+                   encode_prefill_gr_read_mix_pre_normalized(
+                       context, encoder, rows, mode, prepared_consumer,
+                       encode_error);
+        },
+        error);
+    check(prepared_handoff_encoded,
+          label + " prepared producer/consumer encode", error);
+    if (!prepared_handoff_encoded) return false;
+    const bool prepared_handoff_completed = submit_and_wait(
+        prepared_handoff_command, label + " prepared handoff", error);
+    check(prepared_handoff_completed,
+          label + " prepared producer/consumer dispatch", error);
+    if (!prepared_handoff_completed) return false;
+
+    PrefillGRReadTestOutputs prepared_reference;
+    TestBuffer prepared_reference_mixed_bf, prepared_reference_mixed_bf_lo,
+        prepared_reference_mixed_h;
+    const std::size_t prepared_mixer_bytes =
+        static_cast<std::size_t>(rows) * kWidth * kGdnHalfBytes;
+    const bool prepared_reference_allocated =
+        prepared_reference.allocate(
+            context, rows, read_low, label + " prepared read reference",
+            error) &&
+        prepared_reference_mixed_bf.allocate(
+            context, label + " prepared reference mixed BF16",
+            prepared_mixer_bytes, error) &&
+        (mode == PrefillBF16X2Mode::off ||
+         prepared_reference_mixed_bf_lo.allocate(
+             context, label + " prepared reference mixed BF16 low",
+             prepared_mixer_bytes, error)) &&
+        prepared_reference_mixed_h.allocate(
+            context, label + " prepared reference mixed F16",
+            prepared_mixer_bytes, error);
+    check(prepared_reference_allocated,
+          label + " allocate prepared read reference", error);
+    if (!prepared_reference_allocated) return false;
+    const PrefillGRReadBuffers prepared_reference_read =
+        prepared_reference.bind(prepared_handoff.residual.view(),
+                                next_norm.view(), down_read, up_read,
+                                inject_read, read_low);
+    const PrefillGRReadMixBuffers prepared_reference_mix{
+        prepared_reference_read,
+        prepared_reference_mixed_bf.view(),
+        mode == PrefillBF16X2Mode::off
+            ? BufferRef{}
+            : prepared_reference_mixed_bf_lo.view(),
+        prepared_reference_mixed_h.view()};
+    auto prepared_reference_command = context.make_command_buffer(
+        label + " recomputed normalization reference", error);
+    if (!prepared_reference_command) {
+        check(false, label + " recomputed reference command buffer", error);
+        return false;
+    }
+    const bool prepared_reference_encoded = encode_prefill_gr_read_mix(
+        context, *prepared_reference_command, rows, mode,
+        prepared_reference_mix, error);
+    check(prepared_reference_encoded,
+          label + " recomputed read/mix reference encode", error);
+    if (!prepared_reference_encoded) return false;
+    const bool prepared_reference_completed = submit_and_wait(
+        prepared_reference_command, label + " recomputed reference", error);
+    check(prepared_reference_completed,
+          label + " recomputed read/mix reference dispatch", error);
+    if (!prepared_reference_completed) return false;
+
+    bool prepared_handoff_matches = true;
+    const auto compare_handoff = [&](const TestBuffer& actual,
+                                     const TestBuffer& expected,
+                                     std::string_view stage) {
+        const auto actual_bytes = actual.payload();
+        const auto expected_bytes = expected.payload();
+        const bool equal =
+            actual_bytes.size() == expected_bytes.size() &&
+            std::equal(actual_bytes.begin(), actual_bytes.end(),
+                       expected_bytes.begin());
+        check(equal, label + " prepared handoff " + std::string(stage));
+        prepared_handoff_matches &= equal;
+    };
+    compare_handoff(prepared_handoff.residual, composed.residual,
+                    "preserves the transition residual");
+    compare_handoff(prepared_handoff.gr.rs, composed.gr.rs,
+                    "preserves prepared scale");
+    compare_handoff(prepared_handoff.gr.xn16, composed.gr.xn16,
+                    "preserves prepared BF16 values");
+    compare_handoff(prepared_handoff.gr.low_rank,
+                    prepared_reference.low_rank, "down projection parity");
+    compare_handoff(prepared_handoff.gr.low_rank_bf16,
+                    prepared_reference.low_rank_bf16,
+                    "SiLU conversion parity");
+    compare_handoff(prepared_handoff.gr.gated, prepared_reference.gated,
+                    "up projection parity");
+    compare_handoff(prepared_handoff.gr.inject,
+                    prepared_reference.inject, "injection projection parity");
+    compare_handoff(prepared_handoff.mixed_bf,
+                    prepared_reference_mixed_bf, "mixer BF16 parity");
+    compare_handoff(prepared_handoff.mixed_h,
+                    prepared_reference_mixed_h, "mixer F16 parity");
+    compare_handoff(prepared_reference.rs, composed.gr.rs,
+                    "recomputed scale matches producer");
+    compare_handoff(prepared_reference.xn16, composed.gr.xn16,
+                    "recomputed BF16 values match producer");
+    if (read_low) {
+        compare_handoff(prepared_handoff.gr.xn16_lo, composed.gr.xn16_lo,
+                        "preserves prepared remainder");
+        compare_handoff(prepared_handoff.gr.low_rank_bf16_lo,
+                        prepared_reference.low_rank_bf16_lo,
+                        "SiLU remainder parity");
+        compare_handoff(prepared_reference.xn16_lo, composed.gr.xn16_lo,
+                        "recomputed remainder matches producer");
+    }
+    if (mode != PrefillBF16X2Mode::off) {
+        compare_handoff(prepared_handoff.mixed_bf_lo,
+                        prepared_reference_mixed_bf_lo,
+                        "mixer remainder parity");
+    }
+    check(prepared_handoff_matches,
+          label + " fused producer output feeds pre-normalized read/mix");
+
     const PrefillAttentionGDNTransitionBuffers direct_buffers =
         bind_gdn_transition(context, gdn_inputs, direct, norm.view(),
                              down_read, up_read, inject_read, next_norm_read,
@@ -7859,8 +8265,18 @@ bool run_prefill_attention_gdn_transition_case(Context& context, std::uint32_t r
 
     std::vector<TestBuffer*> composed_buffers_to_check;
     std::vector<TestBuffer*> direct_buffers_to_check;
+    std::vector<TestBuffer*> prepared_buffers_to_check;
     composed.collect_buffers(composed_buffers_to_check);
     direct.collect_buffers(direct_buffers_to_check);
+    prepared_handoff.collect_buffers(prepared_buffers_to_check);
+    prepared_buffers_to_check.insert(
+        prepared_buffers_to_check.end(),
+        {&prepared_reference.rs, &prepared_reference.xn16,
+         &prepared_reference.xn16_lo, &prepared_reference.low_rank,
+         &prepared_reference.low_rank_bf16,
+         &prepared_reference.low_rank_bf16_lo, &prepared_reference.gated,
+         &prepared_reference.inject, &prepared_reference_mixed_bf,
+         &prepared_reference_mixed_bf_lo, &prepared_reference_mixed_h});
     const auto buffer_snapshots = [](const std::vector<TestBuffer*>& list) {
         std::vector<std::vector<std::uint8_t>> result;
         result.reserve(list.size());
@@ -8160,10 +8576,12 @@ bool run_prefill_attention_gdn_transition_case(Context& context, std::uint32_t r
     };
     check_output_guards(composed_buffers_to_check);
     check_output_guards(direct_buffers_to_check);
+    check_output_guards(prepared_buffers_to_check);
     check(guards, label + " all active input/output guard regions");
 
     return outputs_match && model_inputs_unchanged && aliases_rejected &&
-           late_failure_rolled_back && open_group_rejected && guards;
+           late_failure_rolled_back && open_group_rejected && guards &&
+           prepared_handoff_matches;
 }
 
 bool test_prefill_attention_gdn_transition(Context& context) {
