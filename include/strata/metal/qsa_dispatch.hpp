@@ -227,8 +227,10 @@ bool encode_qsa_kv_append_i8(
     std::uint32_t token_rows, std::uint32_t cell_capacity,
     const QsaKvAppendI8Buffers& buffers, std::string& error);
 /// Prefill-sized int8 KV append, preserving the Window overload's 1..8 limit.
-/// The standalone form validates before encoding; the caller-owned form must
-/// propagate false so the enclosing Encoder segment is discarded.
+/// Cell positions must be unique, and K/V values must be finite. The encoder
+/// does not scan values that may have been produced by earlier GPU work in the
+/// same command buffer. The standalone form validates before encoding; the
+/// caller-owned form must propagate false so its Encoder segment is discarded.
 bool encode_prefill_qsa_kv_append_i8(
     Context& context, CommandBuffer& command_buffer,
     std::uint32_t token_rows, std::uint32_t cell_capacity,
@@ -259,8 +261,11 @@ bool encode_qsa_kv_append_q4(
     std::uint32_t token_rows, std::uint32_t cell_capacity,
     const QsaKvAppendQ4Buffers& buffers, std::string& error);
 /// Prefill-sized q4_0 KV append, preserving the Window overload's 1..8 limit.
-/// The caller must encode FWHT256 on both K and V first. The standalone form
-/// validates before encoding; the caller-owned form must propagate false.
+/// K/V values must be finite; each nonzero block's fp32 reciprocal scale and
+/// stored fp16 scale must remain finite. The caller must encode FWHT256 on
+/// both K and V earlier in the same ordered command buffer/Encoder segment,
+/// outside an open concurrent dispatch group. The standalone form validates
+/// before encoding; the caller-owned form must propagate false.
 bool encode_prefill_qsa_kv_append_q4(
     Context& context, CommandBuffer& command_buffer,
     std::uint32_t token_rows, std::uint32_t cell_capacity,
@@ -296,9 +301,13 @@ bool encode_qsa_kv_append_k8v4(
     std::uint32_t token_rows, std::uint32_t cell_capacity,
     const QsaKvAppendK8V4Buffers& buffers, std::string& error);
 /// Prefill-sized hybrid KV append, preserving the Window overload's 1..8
-/// limit. The caller must encode FWHT256 on V first. The standalone form
-/// validates its inputs before encoding; the caller-owned form must propagate
-/// false.
+/// limit. K/V values and their stored fp16 scales must remain finite; each
+/// nonzero transformed V block's fp32 reciprocal q4 scale must also remain
+/// finite. K, V and steps must be disjoint because V is transformed in place.
+/// The caller must encode FWHT256 on V earlier in the same ordered command
+/// buffer/Encoder segment, outside an open concurrent dispatch group. The
+/// standalone form validates its inputs before encoding; the caller-owned
+/// form must propagate false.
 bool encode_prefill_qsa_kv_append_k8v4(
     Context& context, CommandBuffer& command_buffer,
     std::uint32_t token_rows, std::uint32_t cell_capacity,

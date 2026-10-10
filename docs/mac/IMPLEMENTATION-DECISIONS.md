@@ -11208,17 +11208,19 @@ measuring L-15 remain open.
   retains the original allocation-free pairwise check through eight rows and
   sorts only larger batches. The reviewer also found no test for duplicate
   positions above eight; T=9 cases now reject a duplicate final position in
-  every format through both standalone and caller-owned APIs.
-- **Disposition:** The first two findings are fixed and covered by focused
-  serial/concurrent QSA tests. The reviewer also noted that the inclusive row
-  bound is accepted only through preflight, not through an actual maximum-size
-  GPU dispatch. This remains an explicit coverage limit: dispatching
-  419,430 rows requires 838,860 threadgroups plus multi-gigabyte input and
-  cache views. A compile-time assertion proves the maximum
-  `token_rows * N_HEAD_KV` shader index fits `uint32_t`; T=9 exercises the
-  dispatched path. Window calls still enforce 1..8 rows, and Prefill
-  scheduling remains pending.
+  every format through both standalone and caller-owned APIs. A follow-up
+  review found that the Prefill int8 contract omitted its finite-input
+  precondition and the q4_0/k8v4 contracts did not state that FWHT must precede
+  append in the same ordered command buffer/Encoder segment, outside an open
+  concurrent dispatch group. The public comments now state those conditions,
+  including the existing q4 scale constraints and the k8v4 in-place V rule.
+- **Disposition:** All actionable findings are fixed. The original maximum-row
+  concern remains an explicit coverage limit: dispatching 419,430 rows
+  requires 838,860 threadgroups plus multi-gigabyte input and cache views. A
+  compile-time assertion proves the maximum `token_rows * N_HEAD_KV` shader
+  index fits `uint32_t`; T=9 exercises the dispatched path. Window calls still
+  enforce 1..8 rows, and Prefill scheduling remains pending.
 - **Validation:** `mac-dev` build passed; QSA serial/concurrent tests passed
   2/2, `test_map` passed 1/1, `git diff --check` passed, and the full
-  `mac-metal` suite passed 90/90. A follow-up hostile review of the corrected
-  tree is in progress.
+  `mac-metal` suite passed 90/90. A hostile follow-up review of the corrected
+  source and tests found no remaining code defect.
