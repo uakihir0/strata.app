@@ -4646,6 +4646,16 @@ dimensions are section 5.6's. `qi` is the layer's index among the 12 QSA layers.
   complete a block that began in an earlier chunk;
 - `idx_e = 4·⌊(p0 + T)/4⌋`: the end of the chunk's last completed block.
 
+`encode_qsa_norm_rope` retains the Window decode row limit of 1..8.
+`encode_prefill_qsa_norm_rope` uses the same validated norm/RoPE shader for
+larger Prefill chunks up to `kPrefillMaxShaderRows`; its row×head grid remains
+below the 32-bit shader index bound. Key and indexer-query modes retain exact
+in-place operation, while the strided query input and compact output remain
+disjoint. Serial and concurrent tests compare all three modes at 65 rows with
+the scalar oracle through standalone and caller-owned Encoder forms. This
+implements only the norm/RoPE substage; Prefill KV append, indexer, selection,
+attention and production chunk scheduling remain separate work.
+
 The three kernels run in this order. Each encodes only when it has work, and the host knows which from p0 and T.
 
 **`strata_idx_append_first`**, grid 1 × 128, encoded when `p0 < idx_f`. It runs `strata_idx_append`'s window body

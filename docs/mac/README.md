@@ -104,6 +104,11 @@ concurrent tests compare the block with the direct component sequence in all
 BF16X2 modes at T=1 and mode 2 at T=3. The coordinator consumes already
 produced `mixed_h`/`mixed_bf`; GR-to-GDN layer scheduling, chunk iteration,
 `Prefill::run` wiring and model-backed inference remain unimplemented.
+The QSA norm/RoPE substage now has a Prefill-specific encoder for chunks
+larger than Window's 1..8-row decode limit, bounded by
+`kPrefillMaxShaderRows`. Serial and concurrent tests compare 65 rows in all
+three modes against scalar oracles through standalone and caller-owned forms.
+The remaining QSA Prefill stages and production scheduling are still pending.
 
 Implementation choices, constraints, and required reviews are tracked in
 [IMPLEMENTATION-DECISIONS.md](IMPLEMENTATION-DECISIONS.md).

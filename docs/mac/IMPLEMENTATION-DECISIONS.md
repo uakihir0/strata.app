@@ -11135,3 +11135,41 @@ measuring L-15 remain open.
   serial and concurrent Prefill tests; `test_map` passed 1/1 and the full
   `mac-metal` suite passed 90/90 on the reference Mac. `git diff --check`
   passed.
+
+### D-IMPL-382: Add a Prefill-sized QSA norm/RoPE entry point
+
+- **Decision:** Keep `encode_qsa_norm_rope` limited to the Window decode
+  contract of 1..8 rows, and add `encode_prefill_qsa_norm_rope` for chunk
+  inputs up to `kPrefillMaxShaderRows`. Reuse the same shader and buffer
+  validation, including exact in-place K/indexer-Q operation, disjoint
+  strided-Q input/output, and per-row RoPE bounds.
+- **Reason:** Prefill chunks can contain more than eight tokens, while widening
+  the decode API would silently change its established validation contract.
+  The existing shader already indexes each head-row independently and uses
+  64-bit buffer offsets, so a bounded Prefill entry point can support larger
+  chunks without introducing a second numerical implementation.
+- **Review required:** Check the `rows × heads` grid extent and host-size
+  arithmetic at the Prefill row bound; all three mode-specific input/output
+  sizes and alias rules; RoPE position validation; transactional rollback;
+  and 65-row scalar-oracle parity through standalone and caller-owned forms.
+  Confirm the remaining QSA Prefill stages and production scheduler stay
+  marked as pending.
+- **Validation:** `mac-dev` built successfully; QSA serial/concurrent tests
+  passed 2/2 and `test_map` passed 1/1 after the review fixes. The full
+  `mac-metal` suite passed 90/90 before the two additional test assertions;
+  implementation code was unchanged by those assertions.
+
+#### REV-178: Adversarial review of Prefill QSA norm/RoPE
+
+- **Review:** No concrete overflow, extent, grid-index or mode-specific alias
+  defect was found. The reviewer confirmed the 65-row scalar-oracle coverage
+  exercises all three modes and both public overload forms. It identified two
+  missing checks: acceptance of the inclusive row limit and rollback through
+  the standalone Prefill overload.
+- **Disposition:** Added a maximum-row preflight case that reaches buffer
+  validation without allocating the multi-gigabyte query views, plus a direct
+  standalone-overload rejection check that verifies command-buffer rollback.
+  The decode API remains constrained to 1..8 rows; the remaining Prefill QSA
+  stages and production scheduler remain pending.
+- **Validation:** The review fixes passed `mac-dev` build, focused QSA
+  serial/concurrent tests 2/2, and `test_map` 1/1.
