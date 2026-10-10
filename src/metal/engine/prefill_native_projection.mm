@@ -18,44 +18,47 @@ namespace {
 struct NativeFormatLayout {
     std::uint32_t values_per_block;
     std::size_t bytes_per_block;
+    std::size_t alignment;
 };
 
 bool format_layout(PrefillNativeWeightFormat format,
                    NativeFormatLayout& layout) {
     switch (format) {
         case PrefillNativeWeightFormat::Q2_0:
-            layout = {64u, sizeof(block_q2_0)};
+            layout = {64u, sizeof(block_q2_0), alignof(block_q2_0)};
             return true;
         case PrefillNativeWeightFormat::IQ4_NL:
-            layout = {32u, sizeof(block_iq4_nl)};
+            layout = {32u, sizeof(block_iq4_nl), alignof(block_iq4_nl)};
             return true;
         case PrefillNativeWeightFormat::Q4_0:
-            layout = {32u, sizeof(block_q4_0)};
+            layout = {32u, sizeof(block_q4_0), alignof(block_q4_0)};
             return true;
         case PrefillNativeWeightFormat::Q5_0:
-            layout = {32u, sizeof(block_q5_0)};
+            layout = {32u, sizeof(block_q5_0), alignof(block_q5_0)};
             return true;
         case PrefillNativeWeightFormat::Q8_0:
-            layout = {32u, sizeof(block_q8_0)};
+            layout = {32u, sizeof(block_q8_0), alignof(block_q8_0)};
             return true;
         case PrefillNativeWeightFormat::Q3_K:
-            layout = {256u, sizeof(block_q3_K)};
+            layout = {256u, sizeof(block_q3_K), alignof(block_q3_K)};
             return true;
         case PrefillNativeWeightFormat::IQ3_S:
-            layout = {256u, sizeof(block_iq3_s)};
+            layout = {256u, sizeof(block_iq3_s), alignof(block_iq3_s)};
             return true;
         case PrefillNativeWeightFormat::IQ4_XS:
-            layout = {256u, sizeof(block_iq4_xs)};
+            layout = {256u, sizeof(block_iq4_xs), alignof(block_iq4_xs)};
             return true;
         case PrefillNativeWeightFormat::Q4_K:
-            layout = {256u, sizeof(block_q4_K)};
+            layout = {256u, sizeof(block_q4_K), alignof(block_q4_K)};
             return true;
         case PrefillNativeWeightFormat::Q5_K:
-            layout = {256u, sizeof(block_q5_K)};
+            layout = {256u, sizeof(block_q5_K), alignof(block_q5_K)};
             return true;
         case PrefillNativeWeightFormat::Q6_K:
-            layout = {256u, sizeof(block_q6_K)};
+            layout = {256u, sizeof(block_q6_K), alignof(block_q6_K)};
             return true;
+        case PrefillNativeWeightFormat::Invalid:
+            return false;
     }
     return false;
 }
@@ -98,6 +101,8 @@ bool encode_dequant(Context& context, Encoder& encoder,
         case PrefillNativeWeightFormat::Q6_K:
             return encode_prefill_dequant_q6_k(context, encoder, params,
                                                buffers, error);
+        case PrefillNativeWeightFormat::Invalid:
+            break;
     }
     error = "Prefill native projection format is invalid";
     return false;
@@ -110,6 +115,62 @@ bool checked_multiply(std::size_t left, std::size_t right,
         return false;
     }
     result = left * right;
+    return true;
+}
+
+bool calculate_buffer_sizes(
+    const PrefillGemmMPPParams& params, PrefillNativeWeightFormat format,
+    PrefillNativeProjectionBufferSizes& sizes, std::string& error) {
+    NativeFormatLayout layout{};
+    if (!format_layout(format, layout)) {
+        error = "Prefill native projection format is invalid";
+        return false;
+    }
+    if (params.rows == 0u || params.n == 0u || params.k == 0u ||
+        params.k % layout.values_per_block != 0u) {
+        error = "Prefill native projection requires positive extents and K "
+                "divisible by the native block size";
+        return false;
+    }
+
+    std::size_t x_elements = 0u;
+    std::size_t x_bytes = 0u;
+    std::size_t blocks = 0u;
+    std::size_t weight_bytes = 0u;
+    std::size_t scratch_elements = 0u;
+    std::size_t scratch_bytes = 0u;
+    if (!checked_multiply(params.rows, params.k, x_elements) ||
+        !checked_multiply(x_elements, sizeof(std::uint16_t), x_bytes) ||
+        !checked_multiply(params.n, params.k / layout.values_per_block,
+                          blocks) ||
+        !checked_multiply(blocks, layout.bytes_per_block, weight_bytes) ||
+        !checked_multiply(params.n, params.k, scratch_elements) ||
+        !checked_multiply(scratch_elements, sizeof(std::uint16_t),
+                          scratch_bytes)) {
+        error = "Prefill native projection buffer size overflows size_t";
+        return false;
+    }
+
+    const std::uint64_t column_end =
+        static_cast<std::uint64_t>(params.col0) + params.n;
+    if (column_end > std::numeric_limits<std::size_t>::max()) {
+        error = "Prefill native projection output column extent overflows "
+                "size_t";
+        return false;
+    }
+    std::size_t last_row_offset = 0u;
+    std::size_t y_bytes = 0u;
+    if (!checked_multiply(params.rows - 1u, params.ldy, last_row_offset) ||
+        static_cast<std::size_t>(column_end) >
+            std::numeric_limits<std::size_t>::max() - last_row_offset ||
+        !checked_multiply(
+            last_row_offset + static_cast<std::size_t>(column_end),
+            sizeof(float), y_bytes)) {
+        error = "Prefill native projection output size overflows size_t";
+        return false;
+    }
+
+    sizes = {x_bytes, weight_bytes, scratch_bytes, y_bytes, layout.alignment};
     return true;
 }
 
@@ -155,60 +216,28 @@ bool views_overlap(Left left, std::size_t left_bytes, Right right,
 }
 
 bool validate_aliases(const PrefillGemmMPPParams& params,
-                      NativeFormatLayout layout,
+                      PrefillNativeWeightFormat format,
                       const PrefillNativeProjectionBuffers& buffers,
                       std::string& error) {
-    if (params.rows == 0u || params.n == 0u || params.k == 0u ||
-        params.k % layout.values_per_block != 0u) {
-        error = "Prefill native projection requires positive extents and K "
-                "divisible by the native block size";
-        return false;
-    }
+    PrefillNativeProjectionBufferSizes sizes;
+    if (!calculate_buffer_sizes(params, format, sizes, error)) return false;
 
-    std::size_t x_elements = 0u;
-    std::size_t x_bytes = 0u;
-    std::size_t blocks = 0u;
-    std::size_t weight_bytes = 0u;
-    std::size_t scratch_elements = 0u;
-    std::size_t scratch_bytes = 0u;
-    if (!checked_multiply(params.rows, params.k, x_elements) ||
-        !checked_multiply(x_elements, sizeof(std::uint16_t), x_bytes) ||
-        !checked_multiply(params.n, params.k / layout.values_per_block,
-                          blocks) ||
-        !checked_multiply(blocks, layout.bytes_per_block, weight_bytes) ||
-        !checked_multiply(params.n, params.k, scratch_elements) ||
-        !checked_multiply(scratch_elements, sizeof(std::uint16_t),
-                          scratch_bytes)) {
-        error = "Prefill native projection buffer size overflows size_t";
-        return false;
-    }
-
-    const std::uint64_t column_end =
-        static_cast<std::uint64_t>(params.col0) + params.n;
-    std::size_t last_row_offset = 0u;
-    std::size_t y_bytes = 0u;
-    if (column_end > std::numeric_limits<std::size_t>::max() ||
-        !checked_multiply(params.rows - 1u, params.ldy, last_row_offset) ||
-        static_cast<std::size_t>(column_end) >
-            std::numeric_limits<std::size_t>::max() - last_row_offset ||
-        !checked_multiply(
-            last_row_offset + static_cast<std::size_t>(column_end),
-            sizeof(float), y_bytes)) {
-        error = "Prefill native projection output size overflows size_t";
-        return false;
-    }
-
-    if (views_overlap(buffers.x_f16, x_bytes, buffers.dequantized_f16,
-                     scratch_bytes) ||
-        views_overlap(buffers.weights, weight_bytes,
-                      buffers.dequantized_f16, scratch_bytes)) {
+    if (views_overlap(buffers.x_f16, sizes.x_f16_bytes,
+                      buffers.dequantized_f16,
+                      sizes.dequantized_f16_bytes) ||
+        views_overlap(buffers.weights, sizes.weights_bytes,
+                      buffers.dequantized_f16,
+                      sizes.dequantized_f16_bytes)) {
         error = "Prefill native projection scratch overlaps an input";
         return false;
     }
-    if (views_overlap(buffers.x_f16, x_bytes, buffers.y_f32, y_bytes) ||
-        views_overlap(buffers.weights, weight_bytes, buffers.y_f32, y_bytes) ||
-        views_overlap(buffers.dequantized_f16, scratch_bytes,
-                      buffers.y_f32, y_bytes)) {
+    if (views_overlap(buffers.x_f16, sizes.x_f16_bytes, buffers.y_f32,
+                      sizes.y_f32_bytes) ||
+        views_overlap(buffers.weights, sizes.weights_bytes, buffers.y_f32,
+                      sizes.y_f32_bytes) ||
+        views_overlap(buffers.dequantized_f16,
+                      sizes.dequantized_f16_bytes, buffers.y_f32,
+                      sizes.y_f32_bytes)) {
         error = "Prefill native projection output overlaps another buffer";
         return false;
     }
@@ -217,23 +246,26 @@ bool validate_aliases(const PrefillGemmMPPParams& params,
 
 }  // namespace
 
+bool prefill_native_projection_buffer_sizes(
+    const PrefillGemmMPPParams& params, PrefillNativeWeightFormat format,
+    PrefillNativeProjectionBufferSizes& sizes, std::string& error) {
+    error.clear();
+    sizes = {};
+    return calculate_buffer_sizes(params, format, sizes, error);
+}
+
 bool encode_prefill_native_projection(
     Context& context, Encoder& encoder,
     const PrefillGemmMPPParams& params, PrefillNativeWeightFormat format,
     const PrefillNativeProjectionBuffers& buffers, std::string& error,
     PrefillGemmBackend* selected_backend) {
     error.clear();
-    NativeFormatLayout layout{};
-    if (!format_layout(format, layout)) {
-        error = "Prefill native projection format is invalid";
-        return false;
-    }
     if (encoder.concurrent_group_open()) {
         error = "Prefill native projection requires an ordered "
                 "concurrent-group boundary";
         return false;
     }
-    if (!validate_aliases(params, layout, buffers, error)) return false;
+    if (!validate_aliases(params, format, buffers, error)) return false;
 
     const PrefillDequantParams dequant_params{params.n, params.k};
     const PrefillDequantBuffers dequant_buffers{
