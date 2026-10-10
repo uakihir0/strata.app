@@ -11173,3 +11173,52 @@ measuring L-15 remain open.
   stages and production scheduler remain pending.
 - **Validation:** The review fixes passed `mac-dev` build, focused QSA
   serial/concurrent tests 2/2, and `test_map` 1/1.
+
+### D-IMPL-383: Add Prefill-sized QSA KV append entry points
+
+- **Decision:** Keep the four existing `encode_qsa_kv_append_*` APIs at the
+  Window limit of 1..8 rows and add matching `encode_prefill_qsa_kv_append_*`
+  overloads up to `kPrefillMaxShaderRows`. Reuse the existing packing,
+  validation and FWHT ordering for fp16, int8, q4_0 and k8v4. Keep the
+  allocation-free pairwise duplicate check through eight rows; above that,
+  sort a temporary position vector to avoid a quadratic scan.
+- **Reason:** Prefill chunks exceed eight rows, and widening the Window API
+  would alter its validation contract. Keeping the cache kernels common avoids
+  format-specific numerical forks. The Prefill row bound makes the old
+  pairwise uniqueness scan unnecessarily expensive for larger chunks, while
+  O(T log T) checking preserves the unique-position contract with bounded
+  temporary memory without adding an allocation to small Window batches.
+- **Review required:** Check host-size arithmetic and the maximum row/grid
+  bound for every cache format; unique-position validation and its failure
+  path; mode-specific extents, aliases and FWHT ordering; both public overloads;
+  nine-row scalar-oracle parity for all formats; and confirmation that Window
+  APIs still reject nine rows and Prefill orchestration remains pending.
+- **Validation:** `mac-dev` built successfully and QSA serial/concurrent tests
+  passed 2/2, including Prefill T=9 in all four formats and both API forms.
+  `test_map` passed 1/1 and the full `mac-metal` suite passed 90/90 after the
+  large-batch duplicate-position cases were added.
+
+#### REV-179: Adversarial review of Prefill QSA KV append
+
+- **Scope:** Review the shared Window/Prefill validation, row and byte-count
+  bounds, unique positions, all four formats, FWHT ordering, both API forms,
+  and T=9 scalar-oracle coverage.
+- **Findings and fixes:** The initial reviewer found that the shared duplicate
+  checker allocated and sorted even for Window-sized inputs. The current code
+  retains the original allocation-free pairwise check through eight rows and
+  sorts only larger batches. The reviewer also found no test for duplicate
+  positions above eight; T=9 cases now reject a duplicate final position in
+  every format through both standalone and caller-owned APIs.
+- **Disposition:** The first two findings are fixed and covered by focused
+  serial/concurrent QSA tests. The reviewer also noted that the inclusive row
+  bound is accepted only through preflight, not through an actual maximum-size
+  GPU dispatch. This remains an explicit coverage limit: dispatching
+  419,430 rows requires 838,860 threadgroups plus multi-gigabyte input and
+  cache views. A compile-time assertion proves the maximum
+  `token_rows * N_HEAD_KV` shader index fits `uint32_t`; T=9 exercises the
+  dispatched path. Window calls still enforce 1..8 rows, and Prefill
+  scheduling remains pending.
+- **Validation:** `mac-dev` build passed; QSA serial/concurrent tests passed
+  2/2, `test_map` passed 1/1, `git diff --check` passed, and the full
+  `mac-metal` suite passed 90/90. A follow-up hostile review of the corrected
+  tree is in progress.

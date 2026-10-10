@@ -108,7 +108,10 @@ The QSA norm/RoPE substage now has a Prefill-specific encoder for chunks
 larger than Window's 1..8-row decode limit, bounded by
 `kPrefillMaxShaderRows`. Serial and concurrent tests compare 65 rows in all
 three modes against scalar oracles through standalone and caller-owned forms.
-The remaining QSA Prefill stages and production scheduling are still pending.
+The four KV cache formats also have Prefill-sized append APIs; serial and
+concurrent nine-row tests cover all formats through both API forms. QSA
+indexer append, selection, attention and production scheduling are still
+pending.
 
 Implementation choices, constraints, and required reviews are tracked in
 [IMPLEMENTATION-DECISIONS.md](IMPLEMENTATION-DECISIONS.md).
