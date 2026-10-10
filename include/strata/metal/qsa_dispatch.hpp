@@ -194,6 +194,18 @@ bool encode_qsa_kv_append_f16(
     Context& context, Encoder& encoder,
     std::uint32_t token_rows, std::uint32_t cell_capacity,
     const QsaKvAppendF16Buffers& buffers, std::string& error);
+/// Prefill-sized fp16 KV append. Supports chunks through
+/// `kPrefillMaxShaderRows` while retaining the Window overload's 1..8 limit.
+/// The standalone form validates before encoding; the caller-owned form must
+/// propagate false so the enclosing Encoder segment is discarded.
+bool encode_prefill_qsa_kv_append_f16(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t token_rows, std::uint32_t cell_capacity,
+    const QsaKvAppendF16Buffers& buffers, std::string& error);
+bool encode_prefill_qsa_kv_append_f16(
+    Context& context, Encoder& encoder, std::uint32_t token_rows,
+    std::uint32_t cell_capacity, const QsaKvAppendF16Buffers& buffers,
+    std::string& error);
 
 /// Append the T rows of two 256-wide K/V heads to the interleaved int8
 /// cache. Scales are fp16 bit patterns, four per cache row (one per 64
@@ -214,6 +226,17 @@ bool encode_qsa_kv_append_i8(
     Context& context, Encoder& encoder,
     std::uint32_t token_rows, std::uint32_t cell_capacity,
     const QsaKvAppendI8Buffers& buffers, std::string& error);
+/// Prefill-sized int8 KV append, preserving the Window overload's 1..8 limit.
+/// The standalone form validates before encoding; the caller-owned form must
+/// propagate false so the enclosing Encoder segment is discarded.
+bool encode_prefill_qsa_kv_append_i8(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t token_rows, std::uint32_t cell_capacity,
+    const QsaKvAppendI8Buffers& buffers, std::string& error);
+bool encode_prefill_qsa_kv_append_i8(
+    Context& context, Encoder& encoder, std::uint32_t token_rows,
+    std::uint32_t cell_capacity, const QsaKvAppendI8Buffers& buffers,
+    std::string& error);
 
 /// Append FWHT256-rotated K/V rows to the packed q4_0 cache. Each cache row
 /// contains eight 18-byte blocks. K/V values must be finite and each
@@ -235,6 +258,17 @@ bool encode_qsa_kv_append_q4(
     Context& context, Encoder& encoder,
     std::uint32_t token_rows, std::uint32_t cell_capacity,
     const QsaKvAppendQ4Buffers& buffers, std::string& error);
+/// Prefill-sized q4_0 KV append, preserving the Window overload's 1..8 limit.
+/// The caller must encode FWHT256 on both K and V first. The standalone form
+/// validates before encoding; the caller-owned form must propagate false.
+bool encode_prefill_qsa_kv_append_q4(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t token_rows, std::uint32_t cell_capacity,
+    const QsaKvAppendQ4Buffers& buffers, std::string& error);
+bool encode_prefill_qsa_kv_append_q4(
+    Context& context, Encoder& encoder, std::uint32_t token_rows,
+    std::uint32_t cell_capacity, const QsaKvAppendQ4Buffers& buffers,
+    std::string& error);
 
 /// Append unrotated K and FWHT256-rotated V rows to the hybrid k8v4 cache.
 /// K uses signed int8 codes and four fp16 scales per row; V uses eight packed
@@ -261,6 +295,18 @@ bool encode_qsa_kv_append_k8v4(
     Context& context, Encoder& encoder,
     std::uint32_t token_rows, std::uint32_t cell_capacity,
     const QsaKvAppendK8V4Buffers& buffers, std::string& error);
+/// Prefill-sized hybrid KV append, preserving the Window overload's 1..8
+/// limit. The caller must encode FWHT256 on V first. The standalone form
+/// validates its inputs before encoding; the caller-owned form must propagate
+/// false.
+bool encode_prefill_qsa_kv_append_k8v4(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t token_rows, std::uint32_t cell_capacity,
+    const QsaKvAppendK8V4Buffers& buffers, std::string& error);
+bool encode_prefill_qsa_kv_append_k8v4(
+    Context& context, Encoder& encoder, std::uint32_t token_rows,
+    std::uint32_t cell_capacity, const QsaKvAppendK8V4Buffers& buffers,
+    std::string& error);
 
 /// Encode an in-place, orthonormal FWHT over `rows` independent 256-float
 /// rows. One simdgroup handles each row; `values` must contain all rows and

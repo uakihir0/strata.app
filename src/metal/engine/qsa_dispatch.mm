@@ -8,12 +8,14 @@
 #include "../kernels/common/params.h"
 #include "../kernels/common/types.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
+#include <new>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -25,6 +27,9 @@ namespace {
 constexpr std::uint32_t kThreads = 256u;
 constexpr std::uint32_t kFwhtThreads = 256u;
 constexpr std::uint32_t kKvAppendThreads = 256u;
+static_assert(
+    static_cast<std::uint64_t>(kPrefillMaxShaderRows) * N_HEAD_KV <=
+    std::numeric_limits<std::uint32_t>::max());
 constexpr std::uint32_t kIndexerSnapshotThreads = 384u;
 constexpr std::uint32_t kIndexerAppendThreads = 128u;
 constexpr std::uint32_t kSelectionScoresThreads = 256u;
@@ -296,6 +301,54 @@ bool validate_buffer(Context& context, BufferRef buffer,
                buffer.gpu_address != native_gpu_address + buffer.offset) {
         error = "QSA " + std::string(name) +
                 " GPU address metadata does not match its Metal view";
+        return false;
+    }
+    return true;
+}
+
+bool validate_kv_step_positions(const StepRow* step_rows,
+                                std::uint32_t token_rows,
+                                std::uint32_t cell_capacity,
+                                std::string_view format,
+                                std::string& error) {
+    for (std::uint32_t row = 0u; row < token_rows; ++row) {
+        const std::int32_t position = step_rows[row].pos;
+        if (position < 0 ||
+            static_cast<std::uint32_t>(position) >= cell_capacity) {
+            error = "QSA " + std::string(format) +
+                    " KV step position is outside the cell capacity";
+            return false;
+        }
+    }
+    if (token_rows <= VERIFY_MAX_T) {
+        for (std::uint32_t row = 0u; row < token_rows; ++row) {
+            for (std::uint32_t earlier = 0u; earlier < row; ++earlier) {
+                if (step_rows[earlier].pos == step_rows[row].pos) {
+                    error = "QSA " + std::string(format) +
+                            " KV step positions must be unique";
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    std::vector<std::int32_t> positions;
+    try {
+        positions.reserve(token_rows);
+    } catch (const std::bad_alloc&) {
+        error = "QSA " + std::string(format) +
+                " KV position validation allocation failed";
+        return false;
+    }
+    for (std::uint32_t row = 0u; row < token_rows; ++row) {
+        positions.push_back(step_rows[row].pos);
+    }
+    std::sort(positions.begin(), positions.end());
+    if (std::adjacent_find(positions.begin(), positions.end()) !=
+        positions.end()) {
+        error = "QSA " + std::string(format) +
+                " KV step positions must be unique";
         return false;
     }
     return true;
@@ -1026,9 +1079,10 @@ static bool encode_qsa_kv_append_f16_impl(
     Context& context, CommandBuffer* command_buffer,
     Encoder* shared_encoder,
     std::uint32_t token_rows, std::uint32_t cell_capacity,
+    std::uint32_t row_limit, std::string_view row_limit_error,
     const QsaKvAppendF16Buffers& buffers, std::string& error) {
-    if (token_rows == 0u || token_rows > VERIFY_MAX_T) {
-        error = "QSA fp16 KV append row count must be in 1..8";
+    if (token_rows == 0u || token_rows > row_limit) {
+        error = row_limit_error;
         return false;
     }
     if (cell_capacity == 0u || cell_capacity % 4u != 0u ||
@@ -1076,18 +1130,9 @@ static bool encode_qsa_kv_append_f16_impl(
 
     const auto* step_rows =
         reinterpret_cast<const StepRow*>(buffers.steps.contents);
-    for (std::uint32_t row = 0u; row < token_rows; ++row) {
-        if (step_rows[row].pos < 0 ||
-            static_cast<std::uint32_t>(step_rows[row].pos) >= cell_capacity) {
-            error = "QSA fp16 KV step position is outside the cell capacity";
-            return false;
-        }
-        for (std::uint32_t earlier = 0u; earlier < row; ++earlier) {
-            if (step_rows[earlier].pos == step_rows[row].pos) {
-                error = "QSA fp16 KV step positions must be unique";
-                return false;
-            }
-        }
+    if (!validate_kv_step_positions(step_rows, token_rows, cell_capacity,
+                                    "fp16", error)) {
+        return false;
     }
 
     if (buffer_overlaps(buffers.key_pool, pool_bytes,
@@ -1172,6 +1217,7 @@ bool encode_qsa_kv_append_f16(
     const QsaKvAppendF16Buffers& buffers, std::string& error) {
     return encode_qsa_kv_append_f16_impl(
         context, &command_buffer, nullptr, token_rows, cell_capacity,
+        VERIFY_MAX_T, "QSA fp16 KV append row count must be in 1..8",
         buffers, error);
 }
 
@@ -1181,6 +1227,29 @@ bool encode_qsa_kv_append_f16(
     const QsaKvAppendF16Buffers& buffers, std::string& error) {
     return encode_qsa_kv_append_f16_impl(
         context, nullptr, &encoder, token_rows, cell_capacity,
+        VERIFY_MAX_T, "QSA fp16 KV append row count must be in 1..8",
+        buffers, error);
+}
+
+bool encode_prefill_qsa_kv_append_f16(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t token_rows, std::uint32_t cell_capacity,
+    const QsaKvAppendF16Buffers& buffers, std::string& error) {
+    return encode_qsa_kv_append_f16_impl(
+        context, &command_buffer, nullptr, token_rows, cell_capacity,
+        kPrefillMaxShaderRows,
+        "Prefill QSA fp16 KV append row count exceeds the shader-row limit",
+        buffers, error);
+}
+
+bool encode_prefill_qsa_kv_append_f16(
+    Context& context, Encoder& encoder,
+    std::uint32_t token_rows, std::uint32_t cell_capacity,
+    const QsaKvAppendF16Buffers& buffers, std::string& error) {
+    return encode_qsa_kv_append_f16_impl(
+        context, nullptr, &encoder, token_rows, cell_capacity,
+        kPrefillMaxShaderRows,
+        "Prefill QSA fp16 KV append row count exceeds the shader-row limit",
         buffers, error);
 }
 
@@ -1188,9 +1257,10 @@ static bool encode_qsa_kv_append_i8_impl(
     Context& context, CommandBuffer* command_buffer,
     Encoder* shared_encoder,
     std::uint32_t token_rows, std::uint32_t cell_capacity,
+    std::uint32_t row_limit, std::string_view row_limit_error,
     const QsaKvAppendI8Buffers& buffers, std::string& error) {
-    if (token_rows == 0u || token_rows > VERIFY_MAX_T) {
-        error = "QSA int8 KV append row count must be in 1..8";
+    if (token_rows == 0u || token_rows > row_limit) {
+        error = row_limit_error;
         return false;
     }
     if (cell_capacity == 0u || cell_capacity % 4u != 0u ||
@@ -1250,18 +1320,9 @@ static bool encode_qsa_kv_append_i8_impl(
 
     const auto* step_rows =
         reinterpret_cast<const StepRow*>(buffers.steps.contents);
-    for (std::uint32_t row = 0u; row < token_rows; ++row) {
-        if (step_rows[row].pos < 0 ||
-            static_cast<std::uint32_t>(step_rows[row].pos) >= cell_capacity) {
-            error = "QSA int8 KV step position is outside the cell capacity";
-            return false;
-        }
-        for (std::uint32_t earlier = 0u; earlier < row; ++earlier) {
-            if (step_rows[earlier].pos == step_rows[row].pos) {
-                error = "QSA int8 KV step positions must be unique";
-                return false;
-            }
-        }
+    if (!validate_kv_step_positions(step_rows, token_rows, cell_capacity,
+                                    "int8", error)) {
+        return false;
     }
 
     const std::array<std::pair<BufferRef, std::size_t>, 4> outputs{{
@@ -1369,6 +1430,7 @@ bool encode_qsa_kv_append_i8(
     const QsaKvAppendI8Buffers& buffers, std::string& error) {
     return encode_qsa_kv_append_i8_impl(
         context, &command_buffer, nullptr, token_rows, cell_capacity,
+        VERIFY_MAX_T, "QSA int8 KV append row count must be in 1..8",
         buffers, error);
 }
 
@@ -1378,6 +1440,29 @@ bool encode_qsa_kv_append_i8(
     const QsaKvAppendI8Buffers& buffers, std::string& error) {
     return encode_qsa_kv_append_i8_impl(
         context, nullptr, &encoder, token_rows, cell_capacity,
+        VERIFY_MAX_T, "QSA int8 KV append row count must be in 1..8",
+        buffers, error);
+}
+
+bool encode_prefill_qsa_kv_append_i8(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t token_rows, std::uint32_t cell_capacity,
+    const QsaKvAppendI8Buffers& buffers, std::string& error) {
+    return encode_qsa_kv_append_i8_impl(
+        context, &command_buffer, nullptr, token_rows, cell_capacity,
+        kPrefillMaxShaderRows,
+        "Prefill QSA int8 KV append row count exceeds the shader-row limit",
+        buffers, error);
+}
+
+bool encode_prefill_qsa_kv_append_i8(
+    Context& context, Encoder& encoder,
+    std::uint32_t token_rows, std::uint32_t cell_capacity,
+    const QsaKvAppendI8Buffers& buffers, std::string& error) {
+    return encode_qsa_kv_append_i8_impl(
+        context, nullptr, &encoder, token_rows, cell_capacity,
+        kPrefillMaxShaderRows,
+        "Prefill QSA int8 KV append row count exceeds the shader-row limit",
         buffers, error);
 }
 
@@ -1385,9 +1470,10 @@ static bool encode_qsa_kv_append_q4_impl(
     Context& context, CommandBuffer* command_buffer,
     Encoder* shared_encoder,
     std::uint32_t token_rows, std::uint32_t cell_capacity,
+    std::uint32_t row_limit, std::string_view row_limit_error,
     const QsaKvAppendQ4Buffers& buffers, std::string& error) {
-    if (token_rows == 0u || token_rows > VERIFY_MAX_T) {
-        error = "QSA q4 KV append row count must be in 1..8";
+    if (token_rows == 0u || token_rows > row_limit) {
+        error = row_limit_error;
         return false;
     }
     if (cell_capacity == 0u || cell_capacity % 4u != 0u ||
@@ -1433,18 +1519,9 @@ static bool encode_qsa_kv_append_q4_impl(
 
     const auto* step_rows =
         reinterpret_cast<const StepRow*>(buffers.steps.contents);
-    for (std::uint32_t row = 0u; row < token_rows; ++row) {
-        if (step_rows[row].pos < 0 ||
-            static_cast<std::uint32_t>(step_rows[row].pos) >= cell_capacity) {
-            error = "QSA q4 KV step position is outside the cell capacity";
-            return false;
-        }
-        for (std::uint32_t earlier = 0u; earlier < row; ++earlier) {
-            if (step_rows[earlier].pos == step_rows[row].pos) {
-                error = "QSA q4 KV step positions must be unique";
-                return false;
-            }
-        }
+    if (!validate_kv_step_positions(step_rows, token_rows, cell_capacity,
+                                    "q4", error)) {
+        return false;
     }
 
     if (buffer_overlaps(buffers.key_pool, pool_bytes,
@@ -1534,6 +1611,7 @@ bool encode_qsa_kv_append_q4(
     const QsaKvAppendQ4Buffers& buffers, std::string& error) {
     return encode_qsa_kv_append_q4_impl(
         context, &command_buffer, nullptr, token_rows, cell_capacity,
+        VERIFY_MAX_T, "QSA q4 KV append row count must be in 1..8",
         buffers, error);
 }
 
@@ -1543,6 +1621,29 @@ bool encode_qsa_kv_append_q4(
     const QsaKvAppendQ4Buffers& buffers, std::string& error) {
     return encode_qsa_kv_append_q4_impl(
         context, nullptr, &encoder, token_rows, cell_capacity,
+        VERIFY_MAX_T, "QSA q4 KV append row count must be in 1..8",
+        buffers, error);
+}
+
+bool encode_prefill_qsa_kv_append_q4(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t token_rows, std::uint32_t cell_capacity,
+    const QsaKvAppendQ4Buffers& buffers, std::string& error) {
+    return encode_qsa_kv_append_q4_impl(
+        context, &command_buffer, nullptr, token_rows, cell_capacity,
+        kPrefillMaxShaderRows,
+        "Prefill QSA q4 KV append row count exceeds the shader-row limit",
+        buffers, error);
+}
+
+bool encode_prefill_qsa_kv_append_q4(
+    Context& context, Encoder& encoder,
+    std::uint32_t token_rows, std::uint32_t cell_capacity,
+    const QsaKvAppendQ4Buffers& buffers, std::string& error) {
+    return encode_qsa_kv_append_q4_impl(
+        context, nullptr, &encoder, token_rows, cell_capacity,
+        kPrefillMaxShaderRows,
+        "Prefill QSA q4 KV append row count exceeds the shader-row limit",
         buffers, error);
 }
 
@@ -1550,10 +1651,11 @@ static bool encode_qsa_kv_append_k8v4_impl(
     Context& context, CommandBuffer* command_buffer,
     Encoder* shared_encoder,
     std::uint32_t token_rows, std::uint32_t cell_capacity,
+    std::uint32_t row_limit, std::string_view row_limit_error,
     const QsaKvAppendK8V4Buffers& buffers, std::string& error) {
     constexpr std::string_view kernel_name = "strata_qsa_kv_append_k8v4";
-    if (token_rows == 0u || token_rows > VERIFY_MAX_T) {
-        error = "QSA k8v4 KV append row count must be in 1..8";
+    if (token_rows == 0u || token_rows > row_limit) {
+        error = row_limit_error;
         return false;
     }
     if (cell_capacity == 0u || cell_capacity % 4u != 0u ||
@@ -1616,19 +1718,9 @@ static bool encode_qsa_kv_append_k8v4_impl(
 
     const auto* step_rows =
         reinterpret_cast<const StepRow*>(buffers.steps.contents);
-    for (std::uint32_t row = 0u; row < token_rows; ++row) {
-        if (step_rows[row].pos < 0 ||
-            static_cast<std::uint32_t>(step_rows[row].pos) >= cell_capacity) {
-            error =
-                "QSA k8v4 KV step position is outside the cell capacity";
-            return false;
-        }
-        for (std::uint32_t earlier = 0u; earlier < row; ++earlier) {
-            if (step_rows[earlier].pos == step_rows[row].pos) {
-                error = "QSA k8v4 KV step positions must be unique";
-                return false;
-            }
-        }
+    if (!validate_kv_step_positions(step_rows, token_rows, cell_capacity,
+                                    "k8v4", error)) {
+        return false;
     }
 
     const std::array<std::pair<BufferRef, std::size_t>, 3> outputs{{
@@ -1745,6 +1837,7 @@ bool encode_qsa_kv_append_k8v4(
     const QsaKvAppendK8V4Buffers& buffers, std::string& error) {
     return encode_qsa_kv_append_k8v4_impl(
         context, &command_buffer, nullptr, token_rows, cell_capacity,
+        VERIFY_MAX_T, "QSA k8v4 KV append row count must be in 1..8",
         buffers, error);
 }
 
@@ -1754,6 +1847,29 @@ bool encode_qsa_kv_append_k8v4(
     const QsaKvAppendK8V4Buffers& buffers, std::string& error) {
     return encode_qsa_kv_append_k8v4_impl(
         context, nullptr, &encoder, token_rows, cell_capacity,
+        VERIFY_MAX_T, "QSA k8v4 KV append row count must be in 1..8",
+        buffers, error);
+}
+
+bool encode_prefill_qsa_kv_append_k8v4(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t token_rows, std::uint32_t cell_capacity,
+    const QsaKvAppendK8V4Buffers& buffers, std::string& error) {
+    return encode_qsa_kv_append_k8v4_impl(
+        context, &command_buffer, nullptr, token_rows, cell_capacity,
+        kPrefillMaxShaderRows,
+        "Prefill QSA k8v4 KV append row count exceeds the shader-row limit",
+        buffers, error);
+}
+
+bool encode_prefill_qsa_kv_append_k8v4(
+    Context& context, Encoder& encoder,
+    std::uint32_t token_rows, std::uint32_t cell_capacity,
+    const QsaKvAppendK8V4Buffers& buffers, std::string& error) {
+    return encode_qsa_kv_append_k8v4_impl(
+        context, nullptr, &encoder, token_rows, cell_capacity,
+        kPrefillMaxShaderRows,
+        "Prefill QSA k8v4 KV append row count exceeds the shader-row limit",
         buffers, error);
 }
 
