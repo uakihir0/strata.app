@@ -16,6 +16,7 @@
 #include "strata/metal/prefill_gdn_gates_dispatch.hpp"
 #include "strata/metal/prefill_gdn_conv_dispatch.hpp"
 #include "strata/metal/prefill_gdn_block_dispatch.hpp"
+#include "strata/metal/prefill_attention_gdn_transition_dispatch.hpp"
 #include "strata/metal/prefill_gdn_dispatch.hpp"
 #include "strata/metal/prefill_gdn_l2_dispatch.hpp"
 #include "strata/metal/prefill_gdn_out_norm_dispatch.hpp"
@@ -7286,6 +7287,83 @@ bool encode_direct_gdn_block(Context& context, Encoder& encoder,
                error);
 }
 
+struct GDNTransitionTestOutputs {
+    TestBuffer residual;
+    PrefillGRReadTestOutputs gr;
+    TestBuffer mixed_bf;
+    TestBuffer mixed_bf_lo;
+    TestBuffer mixed_h;
+    GDNBlockTestOutputs gdn;
+
+    bool allocate(Context& context, std::uint32_t rows,
+                  PrefillBF16X2Mode mode, const std::string& label,
+                  std::string& error) {
+        const bool read_low =
+            mode == PrefillBF16X2Mode::all_projections;
+        const bool mix_low = mode != PrefillBF16X2Mode::off;
+        const std::size_t residual_bytes =
+            static_cast<std::size_t>(rows) * kStreams * kWidth *
+            sizeof(float);
+        const std::size_t mixer_bytes =
+            static_cast<std::size_t>(rows) * kWidth * kGdnHalfBytes;
+        return residual.allocate(context, label + " residual",
+                                 residual_bytes, error) &&
+               gr.allocate(context, rows, read_low, label + " GR", error) &&
+               mixed_bf.allocate(context, label + " mixed BF16",
+                                 mixer_bytes, error) &&
+               (!mix_low ||
+                mixed_bf_lo.allocate(context, label + " mixed BF16 low",
+                                     mixer_bytes, error)) &&
+               mixed_h.allocate(context, label + " mixed F16", mixer_bytes,
+                                error) &&
+               gdn.allocate(context, rows, label + " GDN", error);
+    }
+
+    void collect_buffers(std::vector<TestBuffer*>& output) {
+        output.insert(output.end(),
+                      {&residual, &gr.rs, &gr.xn16, &gr.xn16_lo,
+                       &gr.low_rank, &gr.low_rank_bf16,
+                       &gr.low_rank_bf16_lo, &gr.gated, &gr.inject,
+                       &mixed_bf, &mixed_bf_lo, &mixed_h,
+                       &gdn.dequantized_f16, &gdn.qkv, &gdn.z,
+                       &gdn.alpha_beta, &gdn.history, &gdn.gate,
+                       &gdn.beta, &gdn.h, &gdn.state, &gdn.oc,
+                       &gdn.y_h, &gdn.bo});
+    }
+};
+
+PrefillGRReadMixBuffers bind_gdn_layer_read_mix(
+    GDNTransitionTestOutputs& outputs,
+    BufferRef norm, ReadOnlyBufferRef down_weights,
+    ReadOnlyBufferRef up_weights, ReadOnlyBufferRef inject_weights,
+    PrefillBF16X2Mode mode) {
+    const bool read_low =
+        mode == PrefillBF16X2Mode::all_projections;
+    const bool mix_low = mode != PrefillBF16X2Mode::off;
+    return {
+        outputs.gr.bind(outputs.residual.view(), norm, down_weights,
+                        up_weights, inject_weights, read_low),
+        outputs.mixed_bf.view(),
+        mix_low ? outputs.mixed_bf_lo.view() : BufferRef{},
+        outputs.mixed_h.view()};
+}
+
+PrefillAttentionGDNTransitionBuffers bind_gdn_transition(
+    Context& context, GDNBlockTestInputs& inputs,
+    GDNTransitionTestOutputs& outputs, BufferRef norm,
+    ReadOnlyBufferRef down_weights, ReadOnlyBufferRef up_weights,
+    ReadOnlyBufferRef inject_weights, ReadOnlyBufferRef next_norm,
+    PrefillBF16X2Mode mode) {
+    PrefillGDNBlockBuffers gdn =
+        inputs.bind(context, outputs.gdn, mode);
+    gdn.mixed_h = {};
+    gdn.mixed_bf = {};
+    gdn.mixed_bf_lo = {};
+    return {bind_gdn_layer_read_mix(outputs, norm, down_weights, up_weights,
+                                    inject_weights, mode),
+            gdn, next_norm};
+}
+
 bool run_prefill_gdn_block_case(Context& context, std::uint32_t rows,
                                 PrefillBF16X2Mode mode,
                                 bool standalone_api) {
@@ -7508,6 +7586,603 @@ bool run_prefill_gdn_block_case(Context& context, std::uint32_t rows,
     return outputs_match && inputs_unchanged && guards && rollback;
 }
 
+bool run_prefill_attention_gdn_transition_case(Context& context, std::uint32_t rows,
+                                      PrefillBF16X2Mode mode,
+                                      bool standalone_api) {
+    const std::string label =
+        "Prefill attention-half GDN transition T=" + std::to_string(rows) +
+        " mode=" + std::to_string(static_cast<std::uint32_t>(mode)) +
+        (standalone_api ? " standalone" : " caller-owned");
+    constexpr std::size_t stream_values =
+        static_cast<std::size_t>(kStreams) * kWidth;
+    constexpr std::size_t down_weight_values =
+        static_cast<std::size_t>(HC_LOW_RANK) * stream_values;
+    constexpr std::size_t up_weight_values =
+        stream_values * HC_LOW_RANK;
+    constexpr std::size_t inject_weight_values =
+        static_cast<std::size_t>(kStreams) * stream_values;
+    const bool read_low = mode == PrefillBF16X2Mode::all_projections;
+
+    TestBuffer norm, next_norm, down_weights, up_weights, inject_weights;
+    std::string error;
+    const bool gr_inputs_allocated =
+        norm.allocate(context, label + " GR norm", stream_values * sizeof(float),
+                      error) &&
+        next_norm.allocate(context, label + " next GR norm",
+                           stream_values * sizeof(float), error) &&
+        down_weights.allocate(context, label + " GR down weights",
+                              down_weight_values * kGdnHalfBytes, error) &&
+        up_weights.allocate(context, label + " GR up weights",
+                            up_weight_values * kGdnHalfBytes, error) &&
+        inject_weights.allocate(context, label + " GR inject weights",
+                                inject_weight_values * kGdnHalfBytes, error);
+    check(gr_inputs_allocated, label + " allocate GR model inputs", error);
+    if (!gr_inputs_allocated) return false;
+
+    auto* const norm_values =
+        reinterpret_cast<float*>(norm.payload().data());
+    auto* const next_norm_values =
+        reinterpret_cast<float*>(next_norm.payload().data());
+    for (std::size_t index = 0u; index < stream_values; ++index) {
+        norm_values[index] =
+            0.75f + static_cast<float>((index * 17u + 11u) % 37u) *
+                        0.015625f;
+        next_norm_values[index] =
+            0.625f + static_cast<float>((index * 23u + 3u) % 41u) *
+                         0.015625f;
+    }
+    const auto fill_bf16 = [](TestBuffer& buffer, std::uint32_t multiplier,
+                              std::uint32_t modulus, float scale) {
+        auto* const values =
+            reinterpret_cast<std::uint16_t*>(buffer.payload().data());
+        const std::size_t count = buffer.payload().size() / sizeof(*values);
+        for (std::size_t index = 0u; index < count; ++index) {
+            const int centered =
+                static_cast<int>((index * multiplier + index / 7u) %
+                                 modulus) -
+                static_cast<int>(modulus / 2u);
+            values[index] = strata::kernels::bf16_from_f32(
+                static_cast<float>(centered) * scale);
+        }
+    };
+    fill_bf16(down_weights, 13u, 31u, 0.00390625f);
+    fill_bf16(up_weights, 19u, 29u, 0.00390625f);
+    fill_bf16(inject_weights, 7u, 23u, 0.00390625f);
+
+    GDNBlockTestInputs gdn_inputs;
+    const bool gdn_inputs_allocated =
+        gdn_inputs.allocate(context, rows, label + " GDN inputs", error);
+    check(gdn_inputs_allocated, label + " allocate GDN inputs", error);
+    if (!gdn_inputs_allocated) return false;
+    initialize_gdn_block_inputs(gdn_inputs, rows);
+    const std::array<TestBuffer*, 17u> gr_model_inputs{
+        &norm, &next_norm, &down_weights, &up_weights, &inject_weights,
+        &gdn_inputs.qkv_weights, &gdn_inputs.gate_weights,
+        &gdn_inputs.alpha_weights, &gdn_inputs.beta_weights,
+        &gdn_inputs.out_weights, &gdn_inputs.dt_bias, &gdn_inputs.a,
+        &gdn_inputs.conv_weights, &gdn_inputs.gamma,
+        &gdn_inputs.mixed_h, &gdn_inputs.mixed_bf, &gdn_inputs.mixed_bf_lo};
+    std::array<std::vector<std::uint8_t>, gr_model_inputs.size()>
+        model_snapshots;
+    for (std::size_t index = 0u; index < gr_model_inputs.size(); ++index) {
+        const auto payload = gr_model_inputs[index]->payload();
+        model_snapshots[index].assign(payload.begin(), payload.end());
+    }
+
+    GDNTransitionTestOutputs composed, direct;
+    const bool outputs_allocated =
+        composed.allocate(context, rows, mode, label + " composed", error) &&
+        direct.allocate(context, rows, mode, label + " direct", error);
+    check(outputs_allocated, label + " allocate layer outputs", error);
+    if (!outputs_allocated) return false;
+    std::vector<float> initial_residual(
+        static_cast<std::size_t>(rows) * stream_values);
+    for (std::size_t index = 0u; index < initial_residual.size(); ++index) {
+        const int centered = static_cast<int>((index * 29u + 17u) % 257u) -
+                             128;
+        initial_residual[index] = static_cast<float>(centered) / 128.0f;
+    }
+    const std::size_t residual_bytes =
+        initial_residual.size() * sizeof(float);
+    std::memcpy(composed.residual.payload().data(), initial_residual.data(),
+                residual_bytes);
+    std::memcpy(direct.residual.payload().data(), initial_residual.data(),
+                residual_bytes);
+    composed.gdn.initialize_persistent_state();
+    direct.gdn.initialize_persistent_state();
+
+    const auto down_read = context.buffers().read_only(down_weights.view());
+    const auto up_read = context.buffers().read_only(up_weights.view());
+    const auto inject_read =
+        context.buffers().read_only(inject_weights.view());
+    const auto next_norm_read =
+        context.buffers().read_only(next_norm.view());
+    const PrefillAttentionGDNTransitionBuffers composed_buffers =
+        bind_gdn_transition(context, gdn_inputs, composed, norm.view(),
+                             down_read, up_read, inject_read, next_norm_read,
+                             mode);
+
+    auto composed_command =
+        context.make_command_buffer(label + " composed command", error);
+    check(composed_command != nullptr,
+          label + " create composed command buffer", error);
+    if (!composed_command) return false;
+    const bool composed_encoded =
+        standalone_api
+            ? encode_prefill_attention_gdn_transition(context, *composed_command, rows,
+                                             mode, composed_buffers, error)
+            : Encoder::encode(
+                  context, *composed_command, label + " caller-owned",
+                  [&](Encoder& encoder, std::string& encode_error) {
+                      return encode_prefill_attention_gdn_transition(
+                          context, encoder, rows, mode, composed_buffers,
+                          encode_error);
+                  },
+                  error);
+    check(composed_encoded, label + " composed encode", error);
+    if (!composed_encoded) {
+        composed_command->discard();
+        return false;
+    }
+    if (!submit_and_wait(composed_command, label + " composed", error)) {
+        check(false, label + " composed dispatch", error);
+        return false;
+    }
+
+    const PrefillAttentionGDNTransitionBuffers direct_buffers =
+        bind_gdn_transition(context, gdn_inputs, direct, norm.view(),
+                             down_read, up_read, inject_read, next_norm_read,
+                             mode);
+    auto direct_command =
+        context.make_command_buffer(label + " direct command", error);
+    check(direct_command != nullptr, label + " create direct command buffer",
+          error);
+    if (!direct_command) return false;
+    const bool direct_encoded = Encoder::encode(
+        context, *direct_command, label + " direct component chain",
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encode_prefill_gr_read_reference(
+                    context, encoder, rows, mode,
+                    direct_buffers.gr_read_mix.read, encode_error)) {
+                return false;
+            }
+            const PrefillGRReadBuffers& read =
+                direct_buffers.gr_read_mix.read;
+            const bool mix_low = mode != PrefillBF16X2Mode::off;
+            const PrefillGRMixBuffers mix{
+                context.buffers().read_only(read.residual),
+                context.buffers().read_only(read.rs),
+                context.buffers().read_only(read.norm),
+                context.buffers().read_only(read.gated),
+                direct_buffers.gr_read_mix.mixed_bf,
+                direct_buffers.gr_read_mix.mixed_bf_lo,
+                direct_buffers.gr_read_mix.mixed_h};
+            if (!encode_prefill_gr_mix(context, encoder, rows, mode, mix,
+                                       encode_error)) {
+                return false;
+            }
+
+            PrefillGDNBlockBuffers gdn =
+                gdn_inputs.bind(context, direct.gdn, mode);
+            gdn.mixed_h = context.buffers().read_only(
+                direct_buffers.gr_read_mix.mixed_h);
+            gdn.mixed_bf = context.buffers().read_only(
+                direct_buffers.gr_read_mix.mixed_bf);
+            if (mix_low) {
+                gdn.mixed_bf_lo = context.buffers().read_only(
+                    direct_buffers.gr_read_mix.mixed_bf_lo);
+            }
+            if (!encode_direct_gdn_block(context, encoder, rows, mode, gdn,
+                                         encode_error)) {
+                return false;
+            }
+            const PrefillGRWriteNormBuffers write_norm{
+                read.residual,
+                context.buffers().read_only(gdn.bo),
+                context.buffers().read_only(read.inject),
+                next_norm_read,
+                read.rs,
+                read.xn16,
+                read_low ? read.xn16_lo : BufferRef{}};
+            return encode_prefill_gr_write_norm(context, encoder, rows, mode,
+                                                write_norm, encode_error);
+        },
+        error);
+    check(direct_encoded, label + " direct component encode", error);
+    if (!direct_encoded) {
+        direct_command->discard();
+        return false;
+    }
+    if (!submit_and_wait(direct_command, label + " direct", error)) {
+        check(false, label + " direct dispatch", error);
+        return false;
+    }
+
+    bool outputs_match = true;
+    const auto compare = [&](const TestBuffer& actual,
+                             const TestBuffer& expected,
+                             std::string_view name) {
+        const auto left = actual.payload();
+        const auto right = expected.payload();
+        const bool match =
+            left.size() == right.size() &&
+            std::equal(left.begin(), left.end(), right.begin());
+        check(match, label + " matches direct " + std::string(name));
+        outputs_match &= match;
+    };
+    compare(composed.residual, direct.residual, "written residual");
+    compare(composed.gr.rs, direct.gr.rs, "next-read scale");
+    compare(composed.gr.xn16, direct.gr.xn16, "next-read BF16 values");
+    compare(composed.gr.low_rank, direct.gr.low_rank, "GR low rank");
+    compare(composed.gr.low_rank_bf16, direct.gr.low_rank_bf16,
+            "GR SiLU values");
+    compare(composed.gr.gated, direct.gr.gated, "GR gated values");
+    compare(composed.gr.inject, direct.gr.inject, "GR injection");
+    compare(composed.mixed_bf, direct.mixed_bf, "mixed BF16 values");
+    compare(composed.mixed_h, direct.mixed_h, "mixed F16 values");
+    if (read_low) {
+        compare(composed.gr.xn16_lo, direct.gr.xn16_lo,
+                "next-read BF16 remainder");
+        compare(composed.gr.low_rank_bf16_lo, direct.gr.low_rank_bf16_lo,
+                "GR SiLU remainder");
+    }
+    if (mode != PrefillBF16X2Mode::off) {
+        compare(composed.mixed_bf_lo, direct.mixed_bf_lo,
+                "mixed BF16 remainder");
+    }
+    const std::array<TestBuffer*, 12u> composed_gdn{
+        &composed.gdn.dequantized_f16, &composed.gdn.qkv, &composed.gdn.z,
+        &composed.gdn.alpha_beta, &composed.gdn.history, &composed.gdn.gate,
+        &composed.gdn.beta, &composed.gdn.h, &composed.gdn.state,
+        &composed.gdn.oc, &composed.gdn.y_h, &composed.gdn.bo};
+    const std::array<TestBuffer*, 12u> direct_gdn{
+        &direct.gdn.dequantized_f16, &direct.gdn.qkv, &direct.gdn.z,
+        &direct.gdn.alpha_beta, &direct.gdn.history, &direct.gdn.gate,
+        &direct.gdn.beta, &direct.gdn.h, &direct.gdn.state,
+        &direct.gdn.oc, &direct.gdn.y_h, &direct.gdn.bo};
+    constexpr std::array<std::string_view, 12u> gdn_names{
+        "reused native scratch", "qkv", "z", "alpha/beta", "history",
+        "gate", "beta", "convolution", "recurrent state", "recurrence",
+        "normalized output", "block output"};
+    for (std::size_t index = 0u; index < composed_gdn.size(); ++index) {
+        compare(*composed_gdn[index], *direct_gdn[index], gdn_names[index]);
+    }
+
+    bool model_inputs_unchanged = true;
+    for (std::size_t index = 0u; index < gr_model_inputs.size(); ++index) {
+        const auto payload = gr_model_inputs[index]->payload();
+        model_inputs_unchanged &=
+            std::equal(model_snapshots[index].begin(),
+                       model_snapshots[index].end(), payload.begin());
+    }
+    check(model_inputs_unchanged, label + " keeps model inputs immutable");
+
+    std::vector<TestBuffer*> composed_buffers_to_check;
+    std::vector<TestBuffer*> direct_buffers_to_check;
+    composed.collect_buffers(composed_buffers_to_check);
+    direct.collect_buffers(direct_buffers_to_check);
+    const auto buffer_snapshots = [](const std::vector<TestBuffer*>& list) {
+        std::vector<std::vector<std::uint8_t>> result;
+        result.reserve(list.size());
+        for (const TestBuffer* buffer : list) {
+            const auto payload = buffer->payload();
+            result.emplace_back(payload.begin(), payload.end());
+        }
+        return result;
+    };
+    const auto composed_before_failure =
+        buffer_snapshots(composed_buffers_to_check);
+    const auto unchanged_after_failure =
+        [&](const std::vector<TestBuffer*>& list,
+            const std::vector<std::vector<std::uint8_t>>& before) {
+            bool unchanged = list.size() == before.size();
+            for (std::size_t index = 0u; index < list.size(); ++index) {
+                const auto payload = list[index]->payload();
+                unchanged &= payload.size() == before[index].size() &&
+                             std::equal(before[index].begin(),
+                                        before[index].end(), payload.begin());
+            }
+            return unchanged;
+        };
+
+    bool aliases_rejected = true;
+    const auto rejects_preflight = [&](const std::string& case_label,
+                                       const PrefillAttentionGDNTransitionBuffers& bad,
+                                       std::string_view expected_error) {
+        std::string rejection_error;
+        auto command =
+            context.make_command_buffer(case_label + " command", rejection_error);
+        if (!command) {
+            check(false, case_label + " command buffer", rejection_error);
+            return false;
+        }
+        const bool encoded = encode_prefill_attention_gdn_transition(
+            context, *command, rows, mode, bad, rejection_error);
+        const bool rejected =
+            !encoded && command->unsafe_native_handle() == nullptr &&
+            rejection_error.find(expected_error) != std::string::npos;
+        check(rejected, case_label, rejection_error);
+        return rejected;
+    };
+    if (rows == 1u) {
+        PrefillAttentionGDNTransitionBuffers next_norm_alias = composed_buffers;
+        next_norm_alias.next_norm =
+            context.buffers().read_only(composed.gr.gated.view());
+        aliases_rejected &= rejects_preflight(
+            label + " rejects next norm overwritten by GR", next_norm_alias,
+            "next GR norm overlaps an earlier GR output");
+
+        PrefillAttentionGDNTransitionBuffers gdn_weight_alias = composed_buffers;
+        gdn_weight_alias.gdn.dt_bias =
+            context.buffers().read_only(composed.gr.low_rank.view());
+        aliases_rejected &= rejects_preflight(
+            label + " rejects GDN weight overwritten by GR",
+            gdn_weight_alias, "GDN dt bias overlaps an earlier GR output");
+
+        TestBuffer carried_alias;
+        const std::size_t bo_bytes =
+            static_cast<std::size_t>(rows) * N_EMBD * sizeof(float);
+        const bool carried_allocated = carried_alias.allocate(
+            context, label + " carried injection alias", bo_bytes, error);
+        check(carried_allocated, label + " allocate carried alias", error);
+        if (!carried_allocated) return false;
+        PrefillAttentionGDNTransitionBuffers output_alias = composed_buffers;
+        output_alias.gr_read_mix.read.inject = carried_alias.view();
+        output_alias.gdn.bo = carried_alias.view();
+        aliases_rejected &= rejects_preflight(
+            label + " rejects GDN output overwriting carried injection",
+            output_alias, "GDN block output overlaps carried GR injection");
+
+        PrefillAttentionGDNTransitionBuffers weight_overwrite =
+            composed_buffers;
+        weight_overwrite.gdn.bo =
+            down_weights.view().slice(0u, bo_bytes);
+        aliases_rejected &= rejects_preflight(
+            label + " rejects GDN output overwriting GR model weights",
+            weight_overwrite,
+            "GDN block output overlaps GR down weights");
+
+        const std::size_t history_bytes =
+            static_cast<std::size_t>(kGdnConvKernel - 1u) *
+            kGdnConvChannels * sizeof(float);
+        PrefillAttentionGDNTransitionBuffers history_overwrite =
+            composed_buffers;
+        history_overwrite.gdn.history =
+            down_weights.view().slice(0u, history_bytes);
+        aliases_rejected &= rejects_preflight(
+            label + " rejects persistent history overwriting GR weights",
+            history_overwrite, "GDN history overlaps GR down weights");
+
+        PrefillAttentionGDNTransitionBuffers residual_overwrite =
+            composed_buffers;
+        residual_overwrite.gr_read_mix.read.residual =
+            down_weights.view().slice(0u, residual_bytes);
+        aliases_rejected &= rejects_preflight(
+            label + " rejects final residual overwriting GR model weights",
+            residual_overwrite,
+            "residual overlaps GR down weights");
+
+        TestBuffer reuse_alias;
+        const bool reuse_allocated = reuse_alias.allocate(
+            context, label + " reused GR output alias", bo_bytes, error);
+        check(reuse_allocated, label + " allocate reused output alias", error);
+        if (!reuse_allocated) return false;
+        PrefillAttentionGDNTransitionBuffers reused_output_alias =
+            composed_buffers;
+        reused_output_alias.gr_read_mix.read.rs =
+            reuse_alias.view().slice(0u, HC * sizeof(float));
+        reused_output_alias.gdn.bo = reuse_alias.view();
+        aliases_rejected &= rejects_preflight(
+            label + " rejects GDN output overwriting next GR scale",
+            reused_output_alias,
+            "GDN block output overlaps carried next GR scale output");
+
+        if (mode == PrefillBF16X2Mode::off && standalone_api) {
+            GDNTransitionTestOutputs oversized;
+            TestBuffer arena;
+            const std::size_t residual_view_bytes = residual_bytes * 2u;
+            const std::size_t scale_offset = residual_bytes + 1024u;
+            const std::size_t arena_bytes = scale_offset + residual_bytes;
+            const bool oversized_allocated =
+                oversized.allocate(context, rows, mode,
+                                   label + " oversized outputs", error) &&
+                arena.allocate(context, label + " reusable arena",
+                               arena_bytes, error);
+            check(oversized_allocated,
+                  label + " allocate oversized disjoint active views", error);
+            if (!oversized_allocated) return false;
+            std::memcpy(arena.payload().data(), initial_residual.data(),
+                        residual_bytes);
+            oversized.gdn.initialize_persistent_state();
+            PrefillAttentionGDNTransitionBuffers oversized_buffers =
+                bind_gdn_transition(context, gdn_inputs, oversized, norm.view(),
+                                    down_read, up_read, inject_read,
+                                    next_norm_read, mode);
+            oversized_buffers.gr_read_mix.read.residual =
+                arena.view().slice(0u, residual_view_bytes);
+            oversized_buffers.gr_read_mix.read.rs =
+                arena.view().slice(scale_offset, residual_bytes);
+            const auto byte_ranges_overlap = [](std::size_t left_offset,
+                                                std::size_t left_bytes,
+                                                std::size_t right_offset,
+                                                std::size_t right_bytes) {
+                return left_offset <= right_offset
+                           ? right_offset - left_offset < left_bytes
+                           : left_offset - right_offset < right_bytes;
+            };
+            const std::size_t residual_offset =
+                oversized_buffers.gr_read_mix.read.residual.offset;
+            const std::size_t scale_view_offset =
+                oversized_buffers.gr_read_mix.read.rs.offset;
+            const bool full_views_overlap = byte_ranges_overlap(
+                residual_offset, residual_view_bytes, scale_view_offset,
+                residual_bytes);
+            const bool active_prefixes_disjoint = !byte_ranges_overlap(
+                residual_offset, residual_bytes, scale_view_offset,
+                HC * sizeof(float));
+            check(full_views_overlap && active_prefixes_disjoint,
+                  label + " arena views overlap only outside active prefixes");
+            auto oversized_command =
+                context.make_command_buffer(label + " oversized command",
+                                           error);
+            check(oversized_command != nullptr,
+                  label + " create oversized command", error);
+            if (!oversized_command) return false;
+            const bool oversized_encoded =
+                encode_prefill_attention_gdn_transition(
+                    context, *oversized_command, rows, mode,
+                    oversized_buffers, error);
+            check(oversized_encoded,
+                  label + " accepts disjoint active arena prefixes", error);
+            bool oversized_ran = oversized_encoded;
+            if (oversized_encoded) {
+                oversized_ran = submit_and_wait(
+                    oversized_command, label + " oversized active views",
+                    error);
+                check(oversized_ran,
+                      label + " dispatches oversized active views", error);
+            } else {
+                oversized_command->discard();
+            }
+            if (oversized_ran) {
+                const auto arena_payload = arena.payload();
+                const auto expected_residual = composed.residual.payload();
+                const auto expected_scale = composed.gr.rs.payload();
+                const bool residual_matches =
+                    std::equal(expected_residual.begin(),
+                               expected_residual.begin() + residual_bytes,
+                               arena_payload.begin());
+                const bool scale_matches =
+                    std::equal(expected_scale.begin(),
+                               expected_scale.begin() + HC * sizeof(float),
+                               arena_payload.begin() + scale_offset);
+                check(residual_matches && scale_matches,
+                      label + " oversized arena views preserve active results");
+            }
+            check(arena.guards_intact() && oversized.residual.guards_intact(),
+                  label + " oversized arena and output guards");
+            aliases_rejected &= full_views_overlap &&
+                                active_prefixes_disjoint && oversized_ran;
+        }
+    }
+
+    PrefillAttentionGDNTransitionBuffers short_late_weight = composed_buffers;
+    short_late_weight.gdn.ssm_out_weights =
+        context.buffers().read_only(
+            gdn_inputs.out_weights.view().slice(0u, 1u));
+    bool late_failure_rolled_back = true;
+    for (const bool standalone_form : {true, false}) {
+        const std::string rollback_label =
+            label + (standalone_form ? " standalone late rollback"
+                                     : " caller-owned late rollback");
+        std::string rollback_error;
+        auto rollback_command =
+            context.make_command_buffer(rollback_label, rollback_error);
+        if (!rollback_command) {
+            check(false, rollback_label + " command buffer", rollback_error);
+            late_failure_rolled_back = false;
+            continue;
+        }
+        bool prefix_dispatch_observed = false;
+        const bool encoded =
+            standalone_form
+                ? encode_prefill_attention_gdn_transition(
+                      context, *rollback_command, rows, mode,
+                      short_late_weight, rollback_error)
+                : Encoder::encode(
+                      context, *rollback_command, rollback_label,
+                      [&](Encoder& encoder, std::string& encode_error) {
+                          const bool layer_encoded =
+                              encode_prefill_attention_gdn_transition(
+                                  context, encoder, rows, mode,
+                                  short_late_weight, encode_error);
+                          prefix_dispatch_observed =
+                              encoder.has_encoded_dispatches();
+                          return layer_encoded;
+                      },
+                      rollback_error);
+        const bool rejected =
+            !encoded &&
+            rollback_command->unsafe_native_handle() == nullptr &&
+            rollback_error.find("ssm_out weights buffer is undersized") !=
+                std::string::npos &&
+            (standalone_form || prefix_dispatch_observed);
+        check(rejected, rollback_label + " rejects after GR prefix",
+              rollback_error);
+        if (!standalone_form) {
+            check(prefix_dispatch_observed,
+                  rollback_label + " observed successful GR dispatch prefix",
+                  rollback_error);
+        }
+        const bool unchanged = unchanged_after_failure(
+            composed_buffers_to_check, composed_before_failure);
+        check(unchanged, rollback_label + " preserves all outputs and state");
+        late_failure_rolled_back &= rejected && unchanged;
+    }
+
+    bool open_group_rejected = true;
+    const char* const dispatch = std::getenv("STRATA_METAL_DISPATCH");
+    if (dispatch != nullptr && std::string_view(dispatch) == "concurrent") {
+        std::string group_error;
+        auto group_command =
+            context.make_command_buffer(label + " open group", group_error);
+        if (!group_command) {
+            check(false, label + " open-group command buffer", group_error);
+            open_group_rejected = false;
+        } else {
+            const bool encoded = Encoder::encode(
+                context, *group_command, label + " open concurrent group",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    if (!encoder.group_begin(encode_error)) return false;
+                    return encode_prefill_attention_gdn_transition(
+                        context, encoder, rows, mode, composed_buffers,
+                        encode_error);
+                },
+                group_error);
+            open_group_rejected =
+                !encoded &&
+                group_error.find("ordered concurrent-group boundary") !=
+                    std::string::npos &&
+                group_command->unsafe_native_handle() == nullptr;
+            check(open_group_rejected,
+                  label + " rejects an open concurrent group", group_error);
+        }
+    }
+
+    bool guards = true;
+    for (const TestBuffer* buffer : gr_model_inputs) {
+        guards &= buffer->guards_intact();
+    }
+    const auto check_output_guards = [&](const std::vector<TestBuffer*>& list) {
+        for (const TestBuffer* buffer : list) {
+            if (!buffer->allocation().empty()) guards &= buffer->guards_intact();
+        }
+    };
+    check_output_guards(composed_buffers_to_check);
+    check_output_guards(direct_buffers_to_check);
+    check(guards, label + " all active input/output guard regions");
+
+    return outputs_match && model_inputs_unchanged && aliases_rejected &&
+           late_failure_rolled_back && open_group_rejected && guards;
+}
+
+bool test_prefill_attention_gdn_transition(Context& context) {
+    bool passed = true;
+    const std::array<PrefillBF16X2Mode, 3u> modes{
+        PrefillBF16X2Mode::off,
+        PrefillBF16X2Mode::all_projections,
+        PrefillBF16X2Mode::except_gr};
+    for (std::size_t index = 0u; index < modes.size(); ++index) {
+        passed &= run_prefill_attention_gdn_transition_case(
+            context, 1u, modes[index], index % 2u == 0u);
+    }
+    passed &= run_prefill_attention_gdn_transition_case(
+        context, 3u, PrefillBF16X2Mode::except_gr, false);
+    passed &= run_prefill_attention_gdn_transition_case(
+        context, 65u, PrefillBF16X2Mode::except_gr, false);
+    return passed;
+}
+
 bool test_prefill_native_projection_buffer_sizes() {
     const PrefillGemmMPPParams qkv{
         1u, GDN_CONV_CHANNELS, N_EMBD, GDN_CONV_CHANNELS, 0u, false};
@@ -7728,6 +8403,7 @@ int main(int argc, char** argv) {
     passed &= test_prefill_gdn_out_norm_halfway_rne(*context);
     passed &= test_prefill_native_projection_buffer_sizes();
     passed &= test_prefill_gdn_block_validation(*context);
+    passed &= test_prefill_attention_gdn_transition(*context);
     const std::array<std::uint32_t, 3> rows{1u, 3u, 8u};
     const std::array<PrefillBF16X2Mode, 3> modes{
         PrefillBF16X2Mode::off,
