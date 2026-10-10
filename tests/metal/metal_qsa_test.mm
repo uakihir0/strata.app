@@ -166,7 +166,8 @@ float sample(twin::InputSet set, std::mt19937_64& rng,
 bool run_command(Context& context, const std::string& label,
                  const QsaNormRopeBuffers& buffers,
                  std::uint32_t token_rows, QsaNormRopeMode mode,
-                 std::string& error, bool shared_encoder = false) {
+                 std::string& error, bool shared_encoder = false,
+                 bool prefill_api = false) {
     auto command = context.make_command_buffer(label, error);
     if (!command) {
         check(false, label + " command buffer", error);
@@ -176,13 +177,20 @@ bool run_command(Context& context, const std::string& label,
         ? Encoder::encode(
               context, *command, "shared QSA norm/RoPE",
               [&](Encoder& encoder, std::string& encode_error) {
-                  return encode_qsa_norm_rope(
-                      context, encoder, token_rows, mode, buffers,
-                      encode_error);
+                  return prefill_api
+                      ? encode_prefill_qsa_norm_rope(
+                            context, encoder, token_rows, mode, buffers,
+                            encode_error)
+                      : encode_qsa_norm_rope(
+                            context, encoder, token_rows, mode, buffers,
+                            encode_error);
               },
               error)
-        : encode_qsa_norm_rope(context, *command, token_rows, mode, buffers,
-                               error);
+        : (prefill_api
+               ? encode_prefill_qsa_norm_rope(
+                     context, *command, token_rows, mode, buffers, error)
+               : encode_qsa_norm_rope(
+                     context, *command, token_rows, mode, buffers, error));
     if (!encoded) {
         check(false, label + " encode", error);
         if (!shared_encoder) command->discard();
@@ -220,12 +228,14 @@ bool run_norm_case(Context& context, std::uint32_t token_rows,
                    const twin::Options& options,
                    std::string_view edge_label,
                    std::vector<float>& actual_output,
-                   bool shared_encoder = false) {
+                   bool shared_encoder = false,
+                   bool prefill_api = false) {
     const std::string label =
         "QSA norm_rope " + std::string(mode_name(mode)) +
         " T=" + std::to_string(token_rows) +
         " set=" + twin::input_set_name(set) + std::string(edge_label) +
-        (shared_encoder ? " shared-encoder" : "");
+        (shared_encoder ? " shared-encoder" : "") +
+        (prefill_api ? " prefill" : "");
     const bool in_place = mode != QsaNormRopeMode::query;
     const std::size_t input_bytes = input.size_bytes();
     const std::size_t output_bytes =
@@ -292,7 +302,7 @@ bool run_norm_case(Context& context, std::uint32_t token_rows,
         input_buffer.view(), gamma_buffer.view(), steps_buffer.view(),
         rope_buffer.view(), output_ref};
     if (!run_command(context, label, buffers, token_rows, mode, error,
-                     shared_encoder)) {
+                     shared_encoder, prefill_api)) {
         return false;
     }
 
@@ -580,6 +590,71 @@ void make_steps(std::vector<StepRow>& steps) {
                                        INDEXER_BLOCK_CELLS)),
             static_cast<std::int32_t>(INDEXER_SELECTION_WIDTH_MAX)};
     }
+}
+
+bool run_prefill_norm_rope_case(Context& context,
+                                const twin::Options& options) {
+    constexpr std::uint32_t token_rows = 65u;
+    const std::vector<float> rope = make_rope_table();
+    bool passed = true;
+    for (const auto mode : {QsaNormRopeMode::key, QsaNormRopeMode::query,
+                            QsaNormRopeMode::indexer_query}) {
+        const std::uint32_t heads = heads_per_token(mode);
+        const std::uint32_t stride = input_stride(mode);
+        const std::uint32_t value_width = width(mode);
+        std::mt19937_64 rng(
+            options.seed ^
+            (std::uint64_t{static_cast<std::uint32_t>(mode)} << 40u) ^
+            0x50524546494c4cull);
+        std::vector<float> input(
+            static_cast<std::size_t>(token_rows) * heads * stride);
+        for (std::uint32_t index = 0u; index < input.size(); ++index) {
+            input[index] =
+                sample(twin::InputSet::fixture, rng, index, 0.4f);
+        }
+        std::vector<float> gamma(value_width);
+        for (std::uint32_t index = 0u; index < gamma.size(); ++index) {
+            gamma[index] =
+                1.0f + sample(twin::InputSet::fixture, rng, index + 71u,
+                              0.25f);
+        }
+        std::vector<StepRow> steps(token_rows);
+        for (std::uint32_t token = 0u; token < token_rows; ++token) {
+            const auto position = static_cast<std::int32_t>(
+                token % static_cast<std::uint32_t>(kRopeCells));
+            steps[token] = StepRow{
+                position,
+                position + 1,
+                position / static_cast<std::int32_t>(INDEXER_BLOCK_CELLS),
+                static_cast<std::int32_t>(INDEXER_SELECTION_WIDTH_MAX)};
+        }
+
+        std::vector<float> standalone_output;
+        passed &= run_norm_case(
+            context, token_rows, mode, twin::InputSet::fixture, input,
+            gamma, steps, rope, options, " 65-row Prefill chunk",
+            standalone_output, false, true);
+        std::vector<float> encoder_output;
+        passed &= run_norm_case(
+            context, token_rows, mode, twin::InputSet::fixture, input,
+            gamma, steps, rope, options,
+            " 65-row Prefill chunk",
+            encoder_output, true, true);
+        const auto mismatch = twin::compare_bytes(
+            std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(
+                    standalone_output.data()),
+                standalone_output.size() * sizeof(float)),
+            std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(encoder_output.data()),
+                encoder_output.size() * sizeof(float)));
+        check(!mismatch,
+              "QSA Prefill norm/RoPE " +
+                  std::string(mode_name(mode)) +
+                  " CommandBuffer/Encoder bit parity");
+        passed &= !mismatch;
+    }
+    return passed;
 }
 
 bool run_mode_set(Context& context, QsaNormRopeMode mode,
@@ -1340,12 +1415,84 @@ bool test_norm_rope_shared_encoder_validation(
         check(rejected, label, error);
         return rejected;
     };
+    const auto reject_prefill_rows =
+        [&](const std::string& label, std::uint32_t rows,
+            const std::string& expected_error) {
+            error.clear();
+            auto command = context.make_command_buffer(label, error);
+            if (!command) {
+                check(false, label + " command buffer", error);
+                return false;
+            }
+            const bool failed = !Encoder::encode(
+                context, *command, label,
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encode_prefill_qsa_norm_rope(
+                        context, encoder, rows, QsaNormRopeMode::key, {},
+                        encode_error);
+                },
+                error);
+            const bool rejected =
+                failed &&
+                command->unsafe_native_handle() == nullptr &&
+                error.find(expected_error) != std::string::npos;
+            check(rejected, label, error);
+            return rejected;
+        };
+    const auto reject_prefill_command_buffer =
+        [&](const std::string& label, std::uint32_t rows,
+            const std::string& expected_error) {
+            error.clear();
+            auto command = context.make_command_buffer(label, error);
+            if (!command) {
+                check(false, label + " command buffer", error);
+                return false;
+            }
+            const bool failed = !encode_prefill_qsa_norm_rope(
+                context, *command, rows, QsaNormRopeMode::key, {}, error);
+            const bool rejected =
+                failed && command->unsafe_native_handle() == nullptr &&
+                error.find(expected_error) != std::string::npos;
+            check(rejected, label, error);
+            return rejected;
+        };
+    const auto accept_prefill_row_limit =
+        [&] {
+            constexpr std::string_view kExpectedBufferError =
+                "norm input buffer is not owned by this Context";
+            error.clear();
+            auto command = context.make_command_buffer(
+                "Prefill QSA norm/RoPE accepts shader-row limit", error);
+            if (!command) {
+                check(false, "Prefill QSA row-limit command buffer", error);
+                return false;
+            }
+            const bool reached_buffer_validation =
+                !encode_prefill_qsa_norm_rope(
+                    context, *command, kPrefillMaxShaderRows,
+                    QsaNormRopeMode::key, {}, error) &&
+                command->unsafe_native_handle() == nullptr &&
+                error.find(kExpectedBufferError) != std::string::npos;
+            check(reached_buffer_validation,
+                  "Prefill QSA accepts inclusive shader-row limit", error);
+            return reached_buffer_validation;
+        };
 
     bool passed = true;
     passed &= reject("QSA shared norm/RoPE rejects zero rows", 0u,
                      QsaNormRopeMode::key, {}, "row count");
     passed &= reject("QSA shared norm/RoPE rejects rows above eight", 9u,
                      QsaNormRopeMode::key, {}, "row count");
+    passed &= reject_prefill_rows(
+        "Prefill QSA norm/RoPE rejects zero rows", 0u,
+        "must be positive");
+    passed &= reject_prefill_rows(
+        "Prefill QSA norm/RoPE rejects rows beyond shader limit",
+        kPrefillMaxShaderRows + 1u, "shader-row limit");
+    passed &= accept_prefill_row_limit();
+    passed &= reject_prefill_command_buffer(
+        "Prefill QSA standalone overload rolls back above row limit",
+        kPrefillMaxShaderRows + 1u, "shader-row limit");
     passed &= reject("QSA shared norm/RoPE rejects invalid mode", 1u,
                      static_cast<QsaNormRopeMode>(9u), {}, "mode");
 
@@ -6426,6 +6573,7 @@ int main(int argc, char** argv) {
     passed &= test_encoder_validation(*context, *foreign_context);
     passed &= test_norm_rope_shared_encoder_validation(
         context_options, *foreign_context);
+    passed &= run_prefill_norm_rope_case(*context, options);
     passed &= test_fwht_shared_encoder_validation(
         *context, *foreign_context);
     passed &= test_kv_encoder_validation(*context, *foreign_context);
