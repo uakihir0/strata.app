@@ -154,7 +154,7 @@ It does not cover:
 | `common/params.h` | Architecture constants of [03](03-model-reference.md), section 3.1 (`N_EMBD`, `HC`, `N_LAYER`, ...) as `constant constexpr` values; model metadata such as `rope.freq_base` remains runtime data |
 | `safe/embed.metal` | Q3_K, IQ3_S, IQ4_XS and BF16 token gathers, bit-exact image-row copies and GR stream broadcast; the validated embedding encoders and Prefill embedding coordinator support caller-owned Encoder segments with concurrent-mode barriers. The FullMode T=1 step maps native `token_embd.weight` types Q3_K/IQ3_S/IQ4_XS and composes gather→broadcast→layer-0 MoE→one pending consumer; it checks scratch liveness and allows only exact reuse as `shared.output`. Caller-owned Encoder and standalone transactional CommandBuffer forms share this sequence, with the standalone form discarding all encoded work on validation failure. Its BF16 gather remains available to standalone callers, but this coordinator does not resolve the optional BF16 embedding artifact. A separate layer-0 coordinator composes attention GR read→GDN→FFN GR read. Full Window decode and Prefill production dispatch remain unimplemented |
 | `safe/prefill_gr.metal` | Prefill-specific GR read normalization with the documented two-stage butterfly, fused GR write/next-read normalization, low-rank SiLU and four-stream mix; `encode_prefill_gr_read` composes normalization, down, SiLU, up and injection projections, and `encode_prefill_gr_read_mix` adds the ordered four-stream mixer. The isolated encoders support mode-specific BF16 remainder outputs, while `Prefill::run` remains unimplemented |
-| `safe/prefill_gdn.metal` | Isolated Prefill post-projection GDN gate/beta transforms, 64-row tiled convolution, ordered convolution-history update and q/k L2 normalization with validated standalone and caller-owned Encoder APIs; Prefill GEMM and chunk-loop integration remain pending |
+| `safe/prefill_gdn.metal` | Isolated Prefill GDN transforms and `encode_prefill_gdn_block`, which composes the three native-weight projections, BF16 alpha/beta projections, six post-projection transforms and final `ssm_out` projection for one chunk; production layer scheduling and `Prefill::run` remain pending |
 | `safe/ple.metal` | `strata_ple_gate`, `strata_ple_broadcast`, `strata_ple_conv_residual` and `strata_ple_history` are implemented; validated gate, value-broadcast, conv-residual and history encoders can join a caller-owned `Encoder` segment (the Window path must use its documented serial mode); production PLE dispatch remains unimplemented |
 | `safe/gr.metal` | Weighted RMS norm, fused `strata_gr_norm`, tiled `strata_gr_down`, fused `strata_gr_up`, O-class `strata_gr_cvec`, native `strata_gr_post`, `strata_gr_down_silu` and `strata_gr_pre_gated` are implemented; validated weighted-norm, norm/down/up/cvec/post/down-SiLU/pre-gated encoders exist, and weighted RMS norm, GR norm, GR down, GR up, GR cvec, GR post, GR down-SiLU and GR pre-gated can join a caller-owned `Encoder` segment; the T=1 Window layer-0 coordinator calls attention and FFN GR reads with their distinct `hc_attn_*` and `hc_ffn_*` weights; later Window layers and Prefill production dispatch remain unimplemented |
 | `safe/gdn.metal` | GDN conv, gates, step and commit; all four decode kernels are implemented and covered by validated encoders and `metal_gdn_test`; all four also support caller-owned Encoder segments; the T=1 layer-0 coordinator orders the speculative GDN block between attention and FFN GR reads, while router/MoE, full `Window::run`, commit scheduling and Prefill dispatch remain open |
@@ -4342,8 +4342,9 @@ extents, alignment, Context ownership and output aliases. Serial and
 concurrent Prefill tests exercise both standalone and caller-owned Encoder
 forms at T=1/3/8, including tail lanes, the softplus linear branch, negative
 inputs, immutable read-only inputs, rollback and rejection inside an open
-concurrent group. The stage is not yet connected to the Prefill BF16 GEMM or
-chunk loop.
+concurrent group. The GDN block coordinator below composes this stage with its
+BF16 projection; production GR-to-layer scheduling and the Prefill chunk loop
+remain pending.
 
 **`strata_pf_gdn_conv_tiled`**, grid (80, ⌈T / 64⌉) × 128. Thread `c = 128·tg.x + tid` walks rows
 `t0 = 64·tg.y` .. `min(t0 + 64, T) − 1` of channel c:
@@ -4378,8 +4379,9 @@ of 64-row tile boundaries, input immutability, guards, invalid views,
 rollback, open-group rejection and a cancellation-sensitive FMA-order
 negative control using non-dyadic values. It does not update history; step 5
 is implemented by the separate `strata_pf_gdn_conv_hist` kernel and
-`encode_prefill_gdn_conv_history` API below. Neither encoder is connected to
-Prefill GEMMs or the chunk loop.
+`encode_prefill_gdn_conv_history` API below. The GDN block coordinator below
+composes both encoders with their projections; production chunk scheduling
+remains pending.
 
 **`strata_pf_gdn_conv_hist`**, grid 80 × 128, one channel per thread:
 
@@ -4401,8 +4403,9 @@ shader-unsafe row counts, undersized/misaligned/foreign views, history/QKV
 overlap and calls in an open concurrent group. Serial and concurrent tests
 cover T=1/2/3/8/65; same-Encoder convolution→history compositions at T=1/2/65
 verify convolution consumes the old history before it is advanced. Validation
-and rollback cover both API forms. The step remains isolated from the Prefill
-GEMMs and chunk loop.
+and rollback cover both API forms. The one-chunk GDN coordinator composes this
+step after convolution and with the projection stages; production scheduling
+remains pending.
 
 **`strata_pf_gdn_l2`**, grid (32, T) × 128. Threadgroup (b, t) normalises q/k head b of row t (b < 16 q, else k):
 
@@ -4425,7 +4428,8 @@ open concurrent groups. Serial and concurrent tests cover T=1/2/3/8/65,
 including same-Encoder convolution→L2 composition, an order-sensitive
 reduction sentinel with a regrouping negative control, an epsilon sentinel
 near a 1e-6 sum, unchanged v heads, validation and both-overload rollback.
-Prefill GEMM and chunk-loop integration remain pending.
+The GDN block coordinator below composes this stage with the projections and
+remaining transforms; production chunk scheduling remains pending.
 
 **`strata_pf_gdn_rec`**, grid 192 × 128, 1-D. Threadgroup b handles v-head `head = b / 4` and the 32 columns
 `col = 32·(b % 4) + c`, where `c = tid % 32`. Thread (rg, c), with `rg = tid / 32`, holds state rows
@@ -4475,8 +4479,9 @@ ownership and disjoint writable views, and rejects dispatch inside an open
 concurrent group. Serial and concurrent tests compare output and final state
 against a scalar oracle at T=1/2/3/8/65, cover both encoder forms and
 L2→recurrence composition, and check a reduction-order sentinel, immutable
-inputs, guards, invalid views and rollback. Prefill GEMMs and chunk-loop
-integration remain pending.
+inputs, guards, invalid views and rollback. The GDN block coordinator below
+composes this stage with the projections and remaining transforms; production
+chunk scheduling remains pending.
 
 **`strata_pf_gdn_out_norm`**, grid (T, 48) × 128. Threadgroup (t, head), thread `col = tid`:
 
@@ -4506,15 +4511,18 @@ reduction order with a F16-distinguishing regrouping control, and exercise
 both encoder forms and L2→recurrence→output-normalization composition. Direct
 GPU fixtures lock F16 halfway RNE bits and unsaturated positive/negative
 overflow to infinity; tests also cover input immutability, guards, validation
-and rollback. Prefill GEMMs and chunk-loop integration remain pending.
+and rollback. The GDN block coordinator below composes this stage with the
+projections and remaining transforms; production chunk scheduling remains
+pending.
 
 `encode_prefill_gdn_transforms` now composes the six post-projection stages in
 one ordered segment: gates, tiled convolution, convolution-history advance,
 q/k L2, recurrence and output normalization. Its inputs are the already
 projected `alpha_beta`, `qkv` and `z` tensors plus the layer vectors and
-persistent `history`/`state`; it returns F16 `y_h`. It does not encode the
-four input projections or the final `ssm_out` projection, and is not called by
-the Prefill chunk loop. Before the first dispatch it validates every active
+persistent `history`/`state`; it returns F16 `y_h`. The full GDN block
+coordinator below supplies its projections and consumes its output. The
+transform-only API remains available for callers with already projected
+inputs; production chunk scheduling is not connected. Before the first dispatch it validates every active
 extent, alignment, Context owner and cross-stage writable/read-only alias.
 Convolution consumes the old history before the next-history write; `h` and
 `oc` are then reused by their documented in-place/following stages. The
@@ -4526,8 +4534,33 @@ at the recurrence stage, a short final output before any stage is encoded, and
 an open concurrent group. Oversized history/QKV views whose active ranges are
 disjoint in one arena are accepted through both API forms. The component
 encoders receive active-length slices so their local alias checks match the
-coordinator's preflight. These synthetic post-projection tests do not establish
-model-backed inference.
+coordinator's preflight. These synthetic tests do not establish model-backed
+inference.
+
+`encode_prefill_gdn_block` composes all nine §6.4 steps for one layer chunk:
+native F16 `attn_qkv` and `attn_gate` projections, BF16 `ssm_alpha` and
+`ssm_beta` projections into separate halves of `alpha_beta`, the six
+post-projection transforms above, and native F16 `ssm_out` into F32 `bo`.
+Each native tensor's quantization format is supplied by the caller because it
+varies across model files and layers. Modes 1 and 2 both apply BF16X2 to the
+GDN alpha/beta projections; mode 0 uses only the BF16 high input. One
+K-major-F16 dequantization scratch is reused in projection order. Before the
+first dispatch, the coordinator checks every active extent, format, alignment,
+Context owner and cross-stage alias, then passes active-length slices to the
+projection and transform encoders. Its caller-owned Encoder form requires
+failure propagation; the CommandBuffer form discards the whole unsubmitted
+block on failure.
+
+Serial and concurrent tests use synthetic Q8_0 native tensors and BF16
+alpha/beta weights. They compare every intermediate, persistent state update,
+the final `bo`, and the reused scratch with the direct projection and
+transform sequence for all BF16X2 modes at T=1 and mode 2 at T=3. Preflight
+tests cover a short final output, a late-stage projection format error, a
+cross-stage alias, missing or unexpected remainder input, and open concurrent
+groups. Individual native-projection tests cover all 11 supported formats.
+This block does not schedule layers, consume GR mixer output itself, or connect
+to production `Prefill::run`; synthetic component parity is not model-backed
+inference.
 
 **Bits.**
 - Given the same `qkv`, `gate`, `beta` and `z`, steps 4-8 give the bits of decode's GDN kernels over the same rows:
@@ -5789,7 +5822,7 @@ and foreign Context ownership.
 | `metal_mtp_window_ids_test_concurrent` | metal | Same kernel as `metal_mtp_window_ids_test` | Repeats stage 12 with concurrent dispatch and verifies ordered-boundary rejection without changing fixture buffers |
 | `metal_sampler_parity_test`, `metal_sampler_parity_test_concurrent` | metal | Section 5.12's greedy, split-part, split-merge, composite sampled, coupled-penalty and CPU-tail twin on random, edge and fixture inputs for T=1..8 and model/maximum vocabularies; standalone and shared Encoder paths match the scalar references; concurrent tests reject dependent merge/sample calls in an open group and verify segment discard, including discard of a prior split-part dispatch; shared coupled-penalty→sampled composition and 248,320/262,144 vocabulary merge scratch are checked in one Encoder segment; fixtures 16 and 17 are deterministic semantic ports, with host fixture 15 in `sampler_tail_test`; literal upstream fixtures 1-14 and 18 and production sampler integration remain open under REV-028 | Candidate IDs/logit bits and CPU-tail tokens/probabilities exact |
 | `metal_util_test` | metal | `strata_util_*` | B |
-| `metal_prefill_test` | metal | `strata_pf_gr_norm`, `strata_pf_gr_norm_lo`, `strata_pf_gr_write_norm`, `strata_pf_gr_write_norm_lo`, `strata_pf_gdn_gates`, `strata_pf_gdn_conv_tiled`, `strata_pf_gdn_conv_hist`, `strata_pf_gdn_l2`, `strata_pf_gdn_rec`, `strata_pf_gdn_out_norm`, `strata_pf_gr_silu`, `strata_pf_gr_silu_lo`, `strata_pf_gr_mix`, `strata_pf_gr_mix_lo`, `strata_embed_rows_{q3_k,iq3_s,iq4_xs,bf16}`, `strata_gr_broadcast` | Prefill GR normalization T=1/3/8 covers BF16X2 modes 0/1/2 and random, edge (including an order-sensitive reduction sentinel) and fixture data against a scalar oracle that reproduces 256-thread FMA accumulation and both XOR reduction stages. Scale is U(4), high BF16 is U(1), and the low remainder is bitwise checked from the GPU scale/high outputs. GR write-norm covers T=1/3/8 in all three modes; the fused residual, scale, high BF16 and mode-1 low BF16 outputs match the separate GR-post then GR-normalization GPU chain bitwise. Prefill GDN gates cover T=1/3/8 with softplus gate U(256) and sigmoid beta U(128) against scalar transforms; fixtures cover branch and tail lanes, readonly input overlap, guards, alias/extent/ownership rejection and rollback. Prefill GDN tiled convolution covers T=1/3/64/65/129 against a scalar four-tap/FMA/SiLU oracle with a cancellation-sensitive non-dyadic FMA-order negative control; history/QKV/weight immutability, guards, validation, rollback and open-group rejection are checked. Convolution history covers T=1/2/3/8/65 in standalone and caller-owned Encoder forms against an exact three-row oracle; T=1/2/65 same-segment convolution→history cases verify old-history consumption. History/QKV aliases, short/misaligned/foreign views, row bounds, both-overload rollback and open-group rejection are checked. GDN q/k L2 covers T=1/2/3/8/65 in standalone and caller-owned Encoder forms against an ordered four-simdgroup oracle; order and epsilon sentinels, unchanged v heads, guards, convolution→L2 composition, validation, rollback and open-group rejection are checked. GDN recurrence covers raw output and final state against a scalar oracle at T=1/2/3/8/65, standalone and caller-owned forms, L2→recurrence composition, a regrouping-sensitive sentinel, input immutability, guards, view validation, both-overload rollback and open-group rejection. GR SiLU T=1/3/8 covers modes 0/1/2 with positive, negative, zero and tail values; high BF16 is U(1) and the BF16 remainder is U(2) against the scalar SiLU oracle. Exact high-output BF16 halfway cases check RNE bits in every mode; mode 1 also checks positive and negative remainder halfway cases against exact even-result bits. GR mix covers T=1/3/8 × BF16X2 mode 0/1/2, checks high BF16 and F16 against scalar oracles, and checks `high + low` reconstruction within `2^-15` of the absolute-term magnitude in modes 1/2 while requiring the low part to improve more than a quarter of high-only outputs. Exact binary-input midpoint fixtures assert high BF16 and positive/negative low-remainder RNE bits in modes 1/2. Standalone and shared Encoder forms check read-only inputs, guards, invalid mode/extent/alignment/alias/ownership, and late-failure discard. The embedding gather → GR broadcast → Prefill normalization chain runs in one segment; the GR read coordinator composes normalization → down → SiLU → up → injection for modes 0/1/2 and checks direct-chain parity plus independent FP64 projection oracles. The read/mix coordinator extends this through four-stream mixing for modes 0/1/2, matches every output against the direct component sequence, rejects read-output/model-weight aliases before dispatch, and verifies late selector-failure rollback through both API forms. Open concurrent-group refusal is checked. GDN recurrence compares raw outputs and final state with a scalar oracle at T=1/2/3/8/65; caller-owned Encoder cases run at T=1/8, L2→recurrence composition runs at T=1/3/8, and tests cover an ordered-reduction sentinel, immutable inputs, guards, view validation, both-overload rollback and open-group rejection. GDN output normalization checks F16 output against a scalar oracle at T=1/2/3/8/65, with one-half-ULP tolerance for Metal math approximations; it also has a four-partial-order sentinel whose regrouping control changes F16 bits, exact halfway RNE bits, and unsaturated positive/negative overflow checks. Standalone and caller-owned Encoder forms, epsilon, immutable inputs, guards, validation, both-overload rollback and L2→recurrence→out-normalization composition at T=1/3/8 are covered. Prefill GEMM and chunk-loop integration remain open. |
+| `metal_prefill_test` | metal | `strata_pf_gr_norm`, `strata_pf_gr_norm_lo`, `strata_pf_gr_write_norm`, `strata_pf_gr_write_norm_lo`, `strata_pf_gdn_gates`, `strata_pf_gdn_conv_tiled`, `strata_pf_gdn_conv_hist`, `strata_pf_gdn_l2`, `strata_pf_gdn_rec`, `strata_pf_gdn_out_norm`, `strata_pf_gr_silu`, `strata_pf_gr_silu_lo`, `strata_pf_gr_mix`, `strata_pf_gr_mix_lo`, `strata_embed_rows_{q3_k,iq3_s,iq4_xs,bf16}`, `strata_gr_broadcast` | Prefill GR normalization T=1/3/8 covers BF16X2 modes 0/1/2 and random, edge (including an order-sensitive reduction sentinel) and fixture data against a scalar oracle that reproduces 256-thread FMA accumulation and both XOR reduction stages. Scale is U(4), high BF16 is U(1), and the low remainder is bitwise checked from the GPU scale/high outputs. GR write-norm covers T=1/3/8 in all three modes; the fused residual, scale, high BF16 and mode-1 low BF16 outputs match the separate GR-post then GR-normalization GPU chain bitwise. Prefill GDN gates cover T=1/3/8 with softplus gate U(256) and sigmoid beta U(128) against scalar transforms; fixtures cover branch and tail lanes, readonly input overlap, guards, alias/extent/ownership rejection and rollback. Prefill GDN tiled convolution covers T=1/3/64/65/129 against a scalar four-tap/FMA/SiLU oracle with a cancellation-sensitive non-dyadic FMA-order negative control; history/QKV/weight immutability, guards, validation, rollback and open-group rejection are checked. Convolution history covers T=1/2/3/8/65 in standalone and caller-owned Encoder forms against an exact three-row oracle; T=1/2/65 same-segment convolution→history cases verify old-history consumption. History/QKV aliases, short/misaligned/foreign views, row bounds, both-overload rollback and open-group rejection are checked. GDN q/k L2 covers T=1/2/3/8/65 in standalone and caller-owned Encoder forms against an ordered four-simdgroup oracle; order and epsilon sentinels, unchanged v heads, guards, convolution→L2 composition, validation, rollback and open-group rejection are checked. GDN recurrence covers raw output and final state against a scalar oracle at T=1/2/3/8/65, standalone and caller-owned forms, L2→recurrence composition, a regrouping-sensitive sentinel, input immutability, guards, view validation, both-overload rollback and open-group rejection. GR SiLU T=1/3/8 covers modes 0/1/2 with positive, negative, zero and tail values; high BF16 is U(1) and the BF16 remainder is U(2) against the scalar SiLU oracle. Exact high-output BF16 halfway cases check RNE bits in every mode; mode 1 also checks positive and negative remainder halfway cases against exact even-result bits. GR mix covers T=1/3/8 × BF16X2 mode 0/1/2, checks high BF16 and F16 against scalar oracles, and checks `high + low` reconstruction within `2^-15` of the absolute-term magnitude in modes 1/2 while requiring the low part to improve more than a quarter of high-only outputs. Exact binary-input midpoint fixtures assert high BF16 and positive/negative low-remainder RNE bits in modes 1/2. Standalone and shared Encoder forms check read-only inputs, guards, invalid mode/extent/alignment/alias/ownership, and late-failure discard. The embedding gather → GR broadcast → Prefill normalization chain runs in one segment; the GR read coordinator composes normalization → down → SiLU → up → injection for modes 0/1/2 and checks direct-chain parity plus independent FP64 projection oracles. The read/mix coordinator extends this through four-stream mixing for modes 0/1/2, matches every output against the direct component sequence, rejects read-output/model-weight aliases before dispatch, and verifies late selector-failure rollback through both API forms. Open concurrent-group refusal is checked. GDN recurrence compares raw outputs and final state with a scalar oracle at T=1/2/3/8/65; caller-owned Encoder cases run at T=1/8, L2→recurrence composition runs at T=1/3/8, and tests cover an ordered-reduction sentinel, immutable inputs, guards, view validation, both-overload rollback and open-group rejection. GDN output normalization checks F16 output against a scalar oracle at T=1/2/3/8/65, with one-half-ULP tolerance for Metal math approximations; it also has a four-partial-order sentinel whose regrouping control changes F16 bits, exact halfway RNE bits, and unsaturated positive/negative overflow checks. Standalone and caller-owned Encoder forms, epsilon, immutable inputs, guards, validation, both-overload rollback and L2→recurrence→out-normalization composition at T=1/3/8 are covered. The full one-chunk GDN coordinator compares native and BF16 projections, every transform, persistent history/state, and reused dequant scratch with the direct component chain; late selector failure after dequant dispatch verifies rollback through both API forms. Production GR-to-GDN scheduling and chunk-loop integration remain open. |
 | `metal_dispatch_modes_test` and the `model` properties | model | Section 10.4 | B |
 | `metal_window_gdn_commit_batch_test` | metal | `strata_gdn_conv_commit`, `strata_gdn_step_norm` mode 1, `strata_ple_history` | T=2 accepted-prefix replay across all 36 GDN state ordinals, followed by PLE history advancement in the same segment. Per-layer convolution history uses distinct qkv rows; every recurrent state matches an independent per-layer scalar oracle; PLE history matches the two accepted normalized rows. Rejects a short final gamma, short PLE rows, a repeated GDN state and a PLE/GDN alias before dispatch, verifies caller-owned rollback after an earlier encoded layer, and preserves replay inputs and unused scratch |
 | `metal_window_gdn_commit_batch_test_concurrent` | metal | Same GDN/PLE commit kernels and batch fixture | Runs the same GDN and PLE accepted-prefix state fixture with `STRATA_METAL_DISPATCH=concurrent`, preserving serial layer ordering and all oracle, alias and rollback checks |

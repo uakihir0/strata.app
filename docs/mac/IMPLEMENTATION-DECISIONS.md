@@ -10975,3 +10975,63 @@ measuring L-15 remain open.
   final-output and shared-arena cases. On Mac17,9 (64 GB, macOS 27.0.1,
   Xcode 27.0 build 27A266a), the rebuilt `mac-dev` target succeeded,
   `test_map` passed 1/1 and the final full `mac-metal` suite passed 90/90.
+
+### D-IMPL-378: Compose one complete Prefill GDN chunk
+
+- **Decision:** Add `encode_prefill_gdn_block` to encode the documented
+  `attn_qkv`, `attn_gate`, `ssm_alpha`, `ssm_beta`, GDN transform and
+  `ssm_out` stages for one chunk. Require native-weight format tags per
+  tensor, reuse a single K-major F16 dequantization scratch in projection
+  order, and use BF16X2 for GDN alpha/beta in both modes 1 and 2. Keep
+  layer scheduling, GR production and `Prefill::run` outside this boundary.
+- **Reason:** The corresponding projection and transform components already
+  have independent contracts and tests. Composing the full GDN mixer boundary
+  exercises its ordering, active tensor shapes, format selection, persistent
+  mutations and scratch lifetime without claiming a production Prefill path
+  before the GR-to-layer scheduler and model metadata binding exist.
+- **Review required:** Verify the nine-stage order, all row/column extents and
+  quantized weight byte sizes, BF16X2 behavior in modes 0/1/2, active-range
+  alias checks, serial scratch reuse, full-segment rollback and failure
+  propagation. Confirm tests cover multi-row output sizing and distinguish
+  synthetic block parity from model-backed inference.
+
+### REV-175: Hostile review of Prefill GDN block composition
+
+- **Scope:** Adversarially review the implementation and direct-chain tests for
+  `encode_prefill_gdn_block`, including active sizes, format validation,
+  BF16X2 modes, cross-stage aliases, scratch reuse/order, transactional
+  failure behavior, and the `Encoder` dispatch-prefix observation used by
+  rollback tests.
+- **Findings and fixes:** The first review found that the late-failure test
+  proved discard and unchanged buffers but did not prove an earlier dispatch
+  had actually been encoded. Added `Encoder::has_encoded_dispatches()` and
+  assertions in both API forms that the invalid final projection is rejected
+  after the successful prefix. The review also found stale Prefill status text
+  in the docs; synchronized the kernel, engine, testing and overview pages.
+- **Disposition:** The follow-up hostile review confirmed the dispatch flag is
+  false before dispatch and becomes true only after a successful dispatch,
+  verified prefix rollback and unchanged persistent/scratch/output buffers
+  through both API forms, and found no remaining actionable issue.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `mac-dev` built successfully; focused Prefill and Encoder tests
+  passed 5/5; the full `mac-metal` suite passed 90/90; `mac-host` passed 44/45
+  with one real-input test skipped because model inputs are unavailable;
+  Python passed all 35/35 modules in `.venv`; and `test_map` passed 1/1.
+
+### D-IMPL-379: Expose whether an Encoder segment emitted dispatches
+
+- **Decision:** Add the read-only `Encoder::has_encoded_dispatches()` query.
+  It starts false and changes to true only after a dispatch is successfully
+  encoded; it reports neither command-buffer submission nor GPU completion.
+- **Reason:** Transactional coordinator tests need to distinguish rejection
+  before any work from failure after an encoded prefix. Checking only that a
+  command buffer was discarded and allocations stayed unchanged did not prove
+  that the rollback path had exercised a real dispatch prefix.
+- **Review required:** Keep the state transition tied to successful dispatch
+  encoding, and verify late-failure tests observe the prefix before rollback
+  for both caller-owned and standalone forms. REV-175 reviewed this contract
+  and found no remaining issue.
+- **Validation:** The Prefill caller-owned late-failure test observes the
+  encoded prefix and then verifies discard plus unchanged allocations. The
+  standalone form verifies the same rollback; focused tests passed 5/5 and
+  the full `mac-metal` suite passed 90/90.
