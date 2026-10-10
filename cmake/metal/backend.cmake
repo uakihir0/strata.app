@@ -128,6 +128,7 @@ set(STRATA_METAL_ENGINE_SOURCES
   src/metal/engine/prefill_gdn_rec_dispatch.mm
   src/metal/engine/prefill_gdn_out_norm_dispatch.mm
   src/metal/engine/prefill_gdn_dispatch.mm
+  src/metal/engine/prefill_gdn_block_dispatch.mm
   src/metal/engine/prefill_dequant_dispatch.mm
   src/metal/engine/prefill_native_projection.mm
   src/metal/engine/prefill_gemm_dispatch.mm
