@@ -5371,6 +5371,435 @@ bool run_indexer_append_case(Context& context, std::uint32_t token_rows,
            outer_guards;
 }
 
+bool run_prefill_indexer_batch_case(
+    Context& context, std::uint32_t token_rows, std::uint32_t pos0,
+    twin::InputSet set, const twin::Options& options, bool shared_encoder) {
+    constexpr std::uint32_t kCellCapacity = 512u;
+    constexpr float kRopeZeroCos = 1.125f;
+    constexpr float kRopeZeroSin = -0.0f;
+    constexpr std::size_t kWidth = INDEXER_HEAD_DIM;
+    constexpr std::size_t kTailFloats = 3u * kWidth;
+    const std::size_t pool_rows =
+        kCellCapacity / INDEXER_BLOCK_CELLS + 2u;
+    const std::size_t raw_bytes =
+        static_cast<std::size_t>(token_rows) * kWidth * sizeof(float);
+    const std::size_t step_bytes =
+        static_cast<std::size_t>(token_rows) * sizeof(StepRow);
+    const std::size_t gamma_bytes = kWidth * sizeof(float);
+    const std::size_t rope_bytes =
+        static_cast<std::size_t>(kCellCapacity) * 32u * 2u * sizeof(float);
+    const std::size_t tail_bytes = kTailFloats * sizeof(float);
+    const std::size_t dead_bytes = kWidth * sizeof(float);
+    const std::size_t pool_bytes = pool_rows * kWidth * sizeof(float);
+    const std::string label =
+        "Prefill QSA indexer batch T=" + std::to_string(token_rows) +
+        " p0=" + std::to_string(pos0) + " set=" +
+        twin::input_set_name(set) +
+        (shared_encoder ? " shared Encoder" : " standalone");
+
+    if (token_rows == 0u || token_rows > kPrefillMaxShaderRows ||
+        pos0 > kCellCapacity || token_rows > kCellCapacity - pos0) {
+        check(false, label + " test parameters");
+        return false;
+    }
+    std::vector<std::uint32_t> tokens(token_rows);
+    for (std::uint32_t row = 0u; row < token_rows; ++row) {
+        tokens[row] = row * 17u + 3u;
+    }
+    PrefillChunkMetadata metadata;
+    std::string error;
+    if (!build_prefill_chunk_metadata(pos0, tokens, metadata, error)) {
+        check(false, label + " Prefill metadata", error);
+        return false;
+    }
+
+    std::mt19937_64 rng(options.seed ^
+                        (static_cast<std::uint64_t>(token_rows) << 36u) ^
+                        (static_cast<std::uint64_t>(pos0) << 20u) ^
+                        (static_cast<std::uint64_t>(set) << 12u) ^
+                        (shared_encoder ? 0x5a17u : 0x19c3u));
+    std::vector<float> gamma(kWidth);
+    for (std::uint32_t dimension = 0u; dimension < kWidth; ++dimension) {
+        gamma[dimension] =
+            1.0f + sample(set, rng, dimension + 0x531u, 0.375f);
+    }
+    std::vector<float> rope(
+        static_cast<std::size_t>(kCellCapacity) * 32u * 2u);
+    for (std::uint32_t cell = 0u; cell < kCellCapacity; ++cell) {
+        for (std::uint32_t pair = 0u; pair < 32u; ++pair) {
+            const float angle =
+                static_cast<float>((cell * 13u + pair * 7u) % 257u) * 0.013f;
+            const std::size_t index =
+                (static_cast<std::size_t>(cell) * 32u + pair) * 2u;
+            rope[index] = std::cos(angle) * 1.0625f;
+            rope[index + 1u] = std::sin(angle) * 1.0625f;
+        }
+    }
+    std::vector<float> raw_keys(
+        static_cast<std::size_t>(token_rows) * kWidth);
+    std::vector<StepRow> steps(token_rows);
+    std::vector<std::int32_t> positions(token_rows);
+    for (std::uint32_t row = 0u; row < token_rows; ++row) {
+        positions[row] = static_cast<std::int32_t>(pos0 + row);
+        const std::int32_t n_kv = positions[row] + 1;
+        steps[row] = StepRow{
+            positions[row], n_kv,
+            n_kv / static_cast<std::int32_t>(INDEXER_BLOCK_CELLS),
+            std::min<std::int32_t>(n_kv, 2051)};
+        for (std::uint32_t dimension = 0u; dimension < kWidth;
+             ++dimension) {
+            const std::uint32_t index = row * INDEXER_HEAD_DIM + dimension;
+            raw_keys[index] =
+                set == twin::InputSet::edge
+                    ? sample(set, rng, index + row * 5u, 2.75f)
+                    : sample(set, rng, index + 809u, 2.75f);
+        }
+    }
+
+    oracle::QsaIndexerState initial;
+    initial.tail.assign(kTailFloats, -13.25f);
+    initial.dead.assign(kWidth, -17.5f);
+    initial.pooled.assign(pool_rows * kWidth, -19.75f);
+    initial.block_position = -23;
+    std::vector<std::int32_t> prefix_positions(pos0);
+    std::vector<float> prefix_keys(static_cast<std::size_t>(pos0) * kWidth);
+    for (std::uint32_t row = 0u; row < pos0; ++row) {
+        prefix_positions[row] = static_cast<std::int32_t>(row);
+        for (std::uint32_t dimension = 0u; dimension < kWidth; ++dimension) {
+            const std::uint32_t index = row * INDEXER_HEAD_DIM + dimension;
+            prefix_keys[index] =
+                sample(set, rng, index + 0x1103u, 2.75f);
+        }
+    }
+    oracle::qsa_indexer_append(
+        prefix_keys, prefix_positions, gamma, rope, kRopeZeroCos,
+        kRopeZeroSin, initial);
+    oracle::QsaIndexerState expected = initial;
+    oracle::qsa_indexer_append(raw_keys, positions, gamma, rope,
+                               kRopeZeroCos, kRopeZeroSin, expected);
+
+    twin::GuardedBuffer raw_buffer, steps_buffer, gamma_buffer, rope_buffer;
+    twin::GuardedBuffer window_tail, window_dead, window_pool, window_block;
+    twin::GuardedBuffer prefill_tail, prefill_dead, prefill_pool,
+        prefill_block;
+    const bool allocated =
+        raw_buffer.allocate(context, label + " raw keys", raw_bytes, error) &&
+        steps_buffer.allocate(context, label + " steps", step_bytes, error) &&
+        gamma_buffer.allocate(context, label + " gamma", gamma_bytes, error) &&
+        rope_buffer.allocate(context, label + " RoPE", rope_bytes, error) &&
+        window_tail.allocate(context, label + " Window tail", tail_bytes,
+                             error) &&
+        window_dead.allocate(context, label + " Window dead", dead_bytes,
+                             error) &&
+        window_pool.allocate(context, label + " Window pool", pool_bytes,
+                             error) &&
+        window_block.allocate(context, label + " Window block position",
+                              sizeof(std::int32_t), error) &&
+        prefill_tail.allocate(context, label + " Prefill tail", tail_bytes,
+                              error) &&
+        prefill_dead.allocate(context, label + " Prefill dead", dead_bytes,
+                              error) &&
+        prefill_pool.allocate(context, label + " Prefill pool", pool_bytes,
+                              error) &&
+        prefill_block.allocate(context, label + " Prefill block position",
+                               sizeof(std::int32_t), error);
+    check(allocated, label + " allocations", error);
+    if (!allocated || !raw_buffer.view() || !steps_buffer.view() ||
+        !gamma_buffer.view() || !rope_buffer.view() ||
+        !window_tail.view() || !window_dead.view() || !window_pool.view() ||
+        !window_block.view() || !prefill_tail.view() || !prefill_dead.view() ||
+        !prefill_pool.view() || !prefill_block.view()) {
+        return false;
+    }
+    std::memcpy(raw_buffer.payload().data(), raw_keys.data(), raw_bytes);
+    std::memcpy(steps_buffer.payload().data(), steps.data(), step_bytes);
+    std::memcpy(gamma_buffer.payload().data(), gamma.data(), gamma_bytes);
+    std::memcpy(rope_buffer.payload().data(), rope.data(), rope_bytes);
+    const auto initialize_state = [&](twin::GuardedBuffer& tail,
+                                      twin::GuardedBuffer& dead,
+                                      twin::GuardedBuffer& pool,
+                                      twin::GuardedBuffer& block_position) {
+        std::memcpy(tail.payload().data(), initial.tail.data(), tail_bytes);
+        std::memcpy(dead.payload().data(), initial.dead.data(), dead_bytes);
+        std::memcpy(pool.payload().data(), initial.pooled.data(), pool_bytes);
+        std::memcpy(block_position.payload().data(),
+                    &initial.block_position, sizeof(initial.block_position));
+    };
+    initialize_state(window_tail, window_dead, window_pool, window_block);
+    initialize_state(prefill_tail, prefill_dead, prefill_pool, prefill_block);
+    raw_buffer.capture_before_dispatch();
+    steps_buffer.capture_before_dispatch();
+    gamma_buffer.capture_before_dispatch();
+    rope_buffer.capture_before_dispatch();
+    window_tail.capture_before_dispatch();
+    window_dead.capture_before_dispatch();
+    window_pool.capture_before_dispatch();
+    window_block.capture_before_dispatch();
+    prefill_tail.capture_before_dispatch();
+    prefill_dead.capture_before_dispatch();
+    prefill_pool.capture_before_dispatch();
+    prefill_block.capture_before_dispatch();
+
+    const QsaPrefillIndexerAppendBuffers prefill_buffers{
+        raw_buffer.view(), gamma_buffer.view(), rope_buffer.view(),
+        prefill_tail.view(), prefill_dead.view(), prefill_pool.view(),
+        prefill_block.view()};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const auto encode_window_chunks = [&](Encoder* encoder,
+                                          std::string& encode_error) {
+        for (std::uint32_t start = 0u; start < token_rows;
+             start += VERIFY_MAX_T) {
+            const std::uint32_t rows =
+                std::min(VERIFY_MAX_T, token_rows - start);
+            const BufferRef raw_view = buffer_subview(
+                raw_buffer.view(),
+                static_cast<std::size_t>(start) * kWidth * sizeof(float),
+                static_cast<std::size_t>(rows) * kWidth * sizeof(float));
+            const BufferRef steps_view = buffer_subview(
+                steps_buffer.view(),
+                static_cast<std::size_t>(start) * sizeof(StepRow),
+                static_cast<std::size_t>(rows) * sizeof(StepRow));
+            const QsaIndexerAppendBuffers window_buffers{
+                raw_view, steps_view, gamma_buffer.view(), rope_buffer.view(),
+                window_tail.view(), window_dead.view(), window_pool.view(),
+                window_block.view(), {}, {}};
+            const bool encoded = encoder == nullptr
+                ? encode_qsa_indexer_append(
+                      context, *command, rows, kCellCapacity,
+                      QsaIndexerAppendMode::window, 0u, kRopeZeroCos,
+                      kRopeZeroSin, window_buffers, encode_error)
+                : encode_qsa_indexer_append(
+                      context, *encoder, rows, kCellCapacity,
+                      QsaIndexerAppendMode::window, 0u, kRopeZeroCos,
+                      kRopeZeroSin, window_buffers, encode_error);
+            if (!encoded) return false;
+        }
+        return true;
+    };
+    bool encoded = false;
+    if (shared_encoder) {
+        encoded = Encoder::encode(
+            context, *command, label,
+            [&](Encoder& encoder, std::string& encode_error) {
+                return encode_window_chunks(&encoder, encode_error) &&
+                    encode_prefill_qsa_indexer_append(
+                        context, encoder, metadata.params, kCellCapacity,
+                        kRopeZeroCos, kRopeZeroSin, prefill_buffers,
+                        encode_error);
+            },
+            error);
+    } else {
+        encoded = encode_window_chunks(nullptr, error) &&
+            encode_prefill_qsa_indexer_append(
+                context, *command, metadata.params, kCellCapacity,
+                kRopeZeroCos, kRopeZeroSin, prefill_buffers, error);
+    }
+    check(encoded, label + " encode Window replay and Prefill batch", error);
+    if (!encoded || !command->commit(error)) {
+        check(false, label + " submit", error);
+        if (!shared_encoder) command->discard();
+        return false;
+    }
+    id<MTLCommandBuffer> native =
+        (__bridge id<MTLCommandBuffer>)command->unsafe_native_handle();
+    if (native == nil) {
+        check(false, label + " native command buffer",
+              "command buffer became unavailable");
+        return false;
+    }
+    [native waitUntilCompleted];
+    if (native.status != MTLCommandBufferStatusCompleted) {
+        error = native.error.localizedDescription.UTF8String != nullptr
+            ? native.error.localizedDescription.UTF8String
+            : "Metal command buffer failed";
+        check(false, label + " GPU completion", error);
+        return false;
+    }
+
+    const auto bytes_equal = [](std::span<const float> left,
+                                std::span<const float> right) {
+        return std::memcmp(left.data(), right.data(),
+                           left.size_bytes()) == 0;
+    };
+    const auto window_tail_values = typed<float>(window_tail);
+    const auto prefill_tail_values = typed<float>(prefill_tail);
+    const bool tails_match =
+        bytes_equal(window_tail_values, prefill_tail_values) &&
+        bytes_equal(window_tail_values, expected.tail);
+    check(tails_match, label + " tails equal Window replay and oracle");
+    const std::int32_t window_block_value =
+        *reinterpret_cast<const std::int32_t*>(
+            window_block.payload().data());
+    const std::int32_t prefill_block_value =
+        *reinterpret_cast<const std::int32_t*>(
+            prefill_block.payload().data());
+    const bool block_positions_match =
+        window_block_value == prefill_block_value &&
+        window_block_value == expected.block_position;
+    check(block_positions_match,
+          label + " block positions equal Window replay and oracle");
+
+    const auto window_dead_values = typed<float>(window_dead);
+    const auto prefill_dead_values = typed<float>(prefill_dead);
+    const auto window_pool_values = typed<float>(window_pool);
+    const auto prefill_pool_values = typed<float>(prefill_pool);
+    std::vector<twin::tf> expected_dead(kWidth);
+    std::vector<twin::tf> expected_pool(expected.pooled.size());
+    std::transform(expected.dead.begin(), expected.dead.end(),
+                   expected_dead.begin(),
+                   [](float value) { return twin::tf{value}; });
+    std::transform(expected.pooled.begin(), expected.pooled.end(),
+                   expected_pool.begin(),
+                   [](float value) { return twin::tf{value}; });
+    const bool dead_match =
+        bytes_equal(window_dead_values, prefill_dead_values) &&
+        !twin::compare_floats(window_dead_values, expected_dead,
+                              {twin::Comparison::units, 64.0}) &&
+        !twin::compare_floats(prefill_dead_values, expected_dead,
+                              {twin::Comparison::units, 64.0});
+    check(dead_match, label + " spare keys equal Window replay and oracle");
+    const bool pooled_match =
+        bytes_equal(window_pool_values, prefill_pool_values) &&
+        !twin::compare_floats(window_pool_values, expected_pool,
+                              {twin::Comparison::units, 64.0}) &&
+        !twin::compare_floats(prefill_pool_values, expected_pool,
+                              {twin::Comparison::units, 64.0});
+    check(pooled_match, label + " pooled keys equal Window replay and oracle");
+
+    const bool inputs_unchanged =
+        !raw_buffer.first_unwritten_change({}) &&
+        !steps_buffer.first_unwritten_change({}) &&
+        !gamma_buffer.first_unwritten_change({}) &&
+        !rope_buffer.first_unwritten_change({});
+    check(inputs_unchanged, label + " raw, gamma and RoPE stay read-only");
+    const std::array<twin::ByteRange, 1> tail_written{{{0u, tail_bytes}}};
+    const std::array<twin::ByteRange, 1> dead_written{{{0u, dead_bytes}}};
+    const std::array<twin::ByteRange, 1> pool_written{{{0u, pool_bytes}}};
+    const std::array<twin::ByteRange, 1> block_written{{
+        {0u, sizeof(std::int32_t)}}};
+    const bool guards =
+        !window_tail.first_unwritten_change(tail_written) &&
+        !window_dead.first_unwritten_change(dead_written) &&
+        !window_pool.first_unwritten_change(pool_written) &&
+        !window_block.first_unwritten_change(block_written) &&
+        !prefill_tail.first_unwritten_change(tail_written) &&
+        !prefill_dead.first_unwritten_change(dead_written) &&
+        !prefill_pool.first_unwritten_change(pool_written) &&
+        !prefill_block.first_unwritten_change(block_written);
+    check(guards, label + " buffer guards stay unchanged");
+    return tails_match && block_positions_match && dead_match && pooled_match &&
+           inputs_unchanged && guards;
+}
+
+bool test_prefill_indexer_batch_validation(Context& context) {
+    constexpr std::uint32_t kRows = 9u;
+    constexpr std::uint32_t kCapacity = 32u;
+    constexpr float kRopeZeroCos = 1.0f;
+    constexpr float kRopeZeroSin = 0.0f;
+    const std::vector<std::uint32_t> tokens(kRows, 1u);
+    PrefillChunkMetadata metadata;
+    std::string error;
+    if (!build_prefill_chunk_metadata(3u, tokens, metadata, error)) {
+        check(false, "Prefill indexer validation metadata", error);
+        return false;
+    }
+    const auto allocate = [&](const char* name, std::size_t bytes) {
+        BufferRef buffer = context.buffers().allocate(name, bytes, error);
+        check(static_cast<bool>(buffer), std::string(name) + " allocation",
+              error);
+        if (buffer) std::memset(buffer.contents, 0, buffer.length);
+        return buffer;
+    };
+    const BufferRef raw = allocate(
+        "Prefill indexer validation raw",
+        static_cast<std::size_t>(kRows) * INDEXER_HEAD_DIM * sizeof(float));
+    const BufferRef gamma = allocate(
+        "Prefill indexer validation gamma",
+        INDEXER_HEAD_DIM * sizeof(float));
+    const BufferRef rope = allocate(
+        "Prefill indexer validation RoPE",
+        static_cast<std::size_t>(kCapacity) * 32u * 2u * sizeof(float));
+    const BufferRef tail = allocate(
+        "Prefill indexer validation tail",
+        3u * INDEXER_HEAD_DIM * sizeof(float));
+    const BufferRef dead = allocate(
+        "Prefill indexer validation dead",
+        INDEXER_HEAD_DIM * sizeof(float));
+    const BufferRef pooled = allocate(
+        "Prefill indexer validation pooled",
+        (kCapacity / INDEXER_BLOCK_CELLS + 2u) *
+            INDEXER_HEAD_DIM * sizeof(float));
+    const BufferRef block = allocate("Prefill indexer validation block",
+                                     sizeof(std::int32_t));
+    if (!raw || !gamma || !rope || !tail || !dead || !pooled || !block) {
+        return false;
+    }
+    const QsaPrefillIndexerAppendBuffers valid{
+        raw, gamma, rope, tail, dead, pooled, block};
+    const auto rejected = [&](const std::string& label,
+                              const strata::metal::PrefillParams& params,
+                              std::uint32_t capacity,
+                              const QsaPrefillIndexerAppendBuffers& buffers,
+                              std::string_view expected_error) {
+        error.clear();
+        auto command = context.make_command_buffer(label, error);
+        if (!command) {
+            check(false, label + " command buffer", error);
+            return false;
+        }
+        const bool encoded = encode_prefill_qsa_indexer_append(
+            context, *command, params, capacity, kRopeZeroCos,
+            kRopeZeroSin, buffers, error);
+        const bool is_rejected =
+            !encoded &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find(expected_error) != std::string::npos;
+        check(is_rejected, label, error);
+        return is_rejected;
+    };
+    bool passed = true;
+    strata::metal::PrefillParams invalid = metadata.params;
+    invalid.idx_f += INDEXER_BLOCK_CELLS;
+    passed &= rejected("Prefill indexer rejects mismatched idx_f", invalid,
+                       kCapacity, valid, "parameters do not match");
+    invalid = metadata.params;
+    invalid.idx_e += INDEXER_BLOCK_CELLS;
+    passed &= rejected("Prefill indexer rejects mismatched idx_e", invalid,
+                       kCapacity, valid, "parameters do not match");
+    invalid = metadata.params;
+    invalid.T = 0u;
+    passed &= rejected("Prefill indexer rejects zero rows", invalid,
+                       kCapacity, valid, "row count");
+    invalid = metadata.params;
+    invalid.T = kPrefillMaxShaderRows + 1u;
+    passed &= rejected("Prefill indexer rejects rows above shader limit",
+                       invalid, kCapacity, valid, "shader-row limit");
+    invalid = {9u, 28u, 28u, 36u};
+    passed &= rejected("Prefill indexer rejects chunk beyond capacity",
+                       invalid, kCapacity, valid, "exceeds the cell capacity");
+    QsaPrefillIndexerAppendBuffers aliased = valid;
+    aliased.dead = aliased.tail;
+    passed &= rejected("Prefill indexer rejects overlapping outputs",
+                       metadata.params, kCapacity, aliased,
+                       "outputs must be disjoint");
+
+    if (concurrent_dispatch_mode()) {
+        passed &= expect_append_rejected_in_open_concurrent_group(
+            context, "Prefill QSA indexer batch", "ordered concurrent-group",
+            [](Encoder&, std::string&) { return true; },
+            [&](Encoder& encoder, std::string& append_error) {
+                return encode_prefill_qsa_indexer_append(
+                    context, encoder, metadata.params, kCapacity,
+                    kRopeZeroCos, kRopeZeroSin, valid, append_error);
+            });
+    }
+    return passed;
+}
+
 bool test_indexer_commit_batch(Context& context) {
     constexpr std::uint32_t kRows = 8u;
     constexpr std::uint32_t kAcceptedRows = 3u;
@@ -6917,6 +7346,7 @@ int main(int argc, char** argv) {
     passed &= test_prefill_kv_append_row_bounds(*context);
     passed &= test_indexer_snapshot_validation(*context, *foreign_context);
     passed &= test_indexer_append_validation(*context, *foreign_context);
+    passed &= test_prefill_indexer_batch_validation(*context);
     passed &= run_indexer_snapshot_case(
         *context, 3u * INDEXER_HEAD_DIM, 1u, "packed strides", false);
     passed &= run_indexer_snapshot_case(
@@ -6941,6 +7371,18 @@ int main(int argc, char** argv) {
             *context, 4u, 4u, 16u, set, options, false);
         passed &= run_indexer_append_case(
             *context, 2u, 6u, 16u, set, options, false);
+    }
+    constexpr std::array prefill_indexer_positions{0u, 1u, 3u, 4u, 6u};
+    constexpr std::array prefill_indexer_rows{1u, 2u, 3u, 4u, 5u, 9u, 300u};
+    for (const std::uint32_t position : prefill_indexer_positions) {
+        for (const std::uint32_t rows : prefill_indexer_rows) {
+            passed &= run_prefill_indexer_batch_case(
+                *context, rows, position, twin::InputSet::fixture, options,
+                false);
+            passed &= run_prefill_indexer_batch_case(
+                *context, rows, position, twin::InputSet::fixture, options,
+                true);
+        }
     }
     passed &= run_indexer_append_case(
         *context, 8u, 1u, 16u, twin::InputSet::random, options, true, 1u,
