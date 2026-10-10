@@ -4206,6 +4206,19 @@ discard the encoded prefix and preserve all allocations.
 This completes one isolated GR read half; it does not schedule the later MoE
 path, allocate the production arena or wire `Prefill::run`.
 
+`encode_prefill_gr_read_pre_normalized` and
+`encode_prefill_gr_read_mix_pre_normalized` provide the projection-only form
+for a caller that already has `rs` and `xn16` from a preceding fused GR
+write/next-read normalization for the same active rows and BF16X2 mode. Mode 1
+also consumes `xn16_lo`. The caller must order producer dispatches before
+consumer dispatches in the same Encoder segment or use a supported
+cross-command-buffer dependency before submission. These buffers are
+validated as read-only inputs, and every active projection output must be
+disjoint from them. The projection-only form does not use the residual or norm
+views; read/mix still needs the matching updated residual and norm weights.
+This API exposes reuse but does not wire the transition, FFN/MoE schedule or
+production `Prefill::run`.
+
 **`strata_pf_gr_mix`**, grid (10, T) × 256. Thread `d = 256·tg.x + tid` of threadgroup (·, t) computes element d of
 row t:
 
@@ -4312,9 +4325,12 @@ the GR read/mix and final write encoders. Serial and concurrent tests compare
 the transition against the direct component chain in modes 0/1/2 at T=1 and
 mode 2 at T=3/65; they also cover weight/state/hand-off aliases, legal arena
 reuse with disjoint active prefixes, late rollback and open-group rejection.
-The next GR read/mix entry point currently recomputes the normalization that
-this transition prepares. A later scheduler can consume the prepared `rs` and
-`xn16` directly. This synthetic boundary does not wire `Prefill::run`.
+The transition returns `rs`, `xn16` and the mode-1 remainder for the next
+read. A caller may pass those views to
+`encode_prefill_gr_read_mix_pre_normalized` in a later ordered segment to
+avoid another normalization dispatch; the transition does not schedule this
+consumer itself. FFN/MoE scheduling and production `Prefill::run` remain
+unwired.
 
 ### 6.4 GDN mixer
 

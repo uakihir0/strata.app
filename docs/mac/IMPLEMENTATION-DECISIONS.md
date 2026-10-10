@@ -11086,3 +11086,52 @@ measuring L-15 remain open.
   overlapping full arena views with disjoint active prefixes, direct-chain
   parity and late rollback. The full `mac-metal` suite passed 90/90,
   `test_map` passed 1/1 and `git diff --check` passed.
+
+### D-IMPL-381: Reuse prepared Prefill GR normalization
+
+- **Decision:** Add explicit `encode_prefill_gr_read_pre_normalized` and
+  `encode_prefill_gr_read_mix_pre_normalized` APIs. They skip only the GR
+  normalization dispatch and consume caller-provided `rs`/`xn16` (plus
+  mode-1 `xn16_lo`) as read-only inputs. Keep the existing APIs as the
+  normalize-then-project path. Require projection outputs to be disjoint from
+  all prepared normalization inputs.
+- **Reason:** The fused GR write/next-read stage already produces the exact
+  normalization needed by a subsequent GR read. An explicit entry point makes
+  reuse visible and avoids guessing whether output-shaped buffers are
+  initialized, while preserving the existing API's behavior and keeping
+  orchestration with the caller until the FFN/chunk scheduler exists.
+- **Review required:** Verify mode-specific active sizes and mode-1 remainder
+  use, read-only state ownership and alias protection, matching producer rows
+  and mode, residual/norm identity and dispatch ordering. Verify both the
+  fused-transition → pre-normalized read/mix chain and parity with the
+  normalize-then-project path in all modes. Keep production scheduling and
+  `Prefill::run` status clearly marked pending.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build
+  27A266a), `mac-dev` built successfully; the final serial and concurrent
+  Prefill tests passed 2/2, `test_map` passed 1/1, and the full `mac-metal`
+  suite passed 90/90.
+
+### REV-177: Hostile review of prepared Prefill GR normalization reuse
+
+- **Scope:** Review prepared-state ownership, mode/row matching, output alias
+  checks, residual/norm requirements, producer-consumer ordering, and the
+  fused-transition → prepared-read/mix chain.
+- **Findings and fixes:** The first review found that the projection-only API
+  required residual and norm buffers even though it does not read them. It now
+  validates those buffers only for read/mix. The API contract and docs now
+  state the matching producer rows/mode and ordering requirements, and tests
+  use the actual fused-transition outputs in a same-Encoder consumer chain.
+  A second review found that a projection output could overwrite residual or
+  norm before the mixer consumed it; preflight now rejects every active
+  projection-output alias against both mixer inputs. Its follow-up caught a
+  mode-index omission for the injection output, which was fixed and covered in
+  all modes. The final review requested a mode-1 `low_rank_bf16_lo` alias
+  regression; the added case targets active output index 5 and would fail if
+  that output were removed from the preflight set.
+- **Disposition:** All findings were addressed. The final reviewer confirmed
+  the new mode-1 regression exercises the intended output and found no
+  remaining issue.
+- **Validation:** The mode-1 low-remainder alias regression passed in the
+  serial and concurrent Prefill tests; `test_map` passed 1/1 and the full
+  `mac-metal` suite passed 90/90 on the reference Mac. `git diff --check`
+  passed.

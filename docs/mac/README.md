@@ -50,9 +50,10 @@ The attention-half GR/GDN transition now composes GR read/mix, one GDN chunk
 and fused residual/next-read normalization, with active-range and model-weight
 alias checks. Serial/concurrent tests compare it with the direct chain at T=1
 in all modes and mode 2 at T=3/65, including disjoint active prefixes in
-overlapping arena views. Its current next GR read/mix entry point recomputes
-the prepared normalization; FFN projection/MoE scheduling and production
-`Prefill::run` remain pending.
+overlapping arena views. The transition returns the next normalization outputs;
+a caller can pass them to `encode_prefill_gr_read_mix_pre_normalized` to avoid
+recomputing normalization, but the transition does not schedule that consumer.
+FFN projection/MoE scheduling and production `Prefill::run` remain pending.
 REV-163 replaced Q2_0's initially coupled pack/unpack test fixture with literal
 packed bytes and a separate logical-code table; hostile follow-up review found
 no further issue. REV-164 reviewed the IQ4_NL codebook path and found no
