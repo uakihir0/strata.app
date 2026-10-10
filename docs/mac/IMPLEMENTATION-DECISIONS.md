@@ -11224,3 +11224,57 @@ measuring L-15 remain open.
   2/2, `test_map` passed 1/1, `git diff --check` passed, and the full
   `mac-metal` suite passed 90/90. A hostile follow-up review of the corrected
   source and tests found no remaining code defect.
+
+### D-IMPL-384: Add Prefill-sized batched QSA indexer append
+
+- **Decision:** Keep the existing Window indexer append and accepted-prefix
+  replay contracts at 1..8 rows. Add `encode_prefill_qsa_indexer_append` for
+  the Prefill row limit, validating `T`, `p0`, `idx_f`, `idx_e`, capacity and
+  all participating views against the Prefill metadata contract. Dispatch
+  first-row work, fully contained completed blocks, and final tail writes as
+  three ordered kernels. Support both standalone transactional and
+  caller-owned Encoder forms; reject an open concurrent dispatch group.
+- **Reason:** The Window kernel performs a sequential update for each token,
+  which is correct but has excessive dispatch overhead for Prefill-sized
+  chunks. The documented split preserves the Window arithmetic and last-write
+  behavior while parallelizing independent complete blocks. Keeping the
+  bounded Window entry points intact avoids changing their established
+  validation contract. The three dependent dispatches require serial command
+  buffer ordering and automatic resource barriers, so the caller-owned form
+  must not start inside an open concurrent group.
+- **Review required:** Check the first/block/tail partition at empty-prefix,
+  partial-block and completion boundaries; exact F16 rounding, reduction and
+  RoPE order; `idx_f`/`idx_e` and grid arithmetic at Prefill bounds; view
+  extents, aliases, Context ownership and standalone/caller-owned rollback,
+  including a late shared-Encoder metadata failure after prior work;
+  parity with sequential Window replay and an independent oracle across
+  `p0={0,1,3,4,6}` and `T={1,2,3,4,5,9,300}`; and that selection, attention and
+  production `Prefill::run` remain documented as pending.
+- **Validation:** `mac-dev` built successfully. Focused QSA serial and
+  concurrent CTests passed 2/2, covering the Prefill matrix and validation
+  cases through both API forms. The full `mac-metal` suite passed 90/90 before
+  the review-requested rollback assertion; after adding that assertion,
+  `mac-dev` and the focused serial/concurrent QSA tests passed again. Final
+  review, test-map and diff-check results are recorded in REV-180.
+
+#### REV-180: Adversarial review of Prefill QSA indexer batching
+
+- **Scope:** Check the first/blocks/tail partition and numerical order, Prefill
+  metadata and capacity bounds, view extents and aliases, dispatch ordering,
+  both API forms, parity matrix, and the separation from Window and production
+  Prefill scheduling.
+- **Findings:** No reproducible implementation defect was found. The reviewer
+  identified one missing regression: the shared-Encoder path did not directly
+  prove rollback when Prefill metadata fails after an earlier dispatch had
+  already been encoded in the same segment.
+- **Disposition:** Added a shared `Encoder::encode` case that first encodes
+  QSA FWHT, then calls Prefill indexer append with a mismatched `idx_f`. It
+  verifies the failure propagates, command-buffer commit reports that the
+  segment was discarded, and the FWHT input remains byte-identical. A hostile
+  follow-up confirmed this closes the coverage gap and found no remaining
+  issue in the regression.
+- **Validation:** The first implementation pass built and passed focused QSA
+  serial/concurrent CTests 2/2 and the full `mac-metal` suite 90/90. After
+  adding the rollback regression, `mac-dev` built and focused QSA tests passed
+  2/2. `test_map.py` passed and `git diff --check` passed after the final audit
+  entry. The full-suite run preceded only this additional test assertion.
