@@ -20,10 +20,13 @@ struct PrefillAttentionGDNTransitionBuffers {
 
 /// Encode one attention-half transition: GR read/mix, the complete GDN block,
 /// then the residual write fused with normalization for the next GR read.
-/// This does not encode the FFN GR half, MoE, or a chunk scheduler. The current
-/// GR read/mix entrypoint still recomputes normalization when called next.
-/// The caller-owned form may fail after an earlier dispatch was encoded;
-/// propagate false from the enclosing Encoder::encode body.
+/// This does not encode the FFN GR half, MoE, or a chunk scheduler. A later GR
+/// read/mix may consume the prepared normalization through
+/// `encode_prefill_gr_read_mix_pre_normalized`; the caller must order that
+/// consumer after this transition in the same Encoder segment or establish a
+/// supported cross-command-buffer dependency. The caller-owned form may fail
+/// after an earlier dispatch was encoded; propagate false from the enclosing
+/// Encoder::encode body.
 bool encode_prefill_attention_gdn_transition(
     Context& context, Encoder& encoder, std::uint32_t rows,
     PrefillBF16X2Mode mode,
