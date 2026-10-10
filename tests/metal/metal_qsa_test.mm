@@ -5787,6 +5787,54 @@ bool test_prefill_indexer_batch_validation(Context& context) {
                        metadata.params, kCapacity, aliased,
                        "outputs must be disjoint");
 
+    BufferRef rollback_values = allocate(
+        "Prefill indexer rollback FWHT input", 256u * sizeof(float));
+    if (!rollback_values) return false;
+    auto* rollback_data =
+        reinterpret_cast<float*>(rollback_values.contents);
+    for (std::size_t i = 0u; i < 256u; ++i) {
+        rollback_data[i] = static_cast<float>(static_cast<int>(i % 13u) - 6);
+    }
+    std::array<float, 256u> rollback_before{};
+    std::copy_n(rollback_data, rollback_before.size(),
+                rollback_before.begin());
+    auto rollback_command = context.make_command_buffer(
+        "Prefill indexer shared rollback", error);
+    if (!rollback_command) {
+        check(false, "Prefill indexer rollback command buffer", error);
+        return false;
+    }
+    strata::metal::PrefillParams late_invalid = metadata.params;
+    late_invalid.idx_f += INDEXER_BLOCK_CELLS;
+    bool earlier_dispatch_encoded = false;
+    const bool late_failure_propagated = !Encoder::encode(
+        context, *rollback_command, "Prefill indexer shared rollback",
+        [&](Encoder& encoder, std::string& encode_error) {
+            earlier_dispatch_encoded = encode_qsa_fwht256(
+                context, encoder, 1u, rollback_values, encode_error);
+            return earlier_dispatch_encoded &&
+                encode_prefill_qsa_indexer_append(
+                    context, encoder, late_invalid, kCapacity,
+                    kRopeZeroCos, kRopeZeroSin, valid, encode_error);
+        },
+        error) &&
+        error.find("parameters do not match") != std::string::npos;
+    check(late_failure_propagated && earlier_dispatch_encoded,
+          "Prefill indexer propagates failure after a prior dispatch", error);
+    passed &= late_failure_propagated && earlier_dispatch_encoded;
+    error.clear();
+    const bool rollback_discarded =
+        !rollback_command->commit(error) &&
+        error.find("discarded") != std::string::npos;
+    const bool rollback_unchanged =
+        std::memcmp(rollback_data, rollback_before.data(),
+                    sizeof(rollback_before)) == 0;
+    check(rollback_discarded,
+          "Prefill indexer shared failure discards earlier dispatch", error);
+    check(rollback_unchanged,
+          "Prefill indexer shared rollback preserves earlier input");
+    passed &= rollback_discarded && rollback_unchanged;
+
     if (concurrent_dispatch_mode()) {
         passed &= expect_append_rejected_in_open_concurrent_group(
             context, "Prefill QSA indexer batch", "ordered concurrent-group",
