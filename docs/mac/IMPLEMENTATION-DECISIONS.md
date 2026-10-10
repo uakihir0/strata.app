@@ -11035,3 +11035,54 @@ measuring L-15 remain open.
   encoded prefix and then verifies discard plus unchanged allocations. The
   standalone form verifies the same rollback; focused tests passed 5/5 and
   the full `mac-metal` suite passed 90/90.
+
+### D-IMPL-380: Compose the Prefill attention-half GDN transition
+
+- **Decision:** Add `encode_prefill_attention_gdn_transition` for the
+  attention GR read/mix → one-chunk GDN → fused residual write and next GR
+  normalization sequence. Keep its name and contract scoped to this transition;
+  it does not encode the FFN GR half, MoE or prompt-chunk scheduler. Preflight
+  active ranges across every GR/GDN model read, persistent history/state,
+  intermediate output, carried residual/injection and the `rs`/`xn16` outputs
+  reused by the final write. Pass active-length slices through the GR read/mix
+  and fused write encoders so arena allocations may overlap outside the live
+  prefixes.
+- **Reason:** The constituent GR read/mix, GDN block and GR write/norm
+  coordinators already have separate numerical contracts. Their ordered
+  composition gives a useful next integration boundary and exercises the
+  lifetimes between stages without implying that either GR half, MoE or
+  production `Prefill::run` is wired.
+- **Review required:** Recheck cross-stage read/write aliases for GR and GDN
+  weights, history/state and the final GR hand-off buffers; confirm active
+  extents and mode-specific BF16X2 behavior, legal arena reuse, failure
+  propagation and serial/concurrent parity at T=1, T=3 and the T=65 tile
+  boundary. The current next GR read/mix API recomputes normalization already
+  prepared by the fused write; a later scheduler should consume `rs`/`xn16`
+  directly or document its chosen schedule.
+
+### REV-176: Hostile review of the Prefill attention-half GDN transition
+
+- **Scope:** Adversarially inspect GR-read/mix → GDN → fused-write ordering,
+  active buffer ranges, model and persistent-state lifetimes, mode behavior,
+  arena reuse, rollback, test coverage and whether the API name matches its
+  actual boundary.
+- **Initial findings and fixes:** The first review found that the range map
+  omitted GR model weights from cross-stage writes, allowing a GDN output or
+  persistent state (or the final residual write) to corrupt a GR weight.
+  Added GR and GDN weight ranges against every active write and explicit
+  preservation of the GR scale/BF16 outputs reused by the final write. The
+  review also found that the final encoder received oversized views despite
+  active-range preflight. A regression reproduced the same full-view behavior
+  in GR normalization, so the coordinator now passes bounded active views
+  through GR read/mix and final write. Finally, the first name implied a whole
+  layer; the public API and documentation now call it an attention-half
+  transition and state that the next read/mix recomputes the prepared norm.
+- **Disposition:** The review's three findings were addressed and covered by
+  regression tests. A follow-up subagent review was requested but did not
+  return; no additional review verdict is claimed.
+- **Validation:** `mac-dev` rebuilt successfully. The serial and concurrent
+  Prefill CTests passed 2/2, including all modes at T=1, mode 2 at T=3/65,
+  GR/GDN weight and persistent-state aliases, reused-output protection,
+  overlapping full arena views with disjoint active prefixes, direct-chain
+  parity and late rollback. The full `mac-metal` suite passed 90/90,
+  `test_map` passed 1/1 and `git diff --check` passed.

@@ -4301,6 +4301,21 @@ mode-1 low BF16 bits are compared with `strata_gr_post` followed by
 `strata_pf_gr_norm` on the same inputs. This kernel is not yet connected to
 Prefill GEMMs, layer scheduling or the production chunk loop.
 
+`encode_prefill_attention_gdn_transition` now composes the attention-half GR
+read/mix, one complete GDN chunk and the fused residual write plus
+normalization for the next GR read. The boundary is deliberately named a
+transition: it does not encode the FFN GR half, MoE or a prompt-chunk
+scheduler. Its preflight protects GR and GDN model weights from every write,
+keeps GDN history/state and the residual, injection and normalized GR outputs
+alive through their final consumers, and passes active-length views through
+the GR read/mix and final write encoders. Serial and concurrent tests compare
+the transition against the direct component chain in modes 0/1/2 at T=1 and
+mode 2 at T=3/65; they also cover weight/state/hand-off aliases, legal arena
+reuse with disjoint active prefixes, late rollback and open-group rejection.
+The next GR read/mix entry point currently recomputes the normalization that
+this transition prepares. A later scheduler can consume the prepared `rs` and
+`xn16` directly. This synthetic boundary does not wire `Prefill::run`.
+
 ### 6.4 GDN mixer
 
 Upstream: `prefill.cpp:1342-1364`; `gdn_gates` (206/728), `gdn_conv_tiled` (235), `gdn_conv_hist` (253) and `gdn_l2`
