@@ -498,11 +498,11 @@
     },
     "metal_qsa_test": {
       "label": "metal",
-      "origin": "04 6.5/10.5 / 09 9.1 / D-IMPL-382 / REV-178"
+      "origin": "04 6.5/10.5 / 09 9.1 / D-IMPL-382 / REV-178 / D-IMPL-383 / REV-179"
     },
     "metal_qsa_test_concurrent": {
       "label": "metal",
-      "origin": "04 6.5/10.5 / 09 9.1 / D-IMPL-382 / REV-178"
+      "origin": "04 6.5/10.5 / 09 9.1 / D-IMPL-382 / REV-178 / D-IMPL-383 / REV-179"
     },
     "metal_qsa_indexer_commit_batch_test": {
       "label": "metal",

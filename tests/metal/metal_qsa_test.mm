@@ -2837,6 +2837,262 @@ bool test_kv_k8v4_encoder_validation(Context& context,
     return passed;
 }
 
+bool test_prefill_kv_append_row_bounds(Context& context) {
+    bool passed = true;
+    const auto check_format =
+        [&](const std::string& format, std::string_view input_error,
+            auto&& command_call, auto&& encoder_call) {
+            const auto check_limit =
+                [&](std::uint32_t rows, std::string_view expected_error,
+                    bool shared) {
+                    const std::string label =
+                        "Prefill QSA " + format + " KV append " +
+                        (rows > kPrefillMaxShaderRows
+                             ? "rejects shader-row overflow"
+                             : "accepts inclusive shader-row limit") +
+                        (shared ? " through Encoder" : " standalone");
+                    std::string error;
+                    auto command = context.make_command_buffer(label, error);
+                    if (!command) {
+                        check(false, label + " command buffer", error);
+                        return false;
+                    }
+                    bool rejected = false;
+                    if (shared) {
+                        rejected = !Encoder::encode(
+                            context, *command, label,
+                            [&](Encoder& encoder,
+                                std::string& encode_error) {
+                                return encoder_call(
+                                    encoder, rows, encode_error);
+                            },
+                            error);
+                    } else {
+                        rejected = !command_call(*command, rows, error);
+                    }
+                    rejected = rejected &&
+                        (!shared ||
+                         command->unsafe_native_handle() == nullptr) &&
+                        error.find(expected_error) != std::string::npos;
+                    check(rejected, label, error);
+                    if (command->unsafe_native_handle() != nullptr) {
+                        command->discard();
+                    }
+                    return rejected;
+                };
+            passed &= check_limit(
+                kPrefillMaxShaderRows + 1u, "shader-row limit", false);
+            passed &= check_limit(
+                kPrefillMaxShaderRows + 1u, "shader-row limit", true);
+            passed &= check_limit(kPrefillMaxShaderRows, input_error, false);
+            passed &= check_limit(kPrefillMaxShaderRows, input_error, true);
+        };
+
+    check_format(
+        "fp16", "fp16 KV key input buffer is not owned by this Context",
+        [&](CommandBuffer& command, std::uint32_t rows, std::string& error) {
+            return encode_prefill_qsa_kv_append_f16(
+                context, command, rows, 8u, QsaKvAppendF16Buffers{}, error);
+        },
+        [&](Encoder& encoder, std::uint32_t rows, std::string& error) {
+            return encode_prefill_qsa_kv_append_f16(
+                context, encoder, rows, 8u, QsaKvAppendF16Buffers{}, error);
+        });
+    check_format(
+        "int8", "int8 KV key input buffer is not owned by this Context",
+        [&](CommandBuffer& command, std::uint32_t rows, std::string& error) {
+            return encode_prefill_qsa_kv_append_i8(
+                context, command, rows, 8u, QsaKvAppendI8Buffers{}, error);
+        },
+        [&](Encoder& encoder, std::uint32_t rows, std::string& error) {
+            return encode_prefill_qsa_kv_append_i8(
+                context, encoder, rows, 8u, QsaKvAppendI8Buffers{}, error);
+        });
+    check_format(
+        "q4", "q4 KV key input buffer is not owned by this Context",
+        [&](CommandBuffer& command, std::uint32_t rows, std::string& error) {
+            return encode_prefill_qsa_kv_append_q4(
+                context, command, rows, 8u, QsaKvAppendQ4Buffers{}, error);
+        },
+        [&](Encoder& encoder, std::uint32_t rows, std::string& error) {
+            return encode_prefill_qsa_kv_append_q4(
+                context, encoder, rows, 8u, QsaKvAppendQ4Buffers{}, error);
+        });
+    check_format(
+        "k8v4", "k8v4 KV key input buffer is not owned by this Context",
+        [&](CommandBuffer& command, std::uint32_t rows, std::string& error) {
+            return encode_prefill_qsa_kv_append_k8v4(
+                context, command, rows, 8u, QsaKvAppendK8V4Buffers{}, error);
+        },
+        [&](Encoder& encoder, std::uint32_t rows, std::string& error) {
+            return encode_prefill_qsa_kv_append_k8v4(
+                context, encoder, rows, 8u, QsaKvAppendK8V4Buffers{}, error);
+        });
+
+    constexpr std::uint32_t kRows = VERIFY_MAX_T + 1u;
+    constexpr std::uint32_t kCellCapacity = 32u;
+    constexpr std::size_t kCurrentBytes =
+        static_cast<std::size_t>(kRows) * N_HEAD_KV * HEAD_DIM *
+        sizeof(float);
+    constexpr std::size_t kF16PoolBytes =
+        kCellCapacity * N_HEAD_KV * HEAD_DIM * sizeof(std::uint16_t);
+    constexpr std::size_t kI8CodeBytes =
+        kCellCapacity * N_HEAD_KV * HEAD_DIM * sizeof(std::int8_t);
+    constexpr std::size_t kI8ScaleBytes =
+        kCellCapacity * N_HEAD_KV * 4u * sizeof(std::uint16_t);
+    constexpr std::size_t kQ4PoolBytes =
+        kCellCapacity * N_HEAD_KV * (HEAD_DIM / 32u) *
+        sizeof(block_q4_0);
+    std::string error;
+    const auto allocate = [&](const char* name, std::size_t bytes) {
+        BufferRef buffer = context.buffers().allocate(name, bytes, error);
+        if (!buffer) {
+            check(false, std::string(name) + " allocation", error);
+        } else {
+            std::memset(buffer.contents, 0, buffer.length);
+        }
+        return buffer;
+    };
+    BufferRef keys = allocate("Prefill QSA duplicate-test K", kCurrentBytes);
+    BufferRef values = allocate("Prefill QSA duplicate-test V", kCurrentBytes);
+    BufferRef steps = allocate(
+        "Prefill QSA duplicate-test steps", kRows * sizeof(StepRow));
+    BufferRef f16_key_pool =
+        allocate("Prefill QSA duplicate-test fp16 K", kF16PoolBytes);
+    BufferRef f16_value_pool =
+        allocate("Prefill QSA duplicate-test fp16 V", kF16PoolBytes);
+    BufferRef i8_key_codes =
+        allocate("Prefill QSA duplicate-test int8 K codes", kI8CodeBytes);
+    BufferRef i8_key_scales =
+        allocate("Prefill QSA duplicate-test int8 K scales", kI8ScaleBytes);
+    BufferRef i8_value_codes =
+        allocate("Prefill QSA duplicate-test int8 V codes", kI8CodeBytes);
+    BufferRef i8_value_scales =
+        allocate("Prefill QSA duplicate-test int8 V scales", kI8ScaleBytes);
+    BufferRef q4_key_pool =
+        allocate("Prefill QSA duplicate-test q4 K", kQ4PoolBytes);
+    BufferRef q4_value_pool =
+        allocate("Prefill QSA duplicate-test q4 V", kQ4PoolBytes);
+    BufferRef k8v4_key_codes =
+        allocate("Prefill QSA duplicate-test k8v4 K codes", kI8CodeBytes);
+    BufferRef k8v4_key_scales =
+        allocate("Prefill QSA duplicate-test k8v4 K scales", kI8ScaleBytes);
+    BufferRef k8v4_value_pool =
+        allocate("Prefill QSA duplicate-test k8v4 V", kQ4PoolBytes);
+    const std::array required_buffers{
+        keys, values, steps, f16_key_pool, f16_value_pool, i8_key_codes,
+        i8_key_scales, i8_value_codes, i8_value_scales, q4_key_pool,
+        q4_value_pool, k8v4_key_codes, k8v4_key_scales, k8v4_value_pool};
+    if (std::any_of(required_buffers.begin(), required_buffers.end(),
+                    [](BufferRef buffer) { return !buffer; })) {
+        return false;
+    }
+    auto* step_rows = static_cast<StepRow*>(steps.contents);
+    for (std::uint32_t row = 0u; row < kRows; ++row) {
+        const std::int32_t position =
+            static_cast<std::int32_t>(row == kRows - 1u ? row - 1u : row);
+        step_rows[row] = StepRow{position, position + 1,
+                                 (position + 1) / 4, position + 1};
+    }
+
+    const auto check_duplicate = [&](const std::string& format,
+                                     auto&& command_call,
+                                     auto&& encoder_call) {
+        const auto check_form = [&](bool shared) {
+            const std::string label =
+                "Prefill QSA " + format +
+                " rejects duplicate positions above eight rows" +
+                (shared ? " through Encoder" : " standalone");
+            error.clear();
+            auto command = context.make_command_buffer(label, error);
+            if (!command) {
+                check(false, label + " command buffer", error);
+                return false;
+            }
+            const bool failed = shared
+                ? !Encoder::encode(
+                      context, *command, label,
+                      [&](Encoder& encoder, std::string& encode_error) {
+                          return encoder_call(encoder, encode_error);
+                      },
+                      error)
+                : !command_call(*command, error);
+            const bool rejected =
+                failed &&
+                (!shared ||
+                 command->unsafe_native_handle() == nullptr) &&
+                error.find("positions must be unique") != std::string::npos;
+            check(rejected, label, error);
+            if (command->unsafe_native_handle() != nullptr) {
+                command->discard();
+            }
+            return rejected;
+        };
+        passed &= check_form(false);
+        passed &= check_form(true);
+    };
+
+    const QsaKvAppendF16Buffers f16_buffers{
+        keys, values, steps, f16_key_pool, f16_value_pool};
+    const QsaKvAppendI8Buffers i8_buffers{
+        keys, values, steps, i8_key_codes, i8_key_scales,
+        i8_value_codes, i8_value_scales};
+    const QsaKvAppendQ4Buffers q4_buffers{
+        keys, values, steps, q4_key_pool, q4_value_pool};
+    const QsaKvAppendK8V4Buffers k8v4_buffers{
+        keys, values, steps, k8v4_key_codes, k8v4_key_scales,
+        k8v4_value_pool};
+    check_duplicate(
+        "fp16",
+        [&](CommandBuffer& command, std::string& encode_error) {
+            return encode_prefill_qsa_kv_append_f16(
+                context, command, kRows, kCellCapacity, f16_buffers,
+                encode_error);
+        },
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_qsa_kv_append_f16(
+                context, encoder, kRows, kCellCapacity, f16_buffers,
+                encode_error);
+        });
+    check_duplicate(
+        "int8",
+        [&](CommandBuffer& command, std::string& encode_error) {
+            return encode_prefill_qsa_kv_append_i8(
+                context, command, kRows, kCellCapacity, i8_buffers,
+                encode_error);
+        },
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_qsa_kv_append_i8(
+                context, encoder, kRows, kCellCapacity, i8_buffers,
+                encode_error);
+        });
+    check_duplicate(
+        "q4",
+        [&](CommandBuffer& command, std::string& encode_error) {
+            return encode_prefill_qsa_kv_append_q4(
+                context, command, kRows, kCellCapacity, q4_buffers,
+                encode_error);
+        },
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_qsa_kv_append_q4(
+                context, encoder, kRows, kCellCapacity, q4_buffers,
+                encode_error);
+        });
+    check_duplicate(
+        "k8v4",
+        [&](CommandBuffer& command, std::string& encode_error) {
+            return encode_prefill_qsa_kv_append_k8v4(
+                context, command, kRows, kCellCapacity, k8v4_buffers,
+                encode_error);
+        },
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_qsa_kv_append_k8v4(
+                context, encoder, kRows, kCellCapacity, k8v4_buffers,
+                encode_error);
+        });
+    return passed;
+}
+
 bool run_set(Context& context, twin::InputSet set,
              const twin::Options& options) {
     bool passed = true;
@@ -2868,7 +3124,8 @@ float kv_sample(twin::InputSet set, std::mt19937_64& rng,
 bool run_kv_append_f16_case(Context& context, std::uint32_t token_rows,
                             std::uint32_t pos0, twin::InputSet set,
                             const twin::Options& options,
-                            bool shared_encoder = false) {
+                            bool shared_encoder = false,
+                            bool prefill_api = false) {
     constexpr std::uint32_t kCellCapacity = 32u;
     constexpr std::size_t kPoolElements =
         kCellCapacity * N_HEAD_KV * HEAD_DIM;
@@ -2876,8 +3133,10 @@ bool run_kv_append_f16_case(Context& context, std::uint32_t token_rows,
         "QSA fp16 KV append T=" + std::to_string(token_rows) +
         " pos0=" + std::to_string(pos0) +
         " set=" + twin::input_set_name(set) +
-        (shared_encoder ? " shared Encoder" : " standalone");
-    if (token_rows == 0u || token_rows > VERIFY_MAX_T ||
+        (shared_encoder ? " shared Encoder" : " standalone") +
+        (prefill_api ? " Prefill" : "");
+    if (token_rows == 0u ||
+        token_rows > (prefill_api ? kPrefillMaxShaderRows : VERIFY_MAX_T) ||
         pos0 > kCellCapacity || token_rows > kCellCapacity - pos0) {
         check(false, label + " test parameters");
         return false;
@@ -2966,13 +3225,22 @@ bool run_kv_append_f16_case(Context& context, std::uint32_t token_rows,
         ? Encoder::encode(
               context, *command, label,
               [&](Encoder& encoder, std::string& encode_error) {
-                  return encode_qsa_kv_append_f16(
-                      context, encoder, token_rows, kCellCapacity, buffers,
-                      encode_error);
+                  return prefill_api
+                      ? encode_prefill_qsa_kv_append_f16(
+                            context, encoder, token_rows, kCellCapacity,
+                            buffers, encode_error)
+                      : encode_qsa_kv_append_f16(
+                            context, encoder, token_rows, kCellCapacity,
+                            buffers, encode_error);
               },
               error)
-        : encode_qsa_kv_append_f16(
-              context, *command, token_rows, kCellCapacity, buffers, error);
+        : (prefill_api
+               ? encode_prefill_qsa_kv_append_f16(
+                     context, *command, token_rows, kCellCapacity, buffers,
+                     error)
+               : encode_qsa_kv_append_f16(
+                     context, *command, token_rows, kCellCapacity, buffers,
+                     error));
     if (!encoded) {
         check(false, label + " encode", error);
         command->discard();
@@ -3050,6 +3318,12 @@ bool run_kv_append_f16_set(Context& context, twin::InputSet set,
         context, VERIFY_MAX_T, 0u, set, options, true);
     passed &= run_kv_append_f16_case(
         context, VERIFY_MAX_T, 4u, set, options);
+    if (set == twin::InputSet::fixture) {
+        passed &= run_kv_append_f16_case(
+            context, VERIFY_MAX_T + 1u, 0u, set, options, false, true);
+        passed &= run_kv_append_f16_case(
+            context, VERIFY_MAX_T + 1u, 0u, set, options, true, true);
+    }
     return passed;
 }
 
@@ -3057,7 +3331,8 @@ bool run_kv_append_i8_case(Context& context, std::uint32_t token_rows,
                            std::uint32_t pos0, twin::InputSet set,
                            const twin::Options& options,
                            bool all_zero = false, bool tie_case = false,
-                           bool shared_encoder = false) {
+                           bool shared_encoder = false,
+                           bool prefill_api = false) {
     constexpr std::uint32_t kCellCapacity = 32u;
     constexpr std::size_t kPoolRows =
         kCellCapacity * N_HEAD_KV;
@@ -3079,8 +3354,10 @@ bool run_kv_append_i8_case(Context& context, std::uint32_t token_rows,
         "QSA int8 KV append T=" + std::to_string(token_rows) +
         " pos0=" + std::to_string(pos0) +
         " set=" + twin::input_set_name(set) + pattern_label +
-        (shared_encoder ? " shared Encoder" : " standalone");
-    if (token_rows == 0u || token_rows > VERIFY_MAX_T ||
+        (shared_encoder ? " shared Encoder" : " standalone") +
+        (prefill_api ? " Prefill" : "");
+    if (token_rows == 0u ||
+        token_rows > (prefill_api ? kPrefillMaxShaderRows : VERIFY_MAX_T) ||
         pos0 > kCellCapacity || token_rows > kCellCapacity - pos0 ||
         (all_zero && tie_case)) {
         check(false, label + " test parameters");
@@ -3242,13 +3519,22 @@ bool run_kv_append_i8_case(Context& context, std::uint32_t token_rows,
         ? Encoder::encode(
               context, *command, label,
               [&](Encoder& encoder, std::string& encode_error) {
-                  return encode_qsa_kv_append_i8(
-                      context, encoder, token_rows, kCellCapacity, buffers,
-                      encode_error);
+                  return prefill_api
+                      ? encode_prefill_qsa_kv_append_i8(
+                            context, encoder, token_rows, kCellCapacity,
+                            buffers, encode_error)
+                      : encode_qsa_kv_append_i8(
+                            context, encoder, token_rows, kCellCapacity,
+                            buffers, encode_error);
               },
               error)
-        : encode_qsa_kv_append_i8(
-              context, *command, token_rows, kCellCapacity, buffers, error);
+        : (prefill_api
+               ? encode_prefill_qsa_kv_append_i8(
+                     context, *command, token_rows, kCellCapacity, buffers,
+                     error)
+               : encode_qsa_kv_append_i8(
+                     context, *command, token_rows, kCellCapacity, buffers,
+                     error));
     if (!encoded) {
         check(false, label + " encode", error);
         command->discard();
@@ -3414,6 +3700,14 @@ bool run_kv_append_i8_set(Context& context, twin::InputSet set,
         context, VERIFY_MAX_T, 0u, set, options, false, false, true);
     passed &= run_kv_append_i8_case(
         context, VERIFY_MAX_T, 4u, set, options);
+    if (set == twin::InputSet::fixture) {
+        passed &= run_kv_append_i8_case(
+            context, VERIFY_MAX_T + 1u, 0u, set, options, false, false,
+            false, true);
+        passed &= run_kv_append_i8_case(
+            context, VERIFY_MAX_T + 1u, 0u, set, options, false, false,
+            true, true);
+    }
     return passed;
 }
 
@@ -3421,7 +3715,8 @@ bool run_kv_append_q4_case(Context& context, std::uint32_t token_rows,
                            std::uint32_t pos0, twin::InputSet set,
                            const twin::Options& options,
                            bool all_zero = false, bool tie_case = false,
-                           bool shared_encoder = false) {
+                           bool shared_encoder = false,
+                           bool prefill_api = false) {
     constexpr std::uint32_t kCellCapacity = 32u;
     constexpr std::size_t kBlocksPerRow = HEAD_DIM / 32u;
     constexpr std::size_t kBlockBytes = sizeof(block_q4_0);
@@ -3439,8 +3734,10 @@ bool run_kv_append_q4_case(Context& context, std::uint32_t token_rows,
         "QSA q4 KV append T=" + std::to_string(token_rows) +
         " pos0=" + std::to_string(pos0) +
         " set=" + twin::input_set_name(set) + pattern_label +
-        (shared_encoder ? " shared Encoder" : " standalone");
-    if (token_rows == 0u || token_rows > VERIFY_MAX_T ||
+        (shared_encoder ? " shared Encoder" : " standalone") +
+        (prefill_api ? " Prefill" : "");
+    if (token_rows == 0u ||
+        token_rows > (prefill_api ? kPrefillMaxShaderRows : VERIFY_MAX_T) ||
         pos0 > kCellCapacity || token_rows > kCellCapacity - pos0 ||
         (all_zero && tie_case)) {
         check(false, label + " test parameters");
@@ -3608,17 +3905,26 @@ bool run_kv_append_q4_case(Context& context, std::uint32_t token_rows,
                          encode_qsa_fwht256(
                              context, encoder, current_rows,
                              value_buffer.view(), encode_error) &&
-                         encode_qsa_kv_append_q4(
-                             context, encoder, token_rows, kCellCapacity,
-                             buffers, encode_error);
+                         (prefill_api
+                              ? encode_prefill_qsa_kv_append_q4(
+                                    context, encoder, token_rows,
+                                    kCellCapacity, buffers, encode_error)
+                              : encode_qsa_kv_append_q4(
+                                    context, encoder, token_rows,
+                                    kCellCapacity, buffers, encode_error));
               },
               error)
         : encode_qsa_fwht256(context, *command, current_rows,
                              key_buffer.view(), error) &&
               encode_qsa_fwht256(context, *command, current_rows,
                                  value_buffer.view(), error) &&
-              encode_qsa_kv_append_q4(context, *command, token_rows,
-                                      kCellCapacity, buffers, error);
+              (prefill_api
+                   ? encode_prefill_qsa_kv_append_q4(
+                         context, *command, token_rows, kCellCapacity,
+                         buffers, error)
+                   : encode_qsa_kv_append_q4(
+                         context, *command, token_rows, kCellCapacity,
+                         buffers, error));
     if (!encoded) {
         check(false, label + " FWHT/KV append encode", error);
         command->discard();
@@ -3780,6 +4086,14 @@ bool run_kv_append_q4_set(Context& context, twin::InputSet set,
         context, VERIFY_MAX_T, 0u, set, options, false, false, true);
     passed &= run_kv_append_q4_case(
         context, VERIFY_MAX_T, 4u, set, options);
+    if (set == twin::InputSet::fixture) {
+        passed &= run_kv_append_q4_case(
+            context, VERIFY_MAX_T + 1u, 0u, set, options, false, false,
+            false, true);
+        passed &= run_kv_append_q4_case(
+            context, VERIFY_MAX_T + 1u, 0u, set, options, false, false,
+            true, true);
+    }
     return passed;
 }
 
@@ -3787,7 +4101,8 @@ bool run_kv_append_k8v4_case(Context& context, std::uint32_t token_rows,
                              std::uint32_t pos0, twin::InputSet set,
                              const twin::Options& options,
                              bool all_zero = false, bool tie_case = false,
-                             bool shared_encoder = false) {
+                             bool shared_encoder = false,
+                             bool prefill_api = false) {
     constexpr std::uint32_t kCellCapacity = 32u;
     constexpr std::size_t kPoolRows =
         static_cast<std::size_t>(kCellCapacity) * N_HEAD_KV;
@@ -3808,8 +4123,10 @@ bool run_kv_append_k8v4_case(Context& context, std::uint32_t token_rows,
         "QSA k8v4 KV append T=" + std::to_string(token_rows) +
         " pos0=" + std::to_string(pos0) +
         " set=" + twin::input_set_name(set) + pattern_label +
-        (shared_encoder ? " shared Encoder" : " standalone");
-    if (token_rows == 0u || token_rows > VERIFY_MAX_T ||
+        (shared_encoder ? " shared Encoder" : " standalone") +
+        (prefill_api ? " Prefill" : "");
+    if (token_rows == 0u ||
+        token_rows > (prefill_api ? kPrefillMaxShaderRows : VERIFY_MAX_T) ||
         pos0 > kCellCapacity || token_rows > kCellCapacity - pos0 ||
         (all_zero && tie_case)) {
         check(false, label + " test parameters");
@@ -4018,15 +4335,24 @@ bool run_kv_append_k8v4_case(Context& context, std::uint32_t token_rows,
                   return encode_qsa_fwht256(
                              context, encoder, current_rows,
                              value_buffer.view(), encode_error) &&
-                         encode_qsa_kv_append_k8v4(
-                             context, encoder, token_rows, kCellCapacity,
-                             buffers, encode_error);
+                         (prefill_api
+                              ? encode_prefill_qsa_kv_append_k8v4(
+                                    context, encoder, token_rows,
+                                    kCellCapacity, buffers, encode_error)
+                              : encode_qsa_kv_append_k8v4(
+                                    context, encoder, token_rows,
+                                    kCellCapacity, buffers, encode_error));
               },
               error)
         : encode_qsa_fwht256(context, *command, current_rows,
                              value_buffer.view(), error) &&
-              encode_qsa_kv_append_k8v4(context, *command, token_rows,
-                                        kCellCapacity, buffers, error);
+              (prefill_api
+                   ? encode_prefill_qsa_kv_append_k8v4(
+                         context, *command, token_rows, kCellCapacity,
+                         buffers, error)
+                   : encode_qsa_kv_append_k8v4(
+                         context, *command, token_rows, kCellCapacity,
+                         buffers, error));
     if (!encoded) {
         check(false, label + " FWHT/KV append encode", error);
         command->discard();
@@ -4212,6 +4538,14 @@ bool run_kv_append_k8v4_set(Context& context, twin::InputSet set,
         context, VERIFY_MAX_T, 0u, set, options, false, false, true);
     passed &= run_kv_append_k8v4_case(
         context, VERIFY_MAX_T, 4u, set, options);
+    if (set == twin::InputSet::fixture) {
+        passed &= run_kv_append_k8v4_case(
+            context, VERIFY_MAX_T + 1u, 0u, set, options, false, false,
+            false, true);
+        passed &= run_kv_append_k8v4_case(
+            context, VERIFY_MAX_T + 1u, 0u, set, options, false, false,
+            true, true);
+    }
     return passed;
 }
 
@@ -6580,6 +6914,7 @@ int main(int argc, char** argv) {
     passed &= test_kv_i8_encoder_validation(*context, *foreign_context);
     passed &= test_kv_q4_encoder_validation(*context, *foreign_context);
     passed &= test_kv_k8v4_encoder_validation(*context, *foreign_context);
+    passed &= test_prefill_kv_append_row_bounds(*context);
     passed &= test_indexer_snapshot_validation(*context, *foreign_context);
     passed &= test_indexer_append_validation(*context, *foreign_context);
     passed &= run_indexer_snapshot_case(
