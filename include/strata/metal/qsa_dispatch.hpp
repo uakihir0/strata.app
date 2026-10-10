@@ -86,6 +86,17 @@ struct QsaIndexerAppendBuffers {
     BufferRef block_pos_snapshot;
 };
 
+/// Per-layer views used by the batched Prefill indexer append path.
+struct QsaPrefillIndexerAppendBuffers {
+    BufferRef raw_keys;
+    BufferRef gamma;
+    BufferRef rope;
+    BufferRef tail;
+    BufferRef dead;
+    BufferRef pooled;
+    BufferRef block_position;
+};
+
 struct QsaSelectionScoresBuffers {
     BufferRef pooled;
     BufferRef dead;
@@ -382,6 +393,27 @@ bool encode_qsa_indexer_append(
     QsaIndexerAppendMode mode, std::uint32_t qsa_layer_index,
     float rope_zero_cos, float rope_zero_sin,
     const QsaIndexerAppendBuffers& buffers, std::string& error);
+
+/// Append one Prefill chunk to one QSA indexer layer using the documented
+/// first-row, full-block and tail kernels. `params` must be consistent with
+/// `build_prefill_chunk_metadata`; the cache capacity must be a positive
+/// multiple of four that contains `[p0, p0 + T)`. The pooled view must contain
+/// `cell_capacity / 4 + 2` rows. Raw keys must be finite and round to finite
+/// fp16 values. Writable views must be mutually disjoint and disjoint from
+/// every read-only view. The three dispatches are ordered and must not be
+/// placed inside a concurrent dispatch group.
+bool encode_prefill_qsa_indexer_append(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillParams& params, std::uint32_t cell_capacity,
+    float rope_zero_cos, float rope_zero_sin,
+    const QsaPrefillIndexerAppendBuffers& buffers, std::string& error);
+/// Caller-owned ordered Encoder form. Propagate false from the enclosing
+/// Encoder::encode body so any earlier dispatches in that segment are dropped.
+bool encode_prefill_qsa_indexer_append(
+    Context& context, Encoder& encoder,
+    const PrefillParams& params, std::uint32_t cell_capacity,
+    float rope_zero_cos, float rope_zero_sin,
+    const QsaPrefillIndexerAppendBuffers& buffers, std::string& error);
 
 /// Restore each QSA indexer from the shared packed snapshot, then replay the
 /// accepted prefix in layer order. `layers` must contain exactly 12 entries;

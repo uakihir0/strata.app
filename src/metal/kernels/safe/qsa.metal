@@ -484,6 +484,179 @@ kernel void strata_idx_append(
     }
 }
 
+struct QsaPrefillIndexerAppendParams {
+    PrefillParams prefill;
+    float rope_zero_cos;
+    float rope_zero_sin;
+};
+
+[[max_total_threads_per_threadgroup(128)]]
+kernel void strata_idx_append_first(
+    device const float* raw_keys [[buffer(0)]],
+    device const float* gamma [[buffer(1)]],
+    device const float2* rope [[buffer(2)]],
+    device uint* tail_bits [[buffer(3)]],
+    device float* dead [[buffer(4)]],
+    device float* pooled [[buffer(5)]],
+    device int* block_position [[buffer(6)]],
+    constant QsaPrefillIndexerAppendParams& params [[buffer(7)]],
+    threadgroup float* partials [[threadgroup(0)]],
+    threadgroup float* values [[threadgroup(1)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint warp [[simdgroup_index_in_threadgroup]]) {
+    const uint p0 = params.prefill.p0;
+    const uint end = p0 + params.prefill.T;
+    const uint rows = min(params.prefill.idx_f, end) - p0;
+    for (uint row = 0u; row < rows; ++row) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint position = p0 + row;
+        const uint slot = position % INDEXER_BLOCK_CELLS;
+        const float incoming =
+            float(half(raw_keys[ulong(row) * INDEXER_HEAD_DIM + tid]));
+        if (slot < INDEXER_BLOCK_CELLS - 1u) {
+            tail_bits[slot * INDEXER_HEAD_DIM + tid] = as_type<uint>(incoming);
+        }
+        if (position != 0u && slot != INDEXER_BLOCK_CELLS - 1u) {
+            continue;
+        }
+
+        float sum = position == 0u
+            ? incoming
+            : as_type<float>(tail_bits[tid]);
+        for (uint cell = 1u; cell < INDEXER_BLOCK_CELLS; ++cell) {
+            const float value =
+                position == 0u || cell == INDEXER_BLOCK_CELLS - 1u
+                    ? incoming
+                    : as_type<float>(
+                          tail_bits[cell * INDEXER_HEAD_DIM + tid]);
+            sum = sum + value;
+        }
+        const float mean = fma(0.25f, sum, 0.0f);
+
+        const float square_sum = bfly_sum(mean * mean);
+        if (lane == 0u) partials[warp] = square_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float all_squares =
+            bfly_sum(lane < 4u ? partials[lane] : 0.0f);
+        const float scale =
+            rsqrt(all_squares / float(INDEXER_HEAD_DIM) + RMS_EPSILON);
+        values[tid] = (scale * mean) * gamma[tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint block = position / INDEXER_BLOCK_CELLS;
+        const ulong rope_position = position == 0u
+            ? 0ul
+            : ulong(INDEXER_BLOCK_CELLS) * ulong(block);
+        const float2 cs = position == 0u
+            ? float2(params.rope_zero_cos, params.rope_zero_sin)
+            : rope[rope_position * 32ul + (tid % 32u)];
+        float output = values[tid];
+        if (tid < ROPE_DIM) {
+            const uint pair = tid % (ROPE_DIM / 2u);
+            const float first = values[pair];
+            const float second = values[pair + ROPE_DIM / 2u];
+            output = tid < ROPE_DIM / 2u
+                ? fma(-second, cs.y, first * cs.x)
+                : fma(second, cs.x, first * cs.y);
+        }
+
+        pooled[ulong(block) * INDEXER_HEAD_DIM + tid] = output;
+        if (position == 0u) {
+            dead[tid] = output;
+        } else {
+            pooled[ulong(block + 1u) * INDEXER_HEAD_DIM + tid] = dead[tid];
+        }
+        if (tid == 0u && position != 0u) {
+            *block_position = int(rope_position);
+        }
+    }
+}
+
+[[max_total_threads_per_threadgroup(128)]]
+kernel void strata_idx_append_blocks(
+    device const float* raw_keys [[buffer(0)]],
+    device const float* gamma [[buffer(1)]],
+    device const float2* rope [[buffer(2)]],
+    device const float* dead [[buffer(3)]],
+    device float* pooled [[buffer(4)]],
+    device int* block_position [[buffer(5)]],
+    constant QsaPrefillIndexerAppendParams& params [[buffer(6)]],
+    threadgroup float* partials [[threadgroup(0)]],
+    threadgroup float* values [[threadgroup(1)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint warp [[simdgroup_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    const uint block =
+        params.prefill.idx_f / INDEXER_BLOCK_CELLS + group.x;
+    const uint first_row =
+        block * INDEXER_BLOCK_CELLS - params.prefill.p0;
+    float sum = float(half(
+        raw_keys[ulong(first_row) * INDEXER_HEAD_DIM + tid]));
+    for (uint cell = 1u; cell < INDEXER_BLOCK_CELLS; ++cell) {
+        const float value = float(half(
+            raw_keys[(ulong(first_row) + cell) * INDEXER_HEAD_DIM + tid]));
+        sum = sum + value;
+    }
+    const float mean = fma(0.25f, sum, 0.0f);
+
+    const float square_sum = bfly_sum(mean * mean);
+    if (lane == 0u) partials[warp] = square_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float all_squares =
+        bfly_sum(lane < 4u ? partials[lane] : 0.0f);
+    const float scale =
+        rsqrt(all_squares / float(INDEXER_HEAD_DIM) + RMS_EPSILON);
+    values[tid] = (scale * mean) * gamma[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const ulong rope_position =
+        ulong(INDEXER_BLOCK_CELLS) * ulong(block);
+    const float2 cs = rope[rope_position * 32ul + (tid % 32u)];
+    float output = values[tid];
+    if (tid < ROPE_DIM) {
+        const uint pair = tid % (ROPE_DIM / 2u);
+        const float first = values[pair];
+        const float second = values[pair + ROPE_DIM / 2u];
+        output = tid < ROPE_DIM / 2u
+            ? fma(-second, cs.y, first * cs.x)
+            : fma(second, cs.x, first * cs.y);
+    }
+
+    pooled[ulong(block) * INDEXER_HEAD_DIM + tid] = output;
+    if (params.prefill.idx_e ==
+        (block + 1u) * INDEXER_BLOCK_CELLS) {
+        pooled[ulong(block + 1u) * INDEXER_HEAD_DIM + tid] = dead[tid];
+        if (tid == 0u) {
+            *block_position = int(rope_position);
+        }
+    }
+}
+
+[[max_total_threads_per_threadgroup(128)]]
+kernel void strata_idx_append_tail(
+    device const float* raw_keys [[buffer(0)]],
+    device uint* tail_bits [[buffer(1)]],
+    constant QsaPrefillIndexerAppendParams& params [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    const uint slot = group.x;
+    const uint p0 = params.prefill.p0;
+    const uint last = p0 + params.prefill.T - 1u;
+    const uint back = (last % INDEXER_BLOCK_CELLS +
+                       INDEXER_BLOCK_CELLS - slot) %
+                      INDEXER_BLOCK_CELLS;
+    if (last < back) return;
+    const uint cell = last - back;
+    if (cell >= p0) {
+        const uint row = cell - p0;
+        const float value = float(
+            half(raw_keys[ulong(row) * INDEXER_HEAD_DIM + tid]));
+        tail_bits[slot * INDEXER_HEAD_DIM + tid] = as_type<uint>(value);
+    }
+}
+
 struct QsaNormRopeParams {
     uint token_rows;
     uint mode;

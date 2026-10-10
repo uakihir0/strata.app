@@ -78,6 +78,9 @@ strata_gdn_conv_commit safe 128 1 1
 strata_qsa_norm_rope safe 256 1 1
 strata_idx_snapshot safe 384 1 1
 strata_idx_append safe 128 1 1
+strata_idx_append_first safe 128 1 1
+strata_idx_append_blocks safe 128 1 1
+strata_idx_append_tail safe 128 1 1
 strata_sel_scores safe 256 1 1
 strata_sel_topk_reg safe 1024 1 1
 strata_sel_topk_mem safe 256 1 1

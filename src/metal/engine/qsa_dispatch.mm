@@ -99,6 +99,13 @@ struct IndexerAppendParams {
 };
 static_assert(sizeof(IndexerAppendParams) == 7u * sizeof(std::uint32_t));
 
+struct PrefillIndexerAppendParams {
+    PrefillParams prefill;
+    float rope_zero_cos;
+    float rope_zero_sin;
+};
+static_assert(sizeof(PrefillIndexerAppendParams) == 6u * sizeof(std::uint32_t));
+
 struct SelectionScoresParams {
     std::uint32_t token_rows;
     std::uint32_t max_blocks;
@@ -176,6 +183,18 @@ struct IndexerAppendDispatch {
     BufferRef tail_snapshot_binding;
     BufferRef block_pos_snapshot_binding;
     IndexerAppendParams params{};
+};
+
+struct PrefillIndexerAppendDispatch {
+    std::size_t raw_bytes = 0u;
+    std::size_t gamma_bytes = 0u;
+    std::size_t rope_required_bytes = 0u;
+    std::size_t tail_bytes = 0u;
+    std::size_t dead_bytes = 0u;
+    std::size_t pooled_bytes = 0u;
+    std::uint32_t first_rows = 0u;
+    std::uint32_t block_count = 0u;
+    PrefillIndexerAppendParams params{};
 };
 
 struct SelectionScoresDispatch {
@@ -583,6 +602,45 @@ bool validate_indexer_append_pipeline(Context& context,
         error = "QSA indexer append pipeline is unavailable or below its "
                 "threadgroup limit";
         return false;
+    }
+    return true;
+}
+
+bool validate_prefill_indexer_append_pipelines(Context& context,
+                                               std::string& error) {
+    constexpr std::array<std::string_view, 3> kernel_names{
+        "strata_idx_append_first", "strata_idx_append_blocks",
+        "strata_idx_append_tail"};
+    const KernelInfo* manifest = nullptr;
+    std::size_t count = 0u;
+    manifest = kernel_manifest(count);
+    for (const std::string_view kernel_name : kernel_names) {
+        const KernelInfo* info = nullptr;
+        for (std::size_t i = 0u; i < count; ++i) {
+            if (std::string_view(manifest[i].name) == kernel_name) {
+                info = &manifest[i];
+                break;
+            }
+        }
+        if (info == nullptr || info->threads != kIndexerAppendThreads ||
+            info->threadgroup_x != kIndexerAppendThreads ||
+            info->threadgroup_y != 1u || info->threadgroup_z != 1u) {
+            error = "QSA Prefill indexer append threadgroup does not match "
+                    "its manifest: " +
+                    std::string(kernel_name);
+            return false;
+        }
+        id<MTLComputePipelineState> pipeline =
+            (__bridge id<MTLComputePipelineState>)context.pipeline(
+                kernel_name.data());
+        if (pipeline == nil ||
+            pipeline.maxTotalThreadsPerThreadgroup <
+                kIndexerAppendThreads) {
+            error = "QSA Prefill indexer append pipeline is unavailable or "
+                    "below its threadgroup limit: " +
+                    std::string(kernel_name);
+            return false;
+        }
     }
     return true;
 }
@@ -2339,6 +2397,159 @@ static bool prepare_indexer_append_dispatch(
     return true;
 }
 
+static bool prepare_prefill_indexer_append_dispatch(
+    Context& context, const PrefillParams& prefill,
+    std::uint32_t cell_capacity, float rope_zero_cos, float rope_zero_sin,
+    const QsaPrefillIndexerAppendBuffers& buffers,
+    PrefillIndexerAppendDispatch& dispatch, std::string& error) {
+    error.clear();
+    if (prefill.T == 0u || prefill.T > kPrefillMaxShaderRows) {
+        error = "Prefill QSA indexer append row count exceeds the "
+                "shader-row limit";
+        return false;
+    }
+    if (cell_capacity == 0u || cell_capacity % INDEXER_BLOCK_CELLS != 0u ||
+        cell_capacity >
+            static_cast<std::uint32_t>(
+                std::numeric_limits<std::int32_t>::max())) {
+        error = "Prefill QSA indexer cell capacity is invalid";
+        return false;
+    }
+    if (!std::isfinite(rope_zero_cos) || !std::isfinite(rope_zero_sin)) {
+        error = "Prefill QSA indexer angle-zero pair must be finite";
+        return false;
+    }
+
+    const std::uint64_t end =
+        static_cast<std::uint64_t>(prefill.p0) + prefill.T;
+    if (prefill.p0 >= cell_capacity || end > cell_capacity ||
+        end > static_cast<std::uint64_t>(
+                  std::numeric_limits<std::int32_t>::max())) {
+        error = "Prefill QSA indexer chunk exceeds the cell capacity";
+        return false;
+    }
+    const std::uint64_t expected_idx_f =
+        prefill.p0 == 0u
+            ? INDEXER_BLOCK_CELLS
+            : (static_cast<std::uint64_t>(prefill.p0) +
+               INDEXER_BLOCK_CELLS - 1u) &
+                  ~static_cast<std::uint64_t>(
+                      INDEXER_BLOCK_CELLS - 1u);
+    const std::uint32_t expected_idx_e = static_cast<std::uint32_t>(
+        end & ~static_cast<std::uint64_t>(INDEXER_BLOCK_CELLS - 1u));
+    if (expected_idx_f > std::numeric_limits<std::uint32_t>::max() ||
+        prefill.idx_f != expected_idx_f ||
+        prefill.idx_e != expected_idx_e) {
+        error = "Prefill QSA indexer parameters do not match the chunk";
+        return false;
+    }
+    constexpr std::size_t raw_row_bytes =
+        static_cast<std::size_t>(INDEXER_HEAD_DIM) * sizeof(float);
+    constexpr std::size_t tail_bytes =
+        3u * static_cast<std::size_t>(INDEXER_HEAD_DIM) * sizeof(float);
+    constexpr std::size_t dead_bytes =
+        static_cast<std::size_t>(INDEXER_HEAD_DIM) * sizeof(float);
+    constexpr std::size_t gamma_bytes =
+        static_cast<std::size_t>(INDEXER_HEAD_DIM) * sizeof(float);
+    constexpr std::size_t block_pos_bytes = sizeof(std::int32_t);
+    constexpr std::size_t pool_row_bytes =
+        static_cast<std::size_t>(INDEXER_HEAD_DIM) * sizeof(float);
+    static_assert(
+        static_cast<std::uint64_t>(kPrefillMaxShaderRows) *
+            raw_row_bytes <=
+        std::numeric_limits<std::size_t>::max());
+    const std::size_t maximum = std::numeric_limits<std::size_t>::max();
+    const std::size_t pool_rows =
+        static_cast<std::size_t>(cell_capacity / INDEXER_BLOCK_CELLS) + 2u;
+    if (pool_rows > maximum / pool_row_bytes) {
+        error = "Prefill QSA indexer pool size overflows host address space";
+        return false;
+    }
+    dispatch.raw_bytes =
+        static_cast<std::size_t>(prefill.T) * raw_row_bytes;
+    dispatch.gamma_bytes = gamma_bytes;
+    dispatch.tail_bytes = tail_bytes;
+    dispatch.dead_bytes = dead_bytes;
+    dispatch.pooled_bytes = pool_rows * pool_row_bytes;
+    dispatch.first_rows = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(prefill.idx_f, end) - prefill.p0);
+    dispatch.block_count =
+        prefill.idx_e > prefill.idx_f
+            ? (prefill.idx_e - prefill.idx_f) / INDEXER_BLOCK_CELLS
+            : 0u;
+    dispatch.params = {prefill, rope_zero_cos, rope_zero_sin};
+
+    const std::uint64_t rope_rows =
+        buffers.rope.length / kRopeCellBytes;
+    const std::uint64_t last_block =
+        (static_cast<std::uint64_t>(cell_capacity) - 1u) /
+        INDEXER_BLOCK_CELLS;
+    const std::uint64_t required_rope_rows =
+        last_block * INDEXER_BLOCK_CELLS + 1u;
+    if (buffers.rope.length % kRopeCellBytes != 0u ||
+        required_rope_rows > maximum / kRopeCellBytes) {
+        error = "Prefill QSA indexer RoPE table has an invalid row extent";
+        return false;
+    }
+    dispatch.rope_required_bytes =
+        static_cast<std::size_t>(required_rope_rows) * kRopeCellBytes;
+    if (!validate_buffer(context, buffers.raw_keys, dispatch.raw_bytes,
+                         alignof(float), "Prefill indexer raw keys", error) ||
+        !validate_buffer(context, buffers.gamma, dispatch.gamma_bytes,
+                         alignof(float), "Prefill indexer gamma", error) ||
+        !validate_buffer(context, buffers.rope,
+                         dispatch.rope_required_bytes, kRopeAlignment,
+                         "Prefill indexer RoPE table", error) ||
+        !validate_buffer(context, buffers.tail, dispatch.tail_bytes,
+                         alignof(float), "Prefill indexer tail", error) ||
+        !validate_buffer(context, buffers.dead, dispatch.dead_bytes,
+                         alignof(float), "Prefill indexer dead key", error) ||
+        !validate_buffer(context, buffers.pooled, dispatch.pooled_bytes,
+                         alignof(float), "Prefill indexer pooled keys",
+                         error) ||
+        !validate_buffer(context, buffers.block_position, block_pos_bytes,
+                         alignof(std::int32_t),
+                         "Prefill indexer block position", error)) {
+        return false;
+    }
+    if (rope_rows < required_rope_rows) {
+        error = "Prefill QSA indexer RoPE table does not cover the cell "
+                "capacity";
+        return false;
+    }
+
+    const std::array<std::pair<BufferRef, std::size_t>, 4> outputs{{
+        {buffers.tail, dispatch.tail_bytes},
+        {buffers.dead, dispatch.dead_bytes},
+        {buffers.pooled, dispatch.pooled_bytes},
+        {buffers.block_position, block_pos_bytes},
+    }};
+    for (std::size_t left = 0u; left < outputs.size(); ++left) {
+        for (std::size_t right = left + 1u; right < outputs.size(); ++right) {
+            if (buffer_overlaps(outputs[left].first, outputs[left].second,
+                                outputs[right].first, outputs[right].second)) {
+                error = "Prefill QSA indexer outputs must be disjoint";
+                return false;
+            }
+        }
+    }
+    const std::array<std::pair<BufferRef, std::size_t>, 3> inputs{{
+        {buffers.raw_keys, dispatch.raw_bytes},
+        {buffers.gamma, dispatch.gamma_bytes},
+        {buffers.rope, dispatch.rope_required_bytes},
+    }};
+    for (const auto& [output, output_bytes] : outputs) {
+        for (const auto& [input, input_bytes] : inputs) {
+            if (buffer_overlaps(output, output_bytes, input, input_bytes)) {
+                error = "Prefill QSA indexer outputs must not overlap inputs";
+                return false;
+            }
+        }
+    }
+    error.clear();
+    return true;
+}
+
 bool encode_qsa_indexer_append(
     Context& context, CommandBuffer& command_buffer,
     std::uint32_t token_rows, std::uint32_t cell_capacity,
@@ -2446,6 +2657,104 @@ bool encode_qsa_indexer_append(
         "strata_idx_append", {1u, 1u, 1u},
         {kIndexerAppendThreads, 1u, 1u}, bindings, byte_bindings,
         threadgroup_memory, error);
+}
+
+bool encode_prefill_qsa_indexer_append(
+    Context& context, Encoder& encoder, const PrefillParams& prefill,
+    std::uint32_t cell_capacity, float rope_zero_cos, float rope_zero_sin,
+    const QsaPrefillIndexerAppendBuffers& buffers, std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "Prefill QSA indexer append requires an ordered concurrent-"
+                "group boundary";
+        return false;
+    }
+    PrefillIndexerAppendDispatch dispatch;
+    if (!prepare_prefill_indexer_append_dispatch(
+            context, prefill, cell_capacity, rope_zero_cos, rope_zero_sin,
+            buffers, dispatch, error) ||
+        !validate_prefill_indexer_append_pipelines(context, error)) {
+        return false;
+    }
+
+    const std::array<EncoderThreadgroupMemory, 2> threadgroup_memory{{
+        {0u, 4u * sizeof(float)},
+        {1u, static_cast<std::size_t>(INDEXER_HEAD_DIM) * sizeof(float)},
+    }};
+    const EncoderBytesBinding params_binding{
+        &dispatch.params, sizeof(dispatch.params), 7u};
+    const std::array<EncoderBytesBinding, 1> byte_bindings{params_binding};
+    if (dispatch.first_rows != 0u) {
+        const std::array<EncoderBufferBinding, 7> bindings{{
+            {buffers.raw_keys, 0u, dispatch.raw_bytes, alignof(float)},
+            {buffers.gamma, 1u, dispatch.gamma_bytes, alignof(float)},
+            {buffers.rope, 2u, dispatch.rope_required_bytes,
+             kRopeAlignment},
+            {buffers.tail, 3u, dispatch.tail_bytes, alignof(float)},
+            {buffers.dead, 4u, dispatch.dead_bytes, alignof(float)},
+            {buffers.pooled, 5u, dispatch.pooled_bytes, alignof(float)},
+            {buffers.block_position, 6u, sizeof(std::int32_t),
+             alignof(std::int32_t)},
+        }};
+        if (!encoder.dispatch(
+                "strata_idx_append_first", {1u, 1u, 1u},
+                {kIndexerAppendThreads, 1u, 1u}, bindings, byte_bindings,
+                threadgroup_memory, error)) {
+            return false;
+        }
+    }
+    if (dispatch.block_count != 0u) {
+        const std::array<EncoderBufferBinding, 6> bindings{{
+            {buffers.raw_keys, 0u, dispatch.raw_bytes, alignof(float)},
+            {buffers.gamma, 1u, dispatch.gamma_bytes, alignof(float)},
+            {buffers.rope, 2u, dispatch.rope_required_bytes,
+             kRopeAlignment},
+            {buffers.dead, 3u, dispatch.dead_bytes, alignof(float)},
+            {buffers.pooled, 4u, dispatch.pooled_bytes, alignof(float)},
+            {buffers.block_position, 5u, sizeof(std::int32_t),
+             alignof(std::int32_t)},
+        }};
+        const EncoderBytesBinding blocks_params_binding{
+            &dispatch.params, sizeof(dispatch.params), 6u};
+        const std::array<EncoderBytesBinding, 1> blocks_byte_bindings{
+            blocks_params_binding};
+        if (!encoder.dispatch(
+                "strata_idx_append_blocks",
+                {dispatch.block_count, 1u, 1u},
+                {kIndexerAppendThreads, 1u, 1u}, bindings,
+                blocks_byte_bindings, threadgroup_memory, error)) {
+            return false;
+        }
+    }
+
+    const std::array<EncoderBufferBinding, 2> tail_bindings{{
+        {buffers.raw_keys, 0u, dispatch.raw_bytes, alignof(float)},
+        {buffers.tail, 1u, dispatch.tail_bytes, alignof(float)},
+    }};
+    const EncoderBytesBinding tail_params_binding{
+        &dispatch.params, sizeof(dispatch.params), 2u};
+    const std::array<EncoderBytesBinding, 1> tail_byte_bindings{
+        tail_params_binding};
+    const std::array<EncoderThreadgroupMemory, 0> no_threadgroup_memory{};
+    return encoder.dispatch(
+        "strata_idx_append_tail", {INDEXER_BLOCK_CELLS - 1u, 1u, 1u},
+        {kIndexerAppendThreads, 1u, 1u}, tail_bindings,
+        tail_byte_bindings, no_threadgroup_memory, error);
+}
+
+bool encode_prefill_qsa_indexer_append(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillParams& prefill, std::uint32_t cell_capacity,
+    float rope_zero_cos, float rope_zero_sin,
+    const QsaPrefillIndexerAppendBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Prefill QSA indexer append",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_qsa_indexer_append(
+                context, encoder, prefill, cell_capacity, rope_zero_cos,
+                rope_zero_sin, buffers, encode_error);
+        },
+        error);
 }
 
 bool encode_qsa_indexer_commit_batch(
