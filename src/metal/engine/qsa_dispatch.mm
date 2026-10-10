@@ -3,6 +3,7 @@
 
 #include "strata/metal/qsa_dispatch.hpp"
 #include "strata/metal/encoder.hpp"
+#include "strata/metal/prefill.hpp"
 #include "metal_fence.hpp"
 #include "../kernels/common/params.h"
 #include "../kernels/common/types.h"
@@ -758,10 +759,18 @@ bool prepare_norm_rope_dispatch(Context& context, std::uint32_t token_rows,
                                QsaNormRopeMode mode,
                                const QsaNormRopeBuffers& buffers,
                                NormRopeDispatch& dispatch,
+                               std::uint32_t row_limit,
+                               std::string_view row_limit_error,
                                std::string& error) {
     error.clear();
-    if (token_rows == 0u || token_rows > VERIFY_MAX_T) {
-        error = "QSA token row count must be in 1..8";
+    if (token_rows == 0u) {
+        error = row_limit == VERIFY_MAX_T
+            ? "QSA token row count must be in 1..8"
+            : "Prefill QSA token row count must be positive";
+        return false;
+    }
+    if (token_rows > row_limit) {
+        error = row_limit_error;
         return false;
     }
     if (mode != QsaNormRopeMode::key &&
@@ -922,7 +931,9 @@ bool encode_qsa_norm_rope(Context& context, CommandBuffer& command_buffer,
                           std::string& error) {
     NormRopeDispatch dispatch;
     if (!prepare_norm_rope_dispatch(context, token_rows, mode, buffers,
-                                    dispatch, error)) {
+                                    dispatch, VERIFY_MAX_T,
+                                    "QSA token row count must be in 1..8",
+                                    error)) {
         return false;
     }
     const std::array<Binding, 5> bindings{{
@@ -939,7 +950,9 @@ bool encode_qsa_norm_rope(Context& context, Encoder& encoder,
                           std::string& error) {
     NormRopeDispatch dispatch;
     if (!prepare_norm_rope_dispatch(context, token_rows, mode, buffers,
-                                    dispatch, error)) {
+                                    dispatch, VERIFY_MAX_T,
+                                    "QSA token row count must be in 1..8",
+                                    error)) {
         return false;
     }
     const std::array<EncoderBufferBinding, 5> bindings{{
@@ -960,6 +973,52 @@ bool encode_qsa_norm_rope(Context& context, Encoder& encoder,
         "strata_qsa_norm_rope",
         {static_cast<std::size_t>(dispatch.threadgroups), 1u, 1u},
         {kThreads, 1u, 1u}, bindings, byte_bindings, threadgroup_memory,
+        error);
+}
+
+bool encode_prefill_qsa_norm_rope(
+    Context& context, Encoder& encoder, std::uint32_t token_rows,
+    QsaNormRopeMode mode, const QsaNormRopeBuffers& buffers,
+    std::string& error) {
+    NormRopeDispatch dispatch;
+    if (!prepare_norm_rope_dispatch(
+            context, token_rows, mode, buffers, dispatch,
+            kPrefillMaxShaderRows,
+            "Prefill QSA token row count exceeds the shader-row limit",
+            error)) {
+        return false;
+    }
+    const std::array<EncoderBufferBinding, 5> bindings{{
+        {buffers.input, 0u, dispatch.input_bytes, alignof(float)},
+        {buffers.gamma, 1u, dispatch.gamma_bytes, alignof(float)},
+        {buffers.steps, 2u, dispatch.steps_bytes, alignof(StepRow)},
+        {buffers.rope, 3u, buffers.rope.length, kRopeAlignment},
+        {buffers.output, 4u, dispatch.output_bytes, alignof(float)},
+    }};
+    const EncoderBytesBinding params_binding{
+        &dispatch.params, sizeof(dispatch.params), 5u};
+    const std::array byte_bindings{params_binding};
+    const std::array threadgroup_memory{
+        EncoderThreadgroupMemory{0u, 8u * sizeof(float)},
+        EncoderThreadgroupMemory{1u, HEAD_DIM * sizeof(float)},
+    };
+    return encoder.dispatch(
+        "strata_qsa_norm_rope",
+        {static_cast<std::size_t>(dispatch.threadgroups), 1u, 1u},
+        {kThreads, 1u, 1u}, bindings, byte_bindings, threadgroup_memory,
+        error);
+}
+
+bool encode_prefill_qsa_norm_rope(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t token_rows, QsaNormRopeMode mode,
+    const QsaNormRopeBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Prefill QSA norm/RoPE",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_qsa_norm_rope(
+                context, encoder, token_rows, mode, buffers, encode_error);
+        },
         error);
 }
 

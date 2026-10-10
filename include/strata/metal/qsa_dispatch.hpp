@@ -2,6 +2,7 @@
 #pragma once
 
 #include "strata/metal/context.hpp"
+#include "strata/metal/prefill.hpp"
 
 #include <cstdint>
 #include <span>
@@ -159,6 +160,22 @@ bool encode_qsa_norm_rope(Context& context, Encoder& encoder,
                           std::uint32_t token_rows, QsaNormRopeMode mode,
                           const QsaNormRopeBuffers& buffers,
                           std::string& error);
+
+/// Encode the same QSA norm/RoPE stage for Prefill chunks, whose row count can
+/// exceed the 1..8 Window decode limit. `token_rows` must fit
+/// `kPrefillMaxShaderRows`; the Prefill-specific API keeps the decode contract
+/// unchanged. Input/output aliasing and StepRow position checks match the
+/// Window form.
+bool encode_prefill_qsa_norm_rope(
+    Context& context, CommandBuffer& command_buffer,
+    std::uint32_t token_rows, QsaNormRopeMode mode,
+    const QsaNormRopeBuffers& buffers, std::string& error);
+/// Caller-owned Encoder form for Prefill chunks. Propagate false from the
+/// enclosing Encoder body so earlier dispatches in the segment are discarded.
+bool encode_prefill_qsa_norm_rope(
+    Context& context, Encoder& encoder, std::uint32_t token_rows,
+    QsaNormRopeMode mode, const QsaNormRopeBuffers& buffers,
+    std::string& error);
 
 /// Append the T rows of two 256-wide K/V heads to the interleaved fp16
 /// cache. `cell_capacity` must be a positive multiple of four, and every
