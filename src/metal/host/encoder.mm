@@ -157,6 +157,7 @@ struct Encoder::Impl {
     DispatchMode mode = DispatchMode::serial;
     bool failed = false;
     bool group_open = false;
+    bool has_encoded_dispatches = false;
     std::vector<std::uint32_t> active_buffer_indices;
     std::vector<std::uint32_t> active_threadgroup_memory_indices;
     std::size_t inline_bytes_encoded = 0;
@@ -414,6 +415,7 @@ bool Encoder::dispatch(
     impl_->active_buffer_indices = std::move(argument_indices);
     impl_->active_threadgroup_memory_indices = std::move(threadgroup_indices);
     impl_->inline_bytes_encoded += dispatch_inline_bytes;
+    impl_->has_encoded_dispatches = true;
 
     if (impl_->mode == DispatchMode::concurrent && !impl_->group_open) {
         [impl_->encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -425,6 +427,10 @@ bool Encoder::dispatch(
 bool Encoder::concurrent_group_open() const noexcept {
     return impl_ != nullptr && impl_->mode == DispatchMode::concurrent &&
            impl_->group_open;
+}
+
+bool Encoder::has_encoded_dispatches() const noexcept {
+    return impl_ != nullptr && impl_->has_encoded_dispatches;
 }
 
 bool Encoder::group_begin(std::string& error) {

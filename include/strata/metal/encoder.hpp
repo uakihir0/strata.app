@@ -86,6 +86,10 @@ public:
     /// where automatic inter-dispatch buffer barriers are suppressed.
     bool concurrent_group_open() const noexcept;
 
+    /// Return whether this unsubmitted segment has encoded at least one
+    /// compute dispatch. Useful to verify coordinator rollback after a prefix.
+    bool has_encoded_dispatches() const noexcept;
+
 private:
     struct Impl;
     explicit Encoder(std::unique_ptr<Impl> impl);
