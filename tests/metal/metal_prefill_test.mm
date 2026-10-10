@@ -15,6 +15,7 @@
 #include "strata/metal/prefill_gr_silu_dispatch.hpp"
 #include "strata/metal/prefill_gdn_gates_dispatch.hpp"
 #include "strata/metal/prefill_gdn_conv_dispatch.hpp"
+#include "strata/metal/prefill_gdn_block_dispatch.hpp"
 #include "strata/metal/prefill_gdn_dispatch.hpp"
 #include "strata/metal/prefill_gdn_l2_dispatch.hpp"
 #include "strata/metal/prefill_gdn_out_norm_dispatch.hpp"
@@ -23,6 +24,7 @@
 #include "twin.hpp"
 
 #include "../../src/metal/kernels/common/params.h"
+#include "../../src/metal/kernels/common/types.h"
 
 #import <Metal/Metal.h>
 
@@ -56,6 +58,7 @@ constexpr std::uint32_t kGdnHeadDim = GDN_HEAD_DIM;
 constexpr std::uint32_t kGdnValueDim = GDN_VALUE_DIM;
 constexpr std::uint32_t kGdnStateElements = GDN_STATE_ELEMENTS;
 constexpr std::uint32_t kThreads = 256u;
+constexpr std::size_t kGdnHalfBytes = sizeof(std::uint16_t);
 constexpr float kEpsilon = 1.0e-6f;
 constexpr std::size_t kGuardBytes = 4096u;
 constexpr std::uint8_t kPoison = 0xa5u;
@@ -6926,6 +6929,693 @@ bool run_prefill_gdn_transforms_case(Context& context, std::uint32_t rows,
            shared_history_qkv.guards_intact();
 }
 
+struct GDNBlockTestOutputs;
+
+struct GDNBlockTestInputs {
+    TestBuffer mixed_h;
+    TestBuffer mixed_bf;
+    TestBuffer mixed_bf_lo;
+    TestBuffer qkv_weights;
+    TestBuffer gate_weights;
+    TestBuffer alpha_weights;
+    TestBuffer beta_weights;
+    TestBuffer out_weights;
+    TestBuffer dt_bias;
+    TestBuffer a;
+    TestBuffer conv_weights;
+    TestBuffer gamma;
+
+    bool allocate(Context& context, std::uint32_t rows,
+                  const std::string& label, std::string& error) {
+        const std::size_t q8_qkv =
+            static_cast<std::size_t>(GDN_CONV_CHANNELS) * N_EMBD / 32u *
+            sizeof(block_q8_0);
+        const std::size_t q8_gate =
+            static_cast<std::size_t>(GDN_VALUE_DIM) * N_EMBD / 32u *
+            sizeof(block_q8_0);
+        const std::size_t q8_out =
+            static_cast<std::size_t>(N_EMBD) * GDN_VALUE_DIM / 32u *
+            sizeof(block_q8_0);
+        const std::size_t bf16_projection =
+            static_cast<std::size_t>(GDN_V_HEADS) * N_EMBD * kGdnHalfBytes;
+        const std::size_t activation_bytes =
+            static_cast<std::size_t>(rows) * N_EMBD * kGdnHalfBytes;
+        return mixed_h.allocate(context, label + " mixed_h",
+                                activation_bytes, error) &&
+               mixed_bf.allocate(context, label + " mixed_bf",
+                                 activation_bytes, error) &&
+               mixed_bf_lo.allocate(context, label + " mixed_bf_lo",
+                                     activation_bytes, error) &&
+               qkv_weights.allocate(context, label + " attn_qkv Q8_0",
+                                    q8_qkv, error) &&
+               gate_weights.allocate(context, label + " attn_gate Q8_0",
+                                     q8_gate, error) &&
+               alpha_weights.allocate(context, label + " ssm_alpha BF16",
+                                      bf16_projection, error) &&
+               beta_weights.allocate(context, label + " ssm_beta BF16",
+                                     bf16_projection, error) &&
+               out_weights.allocate(context, label + " ssm_out Q8_0",
+                                    q8_out, error) &&
+               dt_bias.allocate(context, label + " ssm_dt.bias",
+                                 GDN_V_HEADS * sizeof(float), error) &&
+               a.allocate(context, label + " ssm_a",
+                          GDN_V_HEADS * sizeof(float), error) &&
+               conv_weights.allocate(
+                   context, label + " ssm_conv1d",
+                   static_cast<std::size_t>(GDN_CONV_CHANNELS) *
+                       GDN_CONV_KERNEL * sizeof(float),
+                   error) &&
+               gamma.allocate(context, label + " ssm_norm",
+                              GDN_HEAD_DIM * sizeof(float), error);
+    }
+
+    PrefillGDNBlockBuffers bind(Context& context,
+                                struct GDNBlockTestOutputs& outputs,
+                                PrefillBF16X2Mode mode);
+};
+
+struct GDNBlockTestOutputs {
+    TestBuffer dequantized_f16;
+    TestBuffer qkv;
+    TestBuffer z;
+    TestBuffer alpha_beta;
+    TestBuffer history;
+    TestBuffer gate;
+    TestBuffer beta;
+    TestBuffer h;
+    TestBuffer state;
+    TestBuffer oc;
+    TestBuffer y_h;
+    TestBuffer bo;
+
+    bool allocate(Context& context, std::uint32_t rows,
+                  const std::string& label, std::string& error) {
+        const std::size_t row_values =
+            static_cast<std::size_t>(rows) * GDN_CONV_CHANNELS;
+        const std::size_t value_values =
+            static_cast<std::size_t>(rows) * GDN_VALUE_DIM;
+        return dequantized_f16.allocate(
+                   context, label + " dequantized_f16",
+                   static_cast<std::size_t>(GDN_CONV_CHANNELS) * N_EMBD *
+                       kGdnHalfBytes,
+                   error) &&
+               qkv.allocate(context, label + " qkv",
+                            row_values * sizeof(float), error) &&
+               z.allocate(context, label + " z",
+                          value_values * sizeof(float), error) &&
+               alpha_beta.allocate(
+                   context, label + " alpha_beta",
+                   static_cast<std::size_t>(rows) * 2u * GDN_V_HEADS *
+                       sizeof(float),
+                   error) &&
+               history.allocate(
+                   context, label + " history",
+                   static_cast<std::size_t>(GDN_HISTORY_ELEMENTS) *
+                       sizeof(float),
+                   error) &&
+               gate.allocate(context, label + " gate",
+                             static_cast<std::size_t>(rows) * GDN_V_HEADS *
+                                 sizeof(float),
+                             error) &&
+               beta.allocate(context, label + " beta",
+                             static_cast<std::size_t>(rows) * GDN_V_HEADS *
+                                 sizeof(float),
+                             error) &&
+               h.allocate(context, label + " h",
+                          row_values * sizeof(float), error) &&
+               state.allocate(context, label + " state",
+                              static_cast<std::size_t>(GDN_STATE_ELEMENTS) *
+                                  sizeof(float),
+                              error) &&
+               oc.allocate(context, label + " oc",
+                           value_values * sizeof(float), error) &&
+               y_h.allocate(context, label + " y_h",
+                            value_values * kGdnHalfBytes, error) &&
+               bo.allocate(context, label + " bo",
+                           static_cast<std::size_t>(rows) * N_EMBD *
+                               sizeof(float),
+                           error);
+    }
+
+    void initialize_persistent_state() {
+        auto* history_values =
+            reinterpret_cast<float*>(history.payload().data());
+        for (std::size_t i = 0u; i < history.payload().size() / sizeof(float);
+             ++i) {
+            const int centered =
+                static_cast<int>((i * 13u + 9u) % 71u) - 35;
+            history_values[i] = static_cast<float>(centered) * 0.0006f;
+        }
+        auto* state_values =
+            reinterpret_cast<float*>(state.payload().data());
+        for (std::size_t i = 0u; i < GDN_STATE_ELEMENTS; ++i) {
+            const int centered =
+                static_cast<int>((i * 17u + 11u) % 83u) - 41;
+            state_values[i] = static_cast<float>(centered) * 0.00008f;
+        }
+    }
+};
+
+PrefillGDNBlockBuffers GDNBlockTestInputs::bind(
+    Context& context, GDNBlockTestOutputs& outputs,
+    PrefillBF16X2Mode mode) {
+    PrefillGDNBlockBuffers buffers;
+    buffers.mixed_h = context.buffers().read_only(mixed_h.view());
+    buffers.mixed_bf = context.buffers().read_only(mixed_bf.view());
+    if (mode != PrefillBF16X2Mode::off) {
+        buffers.mixed_bf_lo =
+            context.buffers().read_only(mixed_bf_lo.view());
+    }
+    buffers.attn_qkv_weights =
+        context.buffers().read_only(qkv_weights.view());
+    buffers.attn_qkv_format = PrefillNativeWeightFormat::Q8_0;
+    buffers.attn_gate_weights =
+        context.buffers().read_only(gate_weights.view());
+    buffers.attn_gate_format = PrefillNativeWeightFormat::Q8_0;
+    buffers.ssm_alpha_weights =
+        context.buffers().read_only(alpha_weights.view());
+    buffers.ssm_beta_weights =
+        context.buffers().read_only(beta_weights.view());
+    buffers.ssm_out_weights = context.buffers().read_only(out_weights.view());
+    buffers.ssm_out_format = PrefillNativeWeightFormat::Q8_0;
+    buffers.dt_bias = context.buffers().read_only(dt_bias.view());
+    buffers.a = context.buffers().read_only(a.view());
+    buffers.conv_weights = context.buffers().read_only(conv_weights.view());
+    buffers.gamma = context.buffers().read_only(gamma.view());
+    buffers.dequantized_f16 = outputs.dequantized_f16.view();
+    buffers.qkv = outputs.qkv.view();
+    buffers.z = outputs.z.view();
+    buffers.alpha_beta = outputs.alpha_beta.view();
+    buffers.history = outputs.history.view();
+    buffers.gate = outputs.gate.view();
+    buffers.beta = outputs.beta.view();
+    buffers.h = outputs.h.view();
+    buffers.state = outputs.state.view();
+    buffers.oc = outputs.oc.view();
+    buffers.y_h = outputs.y_h.view();
+    buffers.bo = outputs.bo.view();
+    return buffers;
+}
+
+void initialize_gdn_block_inputs(GDNBlockTestInputs& inputs,
+                                 std::uint32_t rows) {
+    auto* mixed_h = reinterpret_cast<std::uint16_t*>(
+        inputs.mixed_h.payload().data());
+    const std::size_t activation_values =
+        static_cast<std::size_t>(rows) * N_EMBD;
+    for (std::size_t i = 0u; i < activation_values; ++i) {
+        const int centered = static_cast<int>((i * 19u + 7u) % 101u) - 50;
+        mixed_h[i] = strata::kernels::f16_from_f32(
+            static_cast<float>(centered) * 0.0009f);
+    }
+
+    auto* mixed_bf = reinterpret_cast<std::uint16_t*>(
+        inputs.mixed_bf.payload().data());
+    auto* mixed_bf_lo = reinterpret_cast<std::uint16_t*>(
+        inputs.mixed_bf_lo.payload().data());
+    for (std::size_t i = 0u; i < activation_values; ++i) {
+        const int high = static_cast<int>((i * 23u + 11u) % 79u) - 39;
+        const int low = static_cast<int>((i * 31u + 3u) % 43u) - 21;
+        mixed_bf[i] = strata::kernels::bf16_from_f32(
+            static_cast<float>(high) * 0.0004f);
+        mixed_bf_lo[i] = strata::kernels::bf16_from_f32(
+            static_cast<float>(low) * 0.000015f);
+    }
+
+    auto fill_q8 = [](TestBuffer& buffer, std::uint32_t input_width,
+                      std::uint32_t output_width, std::uint32_t salt) {
+        auto* blocks = reinterpret_cast<block_q8_0*>(
+            buffer.payload().data());
+        const std::uint32_t blocks_per_row = input_width / 32u;
+        const std::size_t block_count =
+            static_cast<std::size_t>(output_width) * blocks_per_row;
+        for (std::size_t index = 0u; index < block_count; ++index) {
+            block_q8_0& block = blocks[index];
+            block.d = strata::kernels::f16_from_f32(1.0f / 32.0f);
+            const std::uint32_t output_row =
+                static_cast<std::uint32_t>(index / blocks_per_row);
+            for (std::uint32_t lane = 0u; lane < 32u; ++lane) {
+                const int code = static_cast<int>(
+                    (output_row * 11u + static_cast<std::uint32_t>(index) * 3u +
+                     lane * 5u + salt) %
+                    9u) -
+                                 4;
+                block.qs[lane] = static_cast<std::int8_t>(code);
+            }
+        }
+    };
+    fill_q8(inputs.qkv_weights, N_EMBD, GDN_CONV_CHANNELS, 1u);
+    fill_q8(inputs.gate_weights, N_EMBD, GDN_VALUE_DIM, 4u);
+    fill_q8(inputs.out_weights, GDN_VALUE_DIM, N_EMBD, 7u);
+
+    auto fill_bf16 = [](TestBuffer& buffer, std::uint32_t rows,
+                        std::uint32_t columns, std::uint32_t salt) {
+        auto* weights =
+            reinterpret_cast<std::uint16_t*>(buffer.payload().data());
+        for (std::uint32_t row = 0u; row < rows; ++row) {
+            for (std::uint32_t column = 0u; column < columns; ++column) {
+                const int centered = static_cast<int>(
+                    (row * 13u + column * 7u + salt) % 17u) -
+                                     8;
+                weights[static_cast<std::size_t>(row) * columns + column] =
+                    strata::kernels::bf16_from_f32(
+                        static_cast<float>(centered) * 0.0003f);
+            }
+        }
+    };
+    fill_bf16(inputs.alpha_weights, GDN_V_HEADS, N_EMBD, 2u);
+    fill_bf16(inputs.beta_weights, GDN_V_HEADS, N_EMBD, 5u);
+
+    auto* dt_bias =
+        reinterpret_cast<float*>(inputs.dt_bias.payload().data());
+    auto* a = reinterpret_cast<float*>(inputs.a.payload().data());
+    for (std::uint32_t head = 0u; head < GDN_V_HEADS; ++head) {
+        dt_bias[head] =
+            static_cast<float>(static_cast<int>(head % 13u) - 6) * 0.03f;
+        a[head] = 0.4f + static_cast<float>(head % 7u) * 0.05f;
+    }
+    auto* conv_weights =
+        reinterpret_cast<float*>(inputs.conv_weights.payload().data());
+    for (std::size_t i = 0u;
+         i < inputs.conv_weights.payload().size() / sizeof(float); ++i) {
+        const int centered = static_cast<int>((i * 29u + 5u) % 47u) - 23;
+        conv_weights[i] = static_cast<float>(centered) * 0.0012f;
+    }
+    auto* gamma = reinterpret_cast<float*>(inputs.gamma.payload().data());
+    for (std::uint32_t i = 0u; i < GDN_HEAD_DIM; ++i) {
+        gamma[i] = 0.8f + static_cast<float>((i * 3u + 1u) % 23u) * 0.01f;
+    }
+}
+
+bool encode_direct_gdn_block(Context& context, Encoder& encoder,
+                             std::uint32_t rows, PrefillBF16X2Mode mode,
+                             const PrefillGDNBlockBuffers& buffers,
+                             std::string& error) {
+    const PrefillGemmMPPParams qkv_params{
+        rows, GDN_CONV_CHANNELS, N_EMBD, GDN_CONV_CHANNELS, 0u, false};
+    const PrefillGemmMPPParams gate_params{
+        rows, GDN_VALUE_DIM, N_EMBD, GDN_VALUE_DIM, 0u, false};
+    const PrefillGemmMPPParams alpha_params{
+        rows, GDN_V_HEADS, N_EMBD, 2u * GDN_V_HEADS, 0u, false};
+    const PrefillGemmMPPParams beta_params{
+        rows, GDN_V_HEADS, N_EMBD, 2u * GDN_V_HEADS, GDN_V_HEADS, false};
+    const PrefillGemmMPPParams out_params{
+        rows, N_EMBD, GDN_VALUE_DIM, N_EMBD, 0u, false};
+
+    if (!encode_prefill_native_projection(
+            context, encoder, qkv_params, buffers.attn_qkv_format,
+            {buffers.mixed_h, buffers.attn_qkv_weights,
+             buffers.dequantized_f16, buffers.qkv},
+            error) ||
+        !encode_prefill_native_projection(
+            context, encoder, gate_params, buffers.attn_gate_format,
+            {buffers.mixed_h, buffers.attn_gate_weights,
+             buffers.dequantized_f16, buffers.z},
+            error)) {
+        return false;
+    }
+    if (mode == PrefillBF16X2Mode::off) {
+        if (!encode_prefill_gemm(
+                context, encoder, alpha_params,
+                {buffers.mixed_bf, buffers.ssm_alpha_weights,
+                 buffers.alpha_beta},
+                PrefillGemmFormat::BF16, error) ||
+            !encode_prefill_gemm(
+                context, encoder, beta_params,
+                {buffers.mixed_bf, buffers.ssm_beta_weights,
+                 buffers.alpha_beta},
+                PrefillGemmFormat::BF16, error)) {
+            return false;
+        }
+    } else {
+        if (!encode_prefill_gemm_bf16x2(
+                context, encoder, alpha_params,
+                {buffers.mixed_bf, buffers.mixed_bf_lo,
+                 buffers.ssm_alpha_weights, buffers.alpha_beta},
+                error) ||
+            !encode_prefill_gemm_bf16x2(
+                context, encoder, beta_params,
+                {buffers.mixed_bf, buffers.mixed_bf_lo,
+                 buffers.ssm_beta_weights, buffers.alpha_beta},
+                error)) {
+            return false;
+        }
+    }
+
+    const PrefillGDNTransformBuffers transform_buffers{
+        context.buffers().read_only(buffers.alpha_beta),
+        buffers.dt_bias,
+        buffers.a,
+        buffers.history,
+        context.buffers().read_only(buffers.qkv),
+        buffers.conv_weights,
+        buffers.gate,
+        buffers.beta,
+        buffers.h,
+        buffers.state,
+        buffers.oc,
+        context.buffers().read_only(buffers.z),
+        buffers.gamma,
+        buffers.y_h};
+    return encode_prefill_gdn_transforms(
+               context, encoder, rows, transform_buffers, error) &&
+           encode_prefill_native_projection(
+               context, encoder, out_params, buffers.ssm_out_format,
+               {context.buffers().read_only(buffers.y_h),
+                buffers.ssm_out_weights, buffers.dequantized_f16, buffers.bo},
+               error);
+}
+
+bool run_prefill_gdn_block_case(Context& context, std::uint32_t rows,
+                                PrefillBF16X2Mode mode,
+                                bool standalone_api) {
+    const std::string label =
+        "Prefill GDN block T=" + std::to_string(rows) + " mode=" +
+        std::to_string(static_cast<std::uint32_t>(mode)) +
+        (standalone_api ? " standalone" : " caller-owned");
+    GDNBlockTestInputs inputs;
+    GDNBlockTestOutputs composed, direct;
+    std::string error;
+    const bool allocated =
+        inputs.allocate(context, rows, label + " inputs", error) &&
+        composed.allocate(context, rows, label + " composed", error) &&
+        direct.allocate(context, rows, label + " direct", error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    initialize_gdn_block_inputs(inputs, rows);
+
+    const std::array<TestBuffer*, 12u> read_only_inputs{
+        &inputs.mixed_h,     &inputs.mixed_bf,   &inputs.mixed_bf_lo,
+        &inputs.qkv_weights, &inputs.gate_weights, &inputs.alpha_weights,
+        &inputs.beta_weights, &inputs.out_weights, &inputs.dt_bias,
+        &inputs.a,           &inputs.conv_weights, &inputs.gamma};
+    std::array<std::vector<std::uint8_t>, 12u> input_snapshots;
+    for (std::size_t i = 0u; i < read_only_inputs.size(); ++i) {
+        const auto payload = read_only_inputs[i]->payload();
+        input_snapshots[i].assign(payload.begin(), payload.end());
+    }
+
+    composed.initialize_persistent_state();
+    direct.initialize_persistent_state();
+    std::memcpy(direct.history.payload().data(),
+                composed.history.payload().data(),
+                composed.history.payload().size());
+    std::memcpy(direct.state.payload().data(),
+                composed.state.payload().data(),
+                composed.state.payload().size());
+
+    const PrefillGDNBlockBuffers composed_buffers =
+        inputs.bind(context, composed, mode);
+    auto composed_command =
+        context.make_command_buffer(label + " composed command", error);
+    check(composed_command != nullptr, label + " composed command buffer",
+          error);
+    if (!composed_command) return false;
+    const bool composed_encoded =
+        standalone_api
+            ? encode_prefill_gdn_block(context, *composed_command, rows, mode,
+                                       composed_buffers, error)
+            : Encoder::encode(
+                  context, *composed_command, label + " caller-owned",
+                  [&](Encoder& encoder, std::string& encode_error) {
+                      return encode_prefill_gdn_block(
+                          context, encoder, rows, mode, composed_buffers,
+                          encode_error);
+                  },
+                  error);
+    check(composed_encoded, label + " composed encode", error);
+    if (!composed_encoded) {
+        composed_command->discard();
+        return false;
+    }
+    if (!submit_and_wait(composed_command, label + " composed", error)) {
+        check(false, label + " composed dispatch", error);
+        return false;
+    }
+
+    const PrefillGDNBlockBuffers direct_buffers =
+        inputs.bind(context, direct, mode);
+    auto direct_command =
+        context.make_command_buffer(label + " direct command", error);
+    check(direct_command != nullptr, label + " direct command buffer", error);
+    if (!direct_command) return false;
+    const bool direct_encoded = Encoder::encode(
+        context, *direct_command, label + " direct component sequence",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_direct_gdn_block(context, encoder, rows, mode,
+                                           direct_buffers, encode_error);
+        },
+        error);
+    check(direct_encoded, label + " direct component encode", error);
+    if (!direct_encoded) {
+        direct_command->discard();
+        return false;
+    }
+    if (!submit_and_wait(direct_command, label + " direct", error)) {
+        check(false, label + " direct dispatch", error);
+        return false;
+    }
+
+    const std::array<TestBuffer*, 12u> composed_outputs{
+        &composed.dequantized_f16, &composed.qkv,   &composed.z,
+        &composed.alpha_beta,      &composed.history, &composed.gate,
+        &composed.beta,            &composed.h,    &composed.state,
+        &composed.oc,              &composed.y_h,  &composed.bo};
+    const std::array<TestBuffer*, 12u> direct_outputs{
+        &direct.dequantized_f16, &direct.qkv,   &direct.z,
+        &direct.alpha_beta,      &direct.history, &direct.gate,
+        &direct.beta,            &direct.h,    &direct.state,
+        &direct.oc,              &direct.y_h,  &direct.bo};
+    const std::array<std::string_view, 12u> output_names{
+        "reused F16 dequant scratch", "qkv", "z", "alpha_beta",
+        "history", "gate", "beta", "convolution h", "recurrent state",
+        "oc", "F16 y_h", "bo"};
+    bool outputs_match = true;
+    for (std::size_t i = 0u; i < composed_outputs.size(); ++i) {
+        const auto left = composed_outputs[i]->payload();
+        const auto right = direct_outputs[i]->payload();
+        const bool match =
+            left.size() == right.size() &&
+            std::equal(left.begin(), left.end(), right.begin());
+        check(match, label + " matches direct " + std::string(output_names[i]));
+        outputs_match &= match;
+    }
+
+    bool inputs_unchanged = true;
+    for (std::size_t i = 0u; i < read_only_inputs.size(); ++i) {
+        const auto payload = read_only_inputs[i]->payload();
+        inputs_unchanged &=
+            std::equal(input_snapshots[i].begin(), input_snapshots[i].end(),
+                       payload.begin());
+    }
+    check(inputs_unchanged,
+          label + " leaves projection inputs and weights unchanged");
+    bool guards = true;
+    for (TestBuffer* buffer : read_only_inputs) {
+        guards &= buffer->guards_intact();
+    }
+    for (TestBuffer* buffer : composed_outputs) {
+        guards &= buffer->guards_intact();
+    }
+    for (TestBuffer* buffer : direct_outputs) {
+        guards &= buffer->guards_intact();
+    }
+    check(guards, label + " guard regions");
+
+    bool rollback = true;
+    if (rows == 1u && mode == PrefillBF16X2Mode::except_gr) {
+        ScopedEnvironment invalid_selector;
+        const bool environment_set =
+            invalid_selector.set("STRATA_METAL_GEMM", "invalid");
+        check(environment_set, label + " set invalid GEMM selector");
+        rollback &= environment_set;
+        if (environment_set) {
+            std::array<std::vector<std::uint8_t>, 12u> output_snapshots;
+            for (std::size_t i = 0u; i < composed_outputs.size(); ++i) {
+                const auto payload = composed_outputs[i]->payload();
+                output_snapshots[i].assign(payload.begin(), payload.end());
+            }
+
+            const std::array<bool, 2u> standalone_forms{true, false};
+            for (const bool standalone_form : standalone_forms) {
+                std::string rollback_error;
+                const std::string rollback_label =
+                    label + (standalone_form ? " standalone rollback"
+                                             : " caller-owned rollback");
+                auto rollback_command = context.make_command_buffer(
+                    rollback_label, rollback_error);
+                if (!rollback_command) {
+                    check(false, rollback_label + " command buffer",
+                          rollback_error);
+                    rollback = false;
+                    continue;
+                }
+                bool prefix_dispatch_observed = false;
+                const bool encoded =
+                    standalone_form
+                        ? encode_prefill_gdn_block(
+                              context, *rollback_command, rows, mode,
+                              composed_buffers, rollback_error)
+                        : Encoder::encode(
+                              context, *rollback_command, rollback_label,
+                              [&](Encoder& encoder,
+                                  std::string& encode_error) {
+                                  const bool block_encoded =
+                                      encode_prefill_gdn_block(
+                                      context, encoder, rows, mode,
+                                      composed_buffers, encode_error);
+                                  prefix_dispatch_observed =
+                                      encoder.has_encoded_dispatches();
+                                  return block_encoded;
+                              },
+                              rollback_error);
+                if (!standalone_form) {
+                    check(prefix_dispatch_observed,
+                          rollback_label +
+                              " reaches selector failure after an encoded "
+                              "dequant dispatch",
+                          rollback_error);
+                }
+                const bool rejected_and_discarded =
+                    !encoded &&
+                    rollback_command->unsafe_native_handle() == nullptr &&
+                    rollback_error.find(
+                        "STRATA_METAL_GEMM must be 'mpp' or 'simd'") !=
+                        std::string::npos &&
+                    (standalone_form || prefix_dispatch_observed);
+                check(rejected_and_discarded,
+                      rollback_label +
+                          " propagates late projection selector failure",
+                      rollback_error);
+                bool unchanged = true;
+                for (std::size_t i = 0u; i < composed_outputs.size(); ++i) {
+                    const auto payload = composed_outputs[i]->payload();
+                    unchanged &=
+                        std::equal(output_snapshots[i].begin(),
+                                   output_snapshots[i].end(), payload.begin());
+                }
+                check(unchanged,
+                      rollback_label +
+                          " preserves all block outputs and persistent state");
+                rollback &= rejected_and_discarded && unchanged;
+            }
+            const bool environment_restored = invalid_selector.restore();
+            check(environment_restored,
+                  label + " restores GEMM selector environment");
+            rollback &= environment_restored;
+        }
+    }
+    return outputs_match && inputs_unchanged && guards && rollback;
+}
+
+bool test_prefill_native_projection_buffer_sizes() {
+    const PrefillGemmMPPParams qkv{
+        1u, GDN_CONV_CHANNELS, N_EMBD, GDN_CONV_CHANNELS, 0u, false};
+    PrefillNativeProjectionBufferSizes sizes;
+    std::string error;
+    const bool sized = prefill_native_projection_buffer_sizes(
+        qkv, PrefillNativeWeightFormat::Q8_0, sizes, error);
+    const bool expected =
+        sized && sizes.x_f16_bytes == N_EMBD * kGdnHalfBytes &&
+        sizes.weights_bytes ==
+            static_cast<std::size_t>(GDN_CONV_CHANNELS) * N_EMBD / 32u *
+                sizeof(block_q8_0) &&
+        sizes.dequantized_f16_bytes ==
+            static_cast<std::size_t>(GDN_CONV_CHANNELS) * N_EMBD *
+                kGdnHalfBytes &&
+        sizes.y_f32_bytes == GDN_CONV_CHANNELS * sizeof(float) &&
+        sizes.weights_alignment == alignof(block_q8_0);
+    check(expected, "Prefill native projection reports Q8_0 active extents",
+          error);
+    const bool invalid_rejected = !prefill_native_projection_buffer_sizes(
+        qkv, PrefillNativeWeightFormat::Invalid, sizes, error);
+    check(invalid_rejected,
+          "Prefill native projection rejects the invalid format sentinel",
+          error);
+    return expected && invalid_rejected;
+}
+
+bool test_prefill_gdn_block_validation(Context& context) {
+    constexpr std::uint32_t rows = 3u;
+    const std::string label = "Prefill GDN block preflight T=3";
+    GDNBlockTestInputs inputs;
+    GDNBlockTestOutputs outputs;
+    std::string error;
+    const bool allocated =
+        inputs.allocate(context, rows, label + " inputs", error) &&
+        outputs.allocate(context, rows, label + " outputs", error);
+    check(allocated, label + " allocate buffers", error);
+    if (!allocated) return false;
+    initialize_gdn_block_inputs(inputs, rows);
+
+    const auto rejects_before_dispatch =
+        [&](std::string_view case_name, PrefillBF16X2Mode mode,
+            const PrefillGDNBlockBuffers& buffers,
+            std::string_view expected_error) {
+            std::string case_error;
+            auto command = context.make_command_buffer(
+                label + " " + std::string(case_name), case_error);
+            if (!command) {
+                check(false, label + " " + std::string(case_name) +
+                                 " command buffer",
+                      case_error);
+                return false;
+            }
+            const bool rejected =
+                !encode_prefill_gdn_block(context, *command, rows, mode,
+                                          buffers, case_error) &&
+                command->unsafe_native_handle() == nullptr &&
+                case_error.find(expected_error) != std::string::npos;
+            check(rejected,
+                  label + " rejects " + std::string(case_name) +
+                      " before dispatch",
+                  case_error);
+            return rejected;
+        };
+
+    PrefillGDNBlockBuffers short_bo =
+        inputs.bind(context, outputs, PrefillBF16X2Mode::off);
+    const std::size_t bo_bytes =
+        static_cast<std::size_t>(rows) * N_EMBD * sizeof(float);
+    short_bo.bo = outputs.bo.view().slice(0u, bo_bytes - sizeof(float));
+    const bool short_bo_rejected = rejects_before_dispatch(
+        "short final bo", PrefillBF16X2Mode::off, short_bo,
+        "bo buffer is undersized");
+
+    PrefillGDNBlockBuffers missing_low =
+        inputs.bind(context, outputs,
+                    PrefillBF16X2Mode::all_projections);
+    missing_low.mixed_bf_lo = {};
+    const bool missing_low_rejected = rejects_before_dispatch(
+        "missing mode 1 remainder", PrefillBF16X2Mode::all_projections,
+        missing_low, "requires mixed_bf_lo");
+
+    PrefillGDNBlockBuffers unexpected_low =
+        inputs.bind(context, outputs, PrefillBF16X2Mode::off);
+    unexpected_low.mixed_bf_lo =
+        context.buffers().read_only(inputs.mixed_bf_lo.view());
+    const bool unexpected_low_rejected = rejects_before_dispatch(
+        "unexpected mode 0 remainder", PrefillBF16X2Mode::off,
+        unexpected_low, "requires an empty");
+
+    PrefillGDNBlockBuffers late_alias =
+        inputs.bind(context, outputs, PrefillBF16X2Mode::off);
+    late_alias.bo = outputs.qkv.view().slice(0u, bo_bytes);
+    const bool alias_rejected = rejects_before_dispatch(
+        "qkv and final bo alias", PrefillBF16X2Mode::off, late_alias,
+        "writable stages overlap: qkv and bo");
+
+    PrefillGDNBlockBuffers invalid_late_format =
+        inputs.bind(context, outputs, PrefillBF16X2Mode::off);
+    invalid_late_format.ssm_out_format = PrefillNativeWeightFormat::Invalid;
+    const bool format_rejected = rejects_before_dispatch(
+        "invalid final projection format", PrefillBF16X2Mode::off,
+        invalid_late_format, "format is invalid");
+
+    return short_bo_rejected && missing_low_rejected &&
+           unexpected_low_rejected && alias_rejected && format_rejected;
+}
+
 bool test_prefill_gdn_transforms_open_concurrent_group_rejected(
     Context& context) {
     const char* const dispatch = std::getenv("STRATA_METAL_DISPATCH");
@@ -6946,6 +7636,35 @@ bool test_prefill_gdn_transforms_open_concurrent_group_rejected(
             if (!encoder.group_begin(encode_error)) return false;
             return encode_prefill_gdn_transforms(context, encoder, 1u, {},
                                                  encode_error);
+        },
+        error);
+    const bool rejected =
+        !encoded && error.find("ordered concurrent-group boundary") !=
+                        std::string::npos;
+    check(rejected, label, error);
+    return rejected;
+}
+
+bool test_prefill_gdn_block_open_concurrent_group_rejected(Context& context) {
+    const char* const dispatch = std::getenv("STRATA_METAL_DISPATCH");
+    if (dispatch == nullptr || std::string_view(dispatch) != "concurrent") {
+        return true;
+    }
+    const std::string label =
+        "Prefill GDN block rejects open concurrent group";
+    std::string error;
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, label,
+        [&](Encoder& encoder, std::string& encode_error) {
+            if (!encoder.group_begin(encode_error)) return false;
+            return encode_prefill_gdn_block(
+                context, encoder, 1u, PrefillBF16X2Mode::off, {},
+                encode_error);
         },
         error);
     const bool rejected =
@@ -7007,6 +7726,8 @@ int main(int argc, char** argv) {
     passed &=
         test_prefill_gdn_out_norm_unsaturated_half_overflow(*context);
     passed &= test_prefill_gdn_out_norm_halfway_rne(*context);
+    passed &= test_prefill_native_projection_buffer_sizes();
+    passed &= test_prefill_gdn_block_validation(*context);
     const std::array<std::uint32_t, 3> rows{1u, 3u, 8u};
     const std::array<PrefillBF16X2Mode, 3> modes{
         PrefillBF16X2Mode::off,
@@ -7057,6 +7778,7 @@ int main(int argc, char** argv) {
         test_prefill_gdn_out_norm_failure_discards_prior_dispatch(*context);
     passed &= test_prefill_gdn_transforms_open_concurrent_group_rejected(
         *context);
+    passed &= test_prefill_gdn_block_open_concurrent_group_rejected(*context);
     passed &= test_open_concurrent_group_rejected(*context);
     passed &= test_silu_open_concurrent_group_rejected(*context);
     passed &= test_gr_mix_open_concurrent_group_rejected(*context);
@@ -7137,6 +7859,13 @@ int main(int argc, char** argv) {
     passed &= run_prefill_gdn_transforms_case(*context, 1u, true);
     passed &= run_prefill_gdn_transforms_case(*context, 3u, false);
     passed &= run_prefill_gdn_transforms_case(*context, 65u, true);
+    for (std::size_t mode_index = 0u; mode_index < modes.size();
+         ++mode_index) {
+        passed &= run_prefill_gdn_block_case(
+            *context, 1u, modes[mode_index], mode_index == 1u);
+    }
+    passed &= run_prefill_gdn_block_case(
+        *context, 3u, PrefillBF16X2Mode::except_gr, false);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d Prefill Metal test(s) failed\n", g_failures);
         return 1;
