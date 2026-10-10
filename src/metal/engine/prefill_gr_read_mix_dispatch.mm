@@ -72,6 +72,23 @@ bool ranges_overlap(const MemoryRange& left, const MemoryRange& right) {
     return same_allocation || same_cpu_backing || same_gpu_backing;
 }
 
+bool validate_mixer_input(Context& context, BufferRef view,
+                          std::size_t required_bytes, std::size_t alignment,
+                          std::string_view name, std::string& error) {
+    if (!view || !context.buffers().owns(view)) {
+        error = "Prefill GR read/mix " + std::string(name) +
+                " buffer is not owned by this Context";
+        return false;
+    }
+    if (view.length < required_bytes || alignment == 0u ||
+        view.offset % alignment != 0u) {
+        error = "Prefill GR read/mix " + std::string(name) +
+                " buffer is undersized or misaligned";
+        return false;
+    }
+    return true;
+}
+
 bool validate_mix_outputs(Context& context, std::uint32_t rows,
                           PrefillBF16X2Mode mode,
                           const PrefillGRReadMixBuffers& buffers,
@@ -172,6 +189,12 @@ bool validate_mix_outputs(Context& context, std::uint32_t rows,
     }
 
     const PrefillGRReadBuffers& read = buffers.read;
+    if (!validate_mixer_input(context, read.residual, stream_bytes,
+                              kFloatBytes, "residual", error) ||
+        !validate_mixer_input(context, read.norm, norm_float_bytes,
+                              kFloatBytes, "norm weights", error)) {
+        return false;
+    }
     const std::array<BufferRef, 8> read_outputs{
         read.rs, read.xn16, read.xn16_lo, read.low_rank,
         read.low_rank_bf16, read.low_rank_bf16_lo, read.gated, read.inject};
@@ -191,6 +214,33 @@ bool validate_mix_outputs(Context& context, std::uint32_t rows,
                    ? active
                    : kOutputsWithoutRemainders[active];
     };
+    constexpr std::array<std::size_t, 5> kProjectionOutputIndices{
+        3u, 4u, 5u, 6u, 7u};
+    constexpr std::array<std::size_t, 4>
+        kProjectionOutputsWithoutRemainders{3u, 4u, 6u, 7u};
+    const std::size_t projection_output_count =
+        mode == PrefillBF16X2Mode::all_projections
+            ? kProjectionOutputIndices.size()
+            : kProjectionOutputsWithoutRemainders.size();
+    const std::array<MemoryRange, 2> mixer_inputs{
+        memory_range(read.residual, stream_bytes),
+        memory_range(read.norm, norm_float_bytes)};
+    for (std::size_t active = 0u; active < projection_output_count; ++active) {
+        const std::size_t index =
+            mode == PrefillBF16X2Mode::all_projections
+                ? kProjectionOutputIndices[active]
+                : kProjectionOutputsWithoutRemainders[active];
+        if (!read_outputs[index]) continue;
+        const MemoryRange projection_output =
+            memory_range(read_outputs[index], read_output_bytes[index]);
+        for (const MemoryRange& mixer_input : mixer_inputs) {
+            if (ranges_overlap(projection_output, mixer_input)) {
+                error =
+                    "Prefill GR read projection output overlaps a mixer read input";
+                return false;
+            }
+        }
+    }
     for (std::size_t active = 0u; active < output_count; ++active) {
         const MemoryRange& mix_output = output_ranges[active];
         for (std::size_t read_active = 0u;
@@ -226,11 +276,12 @@ bool validate_mix_outputs(Context& context, std::uint32_t rows,
 
 }  // namespace
 
-bool encode_prefill_gr_read_mix(Context& context, Encoder& encoder,
-                                std::uint32_t rows,
-                                PrefillBF16X2Mode mode,
-                                const PrefillGRReadMixBuffers& buffers,
-                                std::string& error) {
+namespace {
+
+bool encode_prefill_gr_read_mix_impl(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    PrefillBF16X2Mode mode, const PrefillGRReadMixBuffers& buffers,
+    bool pre_normalized, std::string& error) {
     error.clear();
     if (encoder.concurrent_group_open()) {
         error =
@@ -240,8 +291,13 @@ bool encode_prefill_gr_read_mix(Context& context, Encoder& encoder,
     if (!validate_mix_outputs(context, rows, mode, buffers, error)) {
         return false;
     }
-    if (!encode_prefill_gr_read(context, encoder, rows, mode, buffers.read,
-                                error)) {
+    const bool read_encoded =
+        pre_normalized
+            ? encode_prefill_gr_read_pre_normalized(
+                  context, encoder, rows, mode, buffers.read, error)
+            : encode_prefill_gr_read(context, encoder, rows, mode,
+                                     buffers.read, error);
+    if (!read_encoded) {
         return false;
     }
 
@@ -257,6 +313,25 @@ bool encode_prefill_gr_read_mix(Context& context, Encoder& encoder,
                                  error);
 }
 
+}  // namespace
+
+bool encode_prefill_gr_read_mix(Context& context, Encoder& encoder,
+                                std::uint32_t rows,
+                                PrefillBF16X2Mode mode,
+                                const PrefillGRReadMixBuffers& buffers,
+                                std::string& error) {
+    return encode_prefill_gr_read_mix_impl(context, encoder, rows, mode,
+                                           buffers, false, error);
+}
+
+bool encode_prefill_gr_read_mix_pre_normalized(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    PrefillBF16X2Mode mode, const PrefillGRReadMixBuffers& buffers,
+    std::string& error) {
+    return encode_prefill_gr_read_mix_impl(context, encoder, rows, mode,
+                                           buffers, true, error);
+}
+
 bool encode_prefill_gr_read_mix(
     Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
     PrefillBF16X2Mode mode, const PrefillGRReadMixBuffers& buffers,
@@ -266,6 +341,19 @@ bool encode_prefill_gr_read_mix(
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_prefill_gr_read_mix(context, encoder, rows, mode,
                                               buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_prefill_gr_read_mix_pre_normalized(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    PrefillBF16X2Mode mode, const PrefillGRReadMixBuffers& buffers,
+    std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Prefill GR read from prepared norm and mix",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_gr_read_mix_pre_normalized(
+                context, encoder, rows, mode, buffers, encode_error);
         },
         error);
 }

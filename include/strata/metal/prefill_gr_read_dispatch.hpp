@@ -43,11 +43,29 @@ bool encode_prefill_gr_read(Context& context, Encoder& encoder,
                             const PrefillGRReadBuffers& buffers,
                             std::string& error);
 
+/// Encode the projection stages using rs/xn16 (and mode-1 xn16_lo) already
+/// produced for the same active rows and BF16X2 mode by an earlier GR
+/// write/norm transition. Order the producer before this consumer in the same
+/// Encoder, or establish a supported cross-command-buffer dependency before
+/// submission. These views are read-only inputs and must not overlap
+/// projection outputs.
+/// residual and norm are unused by this projection-only form.
+bool encode_prefill_gr_read_pre_normalized(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    PrefillBF16X2Mode mode, const PrefillGRReadBuffers& buffers,
+    std::string& error);
+
 /// Transactional wrapper for a caller-supplied fresh command buffer.
 bool encode_prefill_gr_read(Context& context,
                             CommandBuffer& command_buffer,
                             std::uint32_t rows, PrefillBF16X2Mode mode,
                             const PrefillGRReadBuffers& buffers,
                             std::string& error);
+
+/// Transactional wrapper for the pre-normalized projection path.
+bool encode_prefill_gr_read_pre_normalized(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    PrefillBF16X2Mode mode, const PrefillGRReadBuffers& buffers,
+    std::string& error);
 
 }  // namespace strata::metal

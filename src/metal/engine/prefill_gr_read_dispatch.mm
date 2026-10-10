@@ -119,6 +119,7 @@ bool ranges_overlap(const MemoryRange& left, const MemoryRange& right) {
 bool validate_buffers(Context& context, std::uint32_t rows,
                       PrefillBF16X2Mode mode,
                       const PrefillGRReadBuffers& buffers,
+                      bool pre_normalized,
                       std::array<std::size_t, 8>& output_bytes,
                       std::array<std::size_t, 5>& input_bytes,
                       std::string& error) {
@@ -176,9 +177,21 @@ bool validate_buffers(Context& context, std::uint32_t rows,
         "injection output"};
     constexpr std::array<std::size_t, 6> kOutputsWithoutRemainders{
         0u, 1u, 3u, 4u, 6u, 7u};
+    constexpr std::array<std::size_t, 5> kProjectionOutputsWithRemainders{
+        3u, 4u, 5u, 6u, 7u};
+    constexpr std::array<std::size_t, 4> kProjectionOutputsWithoutRemainders{
+        3u, 4u, 6u, 7u};
     const std::size_t active_outputs =
-        write_low ? output_bytes.size() : kOutputsWithoutRemainders.size();
+        pre_normalized
+            ? (write_low ? kProjectionOutputsWithRemainders.size()
+                         : kProjectionOutputsWithoutRemainders.size())
+            : (write_low ? output_bytes.size()
+                         : kOutputsWithoutRemainders.size());
     const auto output_index = [&](std::size_t active_index) {
+        if (pre_normalized) {
+            return write_low ? kProjectionOutputsWithRemainders[active_index]
+                             : kProjectionOutputsWithoutRemainders[active_index];
+        }
         return write_low ? active_index
                          : kOutputsWithoutRemainders[active_index];
     };
@@ -191,10 +204,11 @@ bool validate_buffers(Context& context, std::uint32_t rows,
             return false;
         }
     }
-    if (!validate_view(context, buffers.residual, input_bytes[0], kFloatBytes,
-                       "residual", error) ||
-        !validate_view(context, buffers.norm, input_bytes[1], kFloatBytes,
-                       "norm weights", error) ||
+    if ((!pre_normalized &&
+         (!validate_view(context, buffers.residual, input_bytes[0],
+                         kFloatBytes, "residual", error) ||
+          !validate_view(context, buffers.norm, input_bytes[1], kFloatBytes,
+                         "norm weights", error))) ||
         !validate_view(context, buffers.down_weights, input_bytes[2],
                        kBFloatBytes, "down weights", error) ||
         !validate_view(context, buffers.up_weights, input_bytes[3],
@@ -204,12 +218,40 @@ bool validate_buffers(Context& context, std::uint32_t rows,
         return false;
     }
 
-    const std::array<MemoryRange, 5> read_only{
-        memory_range(buffers.residual, input_bytes[0]),
-        memory_range(buffers.norm, input_bytes[1]),
-        memory_range(buffers.down_weights, input_bytes[2]),
-        memory_range(buffers.up_weights, input_bytes[3]),
-        memory_range(buffers.inject_weights, input_bytes[4])};
+    std::array<MemoryRange, 8> read_only{};
+    std::size_t read_only_count = 0u;
+    if (!pre_normalized) {
+        read_only[read_only_count++] =
+            memory_range(buffers.residual, input_bytes[0]);
+        read_only[read_only_count++] =
+            memory_range(buffers.norm, input_bytes[1]);
+    }
+    read_only[read_only_count++] =
+        memory_range(buffers.down_weights, input_bytes[2]);
+    read_only[read_only_count++] =
+        memory_range(buffers.up_weights, input_bytes[3]);
+    read_only[read_only_count++] =
+        memory_range(buffers.inject_weights, input_bytes[4]);
+    if (pre_normalized) {
+        if (!validate_view(context, buffers.rs, output_bytes[0], kFloatBytes,
+                           "pre-normalized scale input", error) ||
+            !validate_view(context, buffers.xn16, output_bytes[1], kBFloatBytes,
+                           "pre-normalized BF16 input", error) ||
+            (write_low &&
+             !validate_view(context, buffers.xn16_lo, output_bytes[2],
+                            kBFloatBytes,
+                            "pre-normalized BF16 remainder input", error))) {
+            return false;
+        }
+        read_only[read_only_count++] =
+            memory_range(buffers.rs, output_bytes[0]);
+        read_only[read_only_count++] =
+            memory_range(buffers.xn16, output_bytes[1]);
+        if (write_low) {
+            read_only[read_only_count++] =
+                memory_range(buffers.xn16_lo, output_bytes[2]);
+        }
+    }
     std::array<MemoryRange, 8> outputs{};
     for (std::size_t active_index = 0u;
          active_index < active_outputs; ++active_index) {
@@ -219,8 +261,8 @@ bool validate_buffers(Context& context, std::uint32_t rows,
     }
 
     for (std::size_t output = 0u; output < active_outputs; ++output) {
-        for (const MemoryRange& input : read_only) {
-            if (ranges_overlap(outputs[output], input)) {
+        for (std::size_t input = 0u; input < read_only_count; ++input) {
+            if (ranges_overlap(outputs[output], read_only[input])) {
                 error = "Prefill GR read writable output overlaps a read-only input";
                 return false;
             }
@@ -252,10 +294,14 @@ bool encode_projection(Context& context, Encoder& encoder,
 
 }  // namespace
 
-bool encode_prefill_gr_read(Context& context, Encoder& encoder,
-                            std::uint32_t rows, PrefillBF16X2Mode mode,
-                            const PrefillGRReadBuffers& buffers,
-                            std::string& error) {
+namespace {
+
+bool encode_prefill_gr_read_impl(Context& context, Encoder& encoder,
+                                 std::uint32_t rows,
+                                 PrefillBF16X2Mode mode,
+                                 const PrefillGRReadBuffers& buffers,
+                                 bool pre_normalized,
+                                 std::string& error) {
     error.clear();
     if (encoder.concurrent_group_open()) {
         error = "Prefill GR read requires an ordered concurrent-group boundary";
@@ -264,8 +310,8 @@ bool encode_prefill_gr_read(Context& context, Encoder& encoder,
 
     std::array<std::size_t, 8> output_bytes{};
     std::array<std::size_t, 5> input_bytes{};
-    if (!validate_buffers(context, rows, mode, buffers, output_bytes,
-                          input_bytes, error)) {
+    if (!validate_buffers(context, rows, mode, buffers, pre_normalized,
+                          output_bytes, input_bytes, error)) {
         return false;
     }
 
@@ -280,12 +326,14 @@ bool encode_prefill_gr_read(Context& context, Encoder& encoder,
         write_low ? context.buffers().read_only(buffers.low_rank_bf16_lo)
                   : ReadOnlyBufferRef{};
 
-    const PrefillGRNormBuffers norm_buffers{
-        buffers.residual, buffers.norm, buffers.rs, buffers.xn16,
-        write_low ? buffers.xn16_lo : BufferRef{}};
-    if (!encode_prefill_gr_norm(context, encoder, rows, mode, norm_buffers,
-                                error)) {
-        return false;
+    if (!pre_normalized) {
+        const PrefillGRNormBuffers norm_buffers{
+            buffers.residual, buffers.norm, buffers.rs, buffers.xn16,
+            write_low ? buffers.xn16_lo : BufferRef{}};
+        if (!encode_prefill_gr_norm(context, encoder, rows, mode,
+                                    norm_buffers, error)) {
+            return false;
+        }
     }
 
     const PrefillGemmMPPParams down_params{
@@ -325,6 +373,24 @@ bool encode_prefill_gr_read(Context& context, Encoder& encoder,
                              buffers.inject, mode, error);
 }
 
+}  // namespace
+
+bool encode_prefill_gr_read(Context& context, Encoder& encoder,
+                            std::uint32_t rows, PrefillBF16X2Mode mode,
+                            const PrefillGRReadBuffers& buffers,
+                            std::string& error) {
+    return encode_prefill_gr_read_impl(context, encoder, rows, mode, buffers,
+                                       false, error);
+}
+
+bool encode_prefill_gr_read_pre_normalized(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    PrefillBF16X2Mode mode, const PrefillGRReadBuffers& buffers,
+    std::string& error) {
+    return encode_prefill_gr_read_impl(context, encoder, rows, mode, buffers,
+                                       true, error);
+}
+
 bool encode_prefill_gr_read(Context& context,
                             CommandBuffer& command_buffer,
                             std::uint32_t rows, PrefillBF16X2Mode mode,
@@ -335,6 +401,19 @@ bool encode_prefill_gr_read(Context& context,
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_prefill_gr_read(context, encoder, rows, mode,
                                           buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_prefill_gr_read_pre_normalized(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    PrefillBF16X2Mode mode, const PrefillGRReadBuffers& buffers,
+    std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Prefill GR read from prepared norm",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_gr_read_pre_normalized(
+                context, encoder, rows, mode, buffers, encode_error);
         },
         error);
 }
