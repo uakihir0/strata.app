@@ -8,6 +8,7 @@
 #include "strata/metal/prefill_gemm_dispatch.hpp"
 #include "strata/metal/prefill_native_projection.hpp"
 #include "strata/metal/prefill_qsa_gate_dispatch.hpp"
+#include "strata/metal/prefill_qsa_layer_dispatch.hpp"
 #include "strata/metal/prefill_qsa_tail_dispatch.hpp"
 #include "strata/metal/qsa_dispatch.hpp"
 #include "twin.hpp"
@@ -2032,6 +2033,819 @@ std::uint16_t half_order_key(std::uint16_t bits) {
         : static_cast<std::uint16_t>(bits | 0x8000u);
 }
 
+bool run_prefill_qsa_layer_case(
+    Context& context, QsaAttentionMode mode, const twin::Options& options,
+    bool shared_encoder) {
+    constexpr std::uint32_t kRows = 1u;
+    constexpr std::uint32_t kPosition = 31u;
+    constexpr std::uint32_t kCapacity = 128u;
+    constexpr std::uint32_t kIdStride = INDEXER_SELECTION_WIDTH_MAX;
+    constexpr std::uint32_t kMaxBlocks =
+        kCapacity / INDEXER_BLOCK_CELLS + 2u;
+    constexpr std::uint32_t kProjectionN = 2560u;
+    constexpr std::uint32_t kProjectionK = N_HEAD_Q * HEAD_DIM;
+    constexpr float kRopeZeroCos = 1.0625f;
+    constexpr float kRopeZeroSin = -0.0f;
+    const std::string label =
+        "Prefill QSA projected-row layer " +
+        std::string(mode_name(mode)) +
+        std::string(shared_encoder ? " shared Encoder" : " standalone");
+    std::string error;
+
+    PrefillChunkMetadata metadata;
+    const std::array token_ids{1u};
+    if (!build_prefill_chunk_metadata(kPosition, token_ids, metadata, error)) {
+        check(false, label + " metadata", error);
+        return false;
+    }
+    const StepRow step{
+        metadata.steps[0].pos, metadata.steps[0].n_kv,
+        metadata.steps[0].n_bid, metadata.steps[0].width};
+    constexpr std::size_t kKvInputBytes =
+        static_cast<std::size_t>(2u) * HEAD_DIM * sizeof(float);
+    constexpr std::size_t kQFullBytes =
+        static_cast<std::size_t>(N_HEAD_Q) * 2u * HEAD_DIM * sizeof(float);
+    constexpr std::size_t kIndexerQueryBytes =
+        static_cast<std::size_t>(INDEXER_HEADS) * INDEXER_HEAD_DIM *
+        sizeof(float);
+    constexpr std::size_t kIndexerKeyBytes =
+        static_cast<std::size_t>(INDEXER_HEAD_DIM) * sizeof(float);
+    constexpr std::size_t kIndexerGammaBytes =
+        static_cast<std::size_t>(INDEXER_HEAD_DIM) * sizeof(float);
+    constexpr std::size_t kIndexerTailBytes =
+        3u * INDEXER_HEAD_DIM * sizeof(float);
+    constexpr std::size_t kIndexerPoolBytes =
+        static_cast<std::size_t>(kMaxBlocks) * INDEXER_HEAD_DIM *
+        sizeof(float);
+    const std::size_t rope_bytes =
+        static_cast<std::size_t>(kCapacity) * 32u * 2u * sizeof(float);
+
+    AttentionInput attention_input;
+    attention_input.query.assign(
+        static_cast<std::size_t>(kRows) * N_HEAD_Q * HEAD_DIM, 0.0f);
+    attention_input.steps.push_back(step);
+    attention_input.ids.assign(kIdStride, kUntouchedId);
+    CacheData cache = make_cache(
+        mode, kCapacity, twin::InputSet::fixture,
+        options.seed ^ (static_cast<std::uint64_t>(mode) << 32u) ^ 0x91d4u);
+    AttentionBuffers attention;
+    PrefillSelectionBuffers selection;
+    std::size_t partial_acc_bytes = 0u;
+    std::size_t partial_stats_bytes = 0u;
+    if (!allocate_case_buffers(
+            context, kRows, kIdStride, attention_input, cache, attention,
+            partial_acc_bytes, partial_stats_bytes, error) ||
+        !allocate_prefill_selection_buffers(
+            context, kRows, kCapacity, selection, error)) {
+        check(false, label + " selection and attention buffers", error);
+        return false;
+    }
+    const std::vector<std::uint8_t> initial_attention_query(
+        attention.query.payload().begin(), attention.query.payload().end());
+
+    twin::GuardedBuffer keys, values, q_full, key_gamma, query_gamma, rope,
+        indexer_query_gamma, raw_indexer_keys, indexer_gamma, indexer_tail,
+        indexer_block_position, gate_f16, native_weights, dequantized_f16,
+        projected_y;
+    const bool allocated =
+        keys.allocate(context, label + " projected K", kKvInputBytes, error) &&
+        values.allocate(context, label + " projected V", kKvInputBytes,
+                        error) &&
+        q_full.allocate(context, label + " projected Qf", kQFullBytes,
+                        error) &&
+        key_gamma.allocate(context, label + " K gamma",
+                           HEAD_DIM * sizeof(float), error) &&
+        query_gamma.allocate(context, label + " Q gamma",
+                             HEAD_DIM * sizeof(float), error) &&
+        rope.allocate(context, label + " RoPE", rope_bytes, error) &&
+        indexer_query_gamma.allocate(
+            context, label + " indexer query gamma", kIndexerGammaBytes,
+            error) &&
+        raw_indexer_keys.allocate(context, label + " raw indexer K",
+                                  kIndexerKeyBytes, error) &&
+        indexer_gamma.allocate(context, label + " indexer gamma",
+                               kIndexerGammaBytes, error) &&
+        indexer_tail.allocate(context, label + " indexer tail",
+                              kIndexerTailBytes, error) &&
+        indexer_block_position.allocate(
+            context, label + " indexer block position",
+            sizeof(std::int32_t), error) &&
+        gate_f16.allocate(
+            context, label + " gate F16",
+            static_cast<std::size_t>(N_HEAD_Q) * HEAD_DIM *
+                sizeof(std::uint16_t),
+            error) &&
+        native_weights.allocate(
+            context, label + " Q8_0 output weights",
+            static_cast<std::size_t>(kProjectionN) *
+                (kProjectionK / 32u) * sizeof(block_q8_0),
+            error) &&
+        dequantized_f16.allocate(
+            context, label + " dequantized output weights",
+            static_cast<std::size_t>(kProjectionN) * kProjectionK *
+                sizeof(std::uint16_t),
+            error) &&
+        projected_y.allocate(
+            context, label + " projected Y",
+            static_cast<std::size_t>(kProjectionN) * sizeof(float), error);
+    check(allocated, label + " preparation and output buffers", error);
+    if (!allocated) return false;
+
+    std::mt19937_64 rng(options.seed ^ 0x91d4a3u);
+    const auto generate = [&](std::span<float> output, float scale,
+                              std::size_t seed) {
+        for (std::size_t i = 0u; i < output.size(); ++i) {
+            output[i] = sample(twin::InputSet::fixture, rng, i + seed, scale);
+        }
+    };
+    std::vector<float> source_keys(kKvInputBytes / sizeof(float));
+    std::vector<float> source_values(source_keys.size());
+    std::vector<float> source_q_full(kQFullBytes / sizeof(float));
+    std::vector<float> source_indexer_query(
+        kIndexerQueryBytes / sizeof(float));
+    std::vector<float> source_raw_indexer(
+        kIndexerKeyBytes / sizeof(float));
+    std::vector<float> host_gamma(HEAD_DIM, 1.0f);
+    std::vector<float> host_indexer_gamma(INDEXER_HEAD_DIM, 1.0f);
+    std::vector<float> host_rope(rope_bytes / sizeof(float));
+    generate(source_keys, 4.0f, 0x1121u);
+    generate(source_values, 2.0f, 0x2243u);
+    generate(source_q_full, 6.0f, 0x3365u);
+    generate(source_indexer_query, 3.0f, 0x4487u);
+    generate(source_raw_indexer, 2.0f, 0x55a9u);
+    for (std::uint32_t cell = 0u; cell < kCapacity; ++cell) {
+        for (std::uint32_t pair = 0u; pair < 32u; ++pair) {
+            const float angle =
+                static_cast<float>((cell * 11u + pair * 5u) % 251u) *
+                0.011f;
+            const std::size_t index =
+                (static_cast<std::size_t>(cell) * 32u + pair) * 2u;
+            host_rope[index] = std::cos(angle);
+            host_rope[index + 1u] = std::sin(angle);
+        }
+    }
+    std::memcpy(keys.payload().data(), source_keys.data(), kKvInputBytes);
+    std::memcpy(values.payload().data(), source_values.data(), kKvInputBytes);
+    std::memcpy(q_full.payload().data(), source_q_full.data(), kQFullBytes);
+    std::memcpy(key_gamma.payload().data(), host_gamma.data(),
+                HEAD_DIM * sizeof(float));
+    std::memcpy(query_gamma.payload().data(), host_gamma.data(),
+                HEAD_DIM * sizeof(float));
+    std::memcpy(indexer_query_gamma.payload().data(),
+                host_indexer_gamma.data(), kIndexerGammaBytes);
+    std::memcpy(indexer_gamma.payload().data(), host_indexer_gamma.data(),
+                kIndexerGammaBytes);
+    std::memcpy(rope.payload().data(), host_rope.data(), rope_bytes);
+    std::memcpy(selection.indexer_queries.payload().data(),
+                source_indexer_query.data(), kIndexerQueryBytes);
+    std::memcpy(raw_indexer_keys.payload().data(), source_raw_indexer.data(),
+                kIndexerKeyBytes);
+    std::memcpy(attention.steps.payload().data(), &step, sizeof(step));
+    std::memcpy(attention.key_data.payload().data(), cache.key_data.data(),
+                cache.key_data.size());
+    std::memcpy(attention.value_data.payload().data(),
+                cache.value_data.data(), cache.value_data.size());
+    if (!cache.key_scales.empty()) {
+        std::memcpy(attention.key_scales.payload().data(),
+                    cache.key_scales.data(),
+                    cache.key_scales.size() * sizeof(std::uint16_t));
+    }
+    if (!cache.value_scales.empty()) {
+        std::memcpy(attention.value_scales.payload().data(),
+                    cache.value_scales.data(),
+                    cache.value_scales.size() * sizeof(std::uint16_t));
+    }
+    std::fill(typed<float>(selection.scores).begin(),
+              typed<float>(selection.scores).end(), kUntouchedScore);
+    std::fill(typed<std::int32_t>(attention.ids).begin(),
+              typed<std::int32_t>(attention.ids).end(), kUntouchedId);
+
+    oracle::QsaIndexerState indexer_state;
+    indexer_state.tail.assign(3u * INDEXER_HEAD_DIM, -13.25f);
+    indexer_state.dead.assign(INDEXER_HEAD_DIM, -17.5f);
+    indexer_state.pooled.assign(kIndexerPoolBytes / sizeof(float), -19.75f);
+    indexer_state.block_position = -23;
+    std::vector<std::int32_t> prefix_positions(kPosition);
+    std::vector<float> prefix_keys(
+        static_cast<std::size_t>(kPosition) * INDEXER_HEAD_DIM);
+    for (std::uint32_t row = 0u; row < kPosition; ++row) {
+        prefix_positions[row] = static_cast<std::int32_t>(row);
+        for (std::uint32_t dimension = 0u; dimension < INDEXER_HEAD_DIM;
+             ++dimension) {
+            const std::size_t index =
+                static_cast<std::size_t>(row) * INDEXER_HEAD_DIM + dimension;
+            prefix_keys[index] =
+                sample(twin::InputSet::fixture, rng, index + 0x661bu, 2.0f);
+        }
+    }
+    oracle::qsa_indexer_append(
+        prefix_keys, prefix_positions, host_indexer_gamma, host_rope,
+        kRopeZeroCos, kRopeZeroSin, indexer_state);
+    std::memcpy(selection.pooled.payload().data(),
+                indexer_state.pooled.data(), kIndexerPoolBytes);
+    std::memcpy(selection.dead.payload().data(), indexer_state.dead.data(),
+                INDEXER_HEAD_DIM * sizeof(float));
+    std::memcpy(indexer_tail.payload().data(), indexer_state.tail.data(),
+                kIndexerTailBytes);
+    std::memcpy(indexer_block_position.payload().data(),
+                &indexer_state.block_position, sizeof(std::int32_t));
+    const auto snapshot_bytes = [](auto& buffer) {
+        const auto payload = buffer.payload();
+        return std::vector<std::uint8_t>(payload.begin(), payload.end());
+    };
+    const std::vector<std::uint8_t> initial_projected_keys =
+        snapshot_bytes(keys);
+    const std::vector<std::uint8_t> initial_projected_values =
+        snapshot_bytes(values);
+    const std::vector<std::uint8_t> initial_projected_q =
+        snapshot_bytes(q_full);
+    const std::vector<std::uint8_t> initial_steps =
+        snapshot_bytes(attention.steps);
+    const std::vector<std::uint8_t> initial_key_gamma =
+        snapshot_bytes(key_gamma);
+    const std::vector<std::uint8_t> initial_query_gamma =
+        snapshot_bytes(query_gamma);
+    const std::vector<std::uint8_t> initial_rope = snapshot_bytes(rope);
+    const std::vector<std::uint8_t> initial_indexer_query =
+        snapshot_bytes(selection.indexer_queries);
+    const std::vector<std::uint8_t> initial_raw_indexer_key =
+        snapshot_bytes(raw_indexer_keys);
+    const std::vector<std::uint8_t> initial_indexer_gamma =
+        snapshot_bytes(indexer_gamma);
+    const std::vector<std::uint8_t> initial_indexer_query_gamma =
+        snapshot_bytes(indexer_query_gamma);
+    const std::vector<std::uint8_t> initial_indexer_tail =
+        snapshot_bytes(indexer_tail);
+    const std::vector<std::uint8_t> initial_indexer_dead =
+        snapshot_bytes(selection.dead);
+    const std::vector<std::uint8_t> initial_indexer_pool =
+        snapshot_bytes(selection.pooled);
+    const std::vector<std::uint8_t> initial_indexer_block_position =
+        snapshot_bytes(indexer_block_position);
+    const std::vector<std::uint8_t> initial_key_cache =
+        snapshot_bytes(attention.key_data);
+    const std::vector<std::uint8_t> initial_value_cache =
+        snapshot_bytes(attention.value_data);
+    const std::vector<std::uint8_t> initial_key_scales =
+        snapshot_bytes(attention.key_scales);
+    const std::vector<std::uint8_t> initial_value_scales =
+        snapshot_bytes(attention.value_scales);
+
+    std::vector<twin::tf> expected_keys_tf;
+    const std::array positions{static_cast<std::int32_t>(kPosition)};
+    oracle::qsa_norm_rope(source_keys, host_gamma, positions, host_rope,
+                          kRows, QsaNormRopeMode::key, expected_keys_tf);
+    const auto tf_to_float = [](std::span<const twin::tf> source) {
+        std::vector<float> output;
+        output.reserve(source.size());
+        for (const auto value : source) output.push_back(value.value);
+        return output;
+    };
+    const bool rotate_keys = mode == QsaAttentionMode::q4;
+    const bool rotate_values =
+        mode == QsaAttentionMode::q4 || mode == QsaAttentionMode::k8v4;
+    const bool rotate_query = mode == QsaAttentionMode::q4;
+    const bool transform_attention =
+        mode == QsaAttentionMode::q4 || mode == QsaAttentionMode::k8v4;
+    std::vector<twin::tf> expected_keys_transformed = expected_keys_tf;
+    if (rotate_keys) {
+        oracle::qsa_fwht256(tf_to_float(expected_keys_tf), 2u,
+                           expected_keys_transformed);
+    }
+    std::vector<twin::tf> expected_values_transformed;
+    if (rotate_values) {
+        oracle::qsa_fwht256(source_values, 2u, expected_values_transformed);
+    } else {
+        expected_values_transformed.reserve(source_values.size());
+        for (const float value : source_values) {
+            expected_values_transformed.emplace_back(value);
+        }
+    }
+    const std::vector<float> expected_key_values =
+        tf_to_float(expected_keys_transformed);
+    const std::vector<float> expected_value_values =
+        tf_to_float(expected_values_transformed);
+    cache.key_data.assign(attention.key_data.payload().begin(),
+                          attention.key_data.payload().end());
+    cache.value_data.assign(attention.value_data.payload().begin(),
+                            attention.value_data.payload().end());
+    if (mode == QsaAttentionMode::f16) {
+        std::vector<std::uint16_t> key_pool(cache.key_data.size() / 2u);
+        std::vector<std::uint16_t> value_pool(cache.value_data.size() / 2u);
+        std::memcpy(key_pool.data(), cache.key_data.data(),
+                    cache.key_data.size());
+        std::memcpy(value_pool.data(), cache.value_data.data(),
+                    cache.value_data.size());
+        oracle::qsa_kv_append_f16(expected_key_values, expected_value_values,
+                                  positions, key_pool, value_pool);
+        std::memcpy(cache.key_data.data(), key_pool.data(),
+                    cache.key_data.size());
+        std::memcpy(cache.value_data.data(), value_pool.data(),
+                    cache.value_data.size());
+    } else if (mode == QsaAttentionMode::i8) {
+        std::vector<std::int8_t> key_codes(cache.key_data.size());
+        std::vector<std::int8_t> value_codes(cache.value_data.size());
+        std::memcpy(key_codes.data(), cache.key_data.data(),
+                    cache.key_data.size());
+        std::memcpy(value_codes.data(), cache.value_data.data(),
+                    cache.value_data.size());
+        oracle::qsa_kv_append_i8(
+            expected_key_values, expected_value_values, positions, key_codes,
+            cache.key_scales, value_codes, cache.value_scales);
+        std::memcpy(cache.key_data.data(), key_codes.data(),
+                    cache.key_data.size());
+        std::memcpy(cache.value_data.data(), value_codes.data(),
+                    cache.value_data.size());
+    } else if (mode == QsaAttentionMode::q4) {
+        oracle::qsa_kv_append_q4(
+            expected_key_values, expected_value_values, positions,
+            cache.key_data, cache.value_data);
+    } else {
+        std::vector<std::int8_t> key_codes(cache.key_data.size());
+        std::vector<std::int8_t> ignored_value_codes(
+            static_cast<std::size_t>(kCapacity) * N_HEAD_KV * HEAD_DIM);
+        std::vector<std::uint16_t> ignored_value_scales(
+            static_cast<std::size_t>(kCapacity) * N_HEAD_KV * 4u);
+        std::memcpy(key_codes.data(), cache.key_data.data(),
+                    cache.key_data.size());
+        oracle::qsa_kv_append_i8(
+            expected_key_values, source_values, positions, key_codes,
+            cache.key_scales, ignored_value_codes, ignored_value_scales);
+        std::memcpy(cache.key_data.data(), key_codes.data(),
+                    cache.key_data.size());
+        std::vector<std::uint8_t> ignored_key_pool(cache.value_data.size());
+        oracle::qsa_kv_append_q4(
+            expected_key_values, expected_value_values, positions,
+            ignored_key_pool, cache.value_data);
+    }
+
+    std::vector<twin::tf> expected_qcur;
+    oracle::qsa_norm_rope(source_q_full, host_gamma, positions, host_rope,
+                          kRows, QsaNormRopeMode::query, expected_qcur);
+    std::vector<twin::tf> expected_qcur_transformed;
+    if (rotate_query) {
+        oracle::qsa_fwht256(tf_to_float(expected_qcur), N_HEAD_Q,
+                           expected_qcur_transformed);
+    } else {
+        expected_qcur_transformed = expected_qcur;
+    }
+    const std::vector<float> expected_qcur_transformed_values =
+        tf_to_float(expected_qcur_transformed);
+    std::vector<twin::tf> expected_indexer_query;
+    oracle::qsa_norm_rope(
+        source_indexer_query, host_indexer_gamma, positions, host_rope,
+        kRows, QsaNormRopeMode::indexer_query, expected_indexer_query);
+    oracle::qsa_indexer_append(
+        source_raw_indexer, positions, host_indexer_gamma, host_rope,
+        kRopeZeroCos, kRopeZeroSin, indexer_state);
+
+    const std::vector<std::int32_t> n_kv{step.n_kv};
+    const std::vector<std::int32_t> n_bid{step.n_bid};
+    const std::vector<float> expected_indexer_query_values =
+        tf_to_float(expected_indexer_query);
+    std::vector<twin::tf> expected_scores;
+    oracle::qsa_selection_scores(
+        indexer_state.pooled, indexer_state.dead,
+        expected_indexer_query_values, n_kv, n_bid, kMaxBlocks,
+        kUntouchedScore, expected_scores);
+    const std::vector<float> expected_score_values =
+        tf_to_float(expected_scores);
+    std::vector<std::int32_t> expected_ids;
+    oracle::qsa_selection_topk(expected_score_values, n_kv, n_bid,
+                               kMaxBlocks, kUntouchedId, expected_ids);
+    std::vector<twin::tf> expected_attention;
+    oracle::qsa_attention(
+        mode, expected_qcur_transformed_values,
+        std::span<const StepRow>(&step, 1u), expected_ids, cache.key_data,
+        cache.key_scales, cache.value_data, cache.value_scales, kRows,
+        kCapacity, kIdStride, expected_attention);
+    std::vector<twin::tf> expected_attention_transformed;
+    if (transform_attention) {
+        oracle::qsa_fwht256(tf_to_float(expected_attention), N_HEAD_Q,
+                           expected_attention_transformed);
+    } else {
+        expected_attention_transformed = expected_attention;
+    }
+    std::vector<twin::tf> expected_gate;
+    oracle::qsa_gate(tf_to_float(expected_attention_transformed), source_q_full,
+                     kRows, expected_gate);
+    std::vector<std::uint16_t> expected_gate_f16;
+    expected_gate_f16.reserve(expected_gate.size());
+    for (const auto value : expected_gate) {
+        expected_gate_f16.push_back(half_bits(value.value));
+    }
+
+    const QsaNormRopeBuffers key_norm{
+        keys.view(), key_gamma.view(), attention.steps.view(), rope.view(),
+        keys.view()};
+    const QsaNormRopeBuffers query_norm{
+        q_full.view(), query_gamma.view(), attention.steps.view(), rope.view(),
+        attention.query.view()};
+    const QsaNormRopeBuffers indexer_query_norm{
+        selection.indexer_queries.view(), indexer_query_gamma.view(),
+        attention.steps.view(), rope.view(), selection.indexer_queries.view()};
+    PrefillQsaKvAppendBuffers kv_append;
+    switch (mode) {
+        case QsaAttentionMode::f16:
+            kv_append = QsaKvAppendF16Buffers{
+                keys.view(), values.view(), attention.steps.view(),
+                attention.key_data.view(), attention.value_data.view()};
+            break;
+        case QsaAttentionMode::i8:
+            kv_append = QsaKvAppendI8Buffers{
+                keys.view(), values.view(), attention.steps.view(),
+                attention.key_data.view(), attention.key_scales.view(),
+                attention.value_data.view(), attention.value_scales.view()};
+            break;
+        case QsaAttentionMode::q4:
+            kv_append = QsaKvAppendQ4Buffers{
+                keys.view(), values.view(), attention.steps.view(),
+                attention.key_data.view(), attention.value_data.view()};
+            break;
+        case QsaAttentionMode::k8v4:
+            kv_append = QsaKvAppendK8V4Buffers{
+                keys.view(), values.view(), attention.steps.view(),
+                attention.key_data.view(), attention.key_scales.view(),
+                attention.value_data.view()};
+            break;
+    }
+    const QsaPrefillIndexerAppendBuffers indexer_append{
+        raw_indexer_keys.view(), indexer_gamma.view(), rope.view(),
+        indexer_tail.view(), selection.dead.view(), selection.pooled.view(),
+        indexer_block_position.view()};
+    const QsaAttentionScratch scratch{
+        attention.partial_acc.view(), attention.partial_m.view(),
+        attention.partial_l.view()};
+    const QsaPrefillSelectionBuffers selection_views{
+        selection.pooled.view(), selection.dead.view(),
+        selection.indexer_queries.view(), attention.steps.view(),
+        selection.scores.view(), attention.ids.view()};
+    const QsaPrefillAttentionBuffers attention_views{
+        QsaAttentionChunkBuffers{
+            attention.query.view(), attention.steps.view(),
+            attention.ids.view(), attention.key_data.view(),
+            attention.key_scales.view(), attention.value_data.view(),
+            attention.value_scales.view(), scratch},
+        QsaAttentionMergeBuffers{scratch, attention.output.view()}};
+    constexpr std::uint16_t kProjectionScale = 0x3000u;  // F16 0.125
+    auto q8_weights = typed<block_q8_0>(native_weights);
+    for (block_q8_0& block : q8_weights) {
+        block = {};
+        block.d = static_cast<strata_half>(kProjectionScale);
+        std::fill(std::begin(block.qs), std::end(block.qs),
+                  static_cast<strata_i8>(1));
+    }
+    double expected_projection_sum = 0.0;
+    double expected_projection_magnitude = 0.0;
+    const float projection_scale =
+        strata::kernels::f32_from_f16(kProjectionScale);
+    for (const std::uint16_t activation_bits : expected_gate_f16) {
+        const double product =
+            static_cast<double>(
+                strata::kernels::f32_from_f16(activation_bits)) *
+            static_cast<double>(projection_scale);
+        expected_projection_sum += product;
+        expected_projection_magnitude += std::fabs(product);
+    }
+    std::vector<twin::tf> expected_projection;
+    expected_projection.reserve(kProjectionN);
+    for (std::uint32_t column = 0u; column < kProjectionN; ++column) {
+        expected_projection.emplace_back(
+            static_cast<float>(expected_projection_sum),
+            expected_projection_magnitude);
+    }
+    if (!projected_y.poison_floats_against(
+            expected_projection, twin::Comparison::units, error)) {
+        check(false, label + " projection output poison", error);
+        return false;
+    }
+    std::fill(attention.partial_acc.payload().begin(),
+              attention.partial_acc.payload().end(), 0xa5u);
+    std::fill(attention.partial_m.payload().begin(),
+              attention.partial_m.payload().end(), 0xa5u);
+    std::fill(attention.partial_l.payload().begin(),
+              attention.partial_l.payload().end(), 0xa5u);
+    if (!attention.output.poison_floats_against(
+            expected_attention_transformed, twin::Comparison::units, error)) {
+        check(false, label + " output poison", error);
+        return false;
+    }
+    const PrefillQsaLayerBuffers layer_buffers{
+        PrefillQsaPrepareBuffers{
+            key_norm, query_norm, indexer_query_norm, kv_append,
+            indexer_append},
+        PrefillQsaTailBuffers{
+            selection_views, attention_views,
+            PrefillQsaOutputBuffers{
+                {context.buffers().read_only(attention.output.view()),
+                 context.buffers().read_only(q_full.view()), gate_f16.view()},
+                context.buffers().read_only(native_weights.view()),
+                dequantized_f16.view(), projected_y.view(),
+                transform_attention ? attention.output.view() : BufferRef{}}}};
+    const auto encode_layer = [&](CommandBuffer& command,
+                                  const PrefillQsaLayerBuffers& buffers,
+                                  PrefillGemmBackend* backend,
+                                  std::string& encode_error) {
+        if (shared_encoder) {
+            return Encoder::encode(
+                context, command, label,
+                [&](Encoder& encoder, std::string& inner_error) {
+                    return encode_prefill_qsa_layer(
+                        context, encoder, metadata.params, mode,
+                        kCapacity, kRopeZeroCos, kRopeZeroSin, false,
+                        PrefillNativeWeightFormat::Q8_0, buffers, inner_error,
+                        backend);
+                },
+                encode_error);
+        }
+        return encode_prefill_qsa_layer(
+            context, command, metadata.params, mode, kCapacity,
+            kRopeZeroCos, kRopeZeroSin, false,
+            PrefillNativeWeightFormat::Q8_0, buffers, encode_error, backend);
+    };
+    auto invalid_buffers = layer_buffers;
+    invalid_buffers.tail.attention.attention_chunk.query =
+        selection.pooled.view();
+    auto rejected_command =
+        context.make_command_buffer(label + " invalid handoff", error);
+    if (!rejected_command) {
+        check(false, label + " invalid handoff command buffer", error);
+        return false;
+    }
+    PrefillGemmBackend rejected_backend = PrefillGemmBackend::SIMD;
+    const bool rejected =
+        !encode_layer(*rejected_command, invalid_buffers, &rejected_backend,
+                      error) &&
+        rejected_command->unsafe_native_handle() == nullptr &&
+        error.find("qcur must feed attention") != std::string::npos &&
+        std::equal(source_keys.begin(), source_keys.end(),
+                   typed<float>(keys).begin()) &&
+        std::all_of(typed<float>(selection.scores).begin(),
+                    typed<float>(selection.scores).end(),
+                    [](float value) { return value == kUntouchedScore; });
+    check(rejected, label + " rejects a broken handoff before dispatch", error);
+    if (!rejected && rejected_command->unsafe_native_handle() != nullptr) {
+        rejected_command->discard();
+    }
+
+    auto invalid_kv_buffers = layer_buffers;
+    switch (mode) {
+        case QsaAttentionMode::f16:
+            invalid_kv_buffers.tail.attention.attention_chunk.key_data =
+                attention.value_data.view();
+            break;
+        case QsaAttentionMode::i8:
+            invalid_kv_buffers.tail.attention.attention_chunk.value_scales =
+                attention.key_scales.view();
+            break;
+        case QsaAttentionMode::q4:
+            invalid_kv_buffers.tail.attention.attention_chunk.value_data =
+                attention.key_data.view();
+            break;
+        case QsaAttentionMode::k8v4:
+            invalid_kv_buffers.tail.attention.attention_chunk.key_data =
+                attention.value_data.view();
+            break;
+    }
+    auto invalid_kv_command =
+        context.make_command_buffer(label + " invalid KV handoff", error);
+    if (!invalid_kv_command) {
+        check(false, label + " invalid KV handoff command buffer", error);
+        return false;
+    }
+    PrefillGemmBackend invalid_kv_backend = PrefillGemmBackend::SIMD;
+    std::string invalid_kv_error;
+    const bool invalid_kv_encoded =
+        encode_layer(*invalid_kv_command, invalid_kv_buffers,
+                     &invalid_kv_backend, invalid_kv_error);
+    std::string invalid_kv_commit_error;
+    const bool invalid_kv_committed =
+        invalid_kv_command->commit(invalid_kv_commit_error);
+    constexpr std::string_view kInvalidKvHandoffError =
+        "Prefill QSA layer KV append outputs must feed attention";
+    const bool invalid_kv_rejected =
+        !invalid_kv_encoded && !invalid_kv_committed &&
+        invalid_kv_command->unsafe_native_handle() == nullptr &&
+        invalid_kv_error == kInvalidKvHandoffError &&
+        invalid_kv_commit_error.find("discarded") != std::string::npos;
+    check(invalid_kv_rejected,
+          label + " rejects a mode-specific KV handoff before dispatch",
+          invalid_kv_error +
+              (invalid_kv_commit_error.empty()
+                   ? ""
+                   : "; " + invalid_kv_commit_error));
+
+    auto late_invalid_buffers = layer_buffers;
+    late_invalid_buffers.tail.selection.scores.length -= sizeof(float);
+    auto late_rejected_command =
+        context.make_command_buffer(label + " late rollback", error);
+    if (!late_rejected_command) {
+        check(false, label + " late rollback command buffer", error);
+        return false;
+    }
+    PrefillGemmBackend late_rejected_backend = PrefillGemmBackend::SIMD;
+    std::string late_encode_error;
+    const bool late_encode_succeeded =
+        encode_layer(*late_rejected_command, late_invalid_buffers,
+                     &late_rejected_backend, late_encode_error);
+    std::string late_commit_error;
+    const bool late_commit_succeeded =
+        late_rejected_command->commit(late_commit_error);
+    const bool late_reject_reason =
+        !late_encode_succeeded && !late_commit_succeeded &&
+        late_encode_error.find("scores view") != std::string::npos &&
+        late_commit_error.find("discarded") != std::string::npos;
+    const auto bytes_unchanged = [](const std::vector<std::uint8_t>& expected,
+                                    auto& buffer) {
+        const auto actual = buffer.payload();
+        return expected.size() == actual.size() &&
+               std::equal(expected.begin(), expected.end(), actual.begin());
+    };
+    const bool late_inputs_unchanged =
+        bytes_unchanged(initial_projected_keys, keys) &&
+        bytes_unchanged(initial_projected_values, values) &&
+        bytes_unchanged(initial_projected_q, q_full) &&
+        bytes_unchanged(initial_steps, attention.steps) &&
+        bytes_unchanged(initial_key_gamma, key_gamma) &&
+        bytes_unchanged(initial_query_gamma, query_gamma) &&
+        bytes_unchanged(initial_rope, rope) &&
+        bytes_unchanged(initial_indexer_query, selection.indexer_queries) &&
+        bytes_unchanged(initial_raw_indexer_key, raw_indexer_keys) &&
+        bytes_unchanged(initial_indexer_gamma, indexer_gamma) &&
+        bytes_unchanged(initial_indexer_query_gamma, indexer_query_gamma) &&
+        bytes_unchanged(initial_attention_query, attention.query);
+    const bool late_cache_unchanged =
+        bytes_unchanged(initial_key_cache, attention.key_data) &&
+        bytes_unchanged(initial_value_cache, attention.value_data) &&
+        bytes_unchanged(initial_key_scales, attention.key_scales) &&
+        bytes_unchanged(initial_value_scales, attention.value_scales);
+    const bool late_indexer_unchanged =
+        bytes_unchanged(initial_indexer_tail, indexer_tail) &&
+        bytes_unchanged(initial_indexer_dead, selection.dead) &&
+        bytes_unchanged(initial_indexer_pool, selection.pooled) &&
+        bytes_unchanged(initial_indexer_block_position,
+                        indexer_block_position);
+    const bool late_rejected = late_reject_reason && late_inputs_unchanged &&
+                               late_cache_unchanged &&
+                               late_indexer_unchanged;
+    check(late_reject_reason,
+          label + " discards the command after a late tail failure",
+          late_encode_error + (late_commit_error.empty()
+                                   ? ""
+                                   : "; " + late_commit_error));
+    check(late_inputs_unchanged,
+          label + " late rollback preserves raw projection, query and norm inputs");
+    check(late_cache_unchanged,
+          label + " late rollback preserves KV cache and scale bytes");
+    check(late_indexer_unchanged,
+          label + " late rollback preserves indexer query and state bytes");
+
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    PrefillGemmBackend selected_backend = PrefillGemmBackend::SIMD;
+    const bool encoded =
+        encode_layer(*command, layer_buffers, &selected_backend, error);
+    check(encoded, label + " encodes preparation through projection", error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    if (!wait_for_command(command, label, error)) {
+        check(false, label + " GPU completion", error);
+        return false;
+    }
+
+    bool passed = rejected && late_rejected;
+    const auto float_matches = [&](std::span<const float> actual,
+                                   std::span<const twin::tf> expected,
+                                   std::string_view stage) {
+        const auto mismatch = twin::compare_floats(
+            actual, expected, {twin::Comparison::units, 64.0, 0.0, 0u});
+        check(!mismatch,
+              label + " " + std::string(stage) +
+                  " matches the scalar oracle under U(64)");
+        passed &= !mismatch;
+    };
+    float_matches(typed<float>(keys), expected_keys_transformed,
+                  "transformed K");
+    float_matches(typed<float>(values), expected_values_transformed,
+                  "transformed V");
+    float_matches(typed<float>(attention.query), expected_qcur_transformed,
+                  "qcur");
+    float_matches(typed<float>(selection.indexer_queries),
+                  expected_indexer_query, "indexer query");
+    const bool key_bytes_match =
+        std::equal(cache.key_data.begin(), cache.key_data.end(),
+                   attention.key_data.payload().begin());
+    const bool value_bytes_match =
+        std::equal(cache.value_data.begin(), cache.value_data.end(),
+                   attention.value_data.payload().begin());
+    const auto scale_mismatch_detail =
+        [](std::span<const std::uint16_t> expected,
+           std::span<const std::uint16_t> actual) {
+            if (expected.size() != actual.size()) {
+                return "length expected=" + std::to_string(expected.size()) +
+                       " actual=" + std::to_string(actual.size());
+            }
+            for (std::size_t i = 0u; i < expected.size(); ++i) {
+                if (expected[i] != actual[i]) {
+                    return "index=" + std::to_string(i) +
+                           " expected=" + std::to_string(expected[i]) +
+                           " actual=" + std::to_string(actual[i]);
+                }
+            }
+            return std::string{};
+        };
+    const auto actual_key_scales =
+        typed<std::uint16_t>(attention.key_scales);
+    const auto actual_value_scales =
+        typed<std::uint16_t>(attention.value_scales);
+    const bool key_scales_match =
+        cache.key_scales.empty() ||
+        std::equal(cache.key_scales.begin(), cache.key_scales.end(),
+                   actual_key_scales.begin());
+    const bool value_scales_match =
+        cache.value_scales.empty() ||
+        std::equal(cache.value_scales.begin(), cache.value_scales.end(),
+                   actual_value_scales.begin());
+    const bool cache_matches = key_bytes_match && value_bytes_match &&
+                               key_scales_match && value_scales_match;
+    check(key_bytes_match, label + " key cache codes match oracle");
+    check(value_bytes_match, label + " value cache codes match oracle");
+    check(key_scales_match, label + " key cache scales match oracle",
+          scale_mismatch_detail(cache.key_scales, actual_key_scales));
+    check(value_scales_match, label + " value cache scales match oracle",
+          scale_mismatch_detail(cache.value_scales, actual_value_scales));
+    check(cache_matches, label + " KV cache matches oracle bytes");
+    passed &= cache_matches;
+    const bool indexer_matches =
+        std::equal(indexer_state.tail.begin(), indexer_state.tail.end(),
+                   typed<float>(indexer_tail).begin()) &&
+        std::equal(indexer_state.dead.begin(), indexer_state.dead.end(),
+                   typed<float>(selection.dead).begin()) &&
+        std::equal(indexer_state.pooled.begin(), indexer_state.pooled.end(),
+                   typed<float>(selection.pooled).begin());
+    std::int32_t actual_indexer_block_position = 0;
+    std::memcpy(&actual_indexer_block_position,
+                indexer_block_position.payload().data(),
+                sizeof(actual_indexer_block_position));
+    const bool indexer_block_position_matches =
+        actual_indexer_block_position == indexer_state.block_position;
+    check(indexer_block_position_matches,
+          label + " indexer block position matches scalar oracle");
+    const bool indexer_state_matches =
+        indexer_matches && indexer_block_position_matches;
+    check(indexer_state_matches,
+          label + " indexer append matches scalar oracle");
+    passed &= indexer_state_matches;
+    const auto scores_mismatch = twin::compare_floats(
+        typed<float>(selection.scores).first(expected_scores.size()),
+        expected_scores,
+        {twin::Comparison::units, 64.0, 0.0, 0u});
+    if (scores_mismatch) {
+        twin::report_failure(label.c_str(), options, kRows, *scores_mismatch);
+    }
+    check(!scores_mismatch,
+          label + " selection scores match scalar oracle under U(64)");
+    passed &= !scores_mismatch;
+    const bool ids_match =
+        std::equal(expected_ids.begin(), expected_ids.end(),
+                   typed<std::int32_t>(attention.ids).begin());
+    check(ids_match, label + " selected IDs match scalar oracle");
+    passed &= ids_match;
+    const auto attention_mismatch = twin::compare_floats(
+        typed<float>(attention.output), expected_attention_transformed,
+        {twin::Comparison::units, 64.0, 0.0, 0u});
+    if (attention_mismatch) {
+        twin::report_failure(label.c_str(), options, kRows,
+                             *attention_mismatch);
+    }
+    check(!attention_mismatch,
+          label + " transformed attention matches scalar oracle");
+    passed &= !attention_mismatch;
+    bool gate_matches =
+        typed<std::uint16_t>(gate_f16).size() >= expected_gate_f16.size();
+    for (std::size_t i = 0u; gate_matches && i < expected_gate_f16.size(); ++i) {
+        const std::uint16_t actual = half_order_key(
+            typed<std::uint16_t>(gate_f16)[i]);
+        const std::uint16_t expected = half_order_key(expected_gate_f16[i]);
+        gate_matches &= (actual >= expected ? actual - expected
+                                            : expected - actual) <= 2u;
+    }
+    check(gate_matches, label + " F16 gate matches scalar oracle within 2 ULP");
+    passed &= gate_matches;
+    const auto projection_mismatch = twin::compare_floats(
+        typed<float>(projected_y), expected_projection,
+        {twin::Comparison::units, 2.0 * kProjectionK, 0.0, 0u});
+    check(!projection_mismatch,
+          label + " Q8_0 projection matches the scalar FP64 oracle");
+    passed &= !projection_mismatch;
+    return passed;
+}
+
 bool run_prefill_qsa_gate_attn_case(
     Context& context, std::uint32_t rows, twin::InputSet set,
     const twin::Options& options, bool shared_encoder, bool apply_fwht) {
@@ -3471,6 +4285,10 @@ int main(int argc, char** argv) {
             *context, mode, 33u, 3u, 128u, options, false);
         passed &= run_prefill_attention_case(
             *context, mode, 33u, 3u, 128u, options, true);
+    }
+    for (const QsaAttentionMode mode : modes) {
+        passed &= run_prefill_qsa_layer_case(
+            *context, mode, options, concurrent_dispatch_mode());
     }
     passed &= run_prefill_attention_case(
         *context, QsaAttentionMode::f16, 1u, 3u, 128u, options, false);
