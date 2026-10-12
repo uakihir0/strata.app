@@ -9,6 +9,7 @@
 #include "strata/metal/prefill_native_projection.hpp"
 #include "strata/metal/prefill_qsa_gate_dispatch.hpp"
 #include "strata/metal/prefill_qsa_output_dispatch.hpp"
+#include "strata/metal/qsa_dispatch.hpp"
 
 #include "../../src/metal/kernels/common/types.h"
 #include "../../src/metal/kernels/common/codebooks.h"
@@ -1871,11 +1872,12 @@ bool test_qsa_output(Context& context, Context& foreign_context) {
     const std::vector<std::uint8_t> weights_before(
         weights.payload().begin(), weights.payload().end());
 
-    const PrefillQsaOutputBuffers buffers{
+    PrefillQsaOutputBuffers buffers{
         {context.buffers().read_only(attention.view()),
          context.buffers().read_only(q_full.view()), gate.view()},
         context.buffers().read_only(weights.view()), dequantized.view(),
         output.view()};
+    buffers.attention_transform = attention.view();
     const auto expect_alias_rejected =
         [&](const PrefillQsaOutputBuffers& invalid,
             const std::string& label) {
@@ -1906,6 +1908,48 @@ bool test_qsa_output(Context& context, Context& foreign_context) {
     const bool output_q_alias_rejected =
         expect_alias_rejected(output_aliases_q,
                               prefix + " rejects output/Qf overlap");
+    const auto expect_fwht_preflight_rejected =
+        [&](const PrefillQsaOutputBuffers& invalid,
+            const std::string& label, const std::string& expected_error) {
+            auto command = context.make_command_buffer(label, error);
+            if (!command) {
+                check(false, label + " command buffer", error);
+                return false;
+            }
+            error.clear();
+            const bool rejected = !encode_prefill_qsa_output(
+                context, *command, rows, PrefillNativeWeightFormat::Q8_0,
+                invalid, error, nullptr,
+                PrefillQsaAttentionTransform::fwht256);
+            const bool clean =
+                rejected && command->unsafe_native_handle() == nullptr &&
+                error.find(expected_error) != std::string::npos;
+            check(clean, label, error);
+            return clean;
+        };
+    PrefillQsaOutputBuffers missing_fwht_view = buffers;
+    missing_fwht_view.attention_transform = {};
+    const bool missing_fwht_view_rejected =
+        expect_fwht_preflight_rejected(
+            missing_fwht_view, prefix + " rejects missing FWHT view",
+            "FWHT attention is not owned by this Context");
+    PrefillQsaOutputBuffers fwht_aliases_q = buffers;
+    const BufferRef q_attention =
+        q_full.view().slice(0u, attention_bytes);
+    fwht_aliases_q.gate.attn = context.buffers().read_only(q_attention);
+    fwht_aliases_q.attention_transform = q_attention;
+    const bool fwht_q_alias_rejected = expect_fwht_preflight_rejected(
+        fwht_aliases_q, prefix + " rejects FWHT/Qf overlap",
+        "overlaps another active read-only input");
+    PrefillQsaOutputBuffers fwht_aliases_weights = buffers;
+    const BufferRef weights_attention =
+        weights.view().slice(0u, attention_bytes);
+    fwht_aliases_weights.gate.attn =
+        context.buffers().read_only(weights_attention);
+    fwht_aliases_weights.attention_transform = weights_attention;
+    const bool fwht_weight_alias_rejected = expect_fwht_preflight_rejected(
+        fwht_aliases_weights, prefix + " rejects FWHT/weights overlap",
+        "overlaps another active read-only input");
 
     PrefillGemmBackend standalone_backend = PrefillGemmBackend::SIMD;
     auto standalone =
@@ -2000,6 +2044,127 @@ bool test_qsa_output(Context& context, Context& foreign_context) {
     check(component_matches,
           prefix + " composed APIs match gate then native projection");
 
+    std::memcpy(attention.payload().data(), attention_values.data(),
+                attention_bytes);
+    std::fill(gate.payload().begin(), gate.payload().end(), kPoison);
+    std::fill(dequantized.payload().begin(), dequantized.payload().end(),
+              kPoison);
+    std::fill(output.payload().begin(), output.payload().end(), kPoison);
+    PrefillGemmBackend fwht_standalone_backend = PrefillGemmBackend::SIMD;
+    auto fwht_standalone =
+        context.make_command_buffer(prefix + " FWHT standalone", error);
+    check(fwht_standalone != nullptr,
+          prefix + " FWHT standalone command buffer", error);
+    if (!fwht_standalone) return false;
+    const bool fwht_standalone_encoded = encode_prefill_qsa_output(
+        context, *fwht_standalone, rows, PrefillNativeWeightFormat::Q8_0,
+        buffers, error, &fwht_standalone_backend,
+        PrefillQsaAttentionTransform::fwht256);
+    check(fwht_standalone_encoded, prefix + " FWHT standalone encode", error);
+    if (!fwht_standalone_encoded) return false;
+    const bool fwht_standalone_completed =
+        submit_and_wait(fwht_standalone, error);
+    check(fwht_standalone_completed,
+          prefix + " FWHT standalone completion", error);
+    if (!fwht_standalone_completed) return false;
+    const std::vector<std::uint8_t> fwht_attention_expected(
+        attention.payload().begin(), attention.payload().end());
+    const std::vector<std::uint8_t> fwht_gate_expected(
+        gate.payload().begin(), gate.payload().end());
+    const std::vector<std::uint8_t> fwht_output_expected(
+        output.payload().begin(), output.payload().end());
+    const bool fwht_changed_attention =
+        !std::equal(attention_before.begin(), attention_before.end(),
+                    attention.payload().begin());
+    check(fwht_changed_attention,
+          prefix + " optional FWHT transforms attention in place");
+
+    std::memcpy(attention.payload().data(), attention_values.data(),
+                attention_bytes);
+    std::fill(gate.payload().begin(), gate.payload().end(), kPoison);
+    std::fill(dequantized.payload().begin(), dequantized.payload().end(),
+              kPoison);
+    std::fill(output.payload().begin(), output.payload().end(), kPoison);
+    PrefillGemmBackend fwht_caller_backend = PrefillGemmBackend::SIMD;
+    auto fwht_caller =
+        context.make_command_buffer(prefix + " FWHT caller-owned", error);
+    check(fwht_caller != nullptr,
+          prefix + " FWHT caller-owned command buffer", error);
+    if (!fwht_caller) return false;
+    const bool fwht_caller_encoded = Encoder::encode(
+        context, *fwht_caller, prefix + " FWHT caller-owned",
+        [&](Encoder& encoder, std::string& body_error) {
+            return encode_prefill_qsa_output(
+                context, encoder, rows, PrefillNativeWeightFormat::Q8_0,
+                buffers, body_error, &fwht_caller_backend,
+                PrefillQsaAttentionTransform::fwht256);
+        },
+        error);
+    check(fwht_caller_encoded, prefix + " FWHT caller-owned encode", error);
+    if (!fwht_caller_encoded) return false;
+    const bool fwht_caller_completed = submit_and_wait(fwht_caller, error);
+    check(fwht_caller_completed, prefix + " FWHT caller-owned completion",
+          error);
+    if (!fwht_caller_completed) return false;
+    const bool fwht_caller_matches =
+        std::equal(fwht_attention_expected.begin(),
+                   fwht_attention_expected.end(), attention.payload().begin()) &&
+        std::equal(fwht_gate_expected.begin(), fwht_gate_expected.end(),
+                   gate.payload().begin()) &&
+        std::equal(fwht_output_expected.begin(), fwht_output_expected.end(),
+                   output.payload().begin()) &&
+        fwht_caller_backend == fwht_standalone_backend;
+    check(fwht_caller_matches,
+          prefix + " FWHT caller-owned matches standalone composition");
+
+    std::memcpy(attention.payload().data(), attention_values.data(),
+                attention_bytes);
+    std::fill(gate.payload().begin(), gate.payload().end(), kPoison);
+    std::fill(dequantized.payload().begin(), dequantized.payload().end(),
+              kPoison);
+    std::fill(output.payload().begin(), output.payload().end(), kPoison);
+    auto fwht_components =
+        context.make_command_buffer(prefix + " FWHT components", error);
+    check(fwht_components != nullptr,
+          prefix + " FWHT component command buffer", error);
+    if (!fwht_components) return false;
+    PrefillGemmBackend fwht_component_backend = PrefillGemmBackend::SIMD;
+    const bool fwht_components_encoded = Encoder::encode(
+        context, *fwht_components, prefix + " FWHT component reference",
+        [&](Encoder& encoder, std::string& body_error) {
+            if (!encode_qsa_fwht256(context, encoder, rows * 24u,
+                                    attention.view(), body_error)) {
+                return false;
+            }
+            if (!encode_prefill_qsa_gate_attn(
+                    context, encoder, rows, buffers.gate, body_error)) {
+                return false;
+            }
+            return encode_prefill_native_projection(
+                context, encoder, projection_params,
+                PrefillNativeWeightFormat::Q8_0, projection_buffers,
+                body_error, &fwht_component_backend);
+        },
+        error);
+    check(fwht_components_encoded,
+          prefix + " FWHT component reference encode", error);
+    if (!fwht_components_encoded) return false;
+    const bool fwht_components_completed =
+        submit_and_wait(fwht_components, error);
+    check(fwht_components_completed,
+          prefix + " FWHT component completion", error);
+    if (!fwht_components_completed) return false;
+    const bool fwht_component_matches =
+        std::equal(fwht_attention_expected.begin(),
+                   fwht_attention_expected.end(), attention.payload().begin()) &&
+        std::equal(fwht_gate_expected.begin(), fwht_gate_expected.end(),
+                   gate.payload().begin()) &&
+        std::equal(fwht_output_expected.begin(), fwht_output_expected.end(),
+                   output.payload().begin()) &&
+        fwht_component_backend == fwht_standalone_backend;
+    check(fwht_component_matches,
+          prefix + " FWHT coordinator matches explicit FWHT/gate/projection");
+
     std::vector<float> output_values(output_bytes / sizeof(float));
     std::memcpy(output_values.data(), output.payload().data(), output_bytes);
     bool output_finite = true;
@@ -2009,15 +2174,16 @@ bool test_qsa_output(Context& context, Context& foreign_context) {
         output_nonzero |= value != 0.0f;
     }
     const bool input_immutable =
-        std::equal(attention_before.begin(), attention_before.end(),
-                   attention.payload().begin()) &&
+        std::equal(fwht_attention_expected.begin(),
+                   fwht_attention_expected.end(), attention.payload().begin()) &&
         std::equal(q_full_before.begin(), q_full_before.end(),
                    q_full.payload().begin()) &&
         std::equal(weights_before.begin(), weights_before.end(),
                    weights.payload().begin());
     check(output_nonzero, prefix + " writes a nonzero projection result");
     check(output_finite, prefix + " projection output is finite");
-    check(input_immutable, prefix + " preserves attention, Qf and weights");
+    check(input_immutable,
+          prefix + " preserves transformed attention, Qf and weights");
 
     PrefillQsaOutputBuffers foreign_input = buffers;
     foreign_input.native_weights =
@@ -2080,6 +2246,8 @@ bool test_qsa_output(Context& context, Context& foreign_context) {
           prefix + " caller-owned rejects foreign weights before dispatch",
           error);
 
+    std::memcpy(attention.payload().data(), attention_values.data(),
+                attention_bytes);
     ScopedEnvironmentOverride invalid_selector("STRATA_METAL_GEMM",
                                                 "invalid");
     check(invalid_selector.ready(),
@@ -2094,11 +2262,14 @@ bool test_qsa_output(Context& context, Context& foreign_context) {
     error.clear();
     const bool standalone_rejected = !encode_prefill_qsa_output(
         context, *standalone_rollback, rows,
-        PrefillNativeWeightFormat::Q8_0, buffers, error);
+        PrefillNativeWeightFormat::Q8_0, buffers, error, nullptr,
+        PrefillQsaAttentionTransform::fwht256);
     const bool standalone_rollback_ok =
         standalone_rejected &&
         standalone_rollback->unsafe_native_handle() == nullptr &&
         error == "STRATA_METAL_GEMM must be 'mpp' or 'simd'" &&
+        std::equal(attention_before.begin(), attention_before.end(),
+                   attention.payload().begin()) &&
         std::all_of(gate.payload().begin(), gate.payload().end(),
                     [](std::uint8_t byte) { return byte == kPoison; }) &&
         std::all_of(dequantized.payload().begin(), dequantized.payload().end(),
@@ -2106,7 +2277,8 @@ bool test_qsa_output(Context& context, Context& foreign_context) {
         std::all_of(output.payload().begin(), output.payload().end(),
                     [](std::uint8_t byte) { return byte == kPoison; });
     check(standalone_rollback_ok,
-          prefix + " standalone late selector failure discards both stages",
+          prefix + " standalone late selector failure discards FWHT and "
+                   "projection stages",
           error);
 
     auto caller_rollback =
@@ -2121,12 +2293,15 @@ bool test_qsa_output(Context& context, Context& foreign_context) {
         [&](Encoder& encoder, std::string& body_error) {
             return encode_prefill_qsa_output(
                 context, encoder, rows, PrefillNativeWeightFormat::Q8_0,
-                buffers, body_error);
+                buffers, body_error, nullptr,
+                PrefillQsaAttentionTransform::fwht256);
         },
         error);
     const bool caller_rollback_ok =
         caller_rejected && caller_rollback->unsafe_native_handle() == nullptr &&
         error == "STRATA_METAL_GEMM must be 'mpp' or 'simd'" &&
+        std::equal(attention_before.begin(), attention_before.end(),
+                   attention.payload().begin()) &&
         std::all_of(gate.payload().begin(), gate.payload().end(),
                     [](std::uint8_t byte) { return byte == kPoison; }) &&
         std::all_of(dequantized.payload().begin(), dequantized.payload().end(),
@@ -2134,7 +2309,8 @@ bool test_qsa_output(Context& context, Context& foreign_context) {
         std::all_of(output.payload().begin(), output.payload().end(),
                     [](std::uint8_t byte) { return byte == kPoison; });
     check(caller_rollback_ok,
-          prefix + " caller-owned late selector failure discards both stages",
+          prefix + " caller-owned late selector failure discards FWHT and "
+                   "projection stages",
           error);
 
     const bool guards_intact =
@@ -2144,7 +2320,10 @@ bool test_qsa_output(Context& context, Context& foreign_context) {
         foreign_weights.guards_intact();
     check(guards_intact, prefix + " buffer guards");
     return gate_weight_alias_rejected && output_q_alias_rejected &&
-           caller_matches && component_matches && output_nonzero &&
+           missing_fwht_view_rejected && fwht_q_alias_rejected &&
+           fwht_weight_alias_rejected && caller_matches &&
+           component_matches && fwht_changed_attention &&
+           fwht_caller_matches && fwht_component_matches && output_nonzero &&
            output_finite && input_immutable && foreign_standalone_clean &&
            foreign_caller_clean && standalone_rollback_ok &&
            caller_rollback_ok && guards_intact;
