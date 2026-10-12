@@ -11857,3 +11857,64 @@ measuring L-15 remain open.
   `test_map.py` passed with its documented planned/missing-work diagnostics;
   `check_drift.py` reported no upstream changes and valid golden files;
   `git diff --check` passed.
+
+### D-IMPL-395: Implement the isolated Prefill MoE grouping and gather path
+
+- **Decision:** Implement the documented GPU count/scan/scatter stable sort
+  and F16 row gather behind standalone and caller-owned Encoder APIs. Keep
+  route generation, expert execution, layer scheduling and `Prefill::run`
+  out of scope. Validate full caller views, then bind only active byte ranges;
+  for tiered execution bind only the selected layer's residency row and
+  selected 6,400-byte `PfPlan` slot. Preserve the 6,180-byte shader struct,
+  zero its 220-byte slot padding, write `grp_res` as a residency flag, and
+  leave `PfPlan.bad` for the caller to reject before expert work.
+- **Reason:** The documented grouping stage is separable from the incomplete
+  production Prefill scheduler and benefits from an independent GPU oracle
+  before it is connected to later expert kernels. Active slices preserve valid
+  scratch reuse in the caller's arena without weakening range checks. Binding
+  only the chosen residency row prevents unrelated earlier layers from
+  appearing live to dispatch alias validation.
+- **Fixture judgment:** Cover T=1, 7, 25, 26, 64, 300 and 4,096, both 256- and
+  512-expert widths, mixed/single/all-expert distributions and tile
+  boundaries. Compare every histogram column, plan field, tile, stable `src`
+  and `dst` entry, and gathered F16 row with an independent host grouping
+  mirror. Invalid route IDs exercise `PfPlan.bad`, raw high histogram columns,
+  compact output, untouched tails and guards. Include one oversized arena
+  where output views overlap the *capacity* of route IDs and an earlier
+  residency row but remain disjoint from the active route and selected
+  residency ranges.
+- **Review required:** Challenge the per-thread `uint4` gather mapping and
+  exact launch geometry, active-slice encoder bindings, selected residency
+  row, invalid-ID outputs and claims about production integration.
+- **Validation:** Full `mac-dev` build succeeded. Both
+  `metal_prefill_moe_grouping_test` serial and
+  `metal_prefill_moe_grouping_test_concurrent` passed with the listed
+  boundaries, invalid IDs, shared-arena aliases, guards and independent
+  oracles. `test_map.py` passed with its existing planned/no-check diagnostics;
+  `check_drift.py` found no upstream changes and valid golden files;
+  `git diff --check` passed.
+
+### REV-191: Adversarial review of Prefill MoE grouping and gather
+
+- **Scope:** Audit count/scan/scatter/gather ABI and bounds, stable ordering,
+  invalid IDs, tiered residency ranges, active-slice alias checks, dispatch
+  geometry, fixture oracles and documentation claims.
+- **Findings:** The first review found three P2 issues: gather launched eight
+  times its specified work, Encoder alias checks saw oversized whole views
+  rather than active ranges, and invalid-ID coverage omitted histogram
+  columns, `dst`, gather output and untouched tails. After those fixes, review
+  found that tiered residency still appeared to read the full prefix through
+  the selected layer and could falsely alias earlier-layer scratch. It found
+  no P1 issue.
+- **Disposition:** Dispatch one `uint4` per thread at the documented vector
+  count. Slice every Encoder binding to its validated active extent. Slice
+  tiered residency to the selected layer and index that row directly in the
+  shader while still validating the full input table prefix. Expand the
+  invalid-ID oracle to every histogram column and all compact outputs, and
+  add an oversized shared-arena regression that reuses earlier-layer
+  residency bytes as histogram scratch. The final review found no remaining
+  P1/P2 issue.
+- **Validation:** The serial and concurrent focused CTests passed after all
+  review fixes. The full `mac-dev` build succeeded. `test_map.py` passed with
+  its existing planned/no-check diagnostics; `check_drift.py` found no
+  upstream changes and valid golden files; `git diff --check` passed.

@@ -5047,7 +5047,7 @@ if (tid == 0) {                                          // 512 serial steps, in
     for (x = 0; x < n_expert; ++x) {
         off_s[x] = acc;  gix_s[x] = -1;  t0_s[x] = ti;
         if (cnt_s[x] > 0) {
-            r = !tiered || res[l*n_expert + x] >= 0;
+            r = !tiered || res[x] >= 0;                    // scan binds residency row l
             P.grp_e[gi] = x;  P.grp_res[gi] = r;  P.grp_start[gi] = acc;  miss += !r;
             gix_s[x] = gi++;  ti += (cnt_s[x] + 63) / 64;
         }
@@ -5063,8 +5063,8 @@ if (e < n_expert) {
 }
 ```
 
-- `tiered` and `l` come with `setBytes`; T comes from `PrefillParams`. In full mode every expert is resident and
-  `n_miss` is 0.
+- `tiered` and `l` come with `setBytes`; T comes from `PrefillParams`. The host binds `res` to layer l's row and
+  `P` to that layer's plan slot. In full mode every expert is resident and `n_miss` is 0.
 - `tiles` is `uint2 [⌈10C/64⌉ + 512]`, one `{group, first entry}` per tile of up to 64 entries. A group of n entries
   has ⌈n/64⌉ tiles. The sum over groups of ⌈n/64⌉ is at most ⌈10T/64⌉ + n_groups, so the list fits (section 6.1).
   It is rewritten for each layer. The layer's expert kernels read it before the next layer's scan, and the serial
@@ -5922,7 +5922,7 @@ Properties compare two Mac runs, always in class B. "Synthetic" means random wei
 | `ple_batch_eq_sequential` | metal | The PLE kernels over n = 1..64 rows against n single-row runs (section 5.3) | Every output and the history equal |
 | `idx_batch_eq_sequential` | metal | `strata_idx_append_first`, `_blocks` and `_tail` against the window form of `strata_idx_append` in windows of up to 8 rows, for p0 ∈ {0, 1, 3, 4, 6} and T ∈ {1, 2, 3, 4, 5, 9, 300} (section 6.5) | `tail`, `dead`, `pooled` and `block_pos` equal |
 | `pf_gdn_eq_step_norm` | metal | The prefill GDN kernels over T = 1, 3, 64, 65 and 300 rows against `strata_gdn_conv_l2`, `strata_gdn_step_norm` mode 2 and `strata_gdn_conv_commit` in consecutive windows of up to 8 rows, with the same `gate` and `beta` (section 6.4) | The state, the conv history, and `y_h` against `half(y)` |
-| `pf_sort_eq_host_grouping` | metal | `strata_pf_sort_*` against upstream's host grouping loop (`prefill.cpp:1583-1615`, transcribed in the oracle) for T = 1, 7, 64, 300 and 4,096, with random ids, all rows on one expert, and every expert used (section 6.6) | `src`, `dst` (the inverse of `slot`), the `PfPlan` groups and the tile list |
+| `pf_sort_eq_host_grouping` | metal | The isolated GPU grouping fixture against an independent transcription of upstream's host grouping loop (`prefill.cpp:1583-1615`) for T = 1, 7, 25, 26, 64, 300 and 4,096, with 256/512 experts, mixed ids, one expert, every expert, tile boundaries and invalid ids (section 6.6); serial and concurrent CTests each compare to the same oracle | Histogram offsets, `src`, `dst` (the inverse of `slot`), all `PfPlan` fields, tile list, and valid-entry F16 gathers |
 | `samp_coupled_eq_host` | metal | Coupled penalty/selection GPU chain against the independent host arithmetic mirror (section 5.12); the CUDA-only `coupled_draft_sample` function is not called on macOS | Candidate ids/logit bits and tail tokens/probabilities equal |
 | `window_eq_decode` | model | 32 positions of each benchmark prompt as windows of T = 1..8, against the same tokens one at a time | Logits of every row, every state buffer after commit |
 | `state_after_commit_eq_decode` | model | A window of T rows with commit(n_keep), T = 2..8 and n_keep = 1..T, against n_keep single-token windows (section 5.5) | GDN state and conv history, indexer, PLE history, KV cells below `pos0 + n_keep`; cells at and above it untouched |
@@ -5938,6 +5938,15 @@ The synthetic model is used where a property needs no real weights: it has one G
 real shapes and a 4,096-row head, so the `metal` label stays under a minute.
 
 ### 10.5 The test list
+
+`metal_prefill_moe_grouping_test` and its concurrent CTest exercise the
+independent stable-grouping oracle, 256/512-expert plans, 256-entry count-tile
+boundaries, invalid IDs, `PfPlan` padding, active scratch tails, disjoint
+active slices of an oversized shared allocation, and range/alias/ownership
+validation.
+These synthetic fixtures verify the grouping and row gather in isolation;
+production MoE scheduling, expert execution and model-backed Prefill remain
+pending.
 
 The `metal_ple_test` fixture executes the documented weighted-norm, gate,
 broadcast, convolution-residual and history chain at T=1, 2 and 8. The
