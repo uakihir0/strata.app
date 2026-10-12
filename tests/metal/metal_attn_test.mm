@@ -2,10 +2,13 @@
 #include "metallib_sha256.inc"
 #include "oracles/attention.hpp"
 #include "oracles/qsa.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/metal/context.hpp"
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/prefill_gemm_dispatch.hpp"
+#include "strata/metal/prefill_native_projection.hpp"
 #include "strata/metal/prefill_qsa_gate_dispatch.hpp"
+#include "strata/metal/prefill_qsa_tail_dispatch.hpp"
 #include "strata/metal/qsa_dispatch.hpp"
 #include "twin.hpp"
 
@@ -23,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <random>
 #include <span>
 #include <string>
@@ -46,6 +50,8 @@ constexpr std::array<std::uint32_t, VERIFY_MAX_T> kPositions{
 
 int g_failures = 0;
 
+std::uint16_t half_order_key(std::uint16_t bits);
+
 void check(bool condition, const std::string& label,
            const std::string& detail = {}) {
     std::printf("%s %s%s%s\n", condition ? "ok  " : "FAIL", label.c_str(),
@@ -54,6 +60,33 @@ void check(bool condition, const std::string& label,
     std::fflush(stdout);
     if (!condition) ++g_failures;
 }
+
+class ScopedEnvironmentOverride {
+public:
+    ScopedEnvironmentOverride(const char* name, const char* value)
+        : name_(name) {
+        if (const char* const previous = std::getenv(name)) {
+            previous_ = previous;
+        }
+        ready_ = ::setenv(name_.c_str(), value, 1) == 0;
+    }
+
+    ~ScopedEnvironmentOverride() {
+        if (!ready_) return;
+        if (previous_) {
+            ::setenv(name_.c_str(), previous_->c_str(), 1);
+        } else {
+            ::unsetenv(name_.c_str());
+        }
+    }
+
+    bool ready() const noexcept { return ready_; }
+
+private:
+    std::string name_;
+    std::optional<std::string> previous_;
+    bool ready_ = false;
+};
 
 template <class T>
 std::span<T> typed(twin::GuardedBuffer& buffer) {
@@ -1199,13 +1232,18 @@ bool run_selection_attention_case(Context& context, QsaAttentionMode mode,
 bool run_prefill_attention_case(
     Context& context, QsaAttentionMode mode, std::uint32_t token_rows,
     std::uint32_t pos0, std::uint32_t cell_capacity,
-    const twin::Options& options, bool shared_encoder) {
+    const twin::Options& options, bool shared_encoder,
+    bool exercise_output_tail = false, bool apply_tail_fwht = true) {
     constexpr std::uint32_t id_row_stride = INDEXER_SELECTION_WIDTH_MAX;
     const std::string label =
         "Prefill QSA selection→attention " +
         std::string(mode_name(mode)) + " T=" +
         std::to_string(token_rows) + " p0=" + std::to_string(pos0) +
         " capacity=" + std::to_string(cell_capacity) +
+        (exercise_output_tail
+             ? (apply_tail_fwht ? " output tail FWHT"
+                                : " output tail no FWHT")
+             : "") +
         (shared_encoder ? " shared Encoder" : "");
     std::vector<std::uint32_t> tokens(token_rows, 1u);
     PrefillChunkMetadata metadata;
@@ -1284,9 +1322,51 @@ bool run_prefill_attention_case(
         cache.key_scales, cache.value_data, cache.value_scales,
         token_rows, cell_capacity, id_row_stride, expected_attention);
 
+    constexpr std::uint32_t projection_n = 2560u;
+    constexpr std::uint32_t projection_k = 24u * 256u;
+    std::vector<float> q_full_values;
+    std::vector<twin::tf> expected_fwht;
+    std::vector<float> expected_attention_values;
+    std::vector<float> expected_fwht_values;
+    std::vector<twin::tf> expected_gate;
+    std::vector<std::uint16_t> expected_gate_f16;
+    if (exercise_output_tail) {
+        q_full_values.resize(
+            static_cast<std::size_t>(token_rows) * N_HEAD_Q * 2u * HEAD_DIM);
+        for (std::size_t i = 0u; i < q_full_values.size(); ++i) {
+            q_full_values[i] =
+                sample(twin::InputSet::fixture, rng, i + 0x42d91u, 4.0f);
+        }
+        expected_attention_values.reserve(expected_attention.size());
+        for (const twin::tf value : expected_attention) {
+            expected_attention_values.push_back(value.value);
+        }
+        std::vector<float> gate_attention_values =
+            expected_attention_values;
+        if (apply_tail_fwht) {
+            oracle::qsa_fwht256(
+                expected_attention_values,
+                token_rows * static_cast<std::uint32_t>(N_HEAD_Q),
+                expected_fwht);
+            expected_fwht_values.reserve(expected_fwht.size());
+            for (const twin::tf value : expected_fwht) {
+                expected_fwht_values.push_back(value.value);
+            }
+            gate_attention_values = expected_fwht_values;
+        }
+        oracle::qsa_gate(gate_attention_values, q_full_values, token_rows,
+                         expected_gate);
+        expected_gate_f16.reserve(expected_gate.size());
+        for (const twin::tf value : expected_gate) {
+            expected_gate_f16.push_back(half_bits(value.value));
+        }
+    }
+
     std::string allocation_error;
     PrefillSelectionBuffers selection;
     AttentionBuffers attention;
+    twin::GuardedBuffer q_full, gate_f16, native_weights, dequantized_f16,
+        projected_y;
     std::size_t partial_acc_bytes = 0u;
     std::size_t partial_stats_bytes = 0u;
     const bool allocated =
@@ -1295,7 +1375,31 @@ bool run_prefill_attention_case(
         allocate_case_buffers(
             context, token_rows, id_row_stride, input, cache, attention,
             partial_acc_bytes, partial_stats_bytes, allocation_error,
-            kPrefillAttentionBatchRows);
+            kPrefillAttentionBatchRows) &&
+        (!exercise_output_tail ||
+         (q_full.allocate(
+              context, label + " output Qf",
+              q_full_values.size() * sizeof(float), allocation_error) &&
+          gate_f16.allocate(
+              context, label + " gated F16",
+              static_cast<std::size_t>(token_rows) * N_HEAD_Q * HEAD_DIM *
+                  sizeof(std::uint16_t),
+              allocation_error) &&
+          native_weights.allocate(
+              context, label + " Q8_0 output weights",
+              static_cast<std::size_t>(projection_n) *
+                  (projection_k / 32u) * sizeof(block_q8_0),
+              allocation_error) &&
+          dequantized_f16.allocate(
+              context, label + " dequantized output weights",
+              static_cast<std::size_t>(projection_n) * projection_k *
+                  sizeof(std::uint16_t),
+              allocation_error) &&
+          projected_y.allocate(
+              context, label + " projected Y",
+              static_cast<std::size_t>(token_rows) * projection_n *
+                  sizeof(float),
+              allocation_error)));
     check(allocated, label + " allocations", allocation_error);
     if (!allocated) return false;
 
@@ -1326,6 +1430,49 @@ bool run_prefill_attention_case(
         std::memcpy(attention.value_scales.payload().data(),
                     cache.value_scales.data(),
                     cache.value_scales.size() * sizeof(std::uint16_t));
+    }
+    if (exercise_output_tail) {
+        std::memcpy(q_full.payload().data(), q_full_values.data(),
+                    q_full_values.size() * sizeof(float));
+        auto weights = typed<block_q8_0>(native_weights);
+        constexpr std::array<std::uint16_t, 4u> q8_scale_bits{
+            0x2c00u, 0x3000u, 0x3200u, 0x3400u};
+        for (std::uint32_t column = 0u; column < projection_n; ++column) {
+            for (std::uint32_t block_index = 0u;
+                 block_index < projection_k / 32u; ++block_index) {
+                block_q8_0& block =
+                    weights[static_cast<std::size_t>(column) *
+                                (projection_k / 32u) +
+                            block_index];
+                block = {};
+                const std::size_t scale_index =
+                    (static_cast<std::size_t>(column) +
+                     static_cast<std::size_t>(block_index) * 3u) %
+                    q8_scale_bits.size();
+                block.d =
+                    static_cast<strata_half>(q8_scale_bits[scale_index]);
+                for (std::uint32_t value = 0u; value < 32u; ++value) {
+                    std::uint32_t code_hash =
+                        column * 0x9e3779b9u ^
+                        block_index * 0x85ebca6bu ^
+                        value * 0xc2b2ae35u;
+                    code_hash ^= code_hash >> 16u;
+                    code_hash *= 0x7feb352du;
+                    code_hash ^= code_hash >> 15u;
+                    code_hash *= 0x846ca68bu;
+                    code_hash ^= code_hash >> 16u;
+                    const int code =
+                        static_cast<int>(code_hash % 11u) - 5;
+                    block.qs[value] = static_cast<strata_i8>(code);
+                }
+            }
+        }
+        std::fill(gate_f16.payload().begin(), gate_f16.payload().end(),
+                  0xa5u);
+        std::fill(dequantized_f16.payload().begin(),
+                  dequantized_f16.payload().end(), 0xa5u);
+        std::fill(projected_y.payload().begin(), projected_y.payload().end(),
+                  0xa5u);
     }
     std::fill(attention.partial_acc.payload().begin(),
               attention.partial_acc.payload().end(), 0xa5u);
@@ -1375,30 +1522,154 @@ bool run_prefill_attention_case(
             attention.value_scales.view(), scratch},
         QsaAttentionMergeBuffers{scratch, attention.output.view()}};
 
+    PrefillQsaTailBuffers tail_views{};
+    PrefillGemmBackend tail_backend = PrefillGemmBackend::SIMD;
+    if (exercise_output_tail) {
+        const PrefillQsaOutputBuffers output_views{
+            {context.buffers().read_only(attention.output.view()),
+             context.buffers().read_only(q_full.view()), gate_f16.view()},
+            context.buffers().read_only(native_weights.view()),
+            dequantized_f16.view(), projected_y.view(),
+            apply_tail_fwht ? attention.output.view() : BufferRef{}};
+        tail_views = PrefillQsaTailBuffers{
+            selection_views, attention_views, output_views};
+        q_full.capture_before_dispatch();
+        gate_f16.capture_before_dispatch();
+        native_weights.capture_before_dispatch();
+        dequantized_f16.capture_before_dispatch();
+        projected_y.capture_before_dispatch();
+    }
+
+    const auto encode_tail = [&](CommandBuffer& target,
+                                 const PrefillQsaTailBuffers& views,
+                                 PrefillGemmBackend* backend,
+                                 std::string& error) {
+        if (shared_encoder) {
+            return Encoder::encode(
+                context, target, label,
+                [&](Encoder& encoder, std::string& encode_error) {
+                    return encode_prefill_qsa_tail(
+                        context, encoder, metadata.params, mode,
+                        cell_capacity, PrefillNativeWeightFormat::Q8_0,
+                        views, encode_error, backend,
+                        apply_tail_fwht
+                            ? PrefillQsaAttentionTransform::fwht256
+                            : PrefillQsaAttentionTransform::none);
+                },
+                error);
+        }
+        return encode_prefill_qsa_tail(
+            context, target, metadata.params, mode, cell_capacity,
+            PrefillNativeWeightFormat::Q8_0, views, error, backend,
+            apply_tail_fwht ? PrefillQsaAttentionTransform::fwht256
+                            : PrefillQsaAttentionTransform::none);
+    };
+
+    if (exercise_output_tail) {
+        const auto expect_tail_preflight_rejection =
+            [&](const PrefillQsaTailBuffers& invalid,
+                std::string_view expected_error,
+                std::string_view scenario) {
+                const std::string case_label =
+                    label + " " + std::string(scenario);
+                auto rejected_command =
+                    context.make_command_buffer(case_label, allocation_error);
+                if (!rejected_command) {
+                    check(false, case_label + " command buffer",
+                          allocation_error);
+                    return false;
+                }
+                PrefillGemmBackend rejected_backend =
+                    PrefillGemmBackend::SIMD;
+                allocation_error.clear();
+                const bool encoded = encode_tail(
+                    *rejected_command, invalid, &rejected_backend,
+                    allocation_error);
+                const bool rejected =
+                    !encoded &&
+                    rejected_command->unsafe_native_handle() == nullptr &&
+                    allocation_error.find(expected_error) !=
+                        std::string::npos &&
+                    rejected_backend == PrefillGemmBackend::SIMD &&
+                    std::equal(input.query.begin(), input.query.end(),
+                               typed<float>(attention.query).begin());
+                check(rejected, case_label, allocation_error);
+                return rejected;
+            };
+
+        PrefillQsaTailBuffers invalid_handoff = tail_views;
+        invalid_handoff.selection.steps = selection.pooled.view();
+        if (!expect_tail_preflight_rejection(
+                invalid_handoff, "selection and attention must share StepRows",
+                "rejects mismatched StepRows")) {
+            return false;
+        }
+        invalid_handoff = tail_views;
+        invalid_handoff.selection.ids = selection.scores.view();
+        if (!expect_tail_preflight_rejection(
+                invalid_handoff, "selection IDs must feed attention",
+                "rejects mismatched selection IDs")) {
+            return false;
+        }
+        invalid_handoff = tail_views;
+        invalid_handoff.output.gate.attn =
+            context.buffers().read_only(attention.query.view());
+        if (!expect_tail_preflight_rejection(
+                invalid_handoff,
+                "attention output must feed the output gate",
+                "rejects mismatched attention output")) {
+            return false;
+        }
+        if (apply_tail_fwht) {
+            invalid_handoff = tail_views;
+            invalid_handoff.output.attention_transform =
+                q_full.view().slice(0u, attention.output.view().length);
+            if (!expect_tail_preflight_rejection(
+                    invalid_handoff,
+                    "FWHT view must match the attention output",
+                    "rejects mismatched FWHT handoff")) {
+                return false;
+            }
+        }
+        invalid_handoff = tail_views;
+        invalid_handoff.selection.scores = attention.query.view().slice(
+            sizeof(float), selection.scores.view().length);
+        if (!expect_tail_preflight_rejection(
+                invalid_handoff,
+                "selection scores overlaps active attention queries",
+                "rejects a partial score/query overlap")) {
+            return false;
+        }
+    }
+
     auto command = context.make_command_buffer(label, allocation_error);
     if (!command) {
         check(false, label + " command buffer", allocation_error);
         return false;
     }
-    const bool encoded = shared_encoder
-        ? Encoder::encode(
-              context, *command, label,
-              [&](Encoder& encoder, std::string& encode_error) {
-                  return encode_prefill_qsa_selection(
-                             context, encoder, metadata.params,
-                             cell_capacity, selection_views, encode_error) &&
-                         encode_prefill_qsa_attention(
-                             context, encoder, metadata.params, mode,
-                             cell_capacity, attention_views, encode_error);
-              },
-              allocation_error)
-        : encode_prefill_qsa_selection(
-              context, *command, metadata.params, cell_capacity,
-              selection_views, allocation_error) &&
-              encode_prefill_qsa_attention(
-                  context, *command, metadata.params, mode, cell_capacity,
-                  attention_views, allocation_error);
-    check(encoded, label + " encode selection→attention", allocation_error);
+    const bool encoded = exercise_output_tail
+        ? encode_tail(*command, tail_views, &tail_backend, allocation_error)
+        : shared_encoder
+              ? Encoder::encode(
+                    context, *command, label,
+                    [&](Encoder& encoder, std::string& encode_error) {
+                        return encode_prefill_qsa_selection(
+                                   context, encoder, metadata.params,
+                                   cell_capacity, selection_views,
+                                   encode_error) &&
+                               encode_prefill_qsa_attention(
+                                   context, encoder, metadata.params, mode,
+                                   cell_capacity, attention_views,
+                                   encode_error);
+                    },
+                    allocation_error)
+              : encode_prefill_qsa_selection(
+                    context, *command, metadata.params, cell_capacity,
+                    selection_views, allocation_error) &&
+                    encode_prefill_qsa_attention(
+                        context, *command, metadata.params, mode,
+                        cell_capacity, attention_views, allocation_error);
+    check(encoded, label + " encode selection→attention→output", allocation_error);
     if (!encoded) {
         command->discard();
         return false;
@@ -1428,18 +1699,244 @@ bool run_prefill_attention_case(
     check(ids_match, label + " selected IDs match scalar oracle");
     passed &= ids_match;
 
+    const std::vector<twin::tf>& expected_composed_attention =
+        exercise_output_tail && apply_tail_fwht
+            ? expected_fwht
+            : expected_attention;
     const auto actual_attention =
-        typed<float>(attention.output).first(expected_attention.size());
+        typed<float>(attention.output).first(expected_composed_attention.size());
     const auto attention_mismatch = twin::compare_floats(
-        actual_attention, expected_attention,
+        actual_attention, expected_composed_attention,
         {twin::Comparison::units, 32.0, 0.0, 0u});
     if (attention_mismatch) {
         twin::report_failure(label.c_str(), options, token_rows,
                              *attention_mismatch);
     }
     check(!attention_mismatch,
-          label + " batched chunk→merge matches scalar oracle");
+          label + (exercise_output_tail && apply_tail_fwht
+                       ? " attention FWHT matches scalar oracle"
+                       : exercise_output_tail
+                             ? " attention output matches scalar oracle"
+                             : " batched chunk→merge matches scalar oracle"));
     passed &= !attention_mismatch;
+
+    if (exercise_output_tail) {
+        const auto actual_gate = typed<std::uint16_t>(gate_f16)
+                                     .first(expected_gate_f16.size());
+        std::uint16_t max_gate_ulp = 0u;
+        bool gate_matches = actual_gate.size() == expected_gate_f16.size();
+        for (std::size_t i = 0u; gate_matches && i < actual_gate.size(); ++i) {
+            const std::uint16_t actual_order = half_order_key(actual_gate[i]);
+            const std::uint16_t expected_order =
+                half_order_key(expected_gate_f16[i]);
+            const std::uint16_t distance =
+                actual_order >= expected_order
+                    ? static_cast<std::uint16_t>(actual_order - expected_order)
+                    : static_cast<std::uint16_t>(expected_order - actual_order);
+            max_gate_ulp = std::max(max_gate_ulp, distance);
+            gate_matches &= distance <= 2u;
+        }
+        check(gate_matches,
+              label + " F16 gate matches scalar oracle within 2 ULP",
+              "maximum distance=" + std::to_string(max_gate_ulp));
+        passed &= gate_matches;
+
+        const auto projected_values = typed<float>(projected_y).first(
+            static_cast<std::size_t>(token_rows) * projection_n);
+        bool projected_finite = true;
+        bool projected_nonzero = false;
+        for (const float value : projected_values) {
+            projected_finite &= std::isfinite(value);
+            projected_nonzero |= value != 0.0f;
+        }
+        check(projected_finite, label + " native projection is finite");
+        check(projected_nonzero, label + " native projection is nonzero");
+        passed &= projected_finite && projected_nonzero;
+
+        std::vector<twin::tf> expected_projected;
+        std::vector<double> expected_projected_double;
+        expected_projected.reserve(projected_values.size());
+        expected_projected_double.reserve(projected_values.size());
+        const auto q8_weights = typed<block_q8_0>(native_weights);
+        constexpr std::uint32_t projection_blocks_per_column =
+            projection_k / 32u;
+        for (std::uint32_t row = 0u; row < token_rows; ++row) {
+            for (std::uint32_t column = 0u; column < projection_n; ++column) {
+                double sum = 0.0;
+                double magnitude = 0.0;
+                for (std::uint32_t block_index = 0u;
+                     block_index < projection_blocks_per_column;
+                     ++block_index) {
+                    const block_q8_0& block =
+                        q8_weights[static_cast<std::size_t>(column) *
+                                       projection_blocks_per_column +
+                                   block_index];
+                    const float scale = strata::kernels::f32_from_f16(
+                        static_cast<std::uint16_t>(block.d));
+                    for (std::uint32_t value = 0u; value < 32u; ++value) {
+                        const std::uint32_t k = block_index * 32u + value;
+                        const std::uint16_t weight_f16 =
+                            strata::kernels::f16_from_f32(
+                                scale * static_cast<float>(block.qs[value]));
+                        const double product =
+                            static_cast<double>(strata::kernels::f32_from_f16(
+                                expected_gate_f16[
+                                    static_cast<std::size_t>(row) *
+                                        projection_k +
+                                    k])) *
+                            static_cast<double>(
+                                strata::kernels::f32_from_f16(weight_f16));
+                        sum += product;
+                        magnitude += std::fabs(product);
+                    }
+                }
+                expected_projected.emplace_back(
+                    static_cast<float>(sum), magnitude);
+                expected_projected_double.push_back(sum);
+            }
+        }
+        const auto projection_units_mismatch = twin::compare_floats(
+            projected_values, expected_projected,
+            {twin::Comparison::units, 2.0 * projection_k, 0.0, 0u});
+        if (projection_units_mismatch) {
+            twin::report_failure(label.c_str(), options, token_rows,
+                                 *projection_units_mismatch);
+        }
+        check(!projection_units_mismatch,
+              label + " native projection matches independent scalar oracle under U(2K)");
+        const auto projection_relative_mismatch = twin::compare_relative_l2(
+            projected_values, expected_projected_double, 0x1p-16,
+            projection_n);
+        if (projection_relative_mismatch) {
+            twin::report_failure(label.c_str(), options, token_rows,
+                                 *projection_relative_mismatch);
+        }
+        check(!projection_relative_mismatch,
+              label + " native projection matches FP64 oracle under R(2^-16)");
+        passed &= !projection_units_mismatch &&
+                  !projection_relative_mismatch;
+
+        const std::vector<std::uint8_t> tail_gate(
+            gate_f16.payload().begin(), gate_f16.payload().end());
+        const std::vector<std::uint8_t> tail_y(
+            projected_y.payload().begin(), projected_y.payload().end());
+        std::fill(gate_f16.payload().begin(), gate_f16.payload().end(), 0xa5u);
+        std::fill(dequantized_f16.payload().begin(),
+                  dequantized_f16.payload().end(), 0xa5u);
+        std::fill(projected_y.payload().begin(), projected_y.payload().end(),
+                  0xa5u);
+        auto components = context.make_command_buffer(
+            label + " explicit output components", allocation_error);
+        if (!components) {
+            check(false, label + " component command buffer", allocation_error);
+            return false;
+        }
+        PrefillGemmBackend component_backend = PrefillGemmBackend::SIMD;
+        const PrefillGemmMPPParams projection_params{
+            token_rows, projection_n, projection_k, projection_n, 0u, false};
+        const PrefillNativeProjectionBuffers projection_buffers{
+            context.buffers().read_only(gate_f16.view()),
+            tail_views.output.native_weights, dequantized_f16.view(),
+            projected_y.view()};
+        const bool components_encoded = Encoder::encode(
+            context, *components, label + " explicit output components",
+            [&](Encoder& encoder, std::string& encode_error) {
+                if (!encode_prefill_qsa_gate_attn(
+                        context, encoder, token_rows,
+                        tail_views.output.gate, encode_error)) {
+                    return false;
+                }
+                return encode_prefill_native_projection(
+                    context, encoder, projection_params,
+                    PrefillNativeWeightFormat::Q8_0, projection_buffers,
+                    encode_error, &component_backend);
+            },
+            allocation_error);
+        check(components_encoded,
+              label + " explicit gate and projection encode",
+              allocation_error);
+        if (!components_encoded) return false;
+        const bool components_completed =
+            wait_for_command(components, label + " explicit output components",
+                             allocation_error);
+        check(components_completed,
+              label + " explicit gate and projection complete",
+              allocation_error);
+        if (!components_completed) return false;
+        const bool component_match =
+            std::equal(tail_gate.begin(), tail_gate.end(),
+                       gate_f16.payload().begin()) &&
+            std::equal(tail_y.begin(), tail_y.end(),
+                       projected_y.payload().begin()) &&
+            component_backend == tail_backend;
+        check(component_match,
+              label + " tail output matches explicit gate/projection chain");
+        passed &= component_match;
+
+        std::fill(typed<float>(selection.scores).begin(),
+                  typed<float>(selection.scores).end(), kUntouchedScore);
+        std::fill(typed<std::int32_t>(attention.ids).begin(),
+                  typed<std::int32_t>(attention.ids).end(), kUntouchedId);
+        std::fill(attention.partial_acc.payload().begin(),
+                  attention.partial_acc.payload().end(), 0xa5u);
+        std::fill(attention.partial_m.payload().begin(),
+                  attention.partial_m.payload().end(), 0xa5u);
+        std::fill(attention.partial_l.payload().begin(),
+                  attention.partial_l.payload().end(), 0xa5u);
+        std::fill(attention.output.payload().begin(),
+                  attention.output.payload().end(), 0xa5u);
+        std::fill(gate_f16.payload().begin(), gate_f16.payload().end(), 0xa5u);
+        std::fill(dequantized_f16.payload().begin(),
+                  dequantized_f16.payload().end(), 0xa5u);
+        std::fill(projected_y.payload().begin(), projected_y.payload().end(),
+                  0xa5u);
+        ScopedEnvironmentOverride invalid_selector("STRATA_METAL_GEMM",
+                                                    "invalid");
+        const bool selector_ready = invalid_selector.ready();
+        check(selector_ready, label + " install late invalid selector");
+        if (!selector_ready) return false;
+
+        auto rollback_command = context.make_command_buffer(
+            label + " late projection rollback", allocation_error);
+        if (!rollback_command) {
+            check(false, label + " rollback command buffer",
+                  allocation_error);
+            return false;
+        }
+        PrefillGemmBackend rollback_backend = PrefillGemmBackend::MPP;
+        allocation_error.clear();
+        const bool rollback_encoded = encode_tail(
+            *rollback_command, tail_views, &rollback_backend,
+            allocation_error);
+        const bool rollback_ok =
+            !rollback_encoded &&
+            rollback_command->unsafe_native_handle() == nullptr &&
+            allocation_error.find("STRATA_METAL_GEMM") != std::string::npos &&
+            rollback_backend == PrefillGemmBackend::MPP &&
+            std::all_of(
+                typed<float>(selection.scores).begin(),
+                typed<float>(selection.scores).end(),
+                [](float value) { return value == kUntouchedScore; }) &&
+            std::all_of(
+                typed<std::int32_t>(attention.ids).begin(),
+                typed<std::int32_t>(attention.ids).end(),
+                [](std::int32_t value) { return value == kUntouchedId; }) &&
+            std::all_of(attention.output.payload().begin(),
+                        attention.output.payload().end(),
+                        [](std::uint8_t value) { return value == 0xa5u; }) &&
+            std::all_of(gate_f16.payload().begin(), gate_f16.payload().end(),
+                        [](std::uint8_t value) { return value == 0xa5u; }) &&
+            std::all_of(dequantized_f16.payload().begin(),
+                        dequantized_f16.payload().end(),
+                        [](std::uint8_t value) { return value == 0xa5u; }) &&
+            std::all_of(projected_y.payload().begin(),
+                        projected_y.payload().end(),
+                        [](std::uint8_t value) { return value == 0xa5u; });
+        check(rollback_ok,
+              label + " late projection failure discards the complete tail",
+              allocation_error);
+        passed &= rollback_ok;
+    }
 
     std::vector<twin::ByteRange> score_written;
     score_written.reserve(token_rows);
@@ -1475,7 +1972,10 @@ bool run_prefill_attention_case(
         (cache.key_scales.empty() ||
          !attention.key_scales.first_unwritten_change({})) &&
         (cache.value_scales.empty() ||
-         !attention.value_scales.first_unwritten_change({}));
+         !attention.value_scales.first_unwritten_change({})) &&
+        (!exercise_output_tail ||
+         (!q_full.first_unwritten_change({}) &&
+          !native_weights.first_unwritten_change({})));
     const auto scores_guard =
         selection.scores.first_unwritten_change(score_written);
     const auto ids_guard = attention.ids.first_unwritten_change(all_ids_written);
@@ -1487,17 +1987,41 @@ bool run_prefill_attention_case(
         attention.partial_l.first_unwritten_change(stats_written);
     const auto output_guard =
         attention.output.first_unwritten_change(output_written);
+    const std::array<twin::ByteRange, 1> gate_written{{
+        {0u, exercise_output_tail
+                 ? expected_gate_f16.size() * sizeof(std::uint16_t)
+                 : 0u}}};
+    const std::array<twin::ByteRange, 1> dequantized_written{{
+        {0u, exercise_output_tail
+                 ? static_cast<std::size_t>(projection_n) * projection_k *
+                       sizeof(std::uint16_t)
+                 : 0u}}};
+    const std::array<twin::ByteRange, 1> projected_written{{
+        {0u, exercise_output_tail
+                 ? static_cast<std::size_t>(token_rows) * projection_n *
+                       sizeof(float)
+                 : 0u}}};
+    const auto gate_guard = gate_f16.first_unwritten_change(gate_written);
+    const auto dequantized_guard =
+        dequantized_f16.first_unwritten_change(dequantized_written);
+    const auto projected_guard =
+        projected_y.first_unwritten_change(projected_written);
     const bool guards_ok =
         !scores_guard && !ids_guard && !acc_guard && !m_guard &&
-        !l_guard && !output_guard;
+        !l_guard && !output_guard && !gate_guard && !dequantized_guard &&
+        !projected_guard;
     check(inputs_unchanged, label + " read-only inputs are unchanged");
-    check(guards_ok, label + " score, ID, scratch and output guards",
+    check(guards_ok,
+          label + " score, ID, attention/output scratch and output guards",
           scores_guard ? scores_guard->reason
           : ids_guard ? ids_guard->reason
           : acc_guard ? acc_guard->reason
           : m_guard ? m_guard->reason
           : l_guard ? l_guard->reason
-          : output_guard ? output_guard->reason : "");
+          : output_guard ? output_guard->reason
+          : gate_guard ? gate_guard->reason
+          : dequantized_guard ? dequantized_guard->reason
+          : projected_guard ? projected_guard->reason : "");
     passed &= inputs_unchanged && guards_ok;
     return passed;
 }
@@ -2959,6 +3483,14 @@ int main(int argc, char** argv) {
     passed &= run_prefill_attention_case(
         *context, QsaAttentionMode::f16, 33u, 2047u, kLargestCapacity,
         options, true);
+    for (const QsaAttentionMode mode : modes) {
+        passed &= run_prefill_attention_case(
+            *context, mode, 2u, 3u, 128u, options,
+            concurrent_dispatch_mode(), true);
+        passed &= run_prefill_attention_case(
+            *context, mode, 2u, 3u, 128u, options,
+            concurrent_dispatch_mode(), true, false);
+    }
     for (const twin::InputSet set : selected_sets) {
         passed &= run_prefill_qsa_gate_attn_case(
             *context, 1u, set, options, false, false);
