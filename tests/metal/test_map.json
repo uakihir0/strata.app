@@ -480,6 +480,14 @@
       "label": "metal",
       "origin": "04 §6.6 / 06 Prefill MoE shared FFN / D-IMPL-409 / REV-205"
     },
+    "metal_prefill_moe_full_pipeline_test": {
+      "label": "metal",
+      "origin": "04 §6.6 / 06 full-mode Prefill MoE layer composition / D-IMPL-410 / REV-206"
+    },
+    "metal_prefill_moe_full_pipeline_test_concurrent": {
+      "label": "metal",
+      "origin": "04 §6.6 / 06 full-mode Prefill MoE layer composition / D-IMPL-410 / REV-206"
+    },
     "metal_prefill_moe_post_test": {
       "label": "metal",
       "origin": "04 §6.6/§10.4-10.5 / 06 Prefill MoE post-ops / D-IMPL-396 / REV-192"

@@ -143,6 +143,7 @@ src/metal/engine/prefill_moe_post_dispatch.mm
 src/metal/engine/prefill_moe_expert_dispatch.mm
 src/metal/engine/prefill_moe_down_dispatch.mm
 src/metal/engine/prefill_moe_pipeline.cpp
+src/metal/engine/prefill_moe_full_pipeline.cpp
 src/metal/engine/prefill_moe_shared_pipeline.cpp
   src/metal/engine/prefill_gemm_dispatch.mm
   src/metal/engine/prefill_gemm_selector.cpp
