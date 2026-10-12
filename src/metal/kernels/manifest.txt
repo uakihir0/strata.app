@@ -196,7 +196,7 @@ strata_pf_gather_f16 safe 256 1 1
 strata_pf_moe_plan_validate safe 128 1 1
 strata_pf_moe_destination_clear safe 128 1 1
 strata_pf_moe_destination_validate safe 128 1 1
-strata_pf_moe_gu_q2_0 safe 128 1 1
+strata_pf_moe_gu_f16 safe 128 1 1
 strata_pf_moe_down_f16 safe 128 1 1
 strata_pf_swiglu_pair safe 256 1 1
 strata_pf_combine safe 256 1 1

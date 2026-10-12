@@ -1,6 +1,7 @@
-// GPU twin for the first Prefill MoE Q2_0 gate/up tile (docs/mac/04 §6.6).
+// GPU twin for isolated Prefill MoE Q2_0/IQ4_XS gate/up tiles (docs/mac/04 §6.6).
 #include "metallib_sha256.inc"
 
+#include "strata/artifact/dequant.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/metal/context.hpp"
 #include "strata/metal/encoder.hpp"
@@ -8,6 +9,7 @@
 #include "strata/metal/prefill_moe_grouping.hpp"
 #include "strata/metal/prefill.hpp"
 #include "../../src/metal/kernels/common/types.h"
+#include "oracles/iq4_xs_moe_fixture.hpp"
 #include "twin.hpp"
 
 #include <algorithm>
@@ -34,6 +36,8 @@ constexpr std::uint32_t kSecondExpert = 3u;
 constexpr std::uint32_t kLayer = 2u;
 constexpr std::size_t kQ2BlocksPerRow = 40u;
 constexpr std::size_t kQ2BlockBytes = 18u;
+constexpr std::size_t kIQ4XSBlocksPerRow = 10u;
+constexpr std::size_t kIQ4XSBlockBytes = 136u;
 constexpr std::uint8_t kPoison = 0xa5u;
 constexpr std::uint8_t kGuardPoison = 0xffu;
 
@@ -56,6 +60,8 @@ struct Tile {
     std::uint32_t first_entry;
 };
 static_assert(sizeof(Tile) == 8u);
+
+enum class WeightFormat { q2_0, iq4_xs };
 
 struct PrefillMoeExpertAddress {
     std::uint64_t role[3]{};
@@ -145,8 +151,21 @@ void store_code(block_q2_0& block, std::size_t k, std::uint8_t code) {
         static_cast<std::uint8_t>(code << shift));
 }
 
-void fill_weights(twin::GuardedBuffer& buffer, std::uint32_t role,
-                  std::uint32_t expert) {
+void store_iq4_xs_code(block_iq4_xs& block, std::size_t k,
+                       std::uint8_t code) {
+    const std::size_t group = k / 32u;
+    const std::size_t within_group = k % 32u;
+    const std::size_t byte =
+        16u * group + (within_group < 16u ? within_group
+                                          : within_group - 16u);
+    const std::size_t shift = within_group < 16u ? 0u : 4u;
+    block.qs[byte] = static_cast<std::uint8_t>(
+        (block.qs[byte] & static_cast<std::uint8_t>(~(0x0fu << shift))) |
+        static_cast<std::uint8_t>(code << shift));
+}
+
+void fill_q2_weights(twin::GuardedBuffer& buffer, std::uint32_t role,
+                     std::uint32_t expert) {
     auto blocks = typed<block_q2_0>(buffer);
     for (std::uint32_t row = 0u; row < kHidden; ++row) {
         for (std::size_t block_index = 0u;
@@ -172,6 +191,97 @@ void fill_weights(twin::GuardedBuffer& buffer, std::uint32_t role,
     }
 }
 
+void fill_iq4_xs_weights(twin::GuardedBuffer& buffer, std::uint32_t role,
+                         std::uint32_t expert) {
+    auto blocks = typed<block_iq4_xs>(buffer);
+    for (std::uint32_t row = 0u; row < kHidden; ++row) {
+        for (std::size_t block_index = 0u;
+             block_index < kIQ4XSBlocksPerRow; ++block_index) {
+            block_iq4_xs& block =
+                blocks[static_cast<std::size_t>(row) * kIQ4XSBlocksPerRow +
+                       block_index];
+            block.d = 0x1400u;  // F16 2^-10.
+            std::fill(std::begin(block.qs), std::end(block.qs), 0u);
+            std::fill(std::begin(block.scales_l),
+                      std::end(block.scales_l), 0u);
+            block.scales_h = 0u;
+            for (std::size_t group = 0u; group < 8u; ++group) {
+                std::uint32_t scale_code = 0u;
+                if (expert == 0u) {
+                    scale_code =
+                        33u + (row * 3u + block_index * 5u + group * 7u +
+                               role * 11u) %
+                                  31u;
+                } else {
+                    scale_code =
+                        (row * 13u + block_index * 17u + group * 19u +
+                         role * 23u + expert * 29u) &
+                        0x3fu;
+                }
+                const std::uint32_t low_shift =
+                    4u * static_cast<std::uint32_t>(group % 2u);
+                block.scales_l[group / 2u] |=
+                    static_cast<std::uint8_t>((scale_code & 0x0fu)
+                                              << low_shift);
+                block.scales_h |= static_cast<std::uint16_t>(
+                    ((scale_code >> 4u) & 0x03u) << (2u * group));
+            }
+            for (std::size_t k = 0u; k < 256u; ++k) {
+                std::uint8_t code = 0u;
+                if (expert == 0u && role == 0u) {
+                    code = 0u;  // Negative gate weights.
+                } else if (expert == 0u && role == 1u) {
+                    code = 15u;  // Positive up weights.
+                } else {
+                    code = static_cast<std::uint8_t>(
+                        (row * 7u + block_index * 11u + (k % 16u) * 13u +
+                         (k / 16u) * 3u + role * 3u + expert * 5u) %
+                        16u);
+                }
+                store_iq4_xs_code(block, k, code);
+            }
+        }
+    }
+}
+
+void fill_weights(twin::GuardedBuffer& buffer, std::uint32_t role,
+                  std::uint32_t expert, WeightFormat format) {
+    if (format == WeightFormat::q2_0) {
+        fill_q2_weights(buffer, role, expert);
+    } else {
+        fill_iq4_xs_weights(buffer, role, expert);
+    }
+}
+
+bool iq4_xs_fixture_covers_codes_and_scales(
+    const std::array<const twin::GuardedBuffer*, 4u>& weight_buffers) {
+    std::array<bool, 16u> observed_codes{};
+    std::array<bool, 64u> observed_scales{};
+    for (const twin::GuardedBuffer* weight_buffer : weight_buffers) {
+        for (const block_iq4_xs& block : typed<block_iq4_xs>(*weight_buffer)) {
+            for (const std::uint8_t packed : block.qs) {
+                observed_codes[packed & 0x0fu] = true;
+                observed_codes[packed >> 4u] = true;
+            }
+            for (std::size_t group = 0u; group < 8u; ++group) {
+                const std::uint32_t low =
+                    (static_cast<std::uint32_t>(block.scales_l[group / 2u]) >>
+                     (4u * (group % 2u))) &
+                    0x0fu;
+                const std::uint32_t high =
+                    (static_cast<std::uint32_t>(block.scales_h) >>
+                     (2u * group)) &
+                    0x03u;
+                observed_scales[low | (high << 4u)] = true;
+            }
+        }
+    }
+    return std::all_of(observed_codes.begin(), observed_codes.end(),
+                       [](bool observed) { return observed; }) &&
+           std::all_of(observed_scales.begin(), observed_scales.end(),
+                       [](bool observed) { return observed; });
+}
+
 float q2_value(std::span<const block_q2_0> blocks, std::size_t row,
                std::size_t k) {
     const block_q2_0& block =
@@ -183,13 +293,50 @@ float q2_value(std::span<const block_q2_0> blocks, std::size_t row,
 }
 
 double dot_oracle(std::span<const std::uint16_t> x,
-                  std::span<const block_q2_0> weights, std::size_t row) {
+                  const twin::GuardedBuffer& weights, WeightFormat format,
+                  std::size_t row, bool round_iq4_xs_weights = true) {
     double result = 0.0;
-    for (std::size_t k = 0u; k < kWidth; ++k) {
-        result += static_cast<double>(f32(x[k])) *
-                  static_cast<double>(q2_value(weights, row, k));
+    if (format == WeightFormat::q2_0) {
+        const auto blocks = typed<block_q2_0>(weights);
+        for (std::size_t k = 0u; k < kWidth; ++k) {
+            result += static_cast<double>(f32(x[k])) *
+                      static_cast<double>(q2_value(blocks, row, k));
+        }
+    } else {
+        const auto blocks = typed<block_iq4_xs>(weights);
+        std::array<float, 256u> decoded{};
+        for (std::size_t block_index = 0u;
+             block_index < kIQ4XSBlocksPerRow; ++block_index) {
+            const block_iq4_xs& block =
+                blocks[row * kIQ4XSBlocksPerRow + block_index];
+            strata::dequantize_iq4_xs(
+                reinterpret_cast<const std::uint8_t*>(&block),
+                decoded.data());
+            const std::size_t first_k = block_index * decoded.size();
+            for (std::size_t offset = 0u; offset < decoded.size(); ++offset) {
+                const float weight =
+                    round_iq4_xs_weights ? f32(half(decoded[offset]))
+                                         : decoded[offset];
+                result += static_cast<double>(f32(x[first_k + offset])) *
+                          static_cast<double>(weight);
+            }
+        }
     }
     return result;
+}
+
+bool test_iq4_xs_literal_decode_anchor() {
+    const block_iq4_xs block = twin::iq4_xs_moe_fixture();
+    std::array<float, 256u> decoded{};
+    strata::dequantize_iq4_xs(
+        reinterpret_cast<const std::uint8_t*>(&block), decoded.data());
+    const bool matches =
+        decoded[twin::kIQ4XSMoeOneHotPosition] == 1695.0f &&
+        decoded[57u] == -1905.0f;
+    check(matches,
+          "canonical IQ4_XS decoder honors the literal low/high nibble anchor",
+          "d=1, group-1 scale=15, qs[25]=0x0f, K[15]=113");
+    return matches;
 }
 
 std::size_t round_up_div(std::size_t value, std::size_t divisor) {
@@ -197,11 +344,40 @@ std::size_t round_up_div(std::size_t value, std::size_t divisor) {
            static_cast<std::size_t>(value % divisor != 0u);
 }
 
-bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
+bool encode_expert(WeightFormat format, Context& context, Encoder& encoder,
+                   std::uint32_t rows, std::uint32_t experts,
+                   std::uint32_t layer,
+                   const PrefillMoeExpertTileBuffers& buffers,
+                   std::string& error) {
+    if (format == WeightFormat::q2_0) {
+        return encode_prefill_moe_gu_q2_0(
+            context, encoder, rows, experts, layer, buffers, error);
+    }
+    return encode_prefill_moe_gu_iq4_xs(
+        context, encoder, rows, experts, layer, buffers, error);
+}
+
+bool encode_expert(WeightFormat format, Context& context,
+                   CommandBuffer& command_buffer, std::uint32_t rows,
+                   std::uint32_t experts, std::uint32_t layer,
+                   const PrefillMoeExpertTileBuffers& buffers,
+                   std::string& error) {
+    if (format == WeightFormat::q2_0) {
+        return encode_prefill_moe_gu_q2_0(
+            context, command_buffer, rows, experts, layer, buffers, error);
+    }
+    return encode_prefill_moe_gu_iq4_xs(
+        context, command_buffer, rows, experts, layer, buffers, error);
+}
+
+bool run_case(Context& context, WeightFormat format, std::uint32_t rows,
+              bool caller_owned,
               bool missing_second_expert = false,
               bool missing_first_expert = false) {
+    const std::string format_name =
+        format == WeightFormat::q2_0 ? "Q2_0" : "IQ4_XS";
     const std::string label =
-        "Prefill Q2_0 expert tile T=" + std::to_string(rows) +
+        "Prefill " + format_name + " expert tile T=" + std::to_string(rows) +
         (caller_owned ? " caller-owned" : " standalone") +
         (missing_second_expert || missing_first_expert ? " missing-address"
                                                        : "");
@@ -224,7 +400,9 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
         (static_cast<std::size_t>(kLayer) + 1u) * kExperts *
         sizeof(PrefillMoeExpertAddress);
     const std::size_t weight_bytes =
-        kHidden * kQ2BlocksPerRow * kQ2BlockBytes;
+        format == WeightFormat::q2_0
+            ? kHidden * kQ2BlocksPerRow * kQ2BlockBytes
+            : kHidden * kIQ4XSBlocksPerRow * kIQ4XSBlockBytes;
 
     twin::GuardedBuffer ids, resident, mixed, histogram, plans, tiles;
     twin::GuardedBuffer source, destination, gathered, addresses;
@@ -254,13 +432,17 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
         address_snapshot.allocate(
             context, label + " address snapshot",
             kExperts * sizeof(PrefillMoeExpertAddress), error) &&
-        gate0.allocate(context, label + " expert 0 gate Q2_0", weight_bytes,
+        gate0.allocate(context, label + " expert 0 gate " + format_name,
+                       weight_bytes,
                        error) &&
-        up0.allocate(context, label + " expert 0 up Q2_0", weight_bytes,
+        up0.allocate(context, label + " expert 0 up " + format_name,
+                     weight_bytes,
                      error) &&
-        gate3.allocate(context, label + " expert 3 gate Q2_0", weight_bytes,
+        gate3.allocate(context, label + " expert 3 gate " + format_name,
+                       weight_bytes,
                        error) &&
-        up3.allocate(context, label + " expert 3 up Q2_0", weight_bytes,
+        up3.allocate(context, label + " expert 3 up " + format_name,
+                     weight_bytes,
                      error) &&
         hidden.allocate(context, label + " hidden output",
                         hidden_bytes + 64u, error) &&
@@ -292,10 +474,10 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
                 half(value);
         }
     }
-    fill_weights(gate0, 0u, 0u);
-    fill_weights(up0, 1u, 0u);
-    fill_weights(gate3, 0u, kSecondExpert);
-    fill_weights(up3, 1u, kSecondExpert);
+    fill_weights(gate0, 0u, 0u, format);
+    fill_weights(up0, 1u, 0u, format);
+    fill_weights(gate3, 0u, kSecondExpert, format);
+    fill_weights(up3, 1u, kSecondExpert, format);
     auto route_ids = typed<std::int32_t>(ids);
     for (std::size_t entry = 0u; entry < entries; ++entry) {
         const bool first_expert =
@@ -418,8 +600,7 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
                 return encode_prefill_moe_grouping(
                            context, encoder, rows, kExperts, false, kLayer,
                            grouping, encode_error) &&
-                       encode_prefill_moe_gu_q2_0(
-                           context, encoder, rows, kExperts, kLayer,
+                       encode_expert(format, context, encoder, rows, kExperts, kLayer,
                            malformed_expert, encode_error);
             },
             error);
@@ -434,8 +615,7 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
             grouping, error);
         rollback_rejected =
             grouping_encoded &&
-            !encode_prefill_moe_gu_q2_0(
-                context, *rollback_command, rows, kExperts, kLayer,
+            !encode_expert(format, context, *rollback_command, rows, kExperts, kLayer,
                 malformed_expert, error) &&
             rollback_command->unsafe_native_handle() == nullptr;
     }
@@ -455,8 +635,7 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
             if (!encode_prefill_moe_grouping(
                     context, encoder, rows, kExperts, false, kLayer,
                     grouping, encode_error) ||
-                !encode_prefill_moe_gu_q2_0(
-                    context, encoder, rows, kExperts, kLayer, expert,
+                !encode_expert(format, context, encoder, rows, kExperts, kLayer, expert,
                     encode_error)) {
                 return false;
             }
@@ -479,8 +658,7 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
             return encode_prefill_moe_grouping(
                        context, encoder, rows, kExperts, false, kLayer,
                        grouping, encode_error) &&
-                   encode_prefill_moe_gu_q2_0(
-                       context, encoder, rows, kExperts, kLayer, expert,
+                   encode_expert(format, context, encoder, rows, kExperts, kLayer, expert,
                        encode_error);
         };
 
@@ -519,8 +697,7 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
         check(expert_command != nullptr, label + " expert command buffer",
               error);
         if (!expert_command) return false;
-        encoded = encode_prefill_moe_gu_q2_0(
-            context, *expert_command, rows, kExperts, kLayer, expert, error);
+        encoded = encode_expert(format, context, *expert_command, rows, kExperts, kLayer, expert, error);
         check(encoded, label + " standalone expert encode", error);
         if (!encoded) return false;
         encoded = expert_command->commit(error) &&
@@ -570,16 +747,23 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
     check(tile_ranges_valid,
           label + " grouping supplies two independently addressed experts");
 
-    const auto gate0_blocks = typed<block_q2_0>(gate0);
-    const auto up0_blocks = typed<block_q2_0>(up0);
-    const auto gate3_blocks = typed<block_q2_0>(gate3);
-    const auto up3_blocks = typed<block_q2_0>(up3);
+    const std::array<const twin::GuardedBuffer*, 4u> role_weights{
+        &gate0, &up0, &gate3, &up3};
+    if (format == WeightFormat::iq4_xs && rows == 1u && caller_owned &&
+        !missing_second_expert && !missing_first_expert) {
+        check(iq4_xs_fixture_covers_codes_and_scales(role_weights),
+              label + " fixture covers all nonlinear codes and six-bit scales");
+    }
     const auto actual = typed<std::uint16_t>(hidden);
     bool oracle_matches = true;
     bool gather_matches = true;
     std::uint16_t maximum_distance = 0u;
     std::vector<std::uint16_t> row_expected(
         static_cast<std::size_t>(rows) * 2u * kHidden);
+    const bool check_iq4_xs_rounding =
+        format == WeightFormat::iq4_xs && rows == 1u && caller_owned &&
+        !missing_second_expert && !missing_first_expert;
+    bool iq4_xs_rounding_changes_output = !check_iq4_xs_rounding;
     const auto input_view = typed<std::uint16_t>(mixed);
     for (std::uint32_t row = 0u; row < rows; ++row) {
         const auto x = std::span<const std::uint16_t>(
@@ -588,22 +772,40 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
         for (std::size_t column = 0u; column < kHidden; ++column) {
             for (std::size_t expert_slot = 0u; expert_slot < 2u;
                  ++expert_slot) {
-                const auto gate_weights =
-                    expert_slot == 0u ? gate0_blocks : gate3_blocks;
-                const auto up_weights =
-                    expert_slot == 0u ? up0_blocks : up3_blocks;
+                const auto& gate_weights = *role_weights[expert_slot * 2u];
+                const auto& up_weights = *role_weights[expert_slot * 2u + 1u];
                 const double gate_sum =
-                    dot_oracle(x, gate_weights, column);
-                const double up_sum = dot_oracle(x, up_weights, column);
+                    dot_oracle(x, gate_weights, format, column);
+                const double up_sum =
+                    dot_oracle(x, up_weights, format, column);
                 const double silu =
                     gate_sum / (1.0 + std::exp(-gate_sum));
+                const std::uint16_t expected =
+                    output_half(silu * up_sum);
                 row_expected[(static_cast<std::size_t>(row) * 2u +
                               expert_slot) *
                                  kHidden +
-                             column] =
-                    output_half(silu * up_sum);
+                             column] = expected;
+                if (check_iq4_xs_rounding) {
+                    const double unrounded_gate_sum =
+                        dot_oracle(x, gate_weights, format, column, false);
+                    const double unrounded_up_sum =
+                        dot_oracle(x, up_weights, format, column, false);
+                    const double unrounded_silu =
+                        unrounded_gate_sum /
+                        (1.0 + std::exp(-unrounded_gate_sum));
+                    const std::uint16_t unrounded_expected =
+                        output_half(unrounded_silu * unrounded_up_sum);
+                    iq4_xs_rounding_changes_output |=
+                        half_ulp_distance(expected, unrounded_expected) > 4u;
+                }
             }
         }
+    }
+    if (check_iq4_xs_rounding) {
+        check(iq4_xs_rounding_changes_output,
+              label + " F16 weight rounding changes the scalar SwiGLU output "
+                      "beyond the four-ULP tolerance");
     }
     for (std::size_t entry = 0u; entry < entries; ++entry) {
         const std::size_t group_index =
@@ -633,7 +835,8 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
         }
     }
     check(gather_matches, label + " gathers the mapped source row");
-    check(oracle_matches, label + " multi-expert Q2_0/SwiGLU oracle",
+    check(oracle_matches, label + " multi-expert " + format_name +
+                              "/SwiGLU oracle",
           "maximum F16 distance=" + std::to_string(maximum_distance) +
               " ULP (limit 4)");
     const auto status_values = typed<std::uint32_t>(status);
@@ -685,8 +888,7 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
     bool invalid_plan_completed = invalid_plan_command != nullptr;
     if (invalid_plan_completed) {
         invalid_plan_completed =
-            encode_prefill_moe_gu_q2_0(
-                context, *invalid_plan_command, rows, kExperts, kLayer, expert,
+            encode_expert(format, context, *invalid_plan_command, rows, kExperts, kLayer, expert,
                 error) &&
             invalid_plan_command->commit(error) &&
             invalid_plan_command->wait_until_completed(error);
@@ -713,8 +915,7 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
     bool missing_tiles_completed = missing_tiles_command != nullptr;
     if (missing_tiles_completed) {
         missing_tiles_completed =
-            encode_prefill_moe_gu_q2_0(
-                context, *missing_tiles_command, rows, kExperts, kLayer,
+            encode_expert(format, context, *missing_tiles_command, rows, kExperts, kLayer,
                 expert, error) &&
             missing_tiles_command->commit(error) &&
             missing_tiles_command->wait_until_completed(error);
@@ -743,8 +944,7 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
     bool malformed_tile_completed = malformed_tile_command != nullptr;
     if (malformed_tile_completed) {
         malformed_tile_completed =
-            encode_prefill_moe_gu_q2_0(
-                context, *malformed_tile_command, rows, kExperts, kLayer,
+            encode_expert(format, context, *malformed_tile_command, rows, kExperts, kLayer,
                 expert, error) &&
             malformed_tile_command->commit(error) &&
             malformed_tile_command->wait_until_completed(error);
@@ -777,8 +977,7 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
             duplicate_expert_command != nullptr;
         if (duplicate_expert_completed) {
             duplicate_expert_completed =
-                encode_prefill_moe_gu_q2_0(
-                    context, *duplicate_expert_command, rows, kExperts,
+                encode_expert(format, context, *duplicate_expert_command, rows, kExperts,
                     kLayer, expert, error) &&
                 duplicate_expert_command->commit(error) &&
                 duplicate_expert_command->wait_until_completed(error);
@@ -811,8 +1010,7 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
             unordered_expert_command != nullptr;
         if (unordered_expert_completed) {
             unordered_expert_completed =
-                encode_prefill_moe_gu_q2_0(
-                    context, *unordered_expert_command, rows, kExperts,
+                encode_expert(format, context, *unordered_expert_command, rows, kExperts,
                     kLayer, expert, error) &&
                 unordered_expert_command->commit(error) &&
                 unordered_expert_command->wait_until_completed(error);
@@ -860,11 +1058,9 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
             context, *scratch_reuse_command,
             label + " staging scratch reuse",
             [&](Encoder& encoder, std::string& encode_error) {
-                return encode_prefill_moe_gu_q2_0(
-                           context, encoder, rows, kExperts, kLayer, expert,
+                return encode_expert(format, context, encoder, rows, kExperts, kLayer, expert,
                            encode_error) &&
-                       encode_prefill_moe_gu_q2_0(
-                           context, encoder, rows, kExperts, kLayer - 1u,
+                       encode_expert(format, context, encoder, rows, kExperts, kLayer - 1u,
                            expert, encode_error);
             },
             error);
@@ -908,8 +1104,7 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
                 return encode_prefill_moe_grouping(
                            context, encoder, rows, kExperts, false, kLayer,
                            alias_grouping, encode_error) &&
-                       encode_prefill_moe_gu_q2_0(
-                           context, encoder, rows, kExperts, kLayer, expert,
+                       encode_expert(format, context, encoder, rows, kExperts, kLayer, expert,
                            encode_error);
             },
             error);
@@ -1059,7 +1254,14 @@ bool test_decode_probe(Context& context) {
            tail && guards;
 }
 
-bool test_validation(Context& context, Context& foreign_context) {
+bool test_validation(Context& context, Context& foreign_context,
+                     WeightFormat format) {
+    const std::string format_name =
+        format == WeightFormat::q2_0 ? "Q2_0" : "IQ4_XS";
+    const std::size_t weight_bytes =
+        format == WeightFormat::q2_0
+            ? kHidden * kQ2BlocksPerRow * kQ2BlockBytes
+            : kHidden * kIQ4XSBlocksPerRow * kIQ4XSBlockBytes;
     twin::GuardedBuffer addresses, gathered, plan, tiles, hidden, status, foreign;
     twin::GuardedBuffer weight_storage, address_snapshot;
     std::string error;
@@ -1081,10 +1283,11 @@ bool test_validation(Context& context, Context& foreign_context) {
         status.allocate(context, "validation status", 64u, error) &&
         weight_storage.allocate(
             context, "validation weight storage",
-            kHidden * kQ2BlocksPerRow * kQ2BlockBytes, error) &&
+            weight_bytes, error) &&
         foreign.allocate(foreign_context, "validation foreign",
                          entries * kWidth * sizeof(std::uint16_t), error);
-    check(allocated, "Prefill Q2_0 validation allocate", error);
+    check(allocated, "Prefill " + format_name + " validation allocate",
+          error);
     if (!allocated) return false;
     std::fill(addresses.payload().begin(), addresses.payload().end(), 0u);
     std::fill(status.payload().begin(), status.payload().end(), kPoison);
@@ -1117,8 +1320,9 @@ bool test_validation(Context& context, Context& foreign_context) {
             check(false, label + " command buffer", error);
             return false;
         }
-        const bool result = encode_prefill_moe_gu_q2_0(
-            context, *command, rows, experts, layer, buffers, error);
+        const bool result =
+            encode_expert(format, context, *command, rows, experts, layer,
+                          buffers, error);
         const bool rejected =
             !result && error.find(expected) != std::string::npos;
         check(rejected, label, error);
@@ -1236,17 +1440,20 @@ bool test_validation(Context& context, Context& foreign_context) {
         return passed;
     }
 
-    auto command = context.make_command_buffer("Q2_0 expert open group", error);
+    auto command = context.make_command_buffer(
+        "Prefill " + format_name + " expert open group", error);
     if (!command) {
-        check(false, "Q2_0 expert open-group command buffer", error);
+        check(false, "Prefill " + format_name +
+                         " expert open-group command buffer",
+              error);
         return false;
     }
     const bool encoded = Encoder::encode(
-        context, *command, "Q2_0 expert open group",
+        context, *command, "Prefill " + format_name + " expert open group",
         [&](Encoder& encoder, std::string& encode_error) {
             if (!encoder.group_begin(encode_error)) return false;
-            return encode_prefill_moe_gu_q2_0(
-                context, encoder, 1u, kExperts, kLayer, valid, encode_error);
+            return encode_expert(format, context, encoder, 1u, kExperts,
+                                 kLayer, valid, encode_error);
         },
         error);
     const bool rejected =
@@ -1277,13 +1484,21 @@ int main(int argc, char** argv) {
     check(foreign != nullptr, "open foreign Metal Context", error);
     if (!foreign) return 1;
 
-    bool passed = test_validation(*context, *foreign);
+    bool passed = true;
+    for (const WeightFormat format :
+         {WeightFormat::q2_0, WeightFormat::iq4_xs}) {
+        passed &= test_validation(*context, *foreign, format);
+    }
     passed &= test_decode_probe(*context);
-    passed &= run_case(*context, 1u, true);
-    passed &= run_case(*context, 7u, false);
-    passed &= run_case(*context, 1u, false, true);
-    passed &= run_case(*context, 7u, false, false, true);
-    std::printf("%s Prefill Q2_0 expert tile GPU twin (%d failures)\n",
+    passed &= test_iq4_xs_literal_decode_anchor();
+    for (const WeightFormat format :
+         {WeightFormat::q2_0, WeightFormat::iq4_xs}) {
+        passed &= run_case(*context, format, 1u, true);
+        passed &= run_case(*context, format, 7u, false);
+        passed &= run_case(*context, format, 1u, false, true);
+        passed &= run_case(*context, format, 7u, false, false, true);
+    }
+    std::printf("%s Prefill MoE expert tile GPU twin (%d failures)\n",
                 passed ? "PASS" : "FAIL", g_failures);
     return passed && g_failures == 0 ? 0 : 1;
 }

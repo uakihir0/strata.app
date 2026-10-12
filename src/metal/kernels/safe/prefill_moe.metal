@@ -341,6 +341,30 @@ static inline half pf_moe_iq4_nl_value(
     return half(float(block->d) * float(kvalues_iq4nl[code]));
 }
 
+static inline half pf_moe_iq4_xs_value(
+    device const block_iq4_xs* row_weights, uint k) {
+    const device block_iq4_xs* block = row_weights + k / 256u;
+    const uint within_block = k % 256u;
+    const uint scale_group = within_block / 32u;
+    const uint within_group = within_block % 32u;
+    const uint qs_index =
+        16u * scale_group +
+        (within_group < 16u ? within_group : within_group - 16u);
+    const uint packed = uint(block->qs[qs_index]);
+    const uint code =
+        within_group < 16u ? packed & 0x0fu : packed >> 4u;
+    const uint scale_low =
+        (uint(block->scales_l[scale_group / 2u]) >>
+         (4u * (scale_group % 2u))) &
+        0x0fu;
+    const uint scale_high =
+        (uint(block->scales_h) >> (2u * scale_group)) & 0x03u;
+    const int scale = int(scale_low | (scale_high << 4u)) - 32;
+    const float scaled_d = float(block->d) * float(scale);
+    const float expanded = scaled_d * float(kvalues_iq4nl[code]);
+    return half(expanded);
+}
+
 static inline void pf_moe_zero_output_tile(
     device half* output, uint total_entries, uint first_entry,
     uint end_entry, uint column_group, uint tid) {
@@ -536,7 +560,7 @@ kernel void strata_pf_q2_0_decode_probe(
 // interleaves 32 gate and 32 up columns; the epilogue applies SwiGLU and
 // writes the resulting hidden row directly.
 [[max_total_threads_per_threadgroup(128)]]
-kernel void strata_pf_moe_gu_q2_0(
+kernel void strata_pf_moe_gu_f16(
     device const PrefillMoeExpertAddr* addresses [[buffer(0)]],
     device const half* Xs [[buffer(1)]],
     device const PfPlan* plans [[buffer(2)]],
@@ -545,6 +569,7 @@ kernel void strata_pf_moe_gu_q2_0(
     constant PrefillMoeTileParams& params [[buffer(5)]],
     device atomic_uint* status [[buffer(6)]],
     constant uchar* tiered_lease_mask [[buffer(7)]],
+    constant uint& weight_format [[buffer(8)]],
     uint tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     uint2 group [[threadgroup_position_in_grid]]) {
@@ -563,6 +588,15 @@ kernel void strata_pf_moe_gu_q2_0(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (plan_is_invalid != 0u) {
+        pf_moe_zero_output_tile(
+            eh, params.rows * kPfMoeRoutesPerRow, group.y * 64u,
+            params.rows * kPfMoeRoutesPerRow, group.x, tid);
+        return;
+    }
+    if (weight_format > 1u) {
+        if (tid == 0u) {
+            atomic_fetch_or_explicit(status, 2u, memory_order_relaxed);
+        }
         pf_moe_zero_output_tile(
             eh, params.rows * kPfMoeRoutesPerRow, group.y * 64u,
             params.rows * kPfMoeRoutesPerRow, group.x, tid);
@@ -656,12 +690,19 @@ kernel void strata_pf_moe_gu_q2_0(
             const uint output_column =
                 group.x * 32u + (tile_column % 32u);
             const uint role = tile_column < 32u ? 0u : 1u;
-            const device block_q2_0* row_weights =
-                reinterpret_cast<device const block_q2_0*>(
-                    address.role[role]) +
-                output_column * 40u;
-            sw[i] =
-                pf_moe_q2_0_value(row_weights, k0 + tile_k);
+            if (weight_format == 0u) {
+                const device block_q2_0* row_weights =
+                    reinterpret_cast<device const block_q2_0*>(
+                        address.role[role]) +
+                    output_column * 40u;
+                sw[i] = pf_moe_q2_0_value(row_weights, k0 + tile_k);
+            } else {
+                const device block_iq4_xs* row_weights =
+                    reinterpret_cast<device const block_iq4_xs*>(
+                        address.role[role]) +
+                    output_column * 10u;
+                sw[i] = pf_moe_iq4_xs_value(row_weights, k0 + tile_k);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
