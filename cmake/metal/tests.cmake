@@ -420,6 +420,25 @@ strata_metal_test(metal_qsa_test_concurrent metal
 set_tests_properties(metal_qsa_test_concurrent PROPERTIES
   TIMEOUT 300
   ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
+add_executable(metal_qsa_projection_test
+               tests/metal/metal_qsa_projection_test.mm)
+target_include_directories(metal_qsa_projection_test PRIVATE
+  ${STRATA_METAL_GENERATED_DIR})
+target_link_libraries(metal_qsa_projection_test PRIVATE
+  strata_metal_twins strata_metal_engine strata_metal_options)
+set_source_files_properties(tests/metal/metal_qsa_projection_test.mm
+                            PROPERTIES OBJECT_DEPENDS ${STRATA_METALLIB_SHA256_INC})
+add_dependencies(metal_qsa_projection_test strata_metallib)
+strata_metal_test(metal_qsa_projection_test metal
+                  metal_qsa_projection_test ${STRATA_METALLIB})
+set_tests_properties(metal_qsa_projection_test PROPERTIES
+  TIMEOUT 300
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial")
+strata_metal_test(metal_qsa_projection_test_concurrent metal
+                  metal_qsa_projection_test ${STRATA_METALLIB})
+set_tests_properties(metal_qsa_projection_test_concurrent PROPERTIES
+  TIMEOUT 300
+  ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
 strata_metal_test(metal_qsa_indexer_commit_batch_test metal
                   metal_qsa_test ${STRATA_METALLIB}
                   --indexer-commit-batch)

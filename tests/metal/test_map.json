@@ -504,6 +504,14 @@
       "label": "metal",
       "origin": "04 6.5/10.5 / 09 9.1 / D-IMPL-382 / REV-178 / D-IMPL-383 / REV-179 / D-IMPL-384 / REV-180 / D-IMPL-391 / REV-187"
     },
+    "metal_qsa_projection_test": {
+      "label": "metal",
+      "origin": "04 §6.5/§10.5 / 09 9.1 / D-IMPL-393 / REV-189"
+    },
+    "metal_qsa_projection_test_concurrent": {
+      "label": "metal",
+      "origin": "04 §6.5/§10.5 / 09 9.1 / D-IMPL-393 / REV-189"
+    },
     "metal_qsa_indexer_commit_batch_test": {
       "label": "metal",
       "origin": "04 §4.6/§5.6/§10.5, 09 9.1, L10 all-layer QSA accepted-prefix commit, D-IMPL-311, REV-108"
