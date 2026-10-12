@@ -149,11 +149,8 @@ kernel void strata_pf_sort_scan(
             tile_starts[expert] = tile_offset;
             const uint expert_count = counts[expert];
             if (expert_count != 0u) {
-                const ulong resident_index =
-                    ulong(params.layer) * ulong(params.n_expert) +
-                    ulong(expert);
                 const bool is_resident =
-                    params.tiered == 0u || resident[resident_index] >= 0;
+                    params.tiered == 0u || resident[expert] >= 0;
                 plan->grp_e[group_count] = int(expert);
                 plan->grp_res[group_count] = is_resident ? 1 : 0;
                 plan->grp_start[group_count] = int(entry_offset);
@@ -281,12 +278,9 @@ kernel void strata_pf_gather_f16(
         return;
     }
 
-    // The specified dispatch is sized in half elements. One active lane copies
-    // one uint4 (eight halves), so seven of each eight lanes are idle.
-    const ulong dispatch_thread =
+    // One thread copies one uint4 (eight halves), matching gather_rows16.
+    const ulong vector_index =
         ulong(group.x) * 256ul + ulong(tid);
-    if ((dispatch_thread & 7ul) != 0ul) return;
-    const ulong vector_index = dispatch_thread >> 3u;
     const ulong output_vectors = sorted_entries * 320ul;
     const ulong maximum_output_vectors = total_entries * 320ul;
     if (vector_index >= output_vectors ||
