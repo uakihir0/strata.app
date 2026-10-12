@@ -36,6 +36,7 @@ constexpr std::uint32_t kSelectionScoresThreads = 256u;
 constexpr std::uint32_t kSelectionTopkRegThreads = 1024u;
 constexpr std::uint32_t kSelectionTopkMemThreads = 256u;
 constexpr std::uint32_t kPrefillSelectionGroupRows = 256u;
+constexpr std::uint32_t kPrefillAttentionGroupRows = 32u;
 constexpr std::uint32_t kQsaGateThreads = 256u;
 constexpr std::uint32_t kQsaAttentionThreads = 256u;
 constexpr std::uint32_t kQsaIndexerLayers = INDEXER_SNAPSHOT_LAYERS;
@@ -261,6 +262,18 @@ struct QsaAttentionMergeDispatch {
     std::size_t partial_stats_bytes = 0u;
     std::size_t output_bytes = 0u;
     QsaAttentionParams params{};
+};
+
+struct PrefillAttentionDispatch {
+    std::size_t query_bytes = 0u;
+    std::size_t steps_bytes = 0u;
+    std::size_t ids_bytes = 0u;
+    std::size_t output_bytes = 0u;
+    std::size_t query_row_bytes = 0u;
+    std::size_t step_row_bytes = 0u;
+    std::size_t id_row_bytes = 0u;
+    std::size_t output_row_bytes = 0u;
+    QsaAttentionChunkDispatch first_chunk{};
 };
 
 bool overlaps(std::uintptr_t a, std::size_t a_size,
@@ -811,8 +824,9 @@ bool qsa_attention_extents(std::uint32_t token_rows,
                            std::uint32_t& chunk_count,
                            std::size_t& partial_acc_bytes,
                            std::size_t& partial_stats_bytes,
-                           std::size_t& output_bytes) {
-    if (token_rows == 0u || token_rows > VERIFY_MAX_T ||
+                           std::size_t& output_bytes,
+                           std::uint32_t row_limit = VERIFY_MAX_T) {
+    if (token_rows == 0u || token_rows > row_limit ||
         id_row_stride == 0u ||
         id_row_stride > kQsaAttentionMaxCells) {
         return false;
@@ -3673,7 +3687,8 @@ static bool prepare_qsa_attention_chunk_dispatch(
     Context& context, QsaAttentionMode mode, std::uint32_t token_rows,
     std::uint32_t cell_capacity, std::uint32_t id_row_stride,
     const QsaAttentionChunkBuffers& buffers,
-    QsaAttentionChunkDispatch& dispatch, std::string& error) {
+    QsaAttentionChunkDispatch& dispatch, std::string& error,
+    std::uint32_t row_limit = VERIFY_MAX_T) {
     error.clear();
     dispatch.kernel_name = qsa_attention_kernel_name(mode);
     if (dispatch.kernel_name == nullptr) {
@@ -3691,7 +3706,7 @@ static bool prepare_qsa_attention_chunk_dispatch(
     if (!qsa_attention_extents(
             token_rows, id_row_stride, dispatch.chunk_count,
             dispatch.partial_acc_bytes, dispatch.partial_stats_bytes,
-            dispatch.output_bytes)) {
+            dispatch.output_bytes, row_limit)) {
         error = "QSA attention row count or scratch extent is invalid";
         return false;
     }
@@ -3879,13 +3894,14 @@ static bool prepare_qsa_attention_merge_dispatch(
     Context& context, std::uint32_t token_rows,
     std::uint32_t id_row_stride,
     const QsaAttentionMergeBuffers& buffers,
-    QsaAttentionMergeDispatch& dispatch, std::string& error) {
+    QsaAttentionMergeDispatch& dispatch, std::string& error,
+    std::uint32_t row_limit = VERIFY_MAX_T) {
     error.clear();
     std::uint32_t chunk_count = 0u;
     if (!qsa_attention_extents(
             token_rows, id_row_stride, chunk_count,
             dispatch.partial_acc_bytes, dispatch.partial_stats_bytes,
-            dispatch.output_bytes)) {
+            dispatch.output_bytes, row_limit)) {
         error = "QSA attention merge row count or extent is invalid";
         return false;
     }
@@ -4003,15 +4019,16 @@ bool encode_qsa_attention_chunk(
     return true;
 }
 
-bool encode_qsa_attention_chunk(
+static bool encode_qsa_attention_chunk_encoder(
     Context& context, Encoder& encoder, QsaAttentionMode mode,
     std::uint32_t token_rows, std::uint32_t cell_capacity,
     std::uint32_t id_row_stride,
-    const QsaAttentionChunkBuffers& buffers, std::string& error) {
+    const QsaAttentionChunkBuffers& buffers, std::uint32_t row_limit,
+    std::string& error) {
     QsaAttentionChunkDispatch dispatch;
     if (!prepare_qsa_attention_chunk_dispatch(
             context, mode, token_rows, cell_capacity, id_row_stride, buffers,
-            dispatch, error)) {
+            dispatch, error, row_limit)) {
         return false;
     }
     if (!validate_qsa_attention_pipeline(
@@ -4074,6 +4091,16 @@ bool encode_qsa_attention_chunk(
         threadgroup_memory, error);
 }
 
+bool encode_qsa_attention_chunk(
+    Context& context, Encoder& encoder, QsaAttentionMode mode,
+    std::uint32_t token_rows, std::uint32_t cell_capacity,
+    std::uint32_t id_row_stride,
+    const QsaAttentionChunkBuffers& buffers, std::string& error) {
+    return encode_qsa_attention_chunk_encoder(
+        context, encoder, mode, token_rows, cell_capacity, id_row_stride,
+        buffers, VERIFY_MAX_T, error);
+}
+
 bool encode_qsa_attention_merge(
     Context& context, CommandBuffer& command_buffer,
     std::uint32_t token_rows, std::uint32_t id_row_stride,
@@ -4125,13 +4152,15 @@ bool encode_qsa_attention_merge(
     return true;
 }
 
-bool encode_qsa_attention_merge(
+static bool encode_qsa_attention_merge_encoder(
     Context& context, Encoder& encoder,
     std::uint32_t token_rows, std::uint32_t id_row_stride,
-    const QsaAttentionMergeBuffers& buffers, std::string& error) {
+    const QsaAttentionMergeBuffers& buffers, std::uint32_t row_limit,
+    std::string& error) {
     QsaAttentionMergeDispatch dispatch;
     if (!prepare_qsa_attention_merge_dispatch(
-            context, token_rows, id_row_stride, buffers, dispatch, error)) {
+            context, token_rows, id_row_stride, buffers, dispatch, error,
+            row_limit)) {
         return false;
     }
     if (!validate_qsa_attention_pipeline(
@@ -4154,6 +4183,299 @@ bool encode_qsa_attention_merge(
     return encoder.dispatch(
         "strata_attn_merge", {N_HEAD_Q, token_rows, 1u},
         {kQsaAttentionThreads, 1u, 1u}, bindings, byte_bindings, {}, error);
+}
+
+bool encode_qsa_attention_merge(
+    Context& context, Encoder& encoder,
+    std::uint32_t token_rows, std::uint32_t id_row_stride,
+    const QsaAttentionMergeBuffers& buffers, std::string& error) {
+    return encode_qsa_attention_merge_encoder(
+        context, encoder, token_rows, id_row_stride, buffers, VERIFY_MAX_T,
+        error);
+}
+
+static bool prepare_prefill_qsa_attention_dispatch(
+    Context& context, const PrefillParams& prefill, QsaAttentionMode mode,
+    std::uint32_t cell_capacity,
+    const QsaPrefillAttentionBuffers& buffers,
+    PrefillAttentionDispatch& dispatch, std::string& error) {
+    error.clear();
+    if (prefill.T == 0u || prefill.T > kPrefillMaxShaderRows) {
+        error = "Prefill QSA attention row count exceeds the shader-row "
+                "limit";
+        return false;
+    }
+    if (cell_capacity == 0u ||
+        cell_capacity > kQsaAttentionMaxCells ||
+        cell_capacity % INDEXER_BLOCK_CELLS != 0u) {
+        error = "Prefill QSA attention cell capacity is invalid";
+        return false;
+    }
+    const std::uint64_t end =
+        static_cast<std::uint64_t>(prefill.p0) + prefill.T;
+    if (prefill.p0 >= cell_capacity || end > cell_capacity) {
+        error = "Prefill QSA attention chunk exceeds the cell capacity";
+        return false;
+    }
+    const std::uint64_t expected_idx_f =
+        prefill.p0 == 0u
+            ? INDEXER_BLOCK_CELLS
+            : (static_cast<std::uint64_t>(prefill.p0) +
+               INDEXER_BLOCK_CELLS - 1u) &
+                  ~static_cast<std::uint64_t>(
+                      INDEXER_BLOCK_CELLS - 1u);
+    const std::uint32_t expected_idx_e = static_cast<std::uint32_t>(
+        end & ~static_cast<std::uint64_t>(INDEXER_BLOCK_CELLS - 1u));
+    if (prefill.idx_f != expected_idx_f ||
+        prefill.idx_e != expected_idx_e) {
+        error = "Prefill QSA attention parameters do not match the chunk";
+        return false;
+    }
+    if (!same_view(buffers.attention_chunk.scratch.partial_acc,
+                   buffers.attention_merge.scratch.partial_acc) ||
+        !same_view(buffers.attention_chunk.scratch.partial_m,
+                   buffers.attention_merge.scratch.partial_m) ||
+        !same_view(buffers.attention_chunk.scratch.partial_l,
+                   buffers.attention_merge.scratch.partial_l)) {
+        error = "Prefill QSA attention chunk and merge must share the same "
+                "scratch views";
+        return false;
+    }
+
+    constexpr std::size_t query_row_bytes =
+        static_cast<std::size_t>(N_HEAD_Q) * HEAD_DIM * sizeof(float);
+    constexpr std::size_t step_row_bytes = sizeof(StepRow);
+    constexpr std::size_t id_row_bytes =
+        static_cast<std::size_t>(INDEXER_SELECTION_WIDTH_MAX) *
+        sizeof(std::int32_t);
+    dispatch.query_row_bytes = query_row_bytes;
+    dispatch.step_row_bytes = step_row_bytes;
+    dispatch.id_row_bytes = id_row_bytes;
+    dispatch.output_row_bytes = query_row_bytes;
+    if (!checked_product({prefill.T, query_row_bytes},
+                         dispatch.query_bytes) ||
+        !checked_product({prefill.T, step_row_bytes},
+                         dispatch.steps_bytes) ||
+        !checked_product({prefill.T, id_row_bytes}, dispatch.ids_bytes) ||
+        !checked_product({prefill.T, dispatch.output_row_bytes},
+                         dispatch.output_bytes)) {
+        error = "Prefill QSA attention view extent overflows host address "
+                "space";
+        return false;
+    }
+    if (!validate_buffer(context, buffers.attention_chunk.query,
+                         dispatch.query_bytes, alignof(float),
+                         "Prefill attention queries", error) ||
+        !validate_buffer(context, buffers.attention_chunk.steps,
+                         dispatch.steps_bytes, alignof(StepRow),
+                         "Prefill attention StepRows", error) ||
+        !validate_buffer(context, buffers.attention_chunk.ids,
+                         dispatch.ids_bytes, alignof(std::int32_t),
+                         "Prefill attention IDs", error) ||
+        !validate_buffer(context, buffers.attention_merge.output,
+                         dispatch.output_bytes, alignof(float),
+                         "Prefill attention output", error)) {
+        return false;
+    }
+
+    const auto* steps = static_cast<const StepRow*>(
+        buffers.attention_chunk.steps.contents);
+    for (std::uint32_t row = 0u; row < prefill.T; ++row) {
+        const std::uint32_t position = prefill.p0 + row;
+        const std::int32_t n_kv =
+            static_cast<std::int32_t>(position + 1u);
+        const StepRow expected{
+            static_cast<std::int32_t>(position),
+            n_kv,
+            n_kv / static_cast<std::int32_t>(INDEXER_BLOCK_CELLS),
+            std::min<std::int32_t>(
+                n_kv,
+                static_cast<std::int32_t>(INDEXER_SELECTION_WIDTH_MAX)),
+        };
+        const StepRow& actual = steps[row];
+        if (actual.pos != expected.pos ||
+            actual.n_kv != expected.n_kv ||
+            actual.n_bid != expected.n_bid ||
+            actual.width != expected.width) {
+            error = "Prefill QSA attention StepRows must match the chunk's "
+                    "contiguous positions";
+            return false;
+        }
+    }
+
+    for (std::uint32_t group_base = 0u; group_base < prefill.T;
+         group_base += kPrefillAttentionGroupRows) {
+        const std::uint32_t group_rows = std::min(
+            kPrefillAttentionGroupRows, prefill.T - group_base);
+        const std::size_t query_offset =
+            static_cast<std::size_t>(group_base) * query_row_bytes;
+        const std::size_t query_bytes =
+            static_cast<std::size_t>(group_rows) * query_row_bytes;
+        const std::size_t step_offset =
+            static_cast<std::size_t>(group_base) * step_row_bytes;
+        const std::size_t step_bytes =
+            static_cast<std::size_t>(group_rows) * step_row_bytes;
+        const std::size_t id_offset =
+            static_cast<std::size_t>(group_base) * id_row_bytes;
+        const std::size_t ids_bytes =
+            static_cast<std::size_t>(group_rows) * id_row_bytes;
+        const std::size_t output_offset =
+            static_cast<std::size_t>(group_base) *
+            dispatch.output_row_bytes;
+        const std::size_t output_bytes =
+            static_cast<std::size_t>(group_rows) *
+            dispatch.output_row_bytes;
+        QsaAttentionChunkBuffers chunk = buffers.attention_chunk;
+        chunk.query = chunk.query.slice(query_offset, query_bytes);
+        chunk.steps = chunk.steps.slice(step_offset, step_bytes);
+        chunk.ids = chunk.ids.slice(id_offset, ids_bytes);
+        QsaAttentionMergeBuffers merge = buffers.attention_merge;
+        merge.output = merge.output.slice(output_offset, output_bytes);
+
+        QsaAttentionChunkDispatch chunk_dispatch;
+        QsaAttentionMergeDispatch merge_dispatch;
+        if (!prepare_qsa_attention_chunk_dispatch(
+                context, mode, group_rows, cell_capacity,
+                INDEXER_SELECTION_WIDTH_MAX, chunk, chunk_dispatch, error,
+                kPrefillAttentionGroupRows) ||
+            !prepare_qsa_attention_merge_dispatch(
+                context, group_rows, INDEXER_SELECTION_WIDTH_MAX, merge,
+                merge_dispatch, error, kPrefillAttentionGroupRows)) {
+            return false;
+        }
+        if (group_base == 0u) {
+            dispatch.first_chunk = chunk_dispatch;
+        }
+    }
+
+    if (!validate_qsa_attention_pipeline(
+            context, dispatch.first_chunk.kernel_name, error) ||
+        !validate_qsa_attention_pipeline(
+            context, "strata_attn_merge", error)) {
+        return false;
+    }
+
+    const std::array<std::pair<BufferRef, std::size_t>, 7> reads{{
+        {buffers.attention_chunk.query, dispatch.query_bytes},
+        {buffers.attention_chunk.steps, dispatch.steps_bytes},
+        {buffers.attention_chunk.ids, dispatch.ids_bytes},
+        {buffers.attention_chunk.key_data,
+         dispatch.first_chunk.key_data_bytes},
+        {buffers.attention_chunk.key_scales,
+         dispatch.first_chunk.key_scale_bytes},
+        {buffers.attention_chunk.value_data,
+         dispatch.first_chunk.value_data_bytes},
+        {buffers.attention_chunk.value_scales,
+         dispatch.first_chunk.value_scale_bytes},
+    }};
+    const std::array<std::pair<BufferRef, std::size_t>, 4> writes{{
+        {buffers.attention_chunk.scratch.partial_acc,
+         dispatch.first_chunk.partial_acc_bytes},
+        {buffers.attention_chunk.scratch.partial_m,
+         dispatch.first_chunk.partial_stats_bytes},
+        {buffers.attention_chunk.scratch.partial_l,
+         dispatch.first_chunk.partial_stats_bytes},
+        {buffers.attention_merge.output, dispatch.output_bytes},
+    }};
+    for (std::size_t write = 0u; write < writes.size(); ++write) {
+        for (std::size_t other = write + 1u; other < writes.size(); ++other) {
+            if (buffer_overlaps(writes[write].first, writes[write].second,
+                                writes[other].first, writes[other].second)) {
+                error = "Prefill QSA attention outputs and scratch must be "
+                        "disjoint";
+                return false;
+            }
+        }
+        for (const auto& [input, input_bytes] : reads) {
+            if (buffer_overlaps(writes[write].first, writes[write].second,
+                                input, input_bytes)) {
+                error = "Prefill QSA attention outputs must not overlap an "
+                        "input";
+                return false;
+            }
+        }
+    }
+    error.clear();
+    return true;
+}
+
+bool encode_prefill_qsa_attention(
+    Context& context, Encoder& encoder, const PrefillParams& prefill,
+    QsaAttentionMode mode, std::uint32_t cell_capacity,
+    const QsaPrefillAttentionBuffers& buffers, std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "Prefill QSA attention requires an ordered concurrent-group "
+                "boundary";
+        return false;
+    }
+    PrefillAttentionDispatch dispatch;
+    if (!prepare_prefill_qsa_attention_dispatch(
+            context, prefill, mode, cell_capacity, buffers, dispatch,
+            error)) {
+        return false;
+    }
+
+    for (std::uint32_t group_base = 0u; group_base < prefill.T;
+         group_base += kPrefillAttentionGroupRows) {
+        const std::uint32_t group_rows = std::min(
+            kPrefillAttentionGroupRows, prefill.T - group_base);
+        const std::size_t query_offset =
+            static_cast<std::size_t>(group_base) *
+            dispatch.query_row_bytes;
+        const std::size_t query_bytes =
+            static_cast<std::size_t>(group_rows) *
+            dispatch.query_row_bytes;
+        const std::size_t step_offset =
+            static_cast<std::size_t>(group_base) *
+            dispatch.step_row_bytes;
+        const std::size_t step_bytes =
+            static_cast<std::size_t>(group_rows) *
+            dispatch.step_row_bytes;
+        const std::size_t id_offset =
+            static_cast<std::size_t>(group_base) * dispatch.id_row_bytes;
+        const std::size_t ids_bytes =
+            static_cast<std::size_t>(group_rows) * dispatch.id_row_bytes;
+        const std::size_t output_offset =
+            static_cast<std::size_t>(group_base) *
+            dispatch.output_row_bytes;
+        const std::size_t output_bytes =
+            static_cast<std::size_t>(group_rows) *
+            dispatch.output_row_bytes;
+        QsaAttentionChunkBuffers chunk = buffers.attention_chunk;
+        chunk.query = chunk.query.slice(query_offset, query_bytes);
+        chunk.steps = chunk.steps.slice(step_offset, step_bytes);
+        chunk.ids = chunk.ids.slice(id_offset, ids_bytes);
+        QsaAttentionMergeBuffers merge = buffers.attention_merge;
+        merge.output = merge.output.slice(output_offset, output_bytes);
+        if (!encode_qsa_attention_chunk_encoder(
+                context, encoder, mode, group_rows, cell_capacity,
+                INDEXER_SELECTION_WIDTH_MAX, chunk,
+                kPrefillAttentionGroupRows, error) ||
+            !encode_qsa_attention_merge_encoder(
+                context, encoder, group_rows,
+                INDEXER_SELECTION_WIDTH_MAX, merge,
+                kPrefillAttentionGroupRows, error)) {
+            return false;
+        }
+    }
+    error.clear();
+    return true;
+}
+
+bool encode_prefill_qsa_attention(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillParams& prefill, QsaAttentionMode mode,
+    std::uint32_t cell_capacity,
+    const QsaPrefillAttentionBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Prefill QSA attention",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_qsa_attention(
+                context, encoder, prefill, mode, cell_capacity, buffers,
+                encode_error);
+        },
+        error);
 }
 
 bool encode_qsa_selection_attention(

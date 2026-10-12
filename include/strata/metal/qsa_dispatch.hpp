@@ -162,6 +162,11 @@ struct QsaSelectionAttentionBuffers {
     QsaAttentionMergeBuffers attention_merge;
 };
 
+struct QsaPrefillAttentionBuffers {
+    QsaAttentionChunkBuffers attention_chunk;
+    QsaAttentionMergeBuffers attention_merge;
+};
+
 /// Encode one QSA norm/RoPE row for each head and token. `token_rows` is T
 /// in 1..8. Key and indexer-query modes permit exact in-place operation;
 /// query mode reads 512-wide q_full rows and writes compact 256-wide qcur
@@ -584,5 +589,23 @@ bool encode_qsa_selection_attention(
     std::uint32_t token_rows, std::uint32_t cell_capacity,
     std::uint32_t id_row_stride,
     const QsaSelectionAttentionBuffers& buffers, std::string& error);
+
+/// Encode Prefill sparse attention in ordered groups of up to 32 rows.
+/// `query`, `steps`, `ids` and merge `output` cover all Prefill rows;
+/// `ids` has the fixed 2051-int32 row stride. KV pools cover `cell_capacity`
+/// cells. The attention chunk and merge stages must use the same scratch
+/// views, each sized for one 32-row batch. The API validates contiguous
+/// Prefill StepRows and all writable aliases before dispatch. The
+/// caller-owned form requires an ordered Encoder segment and rejects an open
+/// concurrent dispatch group.
+bool encode_prefill_qsa_attention(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillParams& params, QsaAttentionMode mode,
+    std::uint32_t cell_capacity,
+    const QsaPrefillAttentionBuffers& buffers, std::string& error);
+bool encode_prefill_qsa_attention(
+    Context& context, Encoder& encoder, const PrefillParams& params,
+    QsaAttentionMode mode, std::uint32_t cell_capacity,
+    const QsaPrefillAttentionBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal
