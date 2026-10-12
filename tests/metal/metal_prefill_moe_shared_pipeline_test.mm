@@ -234,19 +234,29 @@ bool allocate_case(Context& context, CaseBuffers& b, std::uint32_t rows,
                static_cast<std::size_t>(rows) * sizeof(float), error);
 }
 
-void fill_q2_weights(twin::GuardedBuffer& buffer, std::uint8_t code) {
-    const std::uint8_t packed =
-        static_cast<std::uint8_t>(code * 0x55u);
-    for (block_q2_0& block : typed<block_q2_0>(buffer)) {
-        block.d = 0x2800u;  // F16 0.03125.
+void fill_q2_weights(twin::GuardedBuffer& buffer, std::uint8_t base_code,
+                     std::size_t blocks_per_output) {
+    auto blocks = typed<block_q2_0>(buffer);
+    for (std::size_t index = 0u; index < blocks.size(); ++index) {
+        const std::size_t output_row = index / blocks_per_output;
+        const std::size_t k_block = index % blocks_per_output;
+        const std::uint8_t code = static_cast<std::uint8_t>(
+            (base_code + output_row * 3u + k_block * 2u) % 4u);
+        const std::uint8_t packed = static_cast<std::uint8_t>(code * 0x55u);
+        const float scale =
+            0.03125f *
+            (1.0f + static_cast<float>((output_row * 3u + k_block * 5u) % 9u) *
+                        0.0625f);
+        block_q2_0& block = blocks[index];
+        block.d = strata::kernels::f16_from_f32(scale);
         std::fill(std::begin(block.qs), std::end(block.qs), packed);
     }
 }
 
 void initialize_case(CaseBuffers& b, std::uint32_t rows) {
-    fill_q2_weights(b.gate_weights, 2u);  // code 2 -> +1 × d.
-    fill_q2_weights(b.up_weights, 3u);    // code 3 -> +2 × d.
-    fill_q2_weights(b.down_weights, 0u);  // code 0 -> -1 × d.
+    fill_q2_weights(b.gate_weights, 2u, kWidth / 64u);
+    fill_q2_weights(b.up_weights, 3u, kWidth / 64u);
+    fill_q2_weights(b.down_weights, 0u, kHidden / 64u);
     auto mixed = typed<std::uint16_t>(b.mixed_h);
     auto gate_hi = typed<std::uint16_t>(b.gate_hi);
     auto gate_lo = typed<std::uint16_t>(b.gate_lo);
@@ -372,44 +382,39 @@ bool run_case(Context& context, std::uint32_t rows,
     bool hidden_matches = true;
     bool down_matches = true;
     bool router_gate_matches = true;
-    std::array<double, 8u> expected_gate{};
-    std::array<double, 8u> expected_up{};
+    std::vector<double> expected_gate(
+        static_cast<std::size_t>(rows) * kHidden);
+    std::vector<double> expected_up(
+        static_cast<std::size_t>(rows) * kHidden);
     for (std::uint32_t row = 0u; row < rows; ++row) {
         const auto row_input =
             mixed.subspan(static_cast<std::size_t>(row) * kWidth, kWidth);
-        expected_gate[row] = q2_dot(b.gate_weights, 0u, kWidth, row_input);
-        expected_up[row] = q2_dot(b.up_weights, 0u, kWidth, row_input);
         for (std::uint32_t column = 0u; column < kHidden; ++column) {
             const std::size_t index =
                 static_cast<std::size_t>(row) * kHidden + column;
+            expected_gate[index] =
+                q2_dot(b.gate_weights, column, kWidth, row_input);
+            expected_up[index] =
+                q2_dot(b.up_weights, column, kWidth, row_input);
             gate_matches &=
-                close_enough(gate_actual[index], expected_gate[row], 1.0e-3,
-                             1.0e-5);
+                close_enough(gate_actual[index], expected_gate[index],
+                             1.0e-3, 1.0e-5);
             up_matches &=
-                close_enough(up_actual[index], expected_up[row], 1.0e-3,
+                close_enough(up_actual[index], expected_up[index], 1.0e-3,
                              1.0e-5);
             const std::uint16_t expected =
-                expected_hidden(expected_gate[row], expected_up[row]);
+                expected_hidden(expected_gate[index], expected_up[index]);
             hidden_matches &=
                 half_ulp_distance(hidden_actual[index], expected) <= 2u;
-        }
-        double expected_down = 0.0;
-        for (std::uint32_t k = 0u; k < kHidden; ++k) {
-            const std::uint16_t hidden =
-                hidden_actual[static_cast<std::size_t>(row) * kHidden + k];
-            expected_down +=
-                static_cast<double>(
-                    strata::kernels::f32_from_f16(hidden)) *
-                static_cast<double>(q2_value(
-                    typed<block_q2_0>(b.down_weights)
-                        [static_cast<std::size_t>(0u) *
-                             kQ2BlocksPerHidden +
-                         k / 64u],
-                    k % 64u));
         }
         for (std::uint32_t column = 0u; column < kWidth; ++column) {
             const std::size_t index =
                 static_cast<std::size_t>(row) * kWidth + column;
+            const auto hidden_row =
+                hidden_actual.subspan(static_cast<std::size_t>(row) * kHidden,
+                                      kHidden);
+            const double expected_down =
+                q2_dot(b.down_weights, column, kHidden, hidden_row);
             down_matches &=
                 close_enough(shared_actual[index], expected_down, 1.0e-3,
                              1.0e-5);
@@ -450,16 +455,32 @@ bool run_case(Context& context, std::uint32_t rows,
     check(router_gate_matches,
           label + " BF16X2 shared gate matches scalar oracle");
 
+    const auto matches_dequant_scratch = [](
+        const twin::GuardedBuffer& weights,
+        const twin::GuardedBuffer& scratch, std::size_t output_width,
+        std::size_t input_width) {
+        const auto blocks = typed<block_q2_0>(weights);
+        const auto actual = typed<std::uint16_t>(scratch);
+        const std::size_t blocks_per_output = input_width / 64u;
+        for (std::size_t output = 0u; output < output_width; ++output) {
+            for (std::size_t k = 0u; k < input_width; ++k) {
+                const std::size_t block_index =
+                    output * blocks_per_output + k / 64u;
+                const std::uint16_t expected = strata::kernels::f16_from_f32(
+                    q2_value(blocks[block_index], k % 64u));
+                if (actual[k * output_width + output] != expected) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
     const bool dequant_matches =
-        std::all_of(typed<std::uint16_t>(b.gate_dequant).begin(),
-                    typed<std::uint16_t>(b.gate_dequant).end(),
-                    [](std::uint16_t value) { return value == 0x2800u; }) &&
-        std::all_of(typed<std::uint16_t>(b.up_dequant).begin(),
-                    typed<std::uint16_t>(b.up_dequant).end(),
-                    [](std::uint16_t value) { return value == 0x2c00u; }) &&
-        std::all_of(typed<std::uint16_t>(b.down_dequant).begin(),
-                    typed<std::uint16_t>(b.down_dequant).end(),
-                    [](std::uint16_t value) { return value == 0xa800u; });
+        matches_dequant_scratch(b.gate_weights, b.gate_dequant, kHidden,
+                                kWidth) &&
+        matches_dequant_scratch(b.up_weights, b.up_dequant, kHidden, kWidth) &&
+        matches_dequant_scratch(b.down_weights, b.down_dequant, kWidth,
+                                kHidden);
     check(dequant_matches, label + " K-major F16 scratch values");
 
     bool inputs_unchanged = true;

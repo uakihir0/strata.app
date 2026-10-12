@@ -284,16 +284,34 @@ void initialize_case(CaseBuffers& b, std::uint32_t rows,
     std::fill(x_hi.begin(), x_hi.end(), 0u);
     std::fill(x_lo.begin(), x_lo.end(), 0u);
     std::fill(router_weights.begin(), router_weights.end(), 0u);
+    constexpr std::array<std::uint32_t, 6u> active_k{
+        0u, 17u, 128u, 511u, 1024u, 2559u};
+    constexpr std::array<float, 6u> high_values{
+        0.5f, 0.75f, 0.125f, 1.0f, 0.375f, 0.25f};
+    constexpr std::array<float, 6u> low_values{
+        0.015625f, 0.0078125f, 0.0234375f,
+        0.00390625f, 0.01171875f, 0.01953125f};
+    constexpr std::array<float, 6u> weight_values{
+        0.25f, 0.5f, 0.75f, 0.125f, 0.375f, 0.625f};
     for (std::uint32_t row = 0u; row < rows; ++row) {
-        x_hi[static_cast<std::size_t>(row) * kWidth] =
-            strata::kernels::bf16_from_f32(
-                1.0f + static_cast<float>(row) * 0.125f);
+        const float row_scale = 1.0f + static_cast<float>(row) * 0.125f;
+        for (std::size_t item = 0u; item < active_k.size(); ++item) {
+            const std::size_t index =
+                static_cast<std::size_t>(row) * kWidth + active_k[item];
+            x_hi[index] = strata::kernels::bf16_from_f32(
+                high_values[item] * row_scale);
+            x_lo[index] = strata::kernels::bf16_from_f32(
+                low_values[item] * (1.0f + static_cast<float>(row) * 0.25f));
+        }
     }
     for (std::uint32_t expert = 0u; expert < experts; ++expert) {
         const float score =
             expert < kTopK ? static_cast<float>(kTopK - expert) : -100.0f;
-        router_weights[static_cast<std::size_t>(expert) * kWidth] =
-            strata::kernels::bf16_from_f32(score);
+        for (std::size_t item = 0u; item < active_k.size(); ++item) {
+            router_weights[static_cast<std::size_t>(expert) * kWidth +
+                           active_k[item]] =
+                strata::kernels::bf16_from_f32(score * weight_values[item]);
+        }
     }
     for (std::uint32_t row = 0u; row < rows; ++row) {
         for (std::uint32_t column = 0u; column < kWidth; ++column) {
@@ -354,26 +372,53 @@ bool run_case(Context& context, std::uint32_t rows, std::uint32_t experts) {
     const auto logits = typed<float>(b.logits);
     const auto ids = typed<std::int32_t>(b.route_ids);
     const auto weights = typed<float>(b.route_weights);
+    const auto x_hi = typed<std::uint16_t>(b.x_hi);
+    const auto x_lo = typed<std::uint16_t>(b.x_lo);
+    const auto router_weights = typed<std::uint16_t>(b.router_weights);
+    std::vector<double> expected_logits(
+        static_cast<std::size_t>(rows) * experts, 0.0);
     bool router_matches = true;
     bool route_matches = true;
     for (std::uint32_t row = 0u; row < rows; ++row) {
-        const float scale = 1.0f + static_cast<float>(row) * 0.125f;
-        double selected_sum = 0.0;
-        std::array<double, kTopK> exponentials{};
-        for (std::uint32_t rank = 0u; rank < kTopK; ++rank) {
-            exponentials[rank] =
-                std::exp(static_cast<double>(kTopK - rank) * scale);
-            selected_sum += exponentials[rank];
-        }
         for (std::uint32_t expert = 0u; expert < experts; ++expert) {
-            const float expected =
-                (expert < kTopK ? static_cast<float>(kTopK - expert) : -100.0f) *
-                scale;
+            double high_product = 0.0;
+            double low_product = 0.0;
+            for (std::uint32_t k = 0u; k < kWidth; ++k) {
+                const std::size_t activation_index =
+                    static_cast<std::size_t>(row) * kWidth + k;
+                const std::size_t weight_index =
+                    static_cast<std::size_t>(expert) * kWidth + k;
+                const double weight = strata::kernels::f32_from_bf16(
+                    router_weights[weight_index]);
+                high_product +=
+                    static_cast<double>(strata::kernels::f32_from_bf16(
+                        x_hi[activation_index])) *
+                    weight;
+                low_product +=
+                    static_cast<double>(strata::kernels::f32_from_bf16(
+                        x_lo[activation_index])) *
+                    weight;
+            }
+            expected_logits[static_cast<std::size_t>(row) * experts +
+                            expert] = high_product + low_product;
             const float actual =
                 logits[static_cast<std::size_t>(row) * experts + expert];
             router_matches &=
                 std::isfinite(actual) &&
-                std::abs(actual - expected) <= 2.0e-5f;
+                std::abs(static_cast<double>(actual) -
+                         expected_logits[static_cast<std::size_t>(row) *
+                                             experts +
+                                         expert]) <= 2.0e-4;
+        }
+
+        double selected_sum = 0.0;
+        std::array<double, kTopK> exponentials{};
+        for (std::uint32_t rank = 0u; rank < kTopK; ++rank) {
+            exponentials[rank] =
+                std::exp(expected_logits[static_cast<std::size_t>(row) *
+                                             experts +
+                                         rank]);
+            selected_sum += exponentials[rank];
         }
         for (std::uint32_t rank = 0u; rank < kTopK; ++rank) {
             const std::size_t index =
