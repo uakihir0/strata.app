@@ -138,6 +138,14 @@ and the fixed 6144→2560 F16 `attn_output` projection, with optional ordered
 in-place attention FWHT256; production layer scheduling and `Prefill::run`
 remain pending.
 
+`encode_prefill_qsa_tail` now joins Prefill selection and batched attention to
+that output path in one ordered segment. Serial and concurrent tests cover all
+four KV formats with and without FWHT256, an independent FP64 projection oracle, output guards,
+explicit component parity, cross-stage handoff/alias rejection, and late
+rollback. It consumes caller-prepared QSA inputs; KV and indexer appends,
+model-backed parity, production layer scheduling, and `Prefill::run` remain
+pending.
+
 Implementation choices, constraints, and required reviews are tracked in
 [IMPLEMENTATION-DECISIONS.md](IMPLEMENTATION-DECISIONS.md).
 

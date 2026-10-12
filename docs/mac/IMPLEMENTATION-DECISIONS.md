@@ -1,6 +1,6 @@
 # Implementation decisions and review items
 
-Status: working log, 2026-10-10.
+Status: working log, 2026-10-12.
 
 This file records choices made while implementing the plan. A recorded choice does not
 make a hardware gate, a human review, or an external resource available. Update the
@@ -11537,3 +11537,68 @@ measuring L-15 remain open.
   the repository's existing no-check, missing-check and planned diagnostics;
   `check_drift.py` reported no upstream changes and valid golden files;
   `git diff --check` passed.
+
+### D-IMPL-390: Compose the Prefill QSA selection-to-output tail
+
+- **Decision:** Add `encode_prefill_qsa_tail` as an ordered coordinator for
+  QSA selection, sparse attention, optional attention FWHT256, F16 gating and
+  native `attn_output` projection. Require common StepRows, selected-ID and
+  merged-attention producer/consumer handoffs, shared chunk/merge scratch, and
+  a preflight of mode-specific active extents and cross-stage writable aliases.
+  Keep both a standalone transactional wrapper and a caller-owned Encoder
+  form. The coordinator stops at this tail; it does not append KV/indexer
+  state or schedule a production Prefill layer.
+- **Reason:** The documented QSA order places selection, sparse attention,
+  optional O-class rotation, gate and output projection together after earlier
+  projections and state appends. Existing per-stage APIs already validate
+  their own buffers, but callers otherwise had to reconstruct cross-stage
+  handoffs and ensure every late failure discarded the same command segment.
+  This coordinator makes that ordering and alias policy explicit while
+  keeping the incomplete Prefill host scheduler honest.
+- **Test-fixture judgment:** Generate deterministic high-entropy Q8_0 codes
+  and varied representable F16 scales across output columns and blocks. The
+  earlier periodic codes produced strongly correlated projections and made
+  the row-wise relative error check depend on accidental cancellation; one
+  uniform scale also could not detect a wrong block-scale lookup. A broad
+  synthetic weight fixture gives the independent projection oracle meaningful
+  coverage while remaining reproducible.
+- **Review required:** Audit mode-specific KV and scratch byte extents,
+  producer/consumer identity checks, the alias exceptions, failure propagation
+  through both wrappers, serial/concurrent tests for all KV modes, the
+  independent FP64 projection reference and U(2K)/R(2^-16) tolerances, and
+  canary coverage for the gate, dequantized-weight scratch and projected
+  output. Exercise the complete tail with and without FWHT256. Review that
+  documentation does not imply KV/indexer append or production
+  `Prefill::run` integration.
+- **Validation:** `mac-dev` built successfully. Serial and concurrent
+  `metal_attn_test` CTests passed 2/2 with all four KV modes both with and
+  without FWHT256, scalar attention/gate checks, independent FP64 projection
+  checks, direct output-component parity, output canaries, mismatched handoff
+  and partial-alias rejection, and late full-tail rollback. Adversarial
+  findings and final checks are recorded in REV-186.
+
+### REV-186: Adversarial review of Prefill QSA selection-to-output tail
+
+- **Scope:** Review active KV/scratch/projection extents, selection and
+  attention producer/consumer identity, writable aliases, standalone and
+  caller-owned rollback, output-projection oracle quality, output canaries,
+  both FWHT choices in all KV modes, and documentation scope.
+- **Findings:** The first review found that projected Y had no independent
+  expected result and that gate, dequantized-weight scratch and Y lacked
+  canary checks (P2). Follow-up review found uniform Q8_0 block scales, which
+  could not expose a wrong block-scale lookup (P2), then found that the
+  no-FWHT full-tail case covered only F16 KV while documentation implied all
+  modes (P3). The final review confirmed the corrected matrix and reported no
+  remaining actionable issue.
+- **Disposition:** Added a CPU Q8_0 decode and F16-product FP64 projection
+  oracle checked under U(2K) and R(2^-16), plus active-range guard checks for
+  gate, dequantized weights and projected Y. The fixture now uses deterministic
+  high-entropy codes and varied representable block scales. Every KV mode now
+  exercises the full tail with and without FWHT256; serial tests use the
+  standalone wrapper and concurrent tests use the caller-owned Encoder form.
+  Documentation records the synthetic-weight limitation and keeps KV/indexer
+  append and production `Prefill::run` marked pending.
+- **Validation:** `mac-dev` built successfully; serial and concurrent
+  `metal_attn_test` CTests passed 2/2. `test_map.py` passed with the existing
+  no-check, missing-check and planned diagnostics; `check_drift.py` reported
+  no upstream changes and valid golden files; `git diff --check` passed.
