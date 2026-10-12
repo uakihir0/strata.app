@@ -250,11 +250,11 @@
     },
     "metal_attn_test": {
       "label": "metal",
-      "origin": "04 §5.6/§6.5/§10.5, 09 9.1, D-IMPL-386/387/390, REV-182/183/186"
+      "origin": "04 §5.6/§6.5/§10.5, 09 9.1, D-IMPL-386/387/390/392, REV-182/183/186/188"
     },
     "metal_attn_test_concurrent": {
       "label": "metal",
-      "origin": "04 §5.6/§6.5/§10.5, 09 9.1, D-IMPL-386/387/390, REV-182/183/186"
+      "origin": "04 §5.6/§6.5/§10.5, 09 9.1, D-IMPL-386/387/390/392, REV-182/183/186/188"
     },
     "metal_context_test": {
       "label": "metal",

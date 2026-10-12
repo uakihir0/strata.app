@@ -11668,3 +11668,66 @@ measuring L-15 remain open.
   after the final test additions. All shortened-view cases fail during
   preflight with no command dispatch or arena change. `test_map.py`,
   `check_drift.py` and `git diff --check` passed.
+
+### D-IMPL-392: Compose Prefill QSA preparation with its attention tail
+
+- **Decision:** Add `encode_prefill_qsa_layer` to connect the projected-row
+  preparation coordinator (steps 3–9) to selection, attention, optional
+  output FWHT, gate and native output projection in one ordered segment.
+  Preflight exact producer-to-consumer handoffs for StepRows, qcur, indexer
+  query/state and mode-specific K/V cache storage. Keep both the transactional
+  standalone API and caller-owned Encoder API. The API consumes projected
+  rows and does not claim to schedule input projections or production
+  `Prefill::run`.
+- **Reason:** Correct stage implementations are not enough if the layer can
+  accidentally connect unrelated intermediate buffers. A composed boundary
+  can enforce each known handoff and preserve one ordering/failure boundary
+  while exposing the missing projection and production scheduling work.
+- **Test-fixture judgment:** Use all four cache formats and nonzero synthetic
+  Q8_0 weights. Compare each preparation, selection, attention, gate and output
+  stage to independent scalar oracles, with FP64 projection bounds. Trigger a
+  wrong mode-specific KV handoff in each format and reject it before dispatch.
+  Trigger a late tail-view failure only after preparation has encoded, and
+  compare raw input/cache/indexer bytes to establish rollback. Run the cases in
+  serial and concurrent dispatch configurations.
+- **Review required:** Audit buffer identity and active-range compatibility
+  across every mode, ensure each producer feeds the expected tail consumer,
+  inspect propagation of failures through both APIs, and challenge the scalar
+  and projection oracles. Keep all claims scoped to projected-row synthetic
+  layer integration until input projections and production scheduling exist.
+- **Validation:** `mac-dev` built successfully. Focused serial and concurrent
+  `metal_attn_test` CTests passed 2/2 after the final handoff and rollback
+  assertions. The full `mac-metal` run completed 86/90 tests; four other tests
+  timed out: `metal_sampler_parity_test_concurrent`,
+  `metal_prefill_gemm_auto_test_concurrent`, `metal_gr_test` and
+  `metal_gdn_test`. `test_map.py`, `check_drift.py` and `git diff --check`
+  passed. Final adversarial review found no high-risk issues.
+
+### REV-188: Adversarial review of Prefill QSA layer composition
+
+- **Scope:** Review mode-specific producer/consumer handoffs, format dispatch,
+  serial and concurrent coverage, independent per-stage and FP64 projection
+  oracles, late transactional rollback, API limitations and documentation
+  claims.
+- **Findings:** First pass found missing all-format coordinator coverage, a
+  missing late rollback case and a zero-weight projection fixture (P2), plus
+  missing documentation (P3). After those were fixed, follow-ups found
+  incomplete rollback snapshots, a missing successful block-position oracle,
+  absent mode-specific handoff rejection cases and no explicit pre-dispatch
+  evidence (P2/P3). The final review found no high-risk issues.
+- **Disposition:** Compare raw bytes for projected K/V/Q and the relevant
+  norm/RoPE/indexer inputs and outputs, cache data/scales, and indexer
+  tail/dead/pool/block position on rollback. Compare the device block position
+  with the independent indexer oracle on success. The four KV modes each run
+  successful composition and an intentionally miswired KV handoff; require
+  the exact preflight error, a null native command handle and discarded commit
+  for every miswired case.
+- **Validation:** Updated `mac-dev` build and focused serial/concurrent
+  `metal_attn_test` CTests passed 2/2. All four modes pass composition and
+  reject a deliberately miswired format-specific KV view with the exact
+  preflight error, null native command handle and discarded commit. Rollback
+  snapshots include raw projection/StepRows/norm/RoPE/indexer/cache bytes, and
+  successful indexer block position matches the scalar oracle. `test_map.py`,
+  `check_drift.py` and `git diff --check` passed. The full `mac-metal` run
+  completed 86/90 tests; the four named timeouts above did not exercise this
+  coordinator.
