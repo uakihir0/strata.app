@@ -1,4 +1,4 @@
-// GPU twin for the isolated Prefill Q2_0 MoE down tile (docs/mac/04 §6.6).
+// GPU twin for isolated Prefill Q2_0/IQ4_NL MoE down tiles (docs/mac/04 §6.6).
 #include "metallib_sha256.inc"
 
 #include "strata/kernels/f16_bits.hpp"
@@ -31,11 +31,18 @@ constexpr std::uint32_t kExperts = 256u;
 constexpr std::uint32_t kSecondExpert = 3u;
 constexpr std::uint32_t kLayer = 2u;
 constexpr std::size_t kQ2BlocksPerRow = 10u;
+constexpr std::size_t kIQ4NLBlocksPerRow = 20u;
 constexpr std::size_t kQ2BlockBytes = 18u;
 constexpr std::uint8_t kPoison = 0xa5u;
 constexpr std::uint8_t kGuardPoison = 0xffu;
 
+enum class WeightFormat { q2_0, iq4_nl };
 enum class DestinationCorruption { none, out_of_range, duplicate };
+
+constexpr std::array<std::int8_t, 16u> kIQ4NLCodebook{
+    -127, -104, -83, -65, -49, -35, -22, -10,
+       1,   13,  25,  38,  53,  69,  89, 113,
+};
 
 struct PfPlan {
     std::uint32_t n_groups = 0u;
@@ -76,6 +83,12 @@ void check(bool condition, const std::string& label,
 template <class T>
 std::span<T> typed(twin::GuardedBuffer& buffer) {
     return {reinterpret_cast<T*>(buffer.payload().data()),
+            buffer.payload().size() / sizeof(T)};
+}
+
+template <class T>
+std::span<const T> typed(const twin::GuardedBuffer& buffer) {
+    return {reinterpret_cast<const T*>(buffer.payload().data()),
             buffer.payload().size() / sizeof(T)};
 }
 
@@ -128,7 +141,16 @@ void store_code(block_q2_0& block, std::size_t k, std::uint8_t code) {
         static_cast<std::uint8_t>(code << shift));
 }
 
-void fill_weights(twin::GuardedBuffer& buffer, std::uint32_t expert) {
+void store_iq4_nl_code(block_iq4_nl& block, std::size_t k,
+                       std::uint8_t code) {
+    const std::size_t byte = k & 15u;
+    const std::size_t shift = (k >> 4u) * 4u;
+    block.qs[byte] = static_cast<std::uint8_t>(
+        (block.qs[byte] & static_cast<std::uint8_t>(~(0x0fu << shift))) |
+        static_cast<std::uint8_t>(code << shift));
+}
+
+void fill_q2_weights(twin::GuardedBuffer& buffer, std::uint32_t expert) {
     auto blocks = typed<block_q2_0>(buffer);
     for (std::uint32_t row = 0u; row < kWidth; ++row) {
         for (std::size_t block_index = 0u;
@@ -150,7 +172,41 @@ void fill_weights(twin::GuardedBuffer& buffer, std::uint32_t expert) {
     }
 }
 
-double dot_oracle(std::span<const block_q2_0> weights, std::size_t row) {
+void fill_iq4_nl_weights(twin::GuardedBuffer& buffer,
+                          std::uint32_t expert) {
+    auto blocks = typed<block_iq4_nl>(buffer);
+    for (std::uint32_t row = 0u; row < kWidth; ++row) {
+        for (std::size_t block_index = 0u;
+             block_index < kIQ4NLBlocksPerRow; ++block_index) {
+            block_iq4_nl& block =
+                blocks[static_cast<std::size_t>(row) * kIQ4NLBlocksPerRow +
+                       block_index];
+            block.d = block_index % 2u == 0u
+                          ? 0x3a66u  // F16 0.7998046875.
+                          : 0x2800u; // F16 0.03125.
+            std::fill(std::begin(block.qs), std::end(block.qs), 0u);
+            for (std::size_t k = 0u; k < 32u; ++k) {
+                const std::size_t global_k = block_index * 32u + k;
+                const std::uint8_t code = static_cast<std::uint8_t>(
+                    (row * 7u + global_k * 5u + expert * 3u +
+                     global_k / 32u) %
+                    16u);
+                store_iq4_nl_code(block, k, code);
+            }
+        }
+    }
+}
+
+void fill_weights(twin::GuardedBuffer& buffer, std::uint32_t expert,
+                  WeightFormat format) {
+    if (format == WeightFormat::q2_0) {
+        fill_q2_weights(buffer, expert);
+    } else {
+        fill_iq4_nl_weights(buffer, expert);
+    }
+}
+
+double dot_q2_oracle(std::span<const block_q2_0> weights, std::size_t row) {
     double result = 0.0;
     for (std::size_t k = 0u; k < kHidden; ++k) {
         const block_q2_0& block =
@@ -158,11 +214,63 @@ double dot_oracle(std::span<const block_q2_0> weights, std::size_t row) {
         const std::uint8_t packed = block.qs[(k % 64u) / 4u];
         const int code =
             static_cast<int>((packed >> (2u * (k % 4u))) & 3u) - 1;
-        result += static_cast<double>(base_value(k)) *
-                  static_cast<double>(f32(block.d)) *
-                  static_cast<double>(code);
+        const float decoded =
+            f32(half(f32(block.d) * static_cast<float>(code)));
+        result += static_cast<double>(base_value(k)) * decoded;
     }
     return result;
+}
+
+double dot_iq4_nl_oracle(std::span<const block_iq4_nl> weights,
+                         std::size_t row,
+                         bool round_weights_to_f16 = true) {
+    double result = 0.0;
+    for (std::size_t k = 0u; k < kHidden; ++k) {
+        const std::size_t within_block = k % 32u;
+        const block_iq4_nl& block =
+            weights[row * kIQ4NLBlocksPerRow + k / 32u];
+        const std::uint8_t packed = block.qs[within_block & 15u];
+        const std::size_t shift = (within_block >> 4u) * 4u;
+        const std::uint8_t code =
+            static_cast<std::uint8_t>((packed >> shift) & 0x0fu);
+        const float dequantized =
+            f32(block.d) * static_cast<float>(kIQ4NLCodebook[code]);
+        const float decoded = round_weights_to_f16
+                                  ? f32(half(dequantized))
+                                  : dequantized;
+        result += static_cast<double>(base_value(k)) * decoded;
+    }
+    return result;
+}
+
+double dot_oracle(twin::GuardedBuffer& weights, WeightFormat format,
+                  std::size_t row) {
+    return format == WeightFormat::q2_0
+               ? dot_q2_oracle(typed<block_q2_0>(weights), row)
+               : dot_iq4_nl_oracle(typed<block_iq4_nl>(weights), row);
+}
+
+bool encode_down(Context& context, Encoder& encoder, WeightFormat format,
+                 std::uint32_t rows, const PrefillMoeDownTileBuffers& buffers,
+                 std::string& error) {
+    if (format == WeightFormat::q2_0) {
+        return encode_prefill_moe_down_q2_0(
+            context, encoder, rows, kExperts, kLayer, buffers, error);
+    }
+    return encode_prefill_moe_down_iq4_nl(
+        context, encoder, rows, kExperts, kLayer, buffers, error);
+}
+
+bool encode_down(Context& context, CommandBuffer& command_buffer,
+                 WeightFormat format, std::uint32_t rows,
+                 const PrefillMoeDownTileBuffers& buffers,
+                 std::string& error) {
+    if (format == WeightFormat::q2_0) {
+        return encode_prefill_moe_down_q2_0(
+            context, command_buffer, rows, kExperts, kLayer, buffers, error);
+    }
+    return encode_prefill_moe_down_iq4_nl(
+        context, command_buffer, rows, kExperts, kLayer, buffers, error);
 }
 
 std::size_t round_up_div(std::size_t value, std::size_t divisor) {
@@ -170,14 +278,17 @@ std::size_t round_up_div(std::size_t value, std::size_t divisor) {
            static_cast<std::size_t>(value % divisor != 0u);
 }
 
-bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
-              bool missing_second_expert = false,
-              bool malformed_tile = false,
-              DestinationCorruption destination_corruption =
+bool run_case(Context& context, WeightFormat format, std::uint32_t rows,
+              bool caller_owned,
+                  bool missing_second_expert = false,
+                  bool malformed_tile = false,
+                  DestinationCorruption destination_corruption =
                   DestinationCorruption::none) {
     const std::size_t entries = static_cast<std::size_t>(rows) * 10u;
+    const std::string format_name =
+        format == WeightFormat::q2_0 ? "Q2_0" : "IQ4_NL";
     const std::string label =
-        "Prefill Q2_0 down tile T=" + std::to_string(rows) +
+        "Prefill " + format_name + " down tile T=" + std::to_string(rows) +
         (caller_owned ? " caller-owned" : " standalone") +
         (missing_second_expert ? " missing-address" : "") +
         (malformed_tile ? " malformed-tile" : "") +
@@ -199,6 +310,9 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
         round_up_div(entries, 64u) + 512u;
     const std::size_t tile_capacity =
         round_up_div(entries, 64u) + std::min<std::size_t>(kExperts, entries);
+    const std::size_t weight_blocks_per_row =
+        format == WeightFormat::q2_0 ? kQ2BlocksPerRow
+                                     : kIQ4NLBlocksPerRow;
     const std::size_t plan_table_bytes =
         (static_cast<std::size_t>(kLayer) + 1u) *
         kPrefillMoePlanStrideBytes;
@@ -206,7 +320,7 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
         (static_cast<std::size_t>(kLayer) + 1u) * kExperts *
         sizeof(PrefillMoeExpertAddress);
     const std::size_t weight_bytes =
-        kWidth * kQ2BlocksPerRow * kQ2BlockBytes;
+        kWidth * weight_blocks_per_row * kQ2BlockBytes;
     const std::size_t parts_bytes =
         entries * kWidth * sizeof(float);
 
@@ -215,6 +329,10 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
     twin::GuardedBuffer address_snapshot, weights0, weights3, hidden;
     twin::GuardedBuffer parts, status, alias_storage;
     std::string error;
+    const std::string weight0_label =
+        label + " expert 0 down " + format_name;
+    const std::string weight3_label =
+        label + " expert 3 down " + format_name;
     const bool allocated =
         ids.allocate(context, label + " IDs", route_bytes, error) &&
         resident.allocate(context, label + " residency",
@@ -238,10 +356,8 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
         address_snapshot.allocate(
             context, label + " address snapshot",
             kExperts * sizeof(PrefillMoeExpertAddress), error) &&
-        weights0.allocate(context, label + " expert 0 down Q2_0",
-                          weight_bytes, error) &&
-        weights3.allocate(context, label + " expert 3 down Q2_0",
-                          weight_bytes, error) &&
+        weights0.allocate(context, weight0_label, weight_bytes, error) &&
+        weights3.allocate(context, weight3_label, weight_bytes, error) &&
         hidden.allocate(context, label + " grouped F16 hidden",
                         hidden_bytes, error) &&
         parts.allocate(context, label + " down parts", parts_bytes + 64u,
@@ -263,8 +379,19 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
               typed<std::int32_t>(resident).end(), 0);
     std::fill(addresses.payload().begin(), addresses.payload().end(), 0u);
     std::fill(mixed.payload().begin(), mixed.payload().end(), 0u);
-    fill_weights(weights0, 0u);
-    fill_weights(weights3, kSecondExpert);
+    fill_weights(weights0, 0u, format);
+    fill_weights(weights3, kSecondExpert, format);
+    if (format == WeightFormat::iq4_nl && rows == 1u && !caller_owned) {
+        const auto iq4_weights = typed<block_iq4_nl>(weights0);
+        const double rounded = dot_iq4_nl_oracle(iq4_weights, 0u);
+        const double unrounded =
+            dot_iq4_nl_oracle(iq4_weights, 0u, false);
+        const double tolerance = 2.0e-5 + std::abs(rounded) * 2.0e-5;
+        check(std::abs(rounded - unrounded) > tolerance,
+              label + " IQ4_NL fixture detects F16 weight rounding",
+              "rounded=" + std::to_string(rounded) +
+                  " unrounded=" + std::to_string(unrounded));
+    }
 
     auto route_ids = typed<std::int32_t>(ids);
     for (std::size_t route = 0u; route < entries; ++route) {
@@ -345,9 +472,8 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
                 return encode_prefill_moe_grouping(
                            context, encoder, rows, kExperts, false, kLayer,
                            grouping, encode_error) &&
-                       encode_prefill_moe_down_q2_0(
-                           context, encoder, rows, kExperts, kLayer, down,
-                           encode_error);
+                       encode_down(context, encoder, format, rows, down,
+                                   encode_error);
             },
             error);
         check(encoded, label + " composed encode", error);
@@ -388,8 +514,7 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
         check(down_command != nullptr, label + " down command buffer", error);
         if (!down_command) return false;
         completed =
-            encode_prefill_moe_down_q2_0(
-                context, *down_command, rows, kExperts, kLayer, down, error) &&
+            encode_down(context, *down_command, format, rows, down, error) &&
             down_command->commit(error) &&
             down_command->wait_until_completed(error);
         check(completed, label + " down completion", error);
@@ -427,12 +552,10 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
     auto actual_parts = typed<float>(parts);
     bool outputs_match = true;
     double max_abs_error = 0.0;
-    const auto weight0 = typed<block_q2_0>(weights0);
-    const auto weight3 = typed<block_q2_0>(weights3);
     std::vector<double> base_output(2u * kWidth);
     for (std::size_t output = 0u; output < kWidth; ++output) {
-        base_output[output] = dot_oracle(weight0, output);
-        base_output[kWidth + output] = dot_oracle(weight3, output);
+        base_output[output] = dot_oracle(weights0, format, output);
+        base_output[kWidth + output] = dot_oracle(weights3, format, output);
     }
     const auto actual_destinations = typed<std::int32_t>(destination);
     for (std::size_t grouped = 0u; grouped < entries; ++grouped) {
@@ -473,7 +596,7 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
     }
     check(outputs_match,
           label + " route-restored F32 down parts match independent scalar "
-                  "Q2_0 dot oracle",
+                  "format-specific dot oracle",
           "max_abs_error=" + std::to_string(max_abs_error));
 
     const bool tails_ok =
@@ -502,9 +625,7 @@ bool run_case(Context& context, std::uint32_t rows, bool caller_owned,
           label + " alias rejection command buffer", error);
     if (!alias_command) return false;
     const bool alias_rejected =
-        !encode_prefill_moe_down_q2_0(
-            context, *alias_command, rows, kExperts, kLayer, alias_down,
-            error) &&
+        !encode_down(context, *alias_command, format, rows, alias_down, error) &&
         error.find("overlaps") != std::string::npos &&
         alias_command->unsafe_native_handle() == nullptr &&
         std::equal(before_alias.begin(), before_alias.end(),
@@ -531,15 +652,19 @@ int main(int argc, char** argv) {
     check(context != nullptr, "open Metal Context", error);
     if (!context) return 1;
 
-    bool passed = run_case(*context, 1u, false);
-    passed &= run_case(*context, 7u, true);
-    passed &= run_case(*context, 7u, false, true);
-    passed &= run_case(*context, 7u, false, false, true);
-    passed &= run_case(*context, 7u, false, false, false,
-                       DestinationCorruption::out_of_range);
-    passed &= run_case(*context, 7u, false, false, false,
-                       DestinationCorruption::duplicate);
-    std::printf("%s Prefill Q2_0 down tile GPU twin (%d failures)\n",
+    bool passed = true;
+    for (const WeightFormat format :
+         std::array{WeightFormat::q2_0, WeightFormat::iq4_nl}) {
+        passed &= run_case(*context, format, 1u, false);
+        passed &= run_case(*context, format, 7u, true);
+        passed &= run_case(*context, format, 7u, false, true);
+        passed &= run_case(*context, format, 7u, false, false, true);
+        passed &= run_case(*context, format, 7u, false, false, false,
+                           DestinationCorruption::out_of_range);
+        passed &= run_case(*context, format, 7u, false, false, false,
+                           DestinationCorruption::duplicate);
+    }
+    std::printf("%s Prefill down tile GPU twin (%d failures)\n",
                 passed ? "PASS" : "FAIL", g_failures);
     return passed && g_failures == 0 ? 0 : 1;
 }

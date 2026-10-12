@@ -1,4 +1,4 @@
-// Validated Prefill MoE Q2_0 down-tile encoder.
+// Validated Prefill MoE F16-activation down-tile encoder.
 #include "strata/metal/prefill_moe_down_dispatch.hpp"
 
 #include "strata/metal/encoder.hpp"
@@ -29,8 +29,9 @@ constexpr std::size_t kHalfBytes = sizeof(std::uint16_t);
 constexpr std::size_t kFloatBytes = sizeof(float);
 constexpr std::size_t kQ2BlockBytes = 18u;
 constexpr std::size_t kQ2BlocksPerRow = kHiddenWidth / 64u;
-constexpr std::size_t kQ2ExpertBytes =
-    kModelWidth * kQ2BlocksPerRow * kQ2BlockBytes;
+constexpr std::size_t kIQ4NLBlocksPerRow = kHiddenWidth / 32u;
+
+enum class WeightFormat : std::uint32_t { q2_0 = 0u, iq4_nl = 1u };
 
 struct PrefillMoeExpertAddress {
     std::uint64_t role[3]{};
@@ -118,13 +119,13 @@ bool validate_read_view(Context& context, ReadOnlyBufferRef view,
                         std::size_t required_bytes, std::size_t alignment,
                         std::string_view name, std::string& error) {
     if (!view || !context.buffers().owns(view)) {
-        error = "Prefill MoE Q2_0 down " + std::string(name) +
+        error = "Prefill MoE down " + std::string(name) +
                 " view is not owned by this Context";
         return false;
     }
     if (view.length() < required_bytes || alignment == 0u ||
         view.offset() % alignment != 0u) {
-        error = "Prefill MoE Q2_0 down " + std::string(name) +
+        error = "Prefill MoE down " + std::string(name) +
                 " view is undersized or misaligned";
         return false;
     }
@@ -135,13 +136,13 @@ bool validate_write_view(Context& context, BufferRef view,
                          std::size_t required_bytes, std::size_t alignment,
                          std::string_view name, std::string& error) {
     if (!view || !context.buffers().owns(view)) {
-        error = "Prefill MoE Q2_0 down " + std::string(name) +
+        error = "Prefill MoE down " + std::string(name) +
                 " view is not owned by this Context";
         return false;
     }
     if (view.length < required_bytes || alignment == 0u ||
         view.offset % alignment != 0u) {
-        error = "Prefill MoE Q2_0 down " + std::string(name) +
+        error = "Prefill MoE down " + std::string(name) +
                 " view is undersized or misaligned";
         return false;
     }
@@ -159,9 +160,11 @@ BufferRef active_view(BufferRef view, std::size_t active_bytes) {
 
 bool validate_dispatch(
     Context& context, std::uint32_t rows, std::uint32_t n_experts,
-    std::uint32_t layer, const PrefillMoeDownTileBuffers& buffers,
+    std::uint32_t layer, WeightFormat format,
+    const PrefillMoeDownTileBuffers& buffers,
     std::size_t& selected_address_offset, std::size_t& address_bytes,
-    std::size_t& selected_address_bytes, std::size_t& hidden_bytes,
+    std::size_t& selected_address_bytes, std::size_t& weight_expert_bytes,
+    std::size_t& hidden_bytes,
     std::size_t& plan_bytes, std::size_t& tile_capacity,
     std::size_t& tile_bytes, std::size_t& destination_bytes,
     std::size_t& destination_seen_bytes, std::size_t& parts_bytes,
@@ -170,27 +173,29 @@ bool validate_dispatch(
     std::array<std::uint8_t, 512u>& tiered_lease_mask,
     std::string& error) {
     if (rows == 0u || rows > kPrefillMaxShaderRows) {
-        error = "Prefill MoE Q2_0 down row count exceeds the shader-safe range";
+        error = "Prefill MoE down row count exceeds the shader-safe range";
         return false;
     }
     if (n_experts != 256u && n_experts != 512u) {
-        error = "Prefill MoE Q2_0 down supports 256 or 512 experts";
+        error = "Prefill MoE down supports 256 or 512 experts";
         return false;
     }
     if (layer >= kPrefillMoePlanLayers) {
-        error = "Prefill MoE Q2_0 down layer is outside the PfPlan table";
+        error = "Prefill MoE down layer is outside the PfPlan table";
         return false;
     }
 
     const std::size_t entries =
         static_cast<std::size_t>(rows) * kPrefillMoeTopK;
     if (entries > std::numeric_limits<std::uint32_t>::max()) {
-        error = "Prefill MoE Q2_0 down entries exceed shader indexing";
+        error = "Prefill MoE down entries exceed shader indexing";
         return false;
     }
     tile_capacity =
         round_up_div(entries, kTileRows) +
         std::min<std::size_t>(n_experts, entries);
+    const std::size_t weight_blocks_per_row =
+        format == WeightFormat::q2_0 ? kQ2BlocksPerRow : kIQ4NLBlocksPerRow;
     if (!checked_product(
             {static_cast<std::size_t>(layer) + 1u, n_experts,
              sizeof(PrefillMoeExpertAddress)},
@@ -200,6 +205,8 @@ bool validate_dispatch(
                         selected_address_offset) ||
         !checked_product({n_experts, sizeof(PrefillMoeExpertAddress)},
                         selected_address_bytes) ||
+        !checked_product({kModelWidth, weight_blocks_per_row, kQ2BlockBytes},
+                         weight_expert_bytes) ||
         !checked_product({entries, kHiddenWidth, kHalfBytes}, hidden_bytes) ||
         !checked_product({tile_capacity, sizeof(std::uint32_t) * 2u},
                          tile_bytes) ||
@@ -208,11 +215,11 @@ bool validate_dispatch(
         !checked_product({round_up_div(entries, 32u), sizeof(std::uint32_t)},
                          destination_seen_bytes) ||
         !checked_product({entries, kModelWidth, kFloatBytes}, parts_bytes)) {
-        error = "Prefill MoE Q2_0 down buffer size overflows size_t";
+        error = "Prefill MoE down buffer size overflows size_t";
         return false;
     }
     if (destination_seen_bytes > parts_bytes) {
-        error = "Prefill MoE Q2_0 down destination validation scratch exceeds "
+        error = "Prefill MoE down destination validation scratch exceeds "
                 "the output buffer";
         return false;
     }
@@ -241,14 +248,14 @@ bool validate_dispatch(
         return false;
     }
     if (buffers.status.contents == nullptr) {
-        error = "Prefill MoE Q2_0 down status buffer is not host-writable";
+        error = "Prefill MoE down status buffer is not host-writable";
         return false;
     }
 
     const ReadOnlyBufferRef selected_addresses = buffers.addresses.slice(
         selected_address_offset, selected_address_bytes);
     if (!selected_addresses || selected_addresses.contents() == nullptr) {
-        error = "Prefill MoE Q2_0 down selected address row is not host-readable";
+        error = "Prefill MoE down selected address row is not host-readable";
         return false;
     }
 
@@ -264,7 +271,7 @@ bool validate_dispatch(
         overlaps(address_snapshot_output,
                  read_range(buffers.addresses, buffers.addresses.length(),
                             "address table"))) {
-        error = "Prefill MoE Q2_0 down address snapshot or output aliases an "
+        error = "Prefill MoE down address snapshot or output aliases an "
                 "active input or output";
         return false;
     }
@@ -281,7 +288,7 @@ bool validate_dispatch(
         if (overlaps(parts_output, input) ||
             overlaps(status_output, input) ||
             overlaps(address_snapshot_output, input)) {
-            error = "Prefill MoE Q2_0 down address snapshot or output overlaps "
+            error = "Prefill MoE down address snapshot or output overlaps "
                     "active " +
                     std::string(input.name);
             return false;
@@ -289,7 +296,7 @@ bool validate_dispatch(
     }
 
     if (buffers.weight_storage.empty()) {
-        error = "Prefill MoE Q2_0 down has no weight storage views";
+        error = "Prefill MoE down has no weight storage views";
         return false;
     }
     for (const PrefillMoeWeightStorageView& weight_storage :
@@ -300,7 +307,7 @@ bool validate_dispatch(
             weight_storage.buffer.contents() == nullptr ||
             weight_storage.buffer.gpu_address() == 0u) {
             if (error.empty()) {
-                error = "Prefill MoE Q2_0 down weight storage has no GPU "
+                error = "Prefill MoE down weight storage has no GPU "
                         "address or host mapping";
             }
             return false;
@@ -309,7 +316,7 @@ bool validate_dispatch(
                      read_range(weight_storage.buffer,
                                 weight_storage.buffer.length(),
                                 "weight storage"))) {
-            error = "Prefill MoE Q2_0 down address snapshot overlaps expert "
+            error = "Prefill MoE down address snapshot overlaps expert "
                     "weight storage";
             return false;
         }
@@ -322,7 +329,7 @@ bool validate_dispatch(
         const std::uint64_t address = host_address_snapshot[expert].role[2];
         if (address == 0u) continue;
         if (address % alignof(std::uint16_t) != 0u) {
-            error = "Prefill MoE Q2_0 down weight address is misaligned";
+            error = "Prefill MoE down weight address is misaligned";
             return false;
         }
 
@@ -332,22 +339,22 @@ bool validate_dispatch(
              buffers.weight_storage) {
             std::size_t offset = 0u;
             if (!contains_gpu_range(weight_storage.buffer, address,
-                                    kQ2ExpertBytes, offset)) {
+                                    weight_expert_bytes, offset)) {
                 continue;
             }
             const auto cpu_base = reinterpret_cast<std::uintptr_t>(
                 weight_storage.buffer.contents());
             if (offset >
                 std::numeric_limits<std::uintptr_t>::max() - cpu_base) {
-                error = "Prefill MoE Q2_0 down weight host range overflows";
+                error = "Prefill MoE down weight host range overflows";
                 return false;
             }
             const ActiveRange weight{
                 reinterpret_cast<const void*>(cpu_base + offset), address,
-                kQ2ExpertBytes, "Q2_0 down weights"};
+                weight_expert_bytes, "Prefill down weights"};
             if (overlaps(parts_output, weight) ||
                 overlaps(status_output, weight)) {
-                error = "Prefill MoE Q2_0 down output overlaps active "
+                error = "Prefill MoE down output overlaps active "
                         "expert weights";
                 return false;
             }
@@ -356,7 +363,7 @@ bool validate_dispatch(
             break;
         }
         if (!backed) {
-            error = "Prefill MoE Q2_0 down weight address is outside "
+            error = "Prefill MoE down weight address is outside "
                     "provided storage";
             return false;
         }
@@ -365,7 +372,7 @@ bool validate_dispatch(
             tiered_lease_mask[expert] =
                 buffers.tiered_leases != nullptr &&
                         buffers.tiered_leases->pins(layer, address,
-                                                    kQ2ExpertBytes)
+                                                    weight_expert_bytes)
                     ? 1u
                     : 0u;
         }
@@ -375,11 +382,12 @@ bool validate_dispatch(
 
 bool encode_impl(Context& context, Encoder& encoder, std::uint32_t rows,
                  std::uint32_t n_experts, std::uint32_t layer,
+                 WeightFormat format,
                  const PrefillMoeDownTileBuffers& buffers,
                  std::string& error) {
     error.clear();
     if (encoder.concurrent_group_open()) {
-        error = "Prefill MoE Q2_0 down requires an ordered concurrent-group "
+        error = "Prefill MoE down requires an ordered concurrent-group "
                 "boundary";
         return false;
     }
@@ -387,6 +395,7 @@ bool encode_impl(Context& context, Encoder& encoder, std::uint32_t rows,
     std::size_t selected_address_offset = 0u;
     std::size_t address_bytes = 0u;
     std::size_t selected_address_bytes = 0u;
+    std::size_t weight_expert_bytes = 0u;
     std::size_t hidden_bytes = 0u;
     std::size_t plan_bytes = 0u;
     std::size_t tile_capacity = 0u;
@@ -398,9 +407,10 @@ bool encode_impl(Context& context, Encoder& encoder, std::uint32_t rows,
     std::array<PrefillMoeExpertAddress, 512u> address_snapshot{};
     std::array<std::uint8_t, 512u> tiered_lease_mask{};
     if (!validate_dispatch(
-            context, rows, n_experts, layer, buffers,
+            context, rows, n_experts, layer, format, buffers,
             selected_address_offset, address_bytes, selected_address_bytes,
-            hidden_bytes, plan_bytes, tile_capacity, tile_bytes,
+            weight_expert_bytes, hidden_bytes, plan_bytes, tile_capacity,
+            tile_bytes,
             destination_bytes, destination_seen_bytes, parts_bytes,
             requires_tiered_lease,
             address_snapshot, tiered_lease_mask, error)) {
@@ -409,7 +419,7 @@ bool encode_impl(Context& context, Encoder& encoder, std::uint32_t rows,
     if (requires_tiered_lease &&
         (!buffers.tiered_leases ||
          !buffers.tiered_leases->prepared_for(encoder))) {
-        error = "Prefill MoE Q2_0 down requires the matching prepared "
+        error = "Prefill MoE down requires the matching prepared "
                 "ExpertLeaseSet";
         return false;
     }
@@ -425,7 +435,7 @@ bool encode_impl(Context& context, Encoder& encoder, std::uint32_t rows,
     const ReadOnlyBufferRef addresses = context.buffers().read_only(
         active_view(buffers.address_snapshot, snapshot_bytes));
     if (!addresses) {
-        error = "cannot create Prefill MoE Q2_0 down address snapshot view";
+        error = "cannot create Prefill MoE down address snapshot view";
         return false;
     }
 
@@ -521,12 +531,15 @@ bool encode_impl(Context& context, Encoder& encoder, std::uint32_t rows,
         {tiles, 3u, tile_bytes, alignof(std::uint64_t)},
         {destinations, 4u, destination_bytes, alignof(std::uint32_t)},
     }};
-    const std::array<EncoderBytesBinding, 2u> expert_bytes{{
+    const std::uint32_t weight_format =
+        static_cast<std::uint32_t>(format);
+    const std::array<EncoderBytesBinding, 3u> expert_bytes{{
         {&params, sizeof(params), 6u},
         {tiered_lease_mask.data(), n_experts, 8u},
+        {&weight_format, sizeof(weight_format), 9u},
     }};
     if (!encoder.dispatch(
-            "strata_pf_moe_down_q2_0",
+            "strata_pf_moe_down_f16",
             {kTileColumnGroups, tile_capacity, 1u}, {kThreads, 1u, 1u},
             outputs, inputs, expert_bytes, no_threadgroup, error)) {
         return false;
@@ -540,8 +553,16 @@ bool encode_prefill_moe_down_q2_0(
     Context& context, Encoder& encoder, std::uint32_t rows,
     std::uint32_t n_experts, std::uint32_t layer,
     const PrefillMoeDownTileBuffers& buffers, std::string& error) {
-    return encode_impl(context, encoder, rows, n_experts, layer, buffers,
-                       error);
+    return encode_impl(context, encoder, rows, n_experts, layer,
+                       WeightFormat::q2_0, buffers, error);
+}
+
+bool encode_prefill_moe_down_iq4_nl(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    std::uint32_t n_experts, std::uint32_t layer,
+    const PrefillMoeDownTileBuffers& buffers, std::string& error) {
+    return encode_impl(context, encoder, rows, n_experts, layer,
+                       WeightFormat::iq4_nl, buffers, error);
 }
 
 bool encode_prefill_moe_down_q2_0(
@@ -549,10 +570,23 @@ bool encode_prefill_moe_down_q2_0(
     std::uint32_t n_experts, std::uint32_t layer,
     const PrefillMoeDownTileBuffers& buffers, std::string& error) {
     return Encoder::encode(
-        context, command_buffer, "Prefill MoE Q2_0 down tiles",
+        context, command_buffer, "Prefill MoE down tiles",
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_impl(context, encoder, rows, n_experts, layer,
-                               buffers, encode_error);
+                               WeightFormat::q2_0, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_prefill_moe_down_iq4_nl(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    std::uint32_t n_experts, std::uint32_t layer,
+    const PrefillMoeDownTileBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Prefill MoE IQ4_NL down tiles",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_impl(context, encoder, rows, n_experts, layer,
+                               WeightFormat::iq4_nl, buffers, encode_error);
         },
         error);
 }

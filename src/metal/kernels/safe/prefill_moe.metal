@@ -1,5 +1,6 @@
 // Prefill MoE route grouping and F16 row gather (docs/mac/04 §6.6).
 #include <metal_stdlib>
+#include "codebooks.h"
 #include "../common/math.h"
 #include "../common/reduce.h"
 #include "../common/types.h"
@@ -329,6 +330,15 @@ static inline half pf_moe_q2_0_value(
     const int code =
         int((packed >> (2u * (within_block % 4u))) & 0x03u) - 1;
     return half(float(block->d) * float(code));
+}
+
+static inline half pf_moe_iq4_nl_value(
+    device const block_iq4_nl* row_weights, uint k) {
+    const device block_iq4_nl* block = row_weights + k / 32u;
+    const uint within_block = k % 32u;
+    const uint packed = uint(block->qs[within_block & 15u]);
+    const uint code = (packed >> ((within_block >> 4u) * 4u)) & 0x0fu;
+    return half(float(block->d) * float(kvalues_iq4nl[code]));
 }
 
 static inline void pf_moe_zero_output_tile(
@@ -697,10 +707,10 @@ kernel void strata_pf_moe_gu_q2_0(
     }
 }
 
-// A 64-entry x 64-output-column SIMD-group matrix tile for Q2_0 down
-// projection. Inputs stay grouped by expert; dst restores route order.
+// A 64-entry x 64-output-column SIMD-group matrix tile for F16-activation
+// down projection. Inputs stay grouped by expert; dst restores route order.
 [[max_total_threads_per_threadgroup(128)]]
-kernel void strata_pf_moe_down_q2_0(
+kernel void strata_pf_moe_down_f16(
     device const PrefillMoeExpertAddr* addresses [[buffer(0)]],
     device const half* eh [[buffer(1)]],
     device const PfPlan* plans [[buffer(2)]],
@@ -710,6 +720,7 @@ kernel void strata_pf_moe_down_q2_0(
     constant PrefillMoeTileParams& params [[buffer(6)]],
     device atomic_uint* status [[buffer(7)]],
     constant uchar* tiered_lease_mask [[buffer(8)]],
+    constant uint& weight_format [[buffer(9)]],
     uint tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     uint2 group [[threadgroup_position_in_grid]]) {
@@ -725,6 +736,14 @@ kernel void strata_pf_moe_down_q2_0(
     const uint status_bits =
         atomic_load_explicit(status, memory_order_relaxed);
     if ((status_bits & 2u) != 0u) {
+        pf_moe_zero_down_tile(parts, total_entries, tile_index * 64u,
+                              group.x, tid);
+        return;
+    }
+    if (weight_format > 1u) {
+        if (tid == 0u) {
+            atomic_fetch_or_explicit(status, 2u, memory_order_relaxed);
+        }
         pf_moe_zero_down_tile(parts, total_entries, tile_index * 64u,
                               group.x, tid);
         return;
@@ -811,11 +830,19 @@ kernel void strata_pf_moe_down_q2_0(
             const uint tile_k = i / 64u;
             const uint tile_column = i % 64u;
             const uint output_row = group.x * 64u + tile_column;
-            const device block_q2_0* row_weights =
-                reinterpret_cast<device const block_q2_0*>(
-                    address.role[2]) +
-                output_row * 10u;
-            sw[i] = pf_moe_q2_0_value(row_weights, k0 + tile_k);
+            if (weight_format == 0u) {
+                const device block_q2_0* row_weights =
+                    reinterpret_cast<device const block_q2_0*>(
+                        address.role[2]) +
+                    output_row * 10u;
+                sw[i] = pf_moe_q2_0_value(row_weights, k0 + tile_k);
+            } else {
+                const device block_iq4_nl* row_weights =
+                    reinterpret_cast<device const block_iq4_nl*>(
+                        address.role[2]) +
+                    output_row * 20u;
+                sw[i] = pf_moe_iq4_nl_value(row_weights, k0 + tile_k);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

@@ -1,4 +1,4 @@
-// Validated Prefill MoE Q2_0 down-tile encoder.
+// Validated Prefill MoE down-tile encoders.
 #pragma once
 
 #include "strata/metal/prefill_moe_expert_dispatch.hpp"
@@ -15,7 +15,7 @@ struct PrefillMoeDownTileBuffers {
     /// lifetime and pending-command rules documented by
     /// `PrefillMoeExpertTileBuffers::address_snapshot`.
     BufferRef address_snapshot;
-    /// Context-owned allocations backing each non-null Q2_0 down address.
+    /// Context-owned allocations backing each non-null down-weight address.
     std::span<const PrefillMoeWeightStorageView> weight_storage;
     /// Prepared for the same CommandBuffer by `ExpertStore`.
     std::shared_ptr<ExpertLeaseSet> tiered_leases;
@@ -42,8 +42,20 @@ bool encode_prefill_moe_down_q2_0(
     std::uint32_t n_experts, std::uint32_t layer,
     const PrefillMoeDownTileBuffers& buffers, std::string& error);
 
+/// Encode the F16-activation Prefill down tile with IQ4_NL weights.
+bool encode_prefill_moe_down_iq4_nl(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    std::uint32_t n_experts, std::uint32_t layer,
+    const PrefillMoeDownTileBuffers& buffers, std::string& error);
+
 /// Transactional standalone wrapper for `encode_prefill_moe_down_q2_0`.
 bool encode_prefill_moe_down_q2_0(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    std::uint32_t n_experts, std::uint32_t layer,
+    const PrefillMoeDownTileBuffers& buffers, std::string& error);
+
+/// Transactional standalone wrapper for `encode_prefill_moe_down_iq4_nl`.
+bool encode_prefill_moe_down_iq4_nl(
     Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
     std::uint32_t n_experts, std::uint32_t layer,
     const PrefillMoeDownTileBuffers& buffers, std::string& error);
