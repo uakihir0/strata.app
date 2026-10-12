@@ -342,7 +342,8 @@ bool run_case(Context& context, std::uint32_t rows, std::uint32_t experts) {
     }
     const auto buffers = b.views(context);
     const bool encoded = encode_prefill_moe_full_mode_route_gather(
-        context, *command, rows, experts, 0u, buffers, error);
+        context, *command, rows, experts, 0u,
+        PrefillBF16X2Mode::all_projections, buffers, error);
     check(encoded, label + " encode all six steps", error);
     const bool completed =
         encoded && command->commit(error) &&
@@ -483,9 +484,14 @@ bool run_case(Context& context, std::uint32_t rows, std::uint32_t experts) {
         return false;
     }
     const bool rejected = !encode_prefill_moe_full_mode_route_gather(
-        context, *rejected_command, rows, experts, 0u, bad_buffers, error);
+        context, *rejected_command, rows, experts, 0u,
+        PrefillBF16X2Mode::all_projections, bad_buffers, error);
     check(rejected, label + " late route validation rejects short IDs");
-    const bool rollback =
+    const bool discarded =
+        rejected_command->unsafe_native_handle() == nullptr;
+    check(discarded,
+          label + " late validation discards the encoded router prefix");
+    const bool rollback = discarded &&
         std::equal(logits_before.begin(), logits_before.end(),
                    b.logits.payload().begin()) &&
         std::equal(routes_before.begin(), routes_before.end(),
@@ -496,9 +502,55 @@ bool run_case(Context& context, std::uint32_t rows, std::uint32_t experts) {
                    b.plan.payload().begin());
     check(rollback, label + " later validation rolls back router work");
 
+    auto bad_mode_command =
+        context.make_command_buffer(label + " mode 0 rejection", error);
+    if (!bad_mode_command) {
+        check(false, label + " mode validation command buffer", error);
+        return false;
+    }
+    const bool mode_rejected =
+        !encode_prefill_moe_full_mode_route_gather(
+            context, *bad_mode_command, rows, experts, 0u,
+            PrefillBF16X2Mode::off, buffers, error);
+    check(mode_rejected, label + " rejects mode without BF16X2 remainder");
+    check(std::equal(logits_before.begin(), logits_before.end(),
+                     b.logits.payload().begin()),
+          label + " mode rejection happens before dispatch");
+
+    auto alias_weights_command =
+        context.make_command_buffer(label + " cross-stage alias", error);
+    if (!alias_weights_command) {
+        check(false, label + " cross-stage alias command buffer", error);
+        return false;
+    }
+    auto alias_weights = buffers;
+    alias_weights.route_weights = b.mixed_h.view();
+    const bool input_alias_rejected =
+        !encode_prefill_moe_full_mode_route_gather(
+            context, *alias_weights_command, rows, experts, 0u,
+            PrefillBF16X2Mode::all_projections, alias_weights, error);
+    check(input_alias_rejected,
+          label + " rejects route weights aliasing mixed activation");
+
+    auto alias_output_command =
+        context.make_command_buffer(label + " output alias", error);
+    if (!alias_output_command) {
+        check(false, label + " output alias command buffer", error);
+        return false;
+    }
+    auto alias_output = buffers;
+    alias_output.route_weights = b.histogram.view();
+    const bool output_alias_rejected =
+        !encode_prefill_moe_full_mode_route_gather(
+            context, *alias_output_command, rows, experts, 0u,
+            PrefillBF16X2Mode::all_projections, alias_output, error);
+    check(output_alias_rejected,
+          label + " rejects route weights aliasing grouping output");
+
     return router_matches && route_matches && plan_matches && tiles_match &&
            inputs_unchanged && tails_match && guards_match && rejected &&
-           rollback;
+           rollback && mode_rejected && input_alias_rejected &&
+           output_alias_rejected;
 }
 
 }  // namespace

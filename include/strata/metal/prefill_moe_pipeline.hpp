@@ -2,6 +2,7 @@
 #pragma once
 
 #include "strata/metal/prefill_gemm_dispatch.hpp"
+#include "strata/metal/prefill_gr_norm_dispatch.hpp"
 
 #include <cstdint>
 #include <string>
@@ -35,14 +36,19 @@ struct PrefillMoeRouteGatherBuffers {
 /// Encode Prefill MoE steps 1–6 as one ordered full-mode segment:
 /// BF16X2 router projection, divide-mode top-10 routing, stable GPU grouping,
 /// and F16 input gather. Supports T=1..8 and 256 or 512 experts.
+/// The BF16X2 router requires projection mode 1 or 2.
 ///
 /// This composition deliberately excludes tiered mode. Tiered execution
 /// requires host resolution after the plan is produced and an event wait
 /// before expert consumers; callers should encode grouping on its own and
-/// coordinate that handshake with `ExpertStore`.
+/// coordinate that handshake with `ExpertStore`. The caller-owned Encoder
+/// overload may already have encoded a prefix when it returns false; its
+/// enclosing `Encoder::encode` body must propagate that failure so the
+/// command segment is discarded.
 bool encode_prefill_moe_full_mode_route_gather(
     Context& context, Encoder& encoder, std::uint32_t rows,
     std::uint32_t n_experts, std::uint32_t layer,
+    PrefillBF16X2Mode projection_mode,
     const PrefillMoeRouteGatherBuffers& buffers, std::string& error);
 
 /// Transactional standalone form. A failure in route or grouping validation
@@ -50,6 +56,7 @@ bool encode_prefill_moe_full_mode_route_gather(
 bool encode_prefill_moe_full_mode_route_gather(
     Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
     std::uint32_t n_experts, std::uint32_t layer,
+    PrefillBF16X2Mode projection_mode,
     const PrefillMoeRouteGatherBuffers& buffers, std::string& error);
 
 }  // namespace strata::metal
