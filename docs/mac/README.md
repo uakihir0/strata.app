@@ -10,8 +10,9 @@ output-normalization encoders. Isolated F16 and BF16 MPP and SIMD GEMM
 components are implemented with validated host encoders, as are standalone
 IQ4_NL, Q2_0, Q3_K, IQ4_XS, Q4_0, Q4_K, Q5_K, Q5_0, Q6_K, Q8_0 and
 IQ3_S weight-to-K-major-F16 dequantizers. Prefill MoE now also has isolated
-stable route grouping/gather and shared SwiGLU/weighted-combine post-ops;
-expert tile execution and production `Prefill::run` integration remain open.
+stable route grouping/gather and shared SwiGLU/weighted-combine post-ops,
+Q2_0/IQ4_XS gate/up tiles and Q2_0/IQ4_NL down tiles. Six other gate/up
+formats, production MoE scheduling and `Prefill::run` integration remain open.
 MPP requires
 Apple10; the SIMD paths use F32 SIMD-group matrices and are intended for all
 Apple GPU families, but have only been exercised on the current Apple10 Mac.

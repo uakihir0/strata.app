@@ -12186,3 +12186,56 @@ measuring L-15 remain open.
 - **Validation:** After the fixes, `mac-dev` builds, all 10 focused serial and
   concurrent Metal CTests pass, `test_map.py`, `check_drift.py` and
   `git diff --check` pass.
+
+### D-IMPL-401: Add Prefill IQ4_XS gate/up tiles
+
+- **Decision:** Extend the Prefill MoE gate/up tile with IQ4_XS through a
+  format-selected typed encoder that shares the 64×64 SIMD kernel, plan
+  validation, address snapshot, indirect-resource binding, tiered lease
+  checks, status handling and transactional behavior with Q2_0. Validate
+  address extents as 640 rows of ten 136-byte IQ4_XS blocks. Decode each
+  256-value block's eight 32-value groups using the packed six-bit scales and
+  nonlinear IQ4_NL codebook, and round each expanded value to F16 before the
+  matrix accumulation.
+- **Reason:** IQ4_XS is one of the documented Prefill MoE gate/up formats and
+  its block decoder already has independently exercised codebook, nibble and
+  scale paths in the project's Prefill dequant and decoder tests. Adding it
+  next reuses a validated numerical contract while extending the active
+  isolated expert tile without duplicating scheduling and failure logic.
+  Format-specific extents and decoding stay explicit at the API boundary;
+  production tiered schedule resolution and `Prefill::run` remain incomplete.
+- **Fixture judgment:** Run Q2_0 and IQ4_XS through the same T=1/7 grouping,
+  two-expert split, standalone/caller-owned paths and validation cases.
+  Exercise all 16 IQ4_XS codes and 64 packed scale values, use distinct
+  per-position low/high nibbles and row-varying scales, and require an
+  unrounded-weight negative control to differ beyond the four-F16-ULP result
+  tolerance. Decode raw IQ4_XS blocks in the FP64 dot oracle with the
+  independent `strata::dequantize_iq4_xs` reference; check a literal byte
+  anchor with known low/high nibble outputs so the fixture writer and oracle
+  cannot silently share the same nibble-index mistake.
+- **Review required:** See REV-197. Challenge block and nibble indexing,
+  scale extraction and bias, codebook use, F16 conversion, variable expert
+  extents and lease coverage, kernel bindings, test-oracle independence,
+  fixture sensitivity, rollback and the stated implementation boundary.
+- **Validation:** See REV-197 for hostile review and final build, focused
+  serial/concurrent Metal CTests, test-map, drift and whitespace checks.
+
+### REV-197: Adversarial review of Prefill IQ4_XS gate/up tiles
+
+- **Scope:** Audit IQ4_XS block/nibble/scale decoding and F16 conversion,
+  format-specific weight extents and tiered lease coverage, shared-kernel
+  bindings, transactional behavior, fixture/oracle independence and claims.
+- **Findings:** The first review found a P3 common-mode risk: the IQ4_XS
+  fixture writer and CPU oracle repeated the same packed-nibble indexing, so a
+  shared indexing error could agree with the Metal kernel. The follow-up found
+  no remaining actionable issue after the oracle and fixture were changed.
+- **Disposition:** Decode raw blocks for the FP64 dot oracle with the
+  independent `strata::dequantize_iq4_xs` reference instead of duplicating the
+  shader's mapping. Add a literal raw-byte anchor with checked K=41 and K=57
+  outputs for the low and high nibbles of `qs[25]`. Retain full code/scale
+  coverage and the F16-rounding negative control.
+- **Validation:** The reviewer did not run tests. After the fix,
+  `mac-dev` built, all 10 focused serial/concurrent Metal CTests passed,
+  `test_map.py` passed with the documented planned/no-check diagnostics,
+  `check_drift.py` reported no upstream changes and valid golden files, and
+  `git diff --check` passed.
