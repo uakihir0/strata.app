@@ -2,6 +2,7 @@
 #include "metallib_sha256.inc"
 #include "oracles/attention.hpp"
 #include "oracles/qsa.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/metal/context.hpp"
 #include "strata/metal/encoder.hpp"
@@ -2035,7 +2036,7 @@ std::uint16_t half_order_key(std::uint16_t bits) {
 
 bool run_prefill_qsa_layer_case(
     Context& context, QsaAttentionMode mode, const twin::Options& options,
-    bool shared_encoder) {
+    bool shared_encoder, bool projection_pipeline = false) {
     constexpr std::uint32_t kRows = 1u;
     constexpr std::uint32_t kPosition = 31u;
     constexpr std::uint32_t kCapacity = 128u;
@@ -2044,12 +2045,14 @@ bool run_prefill_qsa_layer_case(
         kCapacity / INDEXER_BLOCK_CELLS + 2u;
     constexpr std::uint32_t kProjectionN = 2560u;
     constexpr std::uint32_t kProjectionK = N_HEAD_Q * HEAD_DIM;
+    constexpr std::uint32_t kInputProjectionK = N_EMBD;
     constexpr float kRopeZeroCos = 1.0625f;
     constexpr float kRopeZeroSin = -0.0f;
     const std::string label =
         "Prefill QSA projected-row layer " +
         std::string(mode_name(mode)) +
-        std::string(shared_encoder ? " shared Encoder" : " standalone");
+        std::string(shared_encoder ? " shared Encoder" : " standalone") +
+        (projection_pipeline ? " with input projections" : "");
     std::string error;
 
     PrefillChunkMetadata metadata;
@@ -2151,6 +2154,168 @@ bool run_prefill_qsa_layer_case(
     check(allocated, label + " preparation and output buffers", error);
     if (!allocated) return false;
 
+    twin::GuardedBuffer mixed_h, mixed_bf, attn_k_weights,
+        attn_v_weights, attn_q_weights, indexer_k_weights,
+        indexer_q_weights, projection_dequantized_f16;
+    PrefillQsaProjectionBuffers projection_buffers;
+    PrefillQsaProjectionBufferSizes projection_sizes;
+    if (projection_pipeline) {
+        projection_buffers.attn_k_format =
+            PrefillNativeWeightFormat::Q8_0;
+        projection_buffers.attn_v_format =
+            PrefillNativeWeightFormat::Q8_0;
+        projection_buffers.attn_q_format =
+            PrefillNativeWeightFormat::Q8_0;
+        const bool sized = prefill_qsa_projection_buffer_sizes(
+            kRows, projection_sizes, projection_buffers, error);
+        const bool projection_allocated =
+            sized &&
+            mixed_h.allocate(context, label + " mixed F16", N_EMBD *
+                                 sizeof(std::uint16_t),
+                             error) &&
+            mixed_bf.allocate(context, label + " mixed BF16", N_EMBD *
+                                  sizeof(std::uint16_t),
+                              error) &&
+            attn_k_weights.allocate(
+                context, label + " attn_k Q8_0",
+                projection_sizes.attn_k.weights_bytes, error) &&
+            attn_v_weights.allocate(
+                context, label + " attn_v Q8_0",
+                projection_sizes.attn_v.weights_bytes, error) &&
+            attn_q_weights.allocate(
+                context, label + " attn_q Q8_0",
+                projection_sizes.attn_q.weights_bytes, error) &&
+            indexer_k_weights.allocate(
+                context, label + " indexer.k_proj BF16",
+                projection_sizes.indexer_k_weights_bytes, error) &&
+            indexer_q_weights.allocate(
+                context, label + " indexer.q_proj BF16",
+                projection_sizes.indexer_q_weights_bytes, error) &&
+            projection_dequantized_f16.allocate(
+                context, label + " input projection F16 scratch",
+                projection_sizes.dequantized_f16_bytes, error);
+        check(projection_allocated,
+              label + " input projection buffers allocate", error);
+        if (!projection_allocated) return false;
+
+        auto mixed_h_values = typed<std::uint16_t>(mixed_h);
+        for (std::size_t k = 0u; k < mixed_h_values.size(); ++k) {
+            std::int32_t code = static_cast<std::int32_t>(
+                (k * 13u + (k / 17u) * 7u) % 31u) - 15;
+            if (code == 0) code = 16;
+            mixed_h_values[k] = strata::kernels::f16_from_f32(
+                static_cast<float>(code) * (1.0f / 64.0f));
+        }
+        auto mixed_bf_values = typed<std::uint16_t>(mixed_bf);
+        for (std::size_t k = 0u; k < mixed_bf_values.size(); ++k) {
+            std::int32_t code = static_cast<std::int32_t>(
+                (k * 19u + (k / 29u) * 11u) % 41u) - 20;
+            if (code == 0) code = 21;
+            mixed_bf_values[k] = strata::kernels::bf16_from_f32(
+                static_cast<float>(code) * (1.0f / 128.0f));
+        }
+        constexpr std::array<float, 4u> kQ8Scales{
+            0.0625f, 0.125f, 0.1875f, 0.25f};
+        const auto fill_q8 = [&](twin::GuardedBuffer& native_weights,
+                                 std::size_t salt) {
+            constexpr std::size_t kBlocksPerRow =
+                kInputProjectionK / 32u;
+            auto weights = typed<block_q8_0>(native_weights);
+            const std::size_t outputs = weights.size() / kBlocksPerRow;
+            for (std::size_t output = 0u; output < outputs; ++output) {
+                for (std::size_t block_index = 0u;
+                     block_index < kBlocksPerRow; ++block_index) {
+                    block_q8_0& block =
+                        weights[output * kBlocksPerRow + block_index];
+                    block = {};
+                    block.d = static_cast<strata_half>(
+                        strata::kernels::f16_from_f32(
+                            kQ8Scales[(output * 3u + block_index * 5u +
+                                       salt * 7u) %
+                                      kQ8Scales.size()]));
+                    for (std::size_t lane = 0u; lane < 32u; ++lane) {
+                        const std::size_t code_index =
+                            (output * 7u + block_index * 11u + lane * 13u +
+                             salt * 3u) %
+                            15u;
+                        const std::int32_t code =
+                            static_cast<std::int32_t>(code_index) - 7;
+                        block.qs[lane] = static_cast<strata_i8>(code);
+                    }
+                }
+            }
+        };
+        fill_q8(attn_k_weights, 1u);
+        fill_q8(attn_v_weights, 2u);
+        fill_q8(attn_q_weights, 3u);
+        const auto fill_bf16 = [](twin::GuardedBuffer& native_weights,
+                                  std::size_t outputs, std::size_t salt) {
+            auto weights = typed<std::uint16_t>(native_weights);
+            for (std::size_t output = 0u; output < outputs; ++output) {
+                for (std::size_t k = 0u; k < N_EMBD; ++k) {
+                    std::int32_t code = static_cast<std::int32_t>(
+                        (output * 17u + k * 13u + (k / 7u) * 3u +
+                         salt * 5u) %
+                        31u) -
+                        15;
+                    if (code == 0) code = 16;
+                    weights[output * N_EMBD + k] =
+                        strata::kernels::bf16_from_f32(
+                            static_cast<float>(code) * (1.0f / 256.0f));
+                }
+            }
+        };
+        fill_bf16(indexer_k_weights, INDEXER_HEAD_DIM, 1u);
+        fill_bf16(indexer_q_weights,
+                  INDEXER_HEADS * INDEXER_HEAD_DIM, 2u);
+        const auto has_nonzero_channel_variation = [](
+            std::span<const std::uint16_t> values) {
+            return std::all_of(values.begin(), values.end(),
+                               [](std::uint16_t bits) { return bits != 0u; }) &&
+                   std::adjacent_find(
+                       values.begin(), values.end(),
+                       [](std::uint16_t left, std::uint16_t right) {
+                           return left != right;
+                       }) != values.end();
+        };
+        check(has_nonzero_channel_variation(mixed_h_values) &&
+                  has_nonzero_channel_variation(mixed_bf_values),
+              label + " all activation channels are nonzero and varied");
+        check(!std::equal(attn_k_weights.payload().begin(),
+                          attn_k_weights.payload().end(),
+                          attn_v_weights.payload().begin()) &&
+                  !std::equal(attn_v_weights.payload().begin(),
+                              attn_v_weights.payload().end(),
+                              attn_q_weights.payload().begin()),
+              label + " Q8_0 projection matrices have distinct patterns");
+        check(!std::equal(typed<std::uint16_t>(indexer_k_weights).begin(),
+                          typed<std::uint16_t>(indexer_k_weights).end(),
+                          typed<std::uint16_t>(indexer_q_weights).begin()),
+              label + " indexer BF16 projection matrices have distinct patterns");
+
+        projection_buffers.mixed_h =
+            context.buffers().read_only(mixed_h.view());
+        projection_buffers.mixed_bf =
+            context.buffers().read_only(mixed_bf.view());
+        projection_buffers.attn_k_weights =
+            context.buffers().read_only(attn_k_weights.view());
+        projection_buffers.attn_v_weights =
+            context.buffers().read_only(attn_v_weights.view());
+        projection_buffers.attn_q_weights =
+            context.buffers().read_only(attn_q_weights.view());
+        projection_buffers.indexer_k_weights =
+            context.buffers().read_only(indexer_k_weights.view());
+        projection_buffers.indexer_q_weights =
+            context.buffers().read_only(indexer_q_weights.view());
+        projection_buffers.dequantized_f16 =
+            projection_dequantized_f16.view();
+        projection_buffers.key = keys.view();
+        projection_buffers.value = values.view();
+        projection_buffers.query_full = q_full.view();
+        projection_buffers.indexer_key = raw_indexer_keys.view();
+        projection_buffers.indexer_query = selection.indexer_queries.view();
+    }
+
     std::mt19937_64 rng(options.seed ^ 0x91d4a3u);
     const auto generate = [&](std::span<float> output, float scale,
                               std::size_t seed) {
@@ -2173,6 +2338,89 @@ bool run_prefill_qsa_layer_case(
     generate(source_q_full, 6.0f, 0x3365u);
     generate(source_indexer_query, 3.0f, 0x4487u);
     generate(source_raw_indexer, 2.0f, 0x55a9u);
+    if (projection_pipeline) {
+        const auto mixed_h_values = typed<std::uint16_t>(mixed_h);
+        const auto mixed_bf_values = typed<std::uint16_t>(mixed_bf);
+        const auto q8_projection_oracle = [](
+            std::span<const std::uint16_t> input,
+            std::span<const block_q8_0> weights, std::size_t outputs) {
+            constexpr std::size_t kBlocksPerRow =
+                kInputProjectionK / 32u;
+            std::vector<float> expected(outputs);
+            for (std::size_t output = 0u; output < outputs; ++output) {
+                double sum = 0.0;
+                for (std::size_t k = 0u; k < kInputProjectionK; ++k) {
+                    const block_q8_0& block =
+                        weights[output * kBlocksPerRow + k / 32u];
+                    const float dequantized_weight =
+                        strata::kernels::f32_from_f16(
+                            strata::kernels::f16_from_f32(
+                                strata::kernels::f32_from_f16(block.d) *
+                                static_cast<float>(block.qs[k % 32u])));
+                    sum += static_cast<double>(
+                               strata::kernels::f32_from_f16(input[k])) *
+                           static_cast<double>(dequantized_weight);
+                }
+                expected[output] = static_cast<float>(sum);
+            }
+            return expected;
+        };
+        const auto bf16_projection_oracle = [](
+            std::span<const std::uint16_t> input,
+            std::span<const std::uint16_t> weights, std::size_t outputs) {
+            std::vector<float> expected(outputs);
+            for (std::size_t output = 0u; output < outputs; ++output) {
+                double sum = 0.0;
+                for (std::size_t k = 0u; k < N_EMBD; ++k) {
+                    sum += static_cast<double>(
+                               strata::kernels::f32_from_bf16(input[k])) *
+                           static_cast<double>(
+                               strata::kernels::f32_from_bf16(
+                                   weights[output * N_EMBD + k]));
+                }
+                expected[output] = static_cast<float>(sum);
+            }
+            return expected;
+        };
+        const auto expected_keys = q8_projection_oracle(
+            mixed_h_values, typed<block_q8_0>(attn_k_weights),
+            source_keys.size());
+        const auto expected_values = q8_projection_oracle(
+            mixed_h_values, typed<block_q8_0>(attn_v_weights),
+            source_values.size());
+        const auto expected_q = q8_projection_oracle(
+            mixed_h_values, typed<block_q8_0>(attn_q_weights),
+            source_q_full.size());
+        const auto expected_indexer_query = bf16_projection_oracle(
+            mixed_bf_values, typed<std::uint16_t>(indexer_q_weights),
+            source_indexer_query.size());
+        const auto expected_indexer_key = bf16_projection_oracle(
+            mixed_bf_values, typed<std::uint16_t>(indexer_k_weights),
+            source_raw_indexer.size());
+        std::copy(expected_keys.begin(), expected_keys.end(),
+                  source_keys.begin());
+        std::copy(expected_values.begin(), expected_values.end(),
+                  source_values.begin());
+        std::copy(expected_q.begin(), expected_q.end(),
+                  source_q_full.begin());
+        std::copy(expected_indexer_query.begin(),
+                  expected_indexer_query.end(),
+                  source_indexer_query.begin());
+        std::copy(expected_indexer_key.begin(), expected_indexer_key.end(),
+                  source_raw_indexer.begin());
+        const auto has_distinct_outputs = [](std::span<const float> values) {
+            return std::adjacent_find(
+                       values.begin(), values.end(),
+                       [](float left, float right) { return left != right; }) !=
+                   values.end();
+        };
+        check(has_distinct_outputs(source_keys) &&
+                  has_distinct_outputs(source_values) &&
+                  has_distinct_outputs(source_q_full) &&
+                  has_distinct_outputs(source_indexer_query) &&
+                  has_distinct_outputs(source_raw_indexer),
+              label + " projection oracle produces varied output rows");
+    }
     for (std::uint32_t cell = 0u; cell < kCapacity; ++cell) {
         for (std::uint32_t pair = 0u; pair < 32u; ++pair) {
             const float angle =
@@ -2184,9 +2432,25 @@ bool run_prefill_qsa_layer_case(
             host_rope[index + 1u] = std::sin(angle);
         }
     }
-    std::memcpy(keys.payload().data(), source_keys.data(), kKvInputBytes);
-    std::memcpy(values.payload().data(), source_values.data(), kKvInputBytes);
-    std::memcpy(q_full.payload().data(), source_q_full.data(), kQFullBytes);
+    if (projection_pipeline) {
+        for (twin::GuardedBuffer* output :
+             {&keys, &values, &q_full, &selection.indexer_queries,
+              &raw_indexer_keys}) {
+            std::fill(output->payload().begin(), output->payload().end(),
+                      0xa5u);
+        }
+    } else {
+        std::memcpy(keys.payload().data(), source_keys.data(),
+                    kKvInputBytes);
+        std::memcpy(values.payload().data(), source_values.data(),
+                    kKvInputBytes);
+        std::memcpy(q_full.payload().data(), source_q_full.data(),
+                    kQFullBytes);
+        std::memcpy(selection.indexer_queries.payload().data(),
+                    source_indexer_query.data(), kIndexerQueryBytes);
+        std::memcpy(raw_indexer_keys.payload().data(),
+                    source_raw_indexer.data(), kIndexerKeyBytes);
+    }
     std::memcpy(key_gamma.payload().data(), host_gamma.data(),
                 HEAD_DIM * sizeof(float));
     std::memcpy(query_gamma.payload().data(), host_gamma.data(),
@@ -2196,10 +2460,6 @@ bool run_prefill_qsa_layer_case(
     std::memcpy(indexer_gamma.payload().data(), host_indexer_gamma.data(),
                 kIndexerGammaBytes);
     std::memcpy(rope.payload().data(), host_rope.data(), rope_bytes);
-    std::memcpy(selection.indexer_queries.payload().data(),
-                source_indexer_query.data(), kIndexerQueryBytes);
-    std::memcpy(raw_indexer_keys.payload().data(), source_raw_indexer.data(),
-                kIndexerKeyBytes);
     std::memcpy(attention.steps.payload().data(), &step, sizeof(step));
     std::memcpy(attention.key_data.payload().data(), cache.key_data.data(),
                 cache.key_data.size());
@@ -2542,6 +2802,26 @@ bool run_prefill_qsa_layer_case(
                 context.buffers().read_only(native_weights.view()),
                 dequantized_f16.view(), projected_y.view(),
                 transform_attention ? attention.output.view() : BufferRef{}}}};
+    const PrefillQsaLayerPipelineBuffers pipeline_buffers{
+        projection_buffers, layer_buffers};
+    const auto encode_layer_in_segment = [&](
+                                             Encoder& encoder,
+                                             const PrefillQsaLayerBuffers& buffers,
+                                             PrefillGemmBackend* backend,
+                                             std::string& encode_error) {
+        if (projection_pipeline) {
+            return encode_prefill_qsa_layer_pipeline(
+                context, encoder, metadata.params, PrefillBF16X2Mode::off,
+                mode, kCapacity, kRopeZeroCos, kRopeZeroSin, false,
+                PrefillNativeWeightFormat::Q8_0,
+                PrefillQsaLayerPipelineBuffers{projection_buffers, buffers},
+                encode_error, backend);
+        }
+        return encode_prefill_qsa_layer(
+            context, encoder, metadata.params, mode, kCapacity,
+            kRopeZeroCos, kRopeZeroSin, false,
+            PrefillNativeWeightFormat::Q8_0, buffers, encode_error, backend);
+    };
     const auto encode_layer = [&](CommandBuffer& command,
                                   const PrefillQsaLayerBuffers& buffers,
                                   PrefillGemmBackend* backend,
@@ -2550,19 +2830,109 @@ bool run_prefill_qsa_layer_case(
             return Encoder::encode(
                 context, command, label,
                 [&](Encoder& encoder, std::string& inner_error) {
-                    return encode_prefill_qsa_layer(
-                        context, encoder, metadata.params, mode,
-                        kCapacity, kRopeZeroCos, kRopeZeroSin, false,
-                        PrefillNativeWeightFormat::Q8_0, buffers, inner_error,
-                        backend);
+                    return encode_layer_in_segment(
+                        encoder, buffers, backend, inner_error);
                 },
                 encode_error);
+        }
+        if (projection_pipeline) {
+            return encode_prefill_qsa_layer_pipeline(
+                context, command, metadata.params, PrefillBF16X2Mode::off,
+                mode, kCapacity, kRopeZeroCos, kRopeZeroSin, false,
+                PrefillNativeWeightFormat::Q8_0,
+                PrefillQsaLayerPipelineBuffers{projection_buffers, buffers},
+                encode_error, backend);
         }
         return encode_prefill_qsa_layer(
             context, command, metadata.params, mode, kCapacity,
             kRopeZeroCos, kRopeZeroSin, false,
             PrefillNativeWeightFormat::Q8_0, buffers, encode_error, backend);
     };
+    if (projection_pipeline) {
+        const auto encode_pipeline = [&](
+                                         CommandBuffer& command,
+                                         const PrefillQsaLayerPipelineBuffers& buffers,
+                                         std::string& encode_error) {
+            if (shared_encoder) {
+                return Encoder::encode(
+                    context, command, label,
+                    [&](Encoder& encoder, std::string& inner_error) {
+                        return encode_prefill_qsa_layer_pipeline(
+                            context, encoder, metadata.params,
+                            PrefillBF16X2Mode::off, mode, kCapacity,
+                            kRopeZeroCos, kRopeZeroSin, false,
+                            PrefillNativeWeightFormat::Q8_0, buffers,
+                            inner_error);
+                    },
+                    encode_error);
+            }
+            return encode_prefill_qsa_layer_pipeline(
+                context, command, metadata.params, PrefillBF16X2Mode::off,
+                mode, kCapacity, kRopeZeroCos, kRopeZeroSin, false,
+                PrefillNativeWeightFormat::Q8_0, buffers, encode_error);
+        };
+        auto invalid_pipeline = pipeline_buffers;
+        invalid_pipeline.projection.value = q_full.view();
+        auto invalid_projection_command = context.make_command_buffer(
+            label + " invalid projection handoff", error);
+        if (!invalid_projection_command) {
+            check(false, label + " invalid projection handoff command",
+                  error);
+            return false;
+        }
+        const bool invalid_projection_rejected =
+            !encode_prefill_qsa_layer_pipeline(
+                context, *invalid_projection_command, metadata.params,
+                PrefillBF16X2Mode::off, mode, kCapacity, kRopeZeroCos,
+                kRopeZeroSin, false, PrefillNativeWeightFormat::Q8_0,
+                invalid_pipeline, error) &&
+            invalid_projection_command->unsafe_native_handle() == nullptr &&
+            error.find("projected V must feed KV append") !=
+                std::string::npos &&
+            std::all_of(keys.payload().begin(), keys.payload().end(),
+                        [](std::uint8_t value) { return value == 0xa5u; }) &&
+            std::all_of(typed<float>(selection.scores).begin(),
+                        typed<float>(selection.scores).end(),
+                        [](float value) { return value == kUntouchedScore; });
+        check(invalid_projection_rejected,
+              label + " rejects projection-to-layer mismatch before dispatch",
+              error);
+        if (!invalid_projection_rejected) {
+            if (invalid_projection_command->unsafe_native_handle() != nullptr) {
+                invalid_projection_command->discard();
+            }
+            return false;
+        }
+
+        auto invalid_scratch_alias = pipeline_buffers;
+        invalid_scratch_alias.layer.preparation.key_norm_rope.gamma =
+            projection_dequantized_f16.view().slice(
+                0u, HEAD_DIM * sizeof(float));
+        auto scratch_alias_command = context.make_command_buffer(
+            label + " projection scratch aliases layer gamma", error);
+        if (!scratch_alias_command) {
+            check(false, label + " projection scratch alias command", error);
+            return false;
+        }
+        const bool scratch_alias_rejected =
+            !encode_pipeline(*scratch_alias_command, invalid_scratch_alias,
+                             error) &&
+            scratch_alias_command->unsafe_native_handle() == nullptr &&
+            error.find("dequantized F16 scratch overlaps live layer input "
+                       "attn_k_norm gamma") != std::string::npos &&
+            std::all_of(keys.payload().begin(), keys.payload().end(),
+                        [](std::uint8_t value) { return value == 0xa5u; });
+        check(scratch_alias_rejected,
+              label + " rejects projection scratch/layer gamma alias before "
+                      "dispatch",
+              error);
+        if (!scratch_alias_rejected) {
+            if (scratch_alias_command->unsafe_native_handle() != nullptr) {
+                scratch_alias_command->discard();
+            }
+            return false;
+        }
+    }
     auto invalid_buffers = layer_buffers;
     invalid_buffers.tail.attention.attention_chunk.query =
         selection.pooled.view();
@@ -2573,17 +2943,37 @@ bool run_prefill_qsa_layer_case(
         return false;
     }
     PrefillGemmBackend rejected_backend = PrefillGemmBackend::SIMD;
+    const bool projection_outputs_unchanged =
+        !projection_pipeline ||
+        (std::all_of(keys.payload().begin(), keys.payload().end(),
+                     [](std::uint8_t value) { return value == 0xa5u; }) &&
+         std::all_of(values.payload().begin(), values.payload().end(),
+                     [](std::uint8_t value) { return value == 0xa5u; }) &&
+         std::all_of(q_full.payload().begin(), q_full.payload().end(),
+                     [](std::uint8_t value) { return value == 0xa5u; }) &&
+         std::all_of(selection.indexer_queries.payload().begin(),
+                     selection.indexer_queries.payload().end(),
+                     [](std::uint8_t value) { return value == 0xa5u; }) &&
+         std::all_of(raw_indexer_keys.payload().begin(),
+                     raw_indexer_keys.payload().end(),
+                     [](std::uint8_t value) { return value == 0xa5u; }));
     const bool rejected =
         !encode_layer(*rejected_command, invalid_buffers, &rejected_backend,
                       error) &&
         rejected_command->unsafe_native_handle() == nullptr &&
         error.find("qcur must feed attention") != std::string::npos &&
-        std::equal(source_keys.begin(), source_keys.end(),
-                   typed<float>(keys).begin()) &&
+        (projection_pipeline ||
+         std::equal(source_keys.begin(), source_keys.end(),
+                    typed<float>(keys).begin())) &&
+        projection_outputs_unchanged &&
         std::all_of(typed<float>(selection.scores).begin(),
                     typed<float>(selection.scores).end(),
                     [](float value) { return value == kUntouchedScore; });
-    check(rejected, label + " rejects a broken handoff before dispatch", error);
+    check(rejected,
+          label + (projection_pipeline
+                       ? " rolls back projections after a broken layer handoff"
+                       : " rejects a broken handoff before dispatch"),
+          error);
     if (!rejected && rejected_command->unsafe_native_handle() != nullptr) {
         rejected_command->discard();
     }
@@ -4290,6 +4680,9 @@ int main(int argc, char** argv) {
         passed &= run_prefill_qsa_layer_case(
             *context, mode, options, concurrent_dispatch_mode());
     }
+    passed &= run_prefill_qsa_layer_case(
+        *context, QsaAttentionMode::f16, options,
+        concurrent_dispatch_mode(), true);
     passed &= run_prefill_attention_case(
         *context, QsaAttentionMode::f16, 1u, 3u, 128u, options, false);
     passed &= run_prefill_attention_case(
