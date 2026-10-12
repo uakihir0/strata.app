@@ -482,11 +482,11 @@
     },
     "metal_prefill_moe_down_test": {
       "label": "metal",
-      "origin": "04 §6.6/§10.4-10.5 / 06 Prefill Q2_0 down tile / D-IMPL-399 / REV-195"
+      "origin": "04 §6.6/§10.4-10.5 / 06 Prefill Q2_0/IQ4_NL down tiles / D-IMPL-399/400 / REV-195/196"
     },
     "metal_prefill_moe_down_test_concurrent": {
       "label": "metal",
-      "origin": "04 §6.6/§10.4-10.5 / 06 Prefill Q2_0 down tile / D-IMPL-399 / REV-195"
+      "origin": "04 §6.6/§10.4-10.5 / 06 Prefill Q2_0/IQ4_NL down tiles / D-IMPL-399/400 / REV-195/196"
     },
     "metal_prefill_dequant_test": {
       "label": "metal",

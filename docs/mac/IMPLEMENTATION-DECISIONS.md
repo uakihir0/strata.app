@@ -12105,8 +12105,9 @@ measuring L-15 remain open.
   check is linear and needs no separate persistent scratch allocation. If the
   map or plan is invalid, set status bit 1 and zero the full active output.
   Give the down encoder a dedicated status word because its plan validator
-  clears status. Keep IQ4_NL down, tiered schedule resolution and production
-  `Prefill::run` integration out of this implementation slice.
+  clears status. IQ4_NL down was deferred from this slice and added under
+  D-IMPL-400; tiered schedule resolution and production `Prefill::run`
+  integration remain outside this implementation.
 - **Reason:** The isolated matrix tile can be checked against a direct scalar
   Q2_0 oracle while exercising the actual GPU grouping and route restoration.
   GPU-produced destinations cannot be validated from the CPU without a
@@ -12143,3 +12144,42 @@ measuring L-15 remain open.
 - **Validation:** The reviewer did not run tests. After the fix, the full
   `mac-dev` build, all 10 focused Metal CTests, all 45 `mac-host` CTests (one
   expected skip), `test_map.py`, `check_drift.py` and `git diff --check` passed.
+
+### D-IMPL-400: Add Prefill IQ4_NL down tiles
+
+- **Decision:** Extend the validated Prefill down encoder and shared 64×64
+  output tile to IQ4_NL weights. Decode each 32-value block through the
+  canonical `kvalues_iq4nl` table, round each dequantized weight to F16, then
+  multiply and accumulate into F32 output parts. Keep format selection in a
+  typed host entry point while sharing the address snapshot, resource and
+  tiered-lease validation, destination permutation checks, failure status and
+  transaction behavior with Q2_0.
+- **Reason:** Prefill's grouped hidden activation is F16, and its down weights
+  can use either Q2_0 or IQ4_NL. The separate format entry point preserves
+  format-specific row extents and decoding while avoiding duplicated GPU
+  validation and route-restoration logic.
+- **Review required:** See REV-196. Challenge IQ4_NL nibble and block indexing,
+  codebook decoding and F16 rounding, format-specific resource bounds, the
+  shared tile's matrix indexing, validation and rollback, and the scope of
+  synthetic coverage.
+- **Validation:** `mac-dev` builds. All 10 focused serial/concurrent Metal
+  CTests pass, including Q2_0 and IQ4_NL T=1/7 down fixtures. The IQ4_NL
+  fixture's rounded and unrounded scalar results differ beyond the GPU output
+  tolerance. `test_map.py`, `check_drift.py` and `git diff --check` pass.
+
+### REV-196: Adversarial review of Prefill IQ4_NL down tiles
+
+- **Scope:** Audit IQ4_NL decoding and rounding, block and matrix indexing,
+  format-specific weight extents, host binding and lease checks, shared
+  validation/status behavior, failure zeroing, route restoration, aliases,
+  transactional rollback and the test claims.
+- **Findings:** No P1/P2 correctness or safety issue. The reviewer identified
+  stale planned-status/kernel-name text and noted that the original IQ4_NL
+  fixture's exact F16 products did not test dequantization rounding.
+- **Disposition:** Update the kernel inventory, test banner and test status.
+  Alternate F16 scales `0x3a66` and `0x2800`, and add a rounded-versus-
+  unrounded scalar sensitivity check whose difference exceeds the GPU result
+  tolerance. The follow-up review is pending.
+- **Validation:** After the fixes, `mac-dev` builds, all 10 focused serial and
+  concurrent Metal CTests pass, `test_map.py`, `check_drift.py` and
+  `git diff --check` pass.

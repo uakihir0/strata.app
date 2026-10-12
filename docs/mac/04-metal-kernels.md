@@ -309,7 +309,7 @@ column points to the specification. "Threads" is the manifest value.
 | `strata_pf_gemm_bf16_mpp` | isolated Apple10 MPP component; not the production selector | 6.2 |
 | `strata_pf_sort_count`, `strata_pf_sort_scan`, `strata_pf_sort_scatter`, `strata_pf_gather_f16` | | 6.6 |
 | `strata_pf_moe_gu_<fmt>` | Q2_0 SIMD tile implemented as an isolated encoder; seven other formats and MPP remain planned. The gate/up tile applies SwiGLU in its epilogue. | 6.6 |
-| `strata_pf_moe_down_<fmt>` | isolated Q2_0 F16-activation tile implemented; IQ4_NL remains planned | 6.6 |
+| `strata_pf_moe_down_f16` | Q2_0 and IQ4_NL F16-activation down tiles share the validated format-selected kernel | 6.6 |
 | `strata_pf_swiglu_pair` (the shared expert's SwiGLU) | | 6.6 |
 | `strata_pf_combine` | | 6.6 |
 
@@ -4985,25 +4985,26 @@ The prefill MoE computes the decode MoE's function over T rows (section 5.10). I
 | 13 | `strata_pf_combine` | `parts`, `wts`, `shared`, `gl` → `bo` |
 
 The count/scan/scatter, row-gather, shared-expert post-ops, and isolated Q2_0
-gate/up and down tiles now have typed GPU encoders and synthetic oracle
-coverage. Both expert encoders copy the selected address row into caller-owned
-scratch before dispatch. Use a unique range for each pending expert dispatch
+gate/up plus Q2_0 and IQ4_NL down tiles now have typed GPU encoders and
+synthetic oracle coverage. Both expert encoders copy the selected address row
+into caller-owned scratch before dispatch. Use a unique range for each pending expert dispatch
 and keep it unchanged through completion. The `CommandBuffer` rejects a
 snapshot range used by any earlier GPU dispatch or indirect resource access,
 rejects later GPU writes to reserved scratch, and rejects overlapping snapshot
 ranges within its pending work. Use distinct ranges across concurrently
 pending command buffers. The GPU tests deliberately alias an earlier grouping
 write with the source address row to verify that the expert consumes the
-snapshot. The down encoder also validates the selected Q2_0 address against
-Context-owned storage, declares the indirect weight resource to Metal, and
-requires a matching prepared `ExpertLeaseSet` for tiered storage. Before
+snapshot. The down encoder also validates the selected Q2_0 or IQ4_NL address
+against Context-owned storage, declares the indirect weight resource to Metal,
+and requires a matching prepared `ExpertLeaseSet` for tiered storage. Before
 projection, it validates that `dst` is an in-range permutation; a temporary
 bitset in the output prefix detects duplicate and out-of-range routes in
 linear work, then the down kernel overwrites the full output. A malformed
 permutation sets the plan-error bit and zeros the complete active output. Its
 status word is dedicated to the down stage because plan validation clears it.
-Other gate/up formats, IQ4_NL down, full scheduling and `Prefill::run`
-integration remain planned.
+Serial and concurrent tests compare both weight formats with format-specific
+scalar oracles. Other gate/up formats, full scheduling, model-backed parity
+and `Prefill::run` integration remain planned.
 
 - Upstream runs the shared expert and its gate before the grouping. The Mac runs the grouping first, so the shared
   expert overlaps the `MissResolver` in tiered mode, as in decode (section 8.3). No step reads another's output
