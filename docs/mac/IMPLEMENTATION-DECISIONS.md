@@ -12285,3 +12285,48 @@ measuring L-15 remain open.
   focused serial/concurrent Prefill MoE CTests passed, `test_map.py` passed
   with its documented planned/no-check diagnostics, `check_drift.py` reported
   no upstream changes and valid golden files, and `git diff --check` passed.
+
+### D-IMPL-403: Add Prefill IQ2_XS gate/up tiles
+
+- **Decision:** Extend the shared Prefill MoE gate/up tile with IQ2_XS through
+  typed caller-owned Encoder and transactional CommandBuffer APIs. Validate
+  each expert's 640×10×74-byte weight extent (473,600 bytes). Decode the
+  9-bit grid and 7-bit sign indices and select one of two 4-bit scale values
+  for each 16-value half of a 32-value part, then round each weight to F16
+  before accumulation.
+- **Reason:** IQ2_XS is another documented gate/up format and the repository
+  already has a standalone packed decoder, canonical codebook tables, a CPU
+  dot oracle and fixed packed fixtures. Reusing the established tile keeps
+  its expert address snapshot, lease, validation, status and rollback behavior
+  shared. The production schedule and Prefill integration are unfinished.
+- **Fixture judgment:** Exercise T=1/7, all 512 grid indices, both low and
+  high scale nibbles across their 16 values, and all 128 sign indices. Use a
+  canonical `dq_iq2_xs` block dequantizer for the FP64 dot oracle and a
+  literal packed-field anchor; freeze a GPU F16 SwiGLU result (`0x2738`) for
+  the existing literal packed block and signed half input. Confirm that
+  skipping F16 weight rounding changes the result by more than four ULPs.
+- **Review required:** See REV-199. Challenge packed index and nibble mapping,
+  scale formula, F16 rounding, the 74-byte block and expert extent, indirect
+  binding and tiered lease checks, rollback and scratch ownership, oracle
+  independence, fixed golden provenance and the stated implementation scope.
+- **Validation:** See REV-199 for hostile review, build, serial/concurrent
+  tests, test-map, drift and whitespace checks.
+
+### REV-199: Adversarial review of Prefill IQ2_XS gate/up tiles
+
+- **Scope:** Audit IQ2_XS grid/sign extraction, low/high scale selection and
+  dequantization, F16 conversion, expert extent and tiered lease coverage,
+  shared kernel dispatch, transactional behavior, fixture and oracle
+  independence, the frozen GPU output, and documentation claims.
+- **Findings:** The reviewer found one P3 documentation mismatch: the test
+  description named four formats but said “All three formats.” No actionable
+  implementation issue was found.
+- **Disposition:** Correct the count to “All four formats.” The reviewer
+  confirmed the 74-byte block geometry, extent calculation, grid/sign fields,
+  scale-nibble mapping, F16 rounding, format dispatch, lease coverage,
+  transaction/scratch behavior and the fixed GPU golden.
+- **Validation:** `mac-dev` built. The serial and concurrent
+  `metal_prefill_moe_expert_test` CTests passed 2/2 after the IQ2_XS change;
+  the full focused Prefill MoE suite passed 10/10. `test_map.py` passed with
+  its documented planned/no-check diagnostics, `check_drift.py` reported no
+  upstream changes and valid golden files, and `git diff --check` passed.
