@@ -12482,3 +12482,70 @@ measuring L-15 remain open.
   its existing planned/no-check/missing-check diagnostics, `check_drift.py`
   reported no upstream changes and valid goldens, and `git diff --check`
   passed.
+
+### D-IMPL-407: Add Prefill IQ1_M gate/up tiles
+
+- **Decision:** Add typed Encoder and transactional CommandBuffer APIs for
+  IQ1_M to the shared Prefill MoE expert tile. Validate each expert's
+  640×10×56-byte extent (358,400 bytes). Compose the 11-bit grid index from
+  `qs` and the three grid-high bits in `qh`, restore each codebook digit
+  0/1/2 to signed −1/0/+1, apply the `qh` delta sign of ±1/8, multiply by
+  the F16 super-scale and one of the two odd local scales in each 32-value
+  part, then round each decoded weight to F16 before accumulation.
+- **Reason:** IQ1_M is a documented gate/up format and the repository
+  includes its 56-byte block type, canonical 2,048-entry grid, upstream
+  dequantization contract and packed tool fixture. The format selector is
+  added to the existing validated address-snapshot, lease, status, bounds,
+  alias and rollback path. This completes the eight isolated gate/up formats;
+  production tiered-plan resolution, MoE scheduling and `Prefill::run`
+  integration remain separate work.
+- **Fixture judgment:** Exercise T=1/7 with synthetic inputs and distinct
+  expert addresses. The exhaustive GPU probe uses 128 packed blocks so every
+  one of the 2,048 grids is tested with both delta signs (4,096
+  grid/delta combinations), while covering each `qh` high bit, both local
+  scale fields at all eight codes, and eight F16 super-scales. Compare all
+  32,768 GPU F16 values with the packed-field CPU oracle. The literal tool
+  block's first grid digit is 1, which represents signed zero; at unit
+  super-scale and local scale 15, positive and negative delta fixtures must
+  decode to `+1.875` and `−1.875`. The fixed Prefill GPU golden for output 0
+  is `0x0000`; require the no-F16-weight-rounding control at that output to
+  differ by more than 10,000 F16 ULPs. Ordinary IQ1_M inputs use small
+  positive values so low-magnitude cancellation does not destabilize the
+  four-ULP oracle comparison; the dedicated signed pair isolates the
+  rounding effect.
+- **Review required:** See REV-203. Challenge the signed-grid bias and delta
+  formula, grid/high-bit and selector composition, local/super-scale unpacking,
+  value order, F16 operation, extent, API and transaction checks, independent
+  packed oracle, grid×delta coverage, literal anchors and rounding control,
+  and the synthetic-only product boundary.
+- **Validation:** See REV-203 for hostile findings and completed build,
+  focused serial/concurrent CTests, test-map, drift and whitespace checks.
+
+### REV-203: Adversarial review of Prefill IQ1_M gate/up tiles
+
+- **Scope:** Audit the 56-byte block and 358,400-byte expert extent; signed
+  grid digits, 11-bit indexing, `qh` grid/delta fields, odd local scales and
+  reconstructed F16 super-scale; F16 conversion and output order; selector,
+  address, lease, bounds, alias and transactional behavior; packed CPU
+  decoder, exhaustive GPU probe, literal anchors, fixed output golden,
+  no-rounding threshold, and documentation scope.
+- **Findings:** The first review found a P1 decode error: `iq1s_grid_gpu`
+  stores biased digits 0/1/2, but the kernel and CPU reference added ±1/8
+  without subtracting the bias. A follow-up found a P2 coverage gap: the
+  original fixture paired each grid with only one delta sign. No other
+  actionable issue was reported after those findings were addressed.
+- **Disposition:** Restore the signed grid value with `code - 1` before
+  applying ±1/8 in both the Metal kernel and packed CPU reference. Update the
+  literal fixture anchor to require `+1.875` and `−1.875` for the signed-zero
+  code. Expand the GPU probe to 128 blocks and assert every grid under both
+  delta signs. The second review confirmed the fixed formula against upstream
+  and existing IQ1_M dot paths. Final follow-up review confirmed that all
+  2,048 grids are paired with both signs, all 32,768 F16 outputs are compared,
+  and no actionable issue remains.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a),
+  `mac-dev` built and the focused serial/concurrent Prefill MoE, encoder and
+  window-storage selection passed 10/10. Synthetic T=1/7 cases use no real
+  model inputs. `test_map.py` passed with its existing planned, no-check and
+  missing-check diagnostics; `check_drift.py` found no upstream changes and
+  confirmed valid goldens, and `git diff --check` passed. Pasteur's final
+  read-only review found no remaining actionable issue; it did not rerun tests.
