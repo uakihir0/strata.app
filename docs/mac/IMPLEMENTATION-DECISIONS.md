@@ -12421,3 +12421,64 @@ measuring L-15 remain open.
   with existing planned/no-check/missing-check diagnostics, `check_drift.py`
   reported unchanged upstream sources and valid golden files, and
   `git diff --check` passed. The reviewer was asked to audit the same revision.
+
+### D-IMPL-406: Add Prefill IQ3_S gate/up tiles
+
+- **Decision:** Extend the shared Prefill MoE gate/up tile with typed Encoder
+  and transactional CommandBuffer APIs for IQ3_S. Validate the complete
+  640×10×110-byte expert extent (704,000 bytes). Decode the 9-bit grid index
+  from `qs` and the corresponding `qh` bit, use each direct 8-bit sign mask,
+  select the low/high scale nibble for each 32-value part, and round
+  `d × (1 + 2 × scale) × grid_value × sign` to F16 before accumulation.
+- **Reason:** IQ3_S is a documented gate/up format and the repository already
+  provides its canonical grid table, packed block type, dequantizer and
+  literal fixture. The shared dispatch keeps its address snapshot, lease,
+  status, alias and rollback checks. Production MoE scheduling and
+  `Prefill::run` integration remain separate work.
+- **Fixture judgment:** Sweep every grid index, both values of each `qh` bit,
+  all 256 direct sign masks and all 16 scale nibbles. For the output-level
+  F16-rounding control, choose two same-sign literal weights whose raw and
+  F16-rounded products differ, orient the synthetic signed inputs to expose
+  that difference, and flip one corresponding up-weight sign. This makes the
+  rounded gate dot cancel while the unrounded-weight control produces a
+  nonzero SwiGLU output. Separately dispatch an eight-block GPU decode probe
+  and compare all 2,048 F16 values with a CPU decoder that traverses packed
+  quartets and scatters them into K order. Freeze `actual[0]` as GPU F16
+  zero `0x0000`; require the no-rounding control for that same output to
+  differ by more than 30,000 ULPs on the recorded Mac.
+- **Review required:** See REV-202. Challenge the packed-field mapping,
+  geometry, F16 operation order, input-pair construction, golden provenance,
+  shared validation/transaction behavior, oracle independence, and the
+  synthetic-only product-scope claims.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a),
+  `mac-dev` built and the focused serial/concurrent Prefill MoE, encoder and
+  window-storage selection passed 10/10. T=1 and T=7 used synthetic weights
+  and signed F16 inputs; no model inputs were used. Static map, drift,
+  whitespace and hostile-review results are recorded in REV-202.
+
+### REV-202: Adversarial review of Prefill IQ3_S gate/up tiles
+
+- **Scope:** Audit the 110-byte block and 704,000-byte extent, `qs`/`qh` grid
+  composition, direct sign masks, scale nibble selection, F16 conversion,
+  API/kernel dispatch, shared bounds/lease/transaction checks, oracle and
+  exhaustive fixture independence, literal anchor, zero GPU golden,
+  cancellation control, and documentation scope.
+- **Findings:** The first hostile review found two issues: the Prefill scalar
+  oracle shared the kernel's linear-index field mapping (P2), and the test
+  allowed a four-ULP negative-control difference despite documenting a
+  30,000-ULP result (P3). Follow-up review found that the initial 30,000-ULP
+  assertion measured the maximum across outputs instead of the fixed GPU
+  golden at output 0 (P3).
+- **Disposition:** Rewrote the Prefill CPU decoder to traverse packed
+  quartets and scatter into K order; added a GPU probe for all 2,048 F16
+  decoder outputs across every grid, high bit, sign mask and scale; and made
+  the test require output 0's no-rounding result to differ from the fixed
+  golden by more than 30,000 ULPs. The follow-up reviewer confirmed that all
+  three findings are resolved and reported no further actionable issues.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a),
+  `mac-dev` built and the focused serial/concurrent Prefill MoE, encoder and
+  window-storage selection passed 10/10 with synthetic weights and signed
+  F16 inputs at T=1/7; no model inputs were used. `test_map.py` passed with
+  its existing planned/no-check/missing-check diagnostics, `check_drift.py`
+  reported no upstream changes and valid goldens, and `git diff --check`
+  passed.
