@@ -39,6 +39,7 @@ strata_pf_gdn_conv_hist safe 128 1 1
 strata_pf_gdn_l2 safe 128 1 1
 strata_pf_gdn_rec safe 128 1 1
 strata_pf_gdn_out_norm safe 128 1 1
+strata_pf_gate_attn safe 256 1 1
 strata_pf_gemm_f16_mpp safe 128 1 1
 strata_pf_gemm_bf16_mpp safe 128 1 1
 strata_pf_gemm_f16_simd safe 128 1 1

@@ -132,6 +132,10 @@ struct QsaGateParams {
     uint token_rows;
 };
 
+struct PrefillQsaGateAttnParams {
+    uint token_rows;
+};
+
 static inline uint qsa_selection_order_key(float score) {
     const float rounded = score + 0.0f;
     if (rounded != rounded) return 0u;
@@ -381,6 +385,27 @@ kernel void strata_qsa_gate(
         (ulong(row) * N_HEAD_Q + head) * (2u * HEAD_DIM) + HEAD_DIM;
     output[attn_base + tid] =
         attn[attn_base + tid] * sigmoid_k(q_full[q_base + tid]);
+}
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void strata_pf_gate_attn(
+    device const float* attn [[buffer(0)]],
+    device const float* q_full [[buffer(1)]],
+    device half* attn_h [[buffer(2)]],
+    constant PrefillQsaGateAttnParams& params [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    const ulong index = ulong(group.x) * HEAD_DIM + tid;
+    const ulong total_values =
+        ulong(params.token_rows) * N_HEAD_Q * HEAD_DIM;
+    if (index >= total_values) return;
+
+    const uint row = uint(index / (N_HEAD_Q * HEAD_DIM));
+    const uint head = uint(index / HEAD_DIM) % N_HEAD_Q;
+    const uint dim = uint(index) % HEAD_DIM;
+    const ulong q_index =
+        (ulong(row) * N_HEAD_Q + head) * (2u * HEAD_DIM) + HEAD_DIM + dim;
+    attn_h[index] = half(attn[index] * sigmoid_k(q_full[q_index]));
 }
 
 [[max_total_threads_per_threadgroup(128)]]
