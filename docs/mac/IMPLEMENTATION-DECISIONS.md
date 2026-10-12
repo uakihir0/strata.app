@@ -12094,3 +12094,50 @@ measuring L-15 remain open.
   resource view, reject earlier-access aliases and future writes, and add
   regression cases including a one-byte minimum resource binding. The reviewer
   did not run tests; local validation is recorded with D-IMPL-398.
+
+### D-IMPL-399: Add isolated Prefill Q2_0 down tiles
+
+- **Decision:** Add a typed encoder and one 64-entry by 64-output-column SIMD
+  tile for F16 grouped activations and Q2_0 down weights. Accumulate F32
+  `parts` and restore route order through the grouping destination map.
+  Validate the destination map as an in-range permutation on the GPU before
+  projection, using the output prefix as a temporary atomic bitset so this
+  check is linear and needs no separate persistent scratch allocation. If the
+  map or plan is invalid, set status bit 1 and zero the full active output.
+  Give the down encoder a dedicated status word because its plan validator
+  clears status. Keep IQ4_NL down, tiered schedule resolution and production
+  `Prefill::run` integration out of this implementation slice.
+- **Reason:** The isolated matrix tile can be checked against a direct scalar
+  Q2_0 oracle while exercising the actual GPU grouping and route restoration.
+  GPU-produced destinations cannot be validated from the CPU without a
+  synchronization point; a bounded GPU permutation check keeps this path
+  ordered and fail-closed. A separate stage status prevents plan validation
+  from erasing earlier gate/up failures when stages are composed later.
+- **Review required:** See REV-195. Challenge codebook decoding, matrix tile
+  bounds, zeroing paths, destination-map validation, status ordering, resource
+  and scratch lifetime, alias rejection, transaction rollback, and the claims
+  made by the synthetic tests.
+- **Validation:** `mac-dev` builds. The serial and concurrent down CTests
+  exercise T=1/7, route-order restoration, all 2,560 output columns, missing
+  weights, malformed tiles, out-of-range and duplicate destinations,
+  active aliases, tails and guards. Ten focused Metal CTests and all 45
+  `mac-host` tests passed; one host test was skipped because real model inputs
+  are unavailable. `test_map.py` and `check_drift.py` passed.
+
+### REV-195: Adversarial review of Prefill Q2_0 down tiles
+
+- **Scope:** Audit Q2_0 decoding, SIMD matrix indexing and bounds, route
+  restoration, status and failure zeroing, selected-address/resource/lease
+  validation, snapshot scratch, aliases, transaction handling and test claims.
+- **Findings:** The first source review found that a corrupt destination map
+  could contain an out-of-range or duplicate route. The kernel's fallback
+  marked the error only from thread zero, so some malformed maps could leave
+  status clear and lose output routes.
+- **Disposition:** Add ordered GPU passes that clear and atomically populate a
+  destination bitset in the output prefix. The validation detects out-of-range
+  and duplicate values before down projection, sets status bit 1 and makes the
+  tile kernel zero all active output. Add GPU fixtures for an odd-index
+  out-of-range destination and an odd-index duplicate.
+- **Validation:** The reviewer did not run tests. After the fix, the full
+  `mac-dev` build, all 10 focused Metal CTests, all 45 `mac-host` CTests (one
+  expected skip), `test_map.py`, `check_drift.py` and `git diff --check` passed.

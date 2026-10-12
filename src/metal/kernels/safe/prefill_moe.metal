@@ -1,6 +1,7 @@
 // Prefill MoE route grouping and F16 row gather (docs/mac/04 §6.6).
 #include <metal_stdlib>
 #include "../common/math.h"
+#include "../common/reduce.h"
 #include "../common/types.h"
 
 using namespace metal;
@@ -343,6 +344,40 @@ static inline void pf_moe_zero_output_tile(
     }
 }
 
+static inline void pf_moe_zero_down_tile(
+    device float* output, uint total_entries, uint first_entry,
+    uint column_group, uint tid) {
+    for (uint i = tid; i < 64u * 64u; i += 128u) {
+        const ulong entry = ulong(first_entry) + ulong(i / 64u);
+        const uint column = i % 64u;
+        if (entry < ulong(total_entries)) {
+            output[entry * 2560ul +
+                   ulong(column_group * 64u + column)] = 0.0f;
+        }
+    }
+}
+
+static inline void pf_moe_zero_down_group_tile(
+    device float* output, device const uint* destinations,
+    uint total_entries, uint first_entry, uint end_entry,
+    uint column_group, uint tid, device atomic_uint* status) {
+    for (uint i = tid; i < 64u * 64u; i += 128u) {
+        const uint entry = first_entry + i / 64u;
+        const uint column = i % 64u;
+        if (entry >= end_entry) continue;
+        const uint destination = destinations[entry];
+        if (destination >= total_entries) {
+            if (tid == 0u) {
+                atomic_fetch_or_explicit(status, 2u,
+                                         memory_order_relaxed);
+            }
+            continue;
+        }
+        output[ulong(destination) * 2560ul +
+               ulong(column_group * 64u + column)] = 0.0f;
+    }
+}
+
 static inline bool pf_moe_plan_header_valid(
     const device PfPlan* plan,
     constant PrefillMoeTileParams& params) {
@@ -433,6 +468,45 @@ kernel void strata_pf_moe_plan_validate(
         if (!valid) {
             atomic_fetch_or_explicit(status, 2u, memory_order_relaxed);
         }
+    }
+}
+
+[[max_total_threads_per_threadgroup(128)]]
+kernel void strata_pf_moe_destination_clear(
+    device atomic_uint* seen [[buffer(0)]],
+    constant PrefillMoeTileParams& params [[buffer(1)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    const uint entries = params.rows * kPfMoeRoutesPerRow;
+    const uint words = entries / 32u + (entries % 32u != 0u ? 1u : 0u);
+    const uint word = group.x * 128u + tid;
+    if (word < words) {
+        atomic_store_explicit(&seen[word], 0u, memory_order_relaxed);
+    }
+}
+
+[[max_total_threads_per_threadgroup(128)]]
+kernel void strata_pf_moe_destination_validate(
+    device const uint* destinations [[buffer(0)]],
+    device atomic_uint* seen [[buffer(1)]],
+    device atomic_uint* status [[buffer(2)]],
+    constant PrefillMoeTileParams& params [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    const uint entries = params.rows * kPfMoeRoutesPerRow;
+    const uint entry = group.x * 128u + tid;
+    if (entry >= entries) return;
+
+    const uint destination = destinations[entry];
+    if (destination >= entries) {
+        atomic_fetch_or_explicit(status, 2u, memory_order_relaxed);
+        return;
+    }
+    const uint mask = 1u << (destination % 32u);
+    const uint previous = atomic_fetch_or_explicit(
+        &seen[destination / 32u], mask, memory_order_relaxed);
+    if ((previous & mask) != 0u) {
+        atomic_fetch_or_explicit(status, 2u, memory_order_relaxed);
     }
 }
 
@@ -619,6 +693,175 @@ kernel void strata_pf_moe_gu_q2_0(
                 ulong(group.x * 32u + column);
             eh[output_index] =
                 half_sat(silu_k(so[i]) * so[i + 32u]);
+        }
+    }
+}
+
+// A 64-entry x 64-output-column SIMD-group matrix tile for Q2_0 down
+// projection. Inputs stay grouped by expert; dst restores route order.
+[[max_total_threads_per_threadgroup(128)]]
+kernel void strata_pf_moe_down_q2_0(
+    device const PrefillMoeExpertAddr* addresses [[buffer(0)]],
+    device const half* eh [[buffer(1)]],
+    device const PfPlan* plans [[buffer(2)]],
+    device const uint2* tiles [[buffer(3)]],
+    device const uint* destinations [[buffer(4)]],
+    device float* parts [[buffer(5)]],
+    constant PrefillMoeTileParams& params [[buffer(6)]],
+    device atomic_uint* status [[buffer(7)]],
+    constant uchar* tiered_lease_mask [[buffer(8)]],
+    uint tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]]) {
+    if (!pf_moe_rows_valid(params.rows) ||
+        (params.n_expert != 256u && params.n_expert != 512u)) {
+        return;
+    }
+    const uint total_entries = params.rows * kPfMoeRoutesPerRow;
+    const uint tile_index = group.y;
+    if (tile_index >= params.tile_capacity) return;
+
+    const device PfPlan* plan = &plans[0];
+    const uint status_bits =
+        atomic_load_explicit(status, memory_order_relaxed);
+    if ((status_bits & 2u) != 0u) {
+        pf_moe_zero_down_tile(parts, total_entries, tile_index * 64u,
+                              group.x, tid);
+        return;
+    }
+    if (tile_index >= plan->n_tiles) return;
+
+    const uint2 tile = tiles[tile_index];
+    const uint group_index = tile.x;
+    const uint first_entry = tile.y;
+    if (group_index >= plan->n_groups) {
+        if (tid == 0u) {
+            atomic_fetch_or_explicit(status, 2u, memory_order_relaxed);
+        }
+        pf_moe_zero_down_tile(parts, total_entries, tile_index * 64u,
+                              group.x, tid);
+        return;
+    }
+    const int group_first_signed = plan->grp_start[group_index];
+    const int group_end_signed = plan->grp_start[group_index + 1u];
+    const int expert_signed = plan->grp_e[group_index];
+    if (group_first_signed < 0 ||
+        group_end_signed <= group_first_signed ||
+        uint(group_end_signed) > plan->n_entries ||
+        expert_signed < 0 || uint(expert_signed) >= params.n_expert) {
+        if (tid == 0u) {
+            atomic_fetch_or_explicit(status, 2u, memory_order_relaxed);
+        }
+        pf_moe_zero_down_tile(parts, total_entries, tile_index * 64u,
+                              group.x, tid);
+        return;
+    }
+    const uint group_first = uint(group_first_signed);
+    const uint group_end = uint(group_end_signed);
+    if (first_entry < group_first || first_entry >= group_end ||
+        (first_entry - group_first) % 64u != 0u) {
+        if (tid == 0u) {
+            atomic_fetch_or_explicit(status, 2u, memory_order_relaxed);
+        }
+        pf_moe_zero_down_tile(parts, total_entries, tile_index * 64u,
+                              group.x, tid);
+        return;
+    }
+    const uint end_entry = min(first_entry + 64u, group_end);
+    const uint expert = uint(expert_signed);
+    const PrefillMoeExpertAddr address = addresses[expert];
+    const bool missing_weights = address.role[2] == nullptr;
+    const bool missing_tiered_lease =
+        !missing_weights && tiered_lease_mask[expert] == 0u;
+    if (missing_weights || missing_tiered_lease) {
+        if (tid == 0u) {
+            atomic_fetch_or_explicit(status,
+                                     missing_weights ? 1u : 4u,
+                                     memory_order_relaxed);
+        }
+        pf_moe_zero_down_group_tile(
+            parts, destinations, total_entries, first_entry, end_entry,
+            group.x, tid, status);
+        return;
+    }
+
+    threadgroup uchar staging[16384];
+    threadgroup half* sx =
+        reinterpret_cast<threadgroup half*>(staging);
+    threadgroup half* sw =
+        reinterpret_cast<threadgroup half*>(staging + 8192u);
+    threadgroup float* so =
+        reinterpret_cast<threadgroup float*>(staging);
+    simdgroup_float8x8 acc[2][8];
+    for (uint i = 0u; i < 2u; ++i) {
+        for (uint c = 0u; c < 8u; ++c) {
+            acc[i][c] = simdgroup_float8x8(0.0f);
+        }
+    }
+
+    const uint row_base = 16u * uint(sg);
+    for (uint k0 = 0u; k0 < 640u; k0 += 32u) {
+        for (uint i = tid; i < 64u * 32u; i += 128u) {
+            const uint tile_row = i / 32u;
+            const uint tile_k = i % 32u;
+            const uint entry = min(first_entry + tile_row, end_entry - 1u);
+            sx[i] = eh[ulong(entry) * 640ul + ulong(k0 + tile_k)];
+        }
+        for (uint i = tid; i < 32u * 64u; i += 128u) {
+            const uint tile_k = i / 64u;
+            const uint tile_column = i % 64u;
+            const uint output_row = group.x * 64u + tile_column;
+            const device block_q2_0* row_weights =
+                reinterpret_cast<device const block_q2_0*>(
+                    address.role[2]) +
+                output_row * 10u;
+            sw[i] = pf_moe_q2_0_value(row_weights, k0 + tile_k);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0u; kk < 32u; kk += 8u) {
+            simdgroup_half8x8 x[2];
+            simdgroup_half8x8 w[8];
+            for (uint i = 0u; i < 2u; ++i) {
+                simdgroup_load(
+                    x[i], &sx[(row_base + 8u * i) * 32u + kk], 32u);
+            }
+            for (uint c = 0u; c < 8u; ++c) {
+                simdgroup_load(w[c], &sw[kk * 64u + 8u * c], 64u);
+            }
+            for (uint i = 0u; i < 2u; ++i) {
+                for (uint c = 0u; c < 8u; ++c) {
+                    simdgroup_multiply_accumulate(acc[i][c], x[i], w[c],
+                                                  acc[i][c]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0u; i < 2u; ++i) {
+        for (uint c = 0u; c < 8u; ++c) {
+            simdgroup_store(acc[i][c],
+                            &so[(row_base + 8u * i) * 64u + 8u * c], 64u);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < 64u * 64u; i += 128u) {
+        const uint row = i / 64u;
+        const uint column = i % 64u;
+        const uint entry = first_entry + row;
+        if (entry < end_entry) {
+            const uint destination = destinations[entry];
+            if (destination < total_entries) {
+                parts[ulong(destination) * 2560ul +
+                      ulong(group.x * 64u + column)] = so[i];
+            } else {
+                atomic_fetch_or_explicit(status, 2u,
+                                         memory_order_relaxed);
+                parts[ulong(entry) * 2560ul +
+                      ulong(group.x * 64u + column)] = 0.0f;
+            }
         }
     }
 }
