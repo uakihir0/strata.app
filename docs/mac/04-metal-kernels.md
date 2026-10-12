@@ -4658,8 +4658,9 @@ disjoint. Serial and concurrent tests compare all three modes at 65 rows with
 the scalar oracle through standalone and caller-owned Encoder forms. This
 implements the norm/RoPE substage; Prefill also has batched KV append,
 indexer-append, selection and sparse-attention encoders. The O-class attention
-output transform, gate-to-projection composition and production chunk
-scheduling remain separate work.
+output transform and production chunk scheduling remain separate work. The
+F32 attention/Qf gate now composes with native `attn_output` dequantization
+and the selected F16 projection in one ordered coordinator.
 
 The four KV cache formats also expose Prefill-specific append entry points up
 to `kPrefillMaxShaderRows`; the Window append APIs retain their 1..8-row
@@ -4843,8 +4844,23 @@ earlier FWHT dispatch or a successful gate followed by downstream GEMM
 validation failure are covered through both API forms. Tests also reject
 foreign and submitted command buffers, foreign output/Qf views, forged or
 out-of-range output metadata, and partial aliases against either read-only
-input. The `attn_output` GEMM and production QSA-layer/chunk scheduling are
-not composed by this encoder.
+input. The gate encoder does not schedule the output projection or a QSA layer.
+
+`encode_prefill_qsa_output` composes the gate with the native-weight
+`attn_output` projection in one ordered Encoder segment. It fixes the shape to
+6144 input values and 2560 F32 output values per row, while the caller supplies
+the native weight format, gate/dequantization scratch and output views. Before
+dispatch it validates active extents, ownership, format alignment and the
+cross-stage alias matrix. Read-only attention, Qf and weight views may overlap;
+each writable view must remain disjoint from every other active stage buffer,
+apart from the gate result's intended producer-to-consumer handoff. Serial and
+concurrent tests use a synthetic Q8_0 weight row, compare standalone and
+caller-owned results with the direct gate→native-dequantization→F16-GEMM
+chain, and verify finite nonzero output, input immutability, cross-stage alias
+rejection and late-failure rollback. The models documented in [03](03-model-reference.md)
+use Q4_K, Q5_K, Q6_K, IQ4_XS or IQ3_S for `attn_output`; this synthetic Q8_0
+case tests the shared native-format path. Production layer scheduling and
+`Prefill::run` remain pending.
 
 **Not ported.** These upstream debug variables are not ported ([06](06-engine-host-port.md), section 4.3):
 - `STRATA_SEL_OVERLAP` (the overlap of neighbouring rows' selections);

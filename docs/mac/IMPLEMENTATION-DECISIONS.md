@@ -11429,3 +11429,54 @@ measuring L-15 remain open.
   `test_map.py` passed with the repository's existing planned, no-check and
   missing-check diagnostics; `check_drift.py` reported no upstream changes and
   valid golden files; `git diff --check` passed.
+
+### D-IMPL-388: Compose Prefill QSA gate and native output projection
+
+- **Decision:** Add `encode_prefill_qsa_output` as a separate ordered
+  coordinator for gate→native `attn_output` dequantization→selected F16 GEMM.
+  Fix its model shape at 6144→2560, keep gate/dequantization/output buffers
+  caller-owned, and allow read-only inputs to overlap. Validate each active
+  view and reject every writable cross-stage overlap before dispatch, except
+  for the gate result's intended producer→consumer handoff. Keep the component
+  independent of `Prefill::run` and optional FWHT scheduling.
+- **Reason:** The two component encoders already implement the required math
+  and native formats. A small coordinator makes their required order explicit
+  and checks aliases that cannot be seen when each stage validates in
+  isolation, while leaving scratch lifetime and production scheduling with
+  the caller.
+- **Review required:** Audit fixed dimensions and output stride, every
+  cross-stage input/output alias through CPU and GPU addresses, ownership and
+  format alignment preflight, backend propagation, ordered dispatch and
+  rollback. Verify the synthetic result against the direct component chain
+  without claiming model-backed inference.
+- **Validation:** `mac-dev` built successfully. The serial and concurrent
+  `metal_prefill_dequant_test` CTests passed 2/2, including the composed
+  QSA-output case. Hostile review, final map, drift and whitespace checks are
+  recorded in REV-184.
+
+### REV-184: Adversarial review of Prefill QSA output composition
+
+- **Scope:** Review the gate→native dequantization→F16 GEMM handoff, fixed
+  `[T][6144]` to `[T][2560]` shape, full writable alias matrix, buffer
+  preflight, selected backend, standalone/caller-owned rollback and serial
+  plus concurrent test coverage.
+- **Findings:** A local adversarial audit found that component-level
+  read-only views could hide the gate result's earlier writable role, allowing
+  it to alias the native weights and corrupt them before dequantization (P1).
+  The same audit found that the initial foreign-weight rollback fixture failed
+  in coordinator preflight, before it could exercise late rollback (P2). The
+  hostile reviewer examined the supplied implementation and found no further
+  actionable issue.
+- **Disposition:** Added coordinator-level CPU/GPU active-range checks for the
+  complete writable alias matrix and explicit gate/weight plus output/Qf
+  alias regressions. Kept foreign weights as a preflight rejection case, and
+  changed late rollback coverage to an invalid GEMM selector that fails only
+  after gate and dequant dispatch encoding. Both standalone and caller-owned
+  tests assert the exact diagnostic, discarded command buffer and unchanged
+  output/scratch. The hostile review confirmed the alias matrix and late-failure
+  coverage; no remaining issue.
+- **Validation:** `mac-dev` built successfully. Serial and concurrent
+  `metal_prefill_dequant_test` CTests passed 2/2. `test_map.py` passed with
+  existing planned, no-check and missing-check diagnostics; `check_drift.py`
+  reported no upstream changes and valid golden files; `git diff --check`
+  passed.
