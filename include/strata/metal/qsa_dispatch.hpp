@@ -111,6 +111,15 @@ struct QsaSelectionTopkBuffers {
     BufferRef ids;
 };
 
+struct QsaPrefillSelectionBuffers {
+    BufferRef pooled;
+    BufferRef dead;
+    BufferRef indexer_queries;
+    BufferRef steps;
+    BufferRef scores;
+    BufferRef ids;
+};
+
 struct QsaGateBuffers {
     BufferRef attn;
     BufferRef q_full;
@@ -479,6 +488,28 @@ bool encode_qsa_selection_topk(
     Context& context, Encoder& encoder,
     std::uint32_t token_rows, std::uint32_t cell_capacity,
     const QsaSelectionTopkBuffers& buffers, std::string& error);
+
+/// Encode Prefill selection (step 10) in groups of up to 256 rows. Each
+/// group's scores are computed in ordered batches of up to eight rows, then
+/// top-k writes `min(n_kv, 2051)` ascending cell IDs for every row. `params`
+/// must be valid Prefill chunk metadata, `steps` must describe the contiguous
+/// positions `[p0, p0 + T)`, `pooled` must contain `cell_capacity / 4 + 2`
+/// rows of 128 floats, and `dead` one 128-float key. `indexer_queries`
+/// contains four 128-float heads per row; `ids` contains 2051 int32 values
+/// per row; `scores` is reusable scratch for 256 rows of
+/// `cell_capacity / 4 + 2` floats. Read-only inputs may overlap. Score and ID
+/// outputs must be disjoint from every input and each other. The indexer
+/// append must precede selection in the same ordered segment. The caller-owned
+/// form rejects an open concurrent dispatch group and requires failure
+/// propagation from the enclosing `Encoder::encode`.
+bool encode_prefill_qsa_selection(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillParams& params, std::uint32_t cell_capacity,
+    const QsaPrefillSelectionBuffers& buffers, std::string& error);
+bool encode_prefill_qsa_selection(
+    Context& context, Encoder& encoder, const PrefillParams& params,
+    std::uint32_t cell_capacity,
+    const QsaPrefillSelectionBuffers& buffers, std::string& error);
 
 /// Multiply each QSA attention value by the sigmoid gate in the second half
 /// of its corresponding `q_full` head. `attn` and `output` contain

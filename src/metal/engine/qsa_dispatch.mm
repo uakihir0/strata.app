@@ -35,6 +35,7 @@ constexpr std::uint32_t kIndexerAppendThreads = 128u;
 constexpr std::uint32_t kSelectionScoresThreads = 256u;
 constexpr std::uint32_t kSelectionTopkRegThreads = 1024u;
 constexpr std::uint32_t kSelectionTopkMemThreads = 256u;
+constexpr std::uint32_t kPrefillSelectionGroupRows = 256u;
 constexpr std::uint32_t kQsaGateThreads = 256u;
 constexpr std::uint32_t kQsaAttentionThreads = 256u;
 constexpr std::uint32_t kQsaIndexerLayers = INDEXER_SNAPSHOT_LAYERS;
@@ -215,6 +216,20 @@ struct SelectionTopkDispatch {
     std::uint32_t threads = 0u;
     std::uint32_t histogram_banks = 0u;
     SelectionTopkParams params{};
+};
+
+struct PrefillSelectionDispatch {
+    std::size_t max_blocks = 0u;
+    std::size_t pooled_bytes = 0u;
+    std::size_t dead_bytes = 0u;
+    std::size_t query_bytes = 0u;
+    std::size_t steps_bytes = 0u;
+    std::size_t scores_bytes = 0u;
+    std::size_t ids_bytes = 0u;
+    std::size_t query_row_bytes = 0u;
+    std::size_t step_row_bytes = 0u;
+    std::size_t score_row_bytes = 0u;
+    std::size_t id_row_bytes = 0u;
 };
 
 struct QsaAttentionChunkDispatch {
@@ -2995,6 +3010,171 @@ static bool prepare_selection_scores_dispatch(
     return true;
 }
 
+static bool prepare_prefill_selection_dispatch(
+    Context& context, const PrefillParams& prefill,
+    std::uint32_t cell_capacity,
+    const QsaPrefillSelectionBuffers& buffers,
+    PrefillSelectionDispatch& dispatch, std::string& error) {
+    error.clear();
+    if (prefill.T == 0u || prefill.T > kPrefillMaxShaderRows) {
+        error = "Prefill QSA selection row count exceeds the shader-row "
+                "limit";
+        return false;
+    }
+    if (cell_capacity == 0u ||
+        cell_capacity % INDEXER_BLOCK_CELLS != 0u ||
+        cell_capacity > static_cast<std::uint32_t>(
+                            std::numeric_limits<std::int32_t>::max())) {
+        error = "Prefill QSA selection cell capacity is invalid";
+        return false;
+    }
+
+    const std::uint64_t end =
+        static_cast<std::uint64_t>(prefill.p0) + prefill.T;
+    if (prefill.p0 >= cell_capacity || end > cell_capacity ||
+        end > static_cast<std::uint64_t>(
+                  std::numeric_limits<std::int32_t>::max())) {
+        error = "Prefill QSA selection chunk exceeds the cell capacity";
+        return false;
+    }
+    const std::uint64_t expected_idx_f =
+        prefill.p0 == 0u
+            ? INDEXER_BLOCK_CELLS
+            : (static_cast<std::uint64_t>(prefill.p0) +
+               INDEXER_BLOCK_CELLS - 1u) &
+                  ~static_cast<std::uint64_t>(
+                      INDEXER_BLOCK_CELLS - 1u);
+    const std::uint32_t expected_idx_e = static_cast<std::uint32_t>(
+        end & ~static_cast<std::uint64_t>(INDEXER_BLOCK_CELLS - 1u));
+    if (expected_idx_f > std::numeric_limits<std::uint32_t>::max() ||
+        prefill.idx_f != expected_idx_f ||
+        prefill.idx_e != expected_idx_e) {
+        error = "Prefill QSA selection parameters do not match the chunk";
+        return false;
+    }
+
+    constexpr std::size_t key_row_bytes =
+        static_cast<std::size_t>(INDEXER_HEAD_DIM) * sizeof(float);
+    constexpr std::size_t query_row_bytes =
+        static_cast<std::size_t>(INDEXER_HEADS) * key_row_bytes;
+    constexpr std::size_t step_row_bytes = sizeof(StepRow);
+    constexpr std::size_t id_row_bytes =
+        static_cast<std::size_t>(INDEXER_SELECTION_WIDTH_MAX) *
+        sizeof(std::int32_t);
+    dispatch.max_blocks =
+        static_cast<std::size_t>(cell_capacity / INDEXER_BLOCK_CELLS) + 2u;
+    if (dispatch.max_blocks >
+            std::numeric_limits<std::uint32_t>::max() ||
+        !checked_product({dispatch.max_blocks, key_row_bytes},
+                         dispatch.pooled_bytes) ||
+        !checked_product({key_row_bytes}, dispatch.dead_bytes) ||
+        !checked_product({prefill.T, query_row_bytes},
+                         dispatch.query_bytes) ||
+        !checked_product({prefill.T, step_row_bytes},
+                         dispatch.steps_bytes) ||
+        !checked_product(
+            {kPrefillSelectionGroupRows, dispatch.max_blocks, sizeof(float)},
+            dispatch.scores_bytes) ||
+        !checked_product({prefill.T, id_row_bytes}, dispatch.ids_bytes) ||
+        !checked_product({dispatch.max_blocks, sizeof(float)},
+                         dispatch.score_row_bytes)) {
+        error = "Prefill QSA selection buffer size overflows host address "
+                "space";
+        return false;
+    }
+    dispatch.query_row_bytes = query_row_bytes;
+    dispatch.step_row_bytes = step_row_bytes;
+    dispatch.id_row_bytes = id_row_bytes;
+
+    if (!validate_buffer(context, buffers.pooled, dispatch.pooled_bytes,
+                         kSelectionVectorAlignment,
+                         "Prefill selection pooled keys", error) ||
+        !validate_buffer(context, buffers.dead, dispatch.dead_bytes,
+                         kSelectionVectorAlignment,
+                         "Prefill selection dead key", error) ||
+        !validate_buffer(context, buffers.indexer_queries,
+                         dispatch.query_bytes, alignof(float),
+                         "Prefill selection indexer queries", error) ||
+        !validate_buffer(context, buffers.steps, dispatch.steps_bytes,
+                         alignof(StepRow), "Prefill selection step rows",
+                         error) ||
+        !validate_buffer(context, buffers.scores, dispatch.scores_bytes,
+                         alignof(float), "Prefill selection score scratch",
+                         error) ||
+        !validate_buffer(context, buffers.ids, dispatch.ids_bytes,
+                         alignof(std::int32_t),
+                         "Prefill selection cell IDs", error)) {
+        return false;
+    }
+
+    static_assert(sizeof(PrefillStepRow) == sizeof(StepRow));
+    const auto* steps =
+        reinterpret_cast<const StepRow*>(buffers.steps.contents);
+    for (std::uint32_t row = 0u; row < prefill.T; ++row) {
+        const std::uint64_t position =
+            static_cast<std::uint64_t>(prefill.p0) + row;
+        const std::int32_t n_kv = static_cast<std::int32_t>(position + 1u);
+        const StepRow expected{
+            static_cast<std::int32_t>(position),
+            n_kv,
+            n_kv / static_cast<std::int32_t>(INDEXER_BLOCK_CELLS),
+            std::min<std::int32_t>(
+                n_kv,
+                static_cast<std::int32_t>(
+                    INDEXER_SELECTION_WIDTH_MAX)),
+        };
+        if (steps[row].pos != expected.pos ||
+            steps[row].n_kv != expected.n_kv ||
+            steps[row].n_bid != expected.n_bid ||
+            steps[row].width != expected.width) {
+            error = "Prefill QSA selection StepRows must match the chunk's "
+                    "contiguous positions";
+            return false;
+        }
+    }
+
+    const std::array<std::pair<BufferRef, std::size_t>, 4> inputs{{
+        {buffers.pooled, dispatch.pooled_bytes},
+        {buffers.dead, dispatch.dead_bytes},
+        {buffers.indexer_queries, dispatch.query_bytes},
+        {buffers.steps, dispatch.steps_bytes},
+    }};
+    const std::array<std::pair<BufferRef, std::size_t>, 2> outputs{{
+        {buffers.scores, dispatch.scores_bytes},
+        {buffers.ids, dispatch.ids_bytes},
+    }};
+    if (buffer_overlaps(outputs[0].first, outputs[0].second,
+                        outputs[1].first, outputs[1].second)) {
+        error = "Prefill QSA selection score and ID outputs must be "
+                "disjoint";
+        return false;
+    }
+    for (const auto& [output, output_bytes] : outputs) {
+        for (const auto& [input, input_bytes] : inputs) {
+            if (buffer_overlaps(output, output_bytes, input, input_bytes)) {
+                error = "Prefill QSA selection outputs must not overlap "
+                        "inputs";
+                return false;
+            }
+        }
+    }
+
+    const bool register_form =
+        dispatch.max_blocks <= kSelectionTopkRegMaxBlocks;
+    if (!validate_selection_scores_pipeline(context, error) ||
+        !validate_selection_topk_pipeline(
+            context,
+            register_form ? "strata_sel_topk_reg"
+                          : "strata_sel_topk_mem",
+            register_form ? kSelectionTopkRegThreads
+                          : kSelectionTopkMemThreads,
+            error)) {
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
 bool encode_qsa_selection_scores(
     Context& context, CommandBuffer& command_buffer,
     std::uint32_t token_rows, std::uint32_t cell_capacity,
@@ -3088,10 +3268,13 @@ static bool prepare_selection_topk_dispatch(
     Context& context, std::uint32_t token_rows,
     std::uint32_t cell_capacity,
     const QsaSelectionTopkBuffers& buffers,
-    SelectionTopkDispatch& dispatch, std::string& error) {
+    SelectionTopkDispatch& dispatch, std::string& error,
+    std::uint32_t row_limit = VERIFY_MAX_T) {
     error.clear();
-    if (token_rows == 0u || token_rows > VERIFY_MAX_T) {
-        error = "QSA top-k row count must be in 1..8";
+    if (token_rows == 0u || token_rows > row_limit) {
+        error = row_limit == VERIFY_MAX_T
+            ? "QSA top-k row count must be in 1..8"
+            : "Prefill QSA top-k row count exceeds its 256-row batch limit";
         return false;
     }
     if (cell_capacity == 0u ||
@@ -3233,13 +3416,15 @@ bool encode_qsa_selection_topk(
     return true;
 }
 
-bool encode_qsa_selection_topk(
+static bool encode_selection_topk_encoder(
     Context& context, Encoder& encoder,
     std::uint32_t token_rows, std::uint32_t cell_capacity,
-    const QsaSelectionTopkBuffers& buffers, std::string& error) {
+    const QsaSelectionTopkBuffers& buffers, std::string& error,
+    std::uint32_t row_limit = VERIFY_MAX_T) {
     SelectionTopkDispatch dispatch;
     if (!prepare_selection_topk_dispatch(
-            context, token_rows, cell_capacity, buffers, dispatch, error)) {
+            context, token_rows, cell_capacity, buffers, dispatch, error,
+            row_limit)) {
         return false;
     }
     if (!validate_selection_topk_pipeline(
@@ -3270,6 +3455,113 @@ bool encode_qsa_selection_topk(
         dispatch.kernel_name, {token_rows, 1u, 1u},
         {dispatch.threads, 1u, 1u}, bindings, byte_bindings,
         threadgroup_memory, error);
+}
+
+bool encode_qsa_selection_topk(
+    Context& context, Encoder& encoder,
+    std::uint32_t token_rows, std::uint32_t cell_capacity,
+    const QsaSelectionTopkBuffers& buffers, std::string& error) {
+    return encode_selection_topk_encoder(
+        context, encoder, token_rows, cell_capacity, buffers, error);
+}
+
+bool encode_prefill_qsa_selection(
+    Context& context, Encoder& encoder, const PrefillParams& prefill,
+    std::uint32_t cell_capacity,
+    const QsaPrefillSelectionBuffers& buffers, std::string& error) {
+    error.clear();
+    if (encoder.concurrent_group_open()) {
+        error = "Prefill QSA selection requires an ordered concurrent-group "
+                "boundary";
+        return false;
+    }
+    PrefillSelectionDispatch dispatch;
+    if (!prepare_prefill_selection_dispatch(
+            context, prefill, cell_capacity, buffers, dispatch, error)) {
+        return false;
+    }
+
+    for (std::uint32_t group_base = 0u; group_base < prefill.T;
+         group_base += kPrefillSelectionGroupRows) {
+        const std::uint32_t group_rows = std::min(
+            kPrefillSelectionGroupRows, prefill.T - group_base);
+        for (std::uint32_t local_base = 0u; local_base < group_rows;
+             local_base += VERIFY_MAX_T) {
+            const std::uint32_t score_rows =
+                std::min(VERIFY_MAX_T, group_rows - local_base);
+            const std::uint32_t input_row = group_base + local_base;
+            const std::size_t query_offset =
+                static_cast<std::size_t>(input_row) *
+                dispatch.query_row_bytes;
+            const std::size_t step_offset =
+                static_cast<std::size_t>(input_row) *
+                dispatch.step_row_bytes;
+            const std::size_t score_offset =
+                static_cast<std::size_t>(local_base) *
+                dispatch.score_row_bytes;
+            const std::size_t query_bytes =
+                static_cast<std::size_t>(score_rows) *
+                dispatch.query_row_bytes;
+            const std::size_t step_bytes =
+                static_cast<std::size_t>(score_rows) *
+                dispatch.step_row_bytes;
+            const std::size_t score_bytes =
+                static_cast<std::size_t>(score_rows) *
+                dispatch.score_row_bytes;
+            const QsaSelectionScoresBuffers score_buffers{
+                buffers.pooled,
+                buffers.dead,
+                buffers.indexer_queries.slice(query_offset, query_bytes),
+                buffers.steps.slice(step_offset, step_bytes),
+                buffers.scores.slice(score_offset, score_bytes),
+            };
+            if (!encode_qsa_selection_scores(
+                    context, encoder, score_rows, cell_capacity,
+                    score_buffers, error)) {
+                return false;
+            }
+        }
+
+        const std::size_t group_score_bytes =
+            static_cast<std::size_t>(group_rows) *
+            dispatch.score_row_bytes;
+        const std::size_t group_step_offset =
+            static_cast<std::size_t>(group_base) *
+            dispatch.step_row_bytes;
+        const std::size_t group_step_bytes =
+            static_cast<std::size_t>(group_rows) *
+            dispatch.step_row_bytes;
+        const std::size_t group_id_offset =
+            static_cast<std::size_t>(group_base) * dispatch.id_row_bytes;
+        const std::size_t group_id_bytes =
+            static_cast<std::size_t>(group_rows) * dispatch.id_row_bytes;
+        const QsaSelectionTopkBuffers topk_buffers{
+            buffers.scores.slice(0u, group_score_bytes),
+            buffers.steps.slice(group_step_offset, group_step_bytes),
+            buffers.ids.slice(group_id_offset, group_id_bytes),
+        };
+        if (!encode_selection_topk_encoder(
+                context, encoder, group_rows, cell_capacity, topk_buffers,
+                error, kPrefillSelectionGroupRows)) {
+            return false;
+        }
+    }
+    error.clear();
+    return true;
+}
+
+bool encode_prefill_qsa_selection(
+    Context& context, CommandBuffer& command_buffer,
+    const PrefillParams& prefill, std::uint32_t cell_capacity,
+    const QsaPrefillSelectionBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Prefill QSA selection",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_qsa_selection(
+                context, encoder, prefill, cell_capacity, buffers,
+                encode_error);
+        },
+        error);
 }
 
 static bool prepare_qsa_gate_dispatch(
