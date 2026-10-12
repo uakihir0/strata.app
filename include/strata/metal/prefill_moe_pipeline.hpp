@@ -44,7 +44,10 @@ struct PrefillMoeRouteGatherBuffers {
 /// coordinate that handshake with `ExpertStore`. The caller-owned Encoder
 /// overload may already have encoded a prefix when it returns false; its
 /// enclosing `Encoder::encode` body must propagate that failure so the
-/// command segment is discarded.
+/// command segment is discarded. If this is ordered with the shared-expert
+/// coordinator in one Encoder segment, every active writable view in either
+/// coordinator must be disjoint from every active view in the other;
+/// cross-coordinator read-only inputs may alias.
 bool encode_prefill_moe_full_mode_route_gather(
     Context& context, Encoder& encoder, std::uint32_t rows,
     std::uint32_t n_experts, std::uint32_t layer,

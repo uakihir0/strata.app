@@ -47,6 +47,10 @@ struct PrefillMoeSharedFFNBuffers {
 /// The BF16X2 shared gate requires projection mode 1 or 2. For caller-owned
 /// use, propagate false from the enclosing `Encoder::encode` body so an
 /// already encoded prefix is discarded.
+/// If ordered with the full-mode route/gather coordinator in one Encoder
+/// segment, every active writable view in either coordinator must be disjoint
+/// from every active view in the other; cross-coordinator read-only inputs may
+/// alias.
 bool encode_prefill_moe_shared_ffn(
     Context& context, Encoder& encoder, std::uint32_t rows,
     PrefillBF16X2Mode projection_mode,

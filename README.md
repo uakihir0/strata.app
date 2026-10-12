@@ -41,9 +41,10 @@ F16 row gather are now composed as one transactional steps 1–6 segment for
 BF16X2 modes 1 and 2, with synthetic serial/concurrent tests and cross-stage
 alias checks. The shared-expert FFN stages 7–10 also have a
 caller-owned/transactional coordinator, verified with synthetic Q2_0 and
-BF16X2 references. These two coordinators can be ordered by a caller; routed
-expert tile consumers and combine, tiered scheduling and production
-`Prefill::run` integration remain pending.
+BF16X2 references. These two coordinators can be ordered by a caller when
+every writable active view in either coordinator is disjoint from every active
+view in the other; routed expert tile consumers and combine, tiered scheduling
+and production `Prefill::run` integration remain pending.
 
 ## Build and test entry points
 

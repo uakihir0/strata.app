@@ -17,8 +17,10 @@ router, divide-mode top-10 route, grouping and F16 row gather (steps 1–6) in
 one transactional segment. Its serial and concurrent tests use synthetic
 inputs at T=1/7 and 256/512 experts. The shared-expert stages 7–10 now have a
 separate typed coordinator and synthetic serial/concurrent tests. Callers
-still schedule the two compositions; routed expert tile consumers and
-combine, tiered scheduling and `Prefill::run` integration remain open.
+still schedule the two compositions and must keep each writable active view
+disjoint from every active view of the other composition; routed expert tile
+consumers and combine, tiered scheduling and `Prefill::run` integration
+remain open.
 MPP requires
 Apple10; the SIMD paths use F32 SIMD-group matrices and are intended for all
 Apple GPU families, but have only been exercised on the current Apple10 Mac.

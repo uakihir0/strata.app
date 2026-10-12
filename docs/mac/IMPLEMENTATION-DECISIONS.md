@@ -12569,15 +12569,18 @@ measuring L-15 remain open.
   later grouping or combine stages still need.
 - **Review required:** See REV-204. Challenge shape and format assumptions,
   the divide-mode selection, the cross-stage alias matrix, active extents,
-  rollback after late validation, scalar and grouping oracle independence,
-  plan-slot padding, and the explicit full-mode-only scope.
+  low-product coverage and the full K reduction, rollback after late
+  validation, scalar and grouping oracle independence, plan-slot padding,
+  and the explicit full-mode-only scope.
 - **Validation:** The full `mac-dev` build passed; focused Prefill MoE,
   Encoder and Window storage CTests passed 14/14; `mac-host` passed 45/45
   with one real-model-input test skipped; and all 35 Python test modules
   passed under the existing `.venv`. `test_map.py` passed with its existing
   planned and missing-requirement diagnostics. The full `mac-metal` suite
   passed 104/104. Final route/gather rollback assertions also passed in the
-  focused serial/concurrent CTests (4/4 across both composed pipelines).
+  focused serial/concurrent CTests (4/4 across both composed pipelines);
+  the strengthened six-coordinate high/low BF16X2 fixture also passed those
+  route tests.
   Follow-up hostile review is pending.
 
 ### D-IMPL-409: Compose Prefill MoE shared-expert steps 7–10
@@ -12586,15 +12589,22 @@ measuring L-15 remain open.
   native shared gate/up projections, F16 SwiGLU, native down projection and
   BF16X2 shared-gate logits. Accept projection modes 1 and 2 only, limit T to
   1..8, and require dedicated dequantization scratch for each native
-  projection.
+  projection. When callers chain this with route/gather in one Encoder,
+  require every writable active view in either component to be disjoint from
+  every active view in the other; read-only inputs across components may
+  alias.
 - **Reason:** The component encoders already define the tensor and arithmetic
   contracts; this coordinator provides their useful ordered boundary without
   claiming a complete per-layer MoE schedule. Mode 0 omits the BF16 low
   product, and overlapping active writes could corrupt intermediate values
-  or route outputs before their next consumers. Tiered event scheduling and
-  production `Prefill::run` integration remain explicit caller work.
+  or route outputs before their next consumers. Keeping route/gather and the
+  shared branch as separate APIs preserves caller control of scheduling; the
+  strict cross-component alias contract makes that composition requirement
+  explicit. Tiered event scheduling and production `Prefill::run` integration
+  remain explicit caller work.
 - **Review required:** See REV-205. Challenge projection formats and extents,
-  BF16X2 mode handling, the cross-stage alias checks, dedicated scratch,
+  BF16X2 mode handling, the cross-stage and cross-component alias contracts,
+  dedicated scratch, per-output-row and per-K-block oracle coverage,
   independent scalar references, and rollback after failures in both API
   forms.
 - **Validation:** T=1/7 synthetic serial/concurrent tests compare every stage
@@ -12604,4 +12614,5 @@ measuring L-15 remain open.
   45/45 with one real-model-input test skipped, all Python modules passed
   35/35 under `.venv`, and `test_map.py` passed with its existing
   planned/missing-requirement diagnostics. Follow-up hostile review is
-  pending.
+  pending. The per-channel/per-K-block Q2_0 oracle changes passed the
+  focused serial/concurrent route/shared CTests (4/4).
