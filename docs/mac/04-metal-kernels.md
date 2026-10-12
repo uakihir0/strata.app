@@ -4743,9 +4743,24 @@ and concurrent integration cases exercise all four KV formats from projected
 rows through native `attn_output`, compare every stage with scalar oracles,
 use nonzero synthetic Q8_0 weights for an independent FP64 projection check,
 and verify that a late tail validation failure discards the encoded
-preparation. Input projections are implemented as a separate coordinator; a
-single coordinator for steps 1–14, production layer scheduling and
-`Prefill::run` remain pending.
+preparation.
+
+`encode_prefill_qsa_layer_pipeline` composes steps 1–14 in one ordered
+transaction: native K/V/Q projection, BF16 indexer K/Q projection, projected
+row preparation and cache/indexer append, selection, sparse attention,
+optional attention FWHT, gate and native `attn_output` projection. Before
+encoding, it checks that all five projection outputs feed their documented
+preparation or append inputs and rejects projection writes that overlap later
+live layer inputs. A one-row synthetic integration fixture runs dense,
+channel-varying Q8_0 and BF16 activation/weight patterns, with distinct
+patterns for each projection, through the f16 KV path;
+independent FP64 projection references feed the scalar oracles for preparation,
+indexer state, selection, attention, gate and output. Serial standalone and
+concurrent caller-owned forms also check projection-handoff and cross-stage
+alias rejection before dispatch and full rollback after a late tail failure.
+This fixture uses synthetic weights and does not establish model parity; the
+other three KV formats are covered by the projected-row coordinator.
+Production layer scheduling and `Prefill::run` remain pending.
 
 The three kernels run in this order. Each encodes only when it has work, and the host knows which from p0 and T.
 

@@ -11786,3 +11786,74 @@ measuring L-15 remain open.
   reports all checks passed with its existing planned/no-check diagnostics.
   `check_drift.py` reports no upstream changes and valid golden files;
   `git diff --check` passes.
+
+### D-IMPL-394: Compose the complete Prefill QSA layer
+
+- **Decision:** Add `encode_prefill_qsa_layer_pipeline` to connect steps 1–2
+  input projections to `encode_prefill_qsa_layer`'s steps 3–14 in one ordered
+  Encoder segment. Before encoding, require K/V/Q and indexer K/Q projection
+  outputs to match the corresponding preparation and append inputs, and
+  reject active projection writes that overlap later live layer inputs.
+  Preserve the existing projected-row API, add both caller-owned and
+  transactional standalone forms, and define the optional backend result as
+  the final `attn_output` projection backend. Keep production layer scheduling
+  and `Prefill::run` out of scope.
+- **Reason:** The individual projection, preparation and tail coordinators
+  already validate their own buffers, but a caller could still wire unrelated
+  producers between stages or accidentally split their failure boundary.
+  The top-level per-layer coordinator makes the documented 1–14 order and
+  projection handoffs explicit while retaining the component APIs for tests
+  and future scheduling.
+- **Fixture judgment:** Use one row, f16 KV and dense, deterministic, exactly
+  representable F16/BF16 activations with distinct per-projection weight
+  patterns. Derive each Q8_0 and BF16 projection row independently in FP64,
+  then use those rows as the source for the scalar preparation and tail
+  oracles. This prevents uniform sums from hiding projection orientation or
+  indexing defects and ensures every input channel contributes. Keep all four
+  KV modes in the projected-row coordinator tests; this full
+  projection-to-output composition fixture does not claim each KV mode or
+  shipped-model parity.
+- **Review required:** Challenge each producer/consumer identity check,
+  verify validation occurs before the first projection, audit standalone and
+  caller-owned failure propagation after projection and preparation work, and
+  confirm the selected-backend result describes only the final projection.
+  Check the integrated oracle and document its one-mode synthetic scope
+  without implying production scheduling.
+- **Validation:** `mac-dev` built successfully. Serial standalone and
+  concurrent caller-owned `metal_attn_test` CTests passed 2/2. The one-row
+  pipeline fixture passed QSA preparation, KV/indexer state, selection,
+  attention, gate and independent FP64 output projection checks; broken
+  projection handoffs and projection-scratch overlap with live normalization
+  gamma failed before dispatch. A broken downstream layer handoff after
+  projection encoding discarded the complete segment, as did late tail
+  validation. Adversarial findings and documentation checks are recorded in
+  REV-190.
+
+### REV-190: Adversarial review of the complete Prefill QSA layer pipeline
+
+- **Scope:** Challenge cross-stage active ranges and aliases, QSA projection
+  handoffs, mode-specific cache extents, projection fixture coverage and
+  independence, standalone/caller-owned transaction rollback, and claims about
+  production scheduling.
+- **Findings:** The first review found a P1: projection F16 scratch could alias
+  a later live input such as `attn_k_norm` gamma, which neither coordinator
+  checked across the stage boundary. It also found a P2: uniform activations
+  and weights could hide projection orientation or indexing errors. The
+  follow-up found two P2 fixture/range issues: f16/q4 marked an unused
+  key-scale view as live, and the projection fixture used only 16 nonzero
+  channels with correlated K/V and indexer K/Q patterns. It noted a P3
+  documentation timing issue while the concurrent test was still running.
+- **Disposition:** Add pre-encode active-range checks for all projection writes
+  against later live layer inputs, and add an explicit overlapping scratch /
+  normalization-gamma rejection test. Use dense, nonzero, channel-varying
+  activations, distinct per-projection weight patterns and independent FP64
+  projection references. Compute exact per-mode cache input extents so absent
+  f16/q4 scale views have zero active bytes. Rerun both tests before recording
+  results. The hostile follow-up found no remaining P1/P2 issue; the result
+  record and current test status resolve the documentation finding.
+- **Validation:** `mac-dev` built successfully. Serial standalone and
+  concurrent caller-owned `metal_attn_test` CTests passed 2/2 with the dense
+  fixture, distinct-weight assertions, alias rejection and rollback cases.
+  `test_map.py` passed with its documented planned/missing-work diagnostics;
+  `check_drift.py` reported no upstream changes and valid golden files;
+  `git diff --check` passed.
