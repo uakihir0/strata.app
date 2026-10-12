@@ -548,6 +548,9 @@ bool CommandBuffer::add_completion_handler(std::function<void(bool)> handler,
     err.clear();
     return true;
 }
+std::shared_ptr<const void> CommandBuffer::identity_token() const noexcept {
+    return submission_state_;
+}
 bool CommandBuffer::can_encode() const noexcept {
     if (handle_ == nullptr || committed_ || discarded_ || enqueued_) return false;
     id<MTLCommandBuffer> command_buffer = (__bridge id<MTLCommandBuffer>)handle_;

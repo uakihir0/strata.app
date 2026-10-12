@@ -5,6 +5,8 @@
 #include "strata/metal/kv.hpp"
 #include "strata/metal/experts.hpp"
 #include "strata/metal/encoder.hpp"
+#include "strata/metal/prefill_moe_expert_dispatch.hpp"
+#include "strata/metal/prefill_moe_grouping.hpp"
 #include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/window_dispatch.hpp"
 #include "strata/metal/window_ple_dispatch.hpp"
@@ -173,6 +175,26 @@ struct TestMoeExpertAddress {
     std::uint64_t role[3]{};
 };
 static_assert(sizeof(TestMoeExpertAddress) == 24);
+
+struct TestPrefillMoePlan {
+    std::uint32_t n_groups = 0u;
+    std::uint32_t n_entries = 0u;
+    std::uint32_t n_miss = 0u;
+    std::uint32_t skip = 0u;
+    std::uint32_t n_tiles = 0u;
+    std::uint32_t bad = 0u;
+    std::uint32_t pad[2]{};
+    std::int32_t grp_e[512]{};
+    std::int32_t grp_res[512]{};
+    std::int32_t grp_start[513]{};
+};
+static_assert(sizeof(TestPrefillMoePlan) == kPrefillMoePlanBytes);
+
+struct TestPrefillMoeTile {
+    std::uint32_t group = 0u;
+    std::uint32_t first_entry = 0u;
+};
+static_assert(sizeof(TestPrefillMoeTile) == 8u);
 
 struct TestMoeGroupedParams {
     std::uint32_t n_expert = 0;
@@ -1344,6 +1366,121 @@ void require_not_overlapping_gguf_mapping(BufferRef buffer, const strata::GgufFi
             label + " overlaps the GGUF mapping address range");
 }
 
+void verify_unpinned_tiered_q2_is_not_dereferenced(
+    Context& context, ExpertStore& expert_store) {
+    constexpr std::uint32_t rows = 1u;
+    constexpr std::uint32_t n_experts = 256u;
+    constexpr std::uint32_t layer = 0u;
+    constexpr std::size_t expert_bytes = 640u * 40u * 18u;
+    constexpr std::size_t gathered_bytes =
+        rows * 10u * 2560u * sizeof(std::uint16_t);
+    constexpr std::size_t hidden_bytes =
+        rows * 10u * 640u * sizeof(std::uint16_t);
+    constexpr std::size_t tile_capacity = 11u;
+    std::string error;
+
+    BufferRef addresses = context.buffers().allocate(
+        "unpinned Q2_0 address table", n_experts * sizeof(TestMoeExpertAddress),
+        error);
+    BufferRef address_snapshot = context.buffers().allocate(
+        "unpinned Q2_0 address snapshot",
+        n_experts * sizeof(TestMoeExpertAddress), error);
+    BufferRef weights = context.buffers().allocate(
+        "unpinned Q2_0 expert storage", 2u * expert_bytes, error);
+    BufferRef gathered =
+        context.buffers().allocate("unpinned Q2_0 gathered rows",
+                                   gathered_bytes, error);
+    BufferRef plan = context.buffers().allocate(
+        "unpinned Q2_0 plan", kPrefillMoePlanStrideBytes, error);
+    BufferRef tiles = context.buffers().allocate(
+        "unpinned Q2_0 tiles",
+        tile_capacity * sizeof(TestPrefillMoeTile), error);
+    BufferRef hidden = context.buffers().allocate(
+        "unpinned Q2_0 hidden output", hidden_bytes + 64u, error);
+    BufferRef status =
+        context.buffers().allocate("unpinned Q2_0 status", 64u, error);
+    require(addresses && address_snapshot && weights && gathered && plan &&
+                tiles && hidden && status,
+            "allocate buffers for an unpinned tiered Q2_0 address: " + error);
+
+    std::memset(addresses.contents, 0, addresses.length);
+    std::memset(weights.contents, 0, weights.length);
+    auto* const weight_bytes = static_cast<std::uint8_t*>(weights.contents);
+    for (std::size_t role = 0u; role < 2u; ++role) {
+        for (std::size_t block = 0u; block < 640u * 40u; ++block) {
+            const std::size_t offset = role * expert_bytes + block * 18u;
+            weight_bytes[offset] = 0x00u;
+            weight_bytes[offset + 1u] = 0x3cu;  // F16 scale 1.0
+            std::fill(weight_bytes + offset + 2u,
+                      weight_bytes + offset + 18u, 0xaau);
+        }
+    }
+    auto* const gathered_values =
+        static_cast<std::uint16_t*>(gathered.contents);
+    std::fill(gathered_values, gathered_values + gathered_bytes /
+                                          sizeof(std::uint16_t),
+              0x3c00u);
+    std::memset(plan.contents, 0, plan.length);
+    std::memset(tiles.contents, 0, tiles.length);
+    std::memset(hidden.contents, 0xa5, hidden.length);
+    std::memset(status.contents, 0xa5, status.length);
+    auto* const address_table =
+        static_cast<TestMoeExpertAddress*>(addresses.contents);
+    address_table[0].role[0] = weights.gpu_address;
+    address_table[0].role[1] = weights.gpu_address + expert_bytes;
+    auto* const pf_plan = static_cast<TestPrefillMoePlan*>(plan.contents);
+    pf_plan->n_groups = 1u;
+    pf_plan->n_entries = rows * 10u;
+    pf_plan->n_tiles = 1u;
+    pf_plan->grp_e[0] = 0;
+    pf_plan->grp_start[0] = 0;
+    pf_plan->grp_start[1] = static_cast<std::int32_t>(rows * 10u);
+    static_cast<TestPrefillMoeTile*>(tiles.contents)[0] = {0u, 0u};
+
+    auto command =
+        context.make_command_buffer("unpinned tiered Q2_0 protection", error);
+    require(command != nullptr,
+            "create unpinned tiered Q2_0 command buffer: " + error);
+    auto leases = expert_store.prepare_command_buffer(*command, error);
+    require(leases != nullptr,
+            "prepare empty tiered Q2_0 lease set: " + error);
+    require(context.buffers().mark_tiered_slot_arena(weights, error),
+            "mark Q2_0 safety-probe storage as a tiered slot arena: " + error);
+    const std::array<PrefillMoeWeightStorageView, 1u> weight_views{{
+        {context.buffers().read_only(weights)},
+    }};
+    const PrefillMoeExpertTileBuffers buffers{
+        context.buffers().read_only(addresses),
+        address_snapshot,
+        weight_views,
+        leases,
+        context.buffers().read_only(gathered),
+        context.buffers().read_only(plan),
+        context.buffers().read_only(tiles),
+        hidden,
+        status,
+    };
+    require(!leases->pins(layer, address_table[0].role[0], expert_bytes),
+            "the empty lease set must not pin the active Q2_0 weight range");
+    require(encode_prefill_moe_gu_q2_0(
+                context, *command, rows, n_experts, layer, buffers, error),
+            "encode the unpinned-address safety probe: " + error);
+    require(command->commit(error) && command->wait_until_completed(error),
+            "complete the unpinned-address safety probe: " + error);
+    const auto* const status_word =
+        static_cast<const std::uint32_t*>(status.contents);
+    const auto* const hidden_bytes_view =
+        static_cast<const std::uint8_t*>(hidden.contents);
+    require(status_word[0] == 4u &&
+                std::all_of(hidden_bytes_view,
+                            hidden_bytes_view + hidden_bytes,
+                            [](std::uint8_t byte) { return byte == 0u; }) &&
+                std::all_of(hidden_bytes_view + hidden_bytes,
+                            hidden_bytes_view + hidden.length,
+                            [](std::uint8_t byte) { return byte == 0xa5u; }),
+            "an unpinned active tiered address must set status and zero its tile without reading it");
+}
+
 void run_tiered_copy_test(Context& context, const Fixture& fixture,
                           WindowSources sources, const Geometry& base_geometry) {
     std::string error;
@@ -1541,6 +1678,8 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     const BufferRef dense_arena = storage->dense_arena();
     const BufferRef resident_arena = storage->resident_arena();
     const BufferRef slot_arena = storage->slot_arena();
+    require(slot_arena && slot_arena.is_tiered_slot_arena(),
+            "TieredStorage must owner-mark its reusable slot arena");
     require(dense_arena && dense_arena.length == layout.dense_arena_bytes &&
                 dense_arena.length % kWindowPageBytes == 0 &&
                 dense_arena.gpu_address % kWindowPageBytes == 0 &&
@@ -1651,6 +1790,54 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
 
     auto expert_store = ExpertStore::create(*storage, geometry, error);
     require(expert_store != nullptr, "create tiered ExpertStore: " + error);
+
+    auto lease_probe_command =
+        context.make_command_buffer("tiered lease command affinity", error);
+    require(lease_probe_command != nullptr,
+            "create command-buffer lease affinity probe: " + error);
+    auto lease_probe =
+        expert_store->prepare_command_buffer(*lease_probe_command, error);
+    require(lease_probe != nullptr,
+            "prepare command-buffer lease affinity probe: " + error);
+    bool matches_prepared_command = false;
+    require(Encoder::encode(
+                context, *lease_probe_command, "tiered lease affinity match",
+                [&](Encoder& encoder, std::string& encode_error) {
+                    matches_prepared_command =
+                        lease_probe->prepared_for(encoder);
+                    if (!matches_prepared_command) {
+                        encode_error =
+                            "lease set did not match its prepared command buffer";
+                    }
+                    return matches_prepared_command;
+                },
+                error) &&
+                matches_prepared_command,
+            "accept the lease set on its prepared command buffer: " + error);
+
+    auto unrelated_command =
+        context.make_command_buffer("unrelated lease command", error);
+    require(unrelated_command != nullptr,
+            "create unrelated lease command buffer: " + error);
+    bool rejects_unrelated_command = false;
+    require(Encoder::encode(
+                context, *unrelated_command, "tiered lease affinity mismatch",
+                [&](Encoder& encoder, std::string&) {
+                    rejects_unrelated_command =
+                        !lease_probe->prepared_for(encoder);
+                    return rejects_unrelated_command;
+                },
+                error) &&
+                rejects_unrelated_command,
+            "reject the lease set on another command buffer: " + error);
+    require(!lease_probe->pins(0u, 0x1000u, sizeof(std::uint16_t)),
+            "an empty command-buffer lease set does not pin an expert address");
+    lease_probe->retire_layer(0u);
+    require(!lease_probe->pins(0u, 0x1000u, sizeof(std::uint16_t)),
+            "retired layer leases cannot validate a GPU address");
+    unrelated_command->discard();
+    lease_probe_command->discard();
+
     TieredMoePlan bad_plan{};
     bad_plan.n_groups = 2;
     bad_plan.n_entries = 2;
@@ -1916,6 +2103,17 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
                 resolve_leases, 0, *handshake_events, arrival_value, release_value,
                 5000, first_resolve, error),
             "resolve the shared GPU plan and release the waiting layer: " + error);
+    const auto pinned_role = [&](std::uint32_t expert, std::size_t role) {
+        const std::uint64_t address =
+            addresses[static_cast<std::size_t>(expert) * 3u + role];
+        return resolve_leases->pins(
+            0u, address,
+            layout.experts[expert].roles[role].byte_count);
+    };
+    require(pinned_role(3u, 0u) && pinned_role(3u, 1u) &&
+                pinned_role(8u, 0u) && pinned_role(8u, 1u) &&
+                !pinned_role(7u, 0u),
+            "ExpertLeaseSet pins both active tiered experts and excludes resident addresses");
     gate_cleanup.mark_layer_released();
     require(handshake_events->wait(consumer_arrival_value, 5000, error),
             "hold the GPU expert consumer at its test gate before reading slots: " + error);
@@ -2244,6 +2442,7 @@ void run_tiered_copy_test(Context& context, const Fixture& fixture,
     [native_cache waitUntilCompleted];
     require(context.buffers().allocation_count() == 11,
             "tiered mode must allocate its three arenas, four tables, GPU-plan input and GPU-reader fixtures, without GGUF windows");
+    verify_unpinned_tiered_q2_is_not_dereferenced(context, *expert_store);
     require_not_overlapping_gguf_mapping(dense_arena, source_file, "tiered dense arena");
     require_not_overlapping_gguf_mapping(resident_arena, source_file, "tiered resident arena");
     require_not_overlapping_gguf_mapping(slot_arena, source_file, "tiered slot arena");

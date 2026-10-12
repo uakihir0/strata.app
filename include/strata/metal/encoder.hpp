@@ -13,6 +13,8 @@
 
 namespace strata::metal {
 
+class ExpertLeaseSet;
+
 struct EncoderSize {
     std::size_t x = 1;
     std::size_t y = 1;
@@ -31,6 +33,15 @@ struct EncoderBufferBinding {
 struct EncoderReadOnlyBufferBinding {
     ReadOnlyBufferRef buffer;
     std::uint32_t index = 0;
+    std::size_t required_bytes = 1;
+    std::size_t alignment = 1;
+};
+
+/// A read-only Metal resource accessed through a GPU address rather than a
+/// shader buffer argument. Declaring it keeps untracked allocations resident
+/// and visible to the command encoder.
+struct EncoderResourceBinding {
+    ReadOnlyBufferRef buffer;
     std::size_t required_bytes = 1;
     std::size_t alignment = 1;
 };
@@ -79,6 +90,17 @@ public:
                   std::span<const EncoderThreadgroupMemory> threadgroup_memory,
                   std::string& error);
 
+    /// Declare read-only resources dereferenced through GPU addresses.
+    bool use_resources(std::span<const EncoderResourceBinding> resources,
+                       std::string& error);
+
+    /// Reserve caller-owned staging bytes once per pending command buffer.
+    /// Reusing an overlapping range in that command buffer is rejected.
+    bool claim_unique_staging_range(BufferRef buffer,
+                                    std::size_t required_bytes,
+                                    std::size_t alignment,
+                                    std::string& error);
+
     bool group_begin(std::string& error);
     bool group_end(std::string& error);
 
@@ -93,7 +115,10 @@ public:
 private:
     struct Impl;
     explicit Encoder(std::unique_ptr<Impl> impl);
+    const void* command_buffer_identity() const noexcept;
     std::unique_ptr<Impl> impl_;
+
+    friend class ExpertLeaseSet;
 };
 
 }  // namespace strata::metal

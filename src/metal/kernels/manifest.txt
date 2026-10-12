@@ -193,8 +193,11 @@ strata_pf_sort_count safe 256 1 1
 strata_pf_sort_scan safe 512 1 1
 strata_pf_sort_scatter safe 256 1 1
 strata_pf_gather_f16 safe 256 1 1
+strata_pf_moe_plan_validate safe 128 1 1
+strata_pf_moe_gu_q2_0 safe 128 1 1
 strata_pf_swiglu_pair safe 256 1 1
 strata_pf_combine safe 256 1 1
+strata_pf_q2_0_decode_probe safe 256 1 1
 strata_samp_greedy safe 1024 1 1
 strata_samp_split_part safe 128 1 1
 strata_samp_split_merge safe 32 1 1

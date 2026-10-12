@@ -1,5 +1,6 @@
 // src/metal/engine/experts.cpp - tiered expert reads, lookahead and DONE counters.
 #include "strata/metal/experts.hpp"
+#include "strata/metal/encoder.hpp"
 
 #include <algorithm>
 #include <array>
@@ -129,12 +130,41 @@ struct ExpertLeaseSet::Impl {
     std::mutex mutex;
     std::array<std::vector<SlotPool::Lease>, kTieredMaxLayers> leases;
     std::array<bool, kTieredMaxLayers> retired_layers{};
+    std::shared_ptr<const void> command_buffer_identity;
     bool completed = false;
 };
 
 ExpertLeaseSet::ExpertLeaseSet(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 ExpertLeaseSet::~ExpertLeaseSet() = default;
+
+bool ExpertLeaseSet::prepared_for(const Encoder& encoder) const noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return !impl_->completed && impl_->command_buffer_identity != nullptr &&
+           impl_->command_buffer_identity.get() ==
+               encoder.command_buffer_identity();
+}
+
+bool ExpertLeaseSet::pins(std::uint32_t layer, std::uint64_t gpu_address,
+                          std::uint64_t bytes) const noexcept {
+    if (gpu_address == 0u || bytes == 0u || layer >= impl_->leases.size()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->completed || impl_->retired_layers[layer]) return false;
+    for (const SlotPool::Lease& lease : impl_->leases[layer]) {
+        const ExpertSlotView& view = lease.view();
+        if (!lease || view.gpu_address == 0u ||
+            gpu_address < view.gpu_address) {
+            continue;
+        }
+        const std::uint64_t offset = gpu_address - view.gpu_address;
+        if (offset <= view.byte_count && bytes <= view.byte_count - offset) {
+            return true;
+        }
+    }
+    return false;
+}
 
 bool ExpertLeaseSet::retain(std::uint32_t layer,
                             std::vector<SlotPool::Lease>& leases,
@@ -364,6 +394,8 @@ std::shared_ptr<ExpertLeaseSet> ExpertStore::prepare_command_buffer(
         error = "cannot allocate expert command-buffer lease set";
         return nullptr;
     }
+    lease_set->impl_->command_buffer_identity =
+        command_buffer.identity_token();
     if (!command_buffer.add_completion_handler(
             [lease_set](bool) { lease_set->complete(); }, error)) {
         return nullptr;

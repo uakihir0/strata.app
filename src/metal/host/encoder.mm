@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::metal {
@@ -135,8 +136,11 @@ bool claim_index(std::vector<std::uint32_t>& indices, std::uint32_t index) {
 
 struct Encoder::Impl {
     Impl(Context& owner, id<MTLComputeCommandEncoder> native_encoder,
-         DispatchMode dispatch_mode)
-        : context(owner), encoder(native_encoder), mode(dispatch_mode) {}
+         DispatchMode dispatch_mode, CommandBuffer& owner_command_buffer,
+         std::shared_ptr<const void> command_buffer_identity_token)
+        : context(owner), encoder(native_encoder), mode(dispatch_mode),
+          command_buffer(&owner_command_buffer),
+          command_buffer_identity(std::move(command_buffer_identity_token)) {}
 
     ~Impl() { finish(); }
 
@@ -155,6 +159,8 @@ struct Encoder::Impl {
     Context& context;
     __strong id<MTLComputeCommandEncoder> encoder = nil;
     DispatchMode mode = DispatchMode::serial;
+    CommandBuffer* command_buffer = nullptr;
+    std::shared_ptr<const void> command_buffer_identity;
     bool failed = false;
     bool group_open = false;
     bool has_encoded_dispatches = false;
@@ -215,7 +221,9 @@ bool Encoder::encode(Context& context, CommandBuffer& command_buffer,
             native_encoder.label = native_label;
             [native_encoder waitForFence:fence];
 
-            Encoder encoder(std::make_unique<Impl>(context, native_encoder, mode));
+            Encoder encoder(std::make_unique<Impl>(
+                context, native_encoder, mode, command_buffer,
+                command_buffer.identity_token()));
             bool body_succeeded = body(encoder, encode_error);
             if (encoder.impl_->group_open) {
                 encoder.impl_->fail(encode_error,
@@ -422,6 +430,87 @@ bool Encoder::dispatch(
     }
     error.clear();
     return true;
+}
+
+bool Encoder::use_resources(
+    std::span<const EncoderResourceBinding> resources,
+    std::string& error) {
+    error.clear();
+    if (impl_ == nullptr || impl_->failed) {
+        error = "Metal compute encoder is unavailable after an earlier failure";
+        return false;
+    }
+    std::vector<void*> used_handles;
+    used_handles.reserve(resources.size());
+    for (const EncoderResourceBinding& resource : resources) {
+        const EncoderBufferBinding validation_binding{
+            resource.buffer.buffer_, 0u, resource.required_bytes,
+            resource.alignment};
+        if (!validate_buffer(impl_->context, validation_binding, error)) {
+            impl_->failed = true;
+            return false;
+        }
+        void* const handle = resource.buffer.buffer_.handle;
+        if (std::find(used_handles.begin(), used_handles.end(), handle) !=
+            used_handles.end()) {
+            continue;
+        }
+        id<MTLBuffer> native = (__bridge id<MTLBuffer>)handle;
+        [impl_->encoder useResource:native usage:MTLResourceUsageRead];
+        used_handles.push_back(handle);
+    }
+    return true;
+}
+
+bool CommandBuffer::claim_staging_range(BufferRef range,
+                                        std::string& error) {
+    std::lock_guard<std::recursive_mutex> lock(encoding_mutex_);
+    if (!can_encode() || !range) {
+        error = "cannot reserve staging scratch on an unavailable command buffer";
+        return false;
+    }
+    for (const BufferRef& existing : staging_ranges_) {
+        if (buffer_views_overlap(existing, range)) {
+            error = "command buffer reuses overlapping staging scratch";
+            return false;
+        }
+    }
+    staging_ranges_.push_back(range);
+    error.clear();
+    return true;
+}
+
+bool Encoder::claim_unique_staging_range(BufferRef buffer,
+                                         std::size_t required_bytes,
+                                         std::size_t alignment,
+                                         std::string& error) {
+    error.clear();
+    if (impl_ == nullptr || impl_->failed ||
+        impl_->command_buffer == nullptr) {
+        error = "Metal encoder is unavailable for staging scratch";
+        if (impl_ != nullptr) impl_->failed = true;
+        return false;
+    }
+    const EncoderBufferBinding binding{buffer, 0u, required_bytes, alignment};
+    if (!validate_buffer(impl_->context, binding, error)) {
+        impl_->failed = true;
+        return false;
+    }
+    const BufferRef active_range = buffer.slice(0u, required_bytes);
+    if (!active_range ||
+        !impl_->command_buffer->claim_staging_range(active_range, error)) {
+        if (error.empty()) {
+            error = "Metal encoder cannot reserve its staging scratch range";
+        }
+        impl_->failed = true;
+        return false;
+    }
+    return true;
+}
+
+const void* Encoder::command_buffer_identity() const noexcept {
+    return impl_ == nullptr ? nullptr
+                            : impl_->command_buffer_identity.get();
 }
 
 bool Encoder::concurrent_group_open() const noexcept {

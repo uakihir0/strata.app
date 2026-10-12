@@ -781,6 +781,10 @@ std::unique_ptr<TieredStorage> TieredStorage::open(Context& context,
         candidate->slot_arena = context.buffers().allocate(
             "tiered slot arena", static_cast<std::size_t>(memory_plan.slot_bytes), error);
         if (!candidate->slot_arena) return nullptr;
+        if (!context.buffers().mark_tiered_slot_arena(candidate->slot_arena,
+                                                       error)) {
+            return nullptr;
+        }
     }
     candidate->slot_pool = SlotPool::create(
         candidate->slot_arena, geometry.n_layers, geometry.n_expert,

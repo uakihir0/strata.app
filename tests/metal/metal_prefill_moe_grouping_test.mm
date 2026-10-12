@@ -802,6 +802,8 @@ bool test_validation(Context& context, Context& foreign_context) {
     constexpr std::uint32_t rows = 1u;
     constexpr std::uint32_t experts = 512u;
     constexpr std::size_t entries = rows * kPrefillMoeTopK;
+    const std::size_t tile_capacity_bytes =
+        (round_up_div(entries, 64u) + 512u) * sizeof(Tile);
     twin::GuardedBuffer ids, resident, mixed, histogram, plans, tiles;
     twin::GuardedBuffer source, destination, gathered, foreign;
     std::string error;
@@ -816,8 +818,7 @@ bool test_validation(Context& context, Context& foreign_context) {
                            512u * sizeof(std::uint32_t), error) &&
         plans.allocate(context, "validation plan", kPrefillMoePlanStrideBytes,
                        error) &&
-        tiles.allocate(context, "validation tiles",
-                       (round_up_div(entries, 64u) + 512u) * sizeof(Tile),
+        tiles.allocate(context, "validation tiles", tile_capacity_bytes + 8u,
                        error) &&
         source.allocate(context, "validation source",
                         entries * sizeof(std::int32_t), error) &&
@@ -877,6 +878,10 @@ bool test_validation(Context& context, Context& foreign_context) {
         2u, entries * kWidth * sizeof(std::uint16_t));
     passed &= rejects(1u, experts, kLayer, misaligned_output, "misaligned",
                       "rejects unaligned uint4 gather output");
+    auto misaligned_tiles = valid;
+    misaligned_tiles.tiles = tiles.view().slice(4u, tile_capacity_bytes);
+    passed &= rejects(1u, experts, kLayer, misaligned_tiles, "misaligned",
+                      "rejects unaligned uint2 tile output");
     auto output_input_alias = valid;
     output_input_alias.source_rows = ids.view();
     passed &= rejects(1u, experts, kLayer, output_input_alias,

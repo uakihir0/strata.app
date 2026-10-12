@@ -202,7 +202,7 @@ bool validate_dispatch(Context& context, std::uint32_t rows,
                              kPrefillMoePlanStrideBytes, alignof(std::uint32_t),
                              "PfPlan slot", error) ||
         !validate_write_view(context, buffers.tiles, tile_bytes,
-                             alignof(std::uint32_t), "tile list", error) ||
+                             alignof(std::uint64_t), "tile list", error) ||
         !validate_write_view(context, buffers.source_rows, route_bytes,
                              alignof(std::int32_t), "source rows", error) ||
         !validate_write_view(context, buffers.destination_rows, route_bytes,
@@ -320,7 +320,7 @@ bool encode_grouping(Context& context, Encoder& encoder, std::uint32_t rows,
         {histogram, 0u, histogram_bytes, alignof(std::uint32_t)},
         {plans, 2u, kPrefillMoePlanStrideBytes,
          alignof(std::uint32_t)},
-        {tiles, 3u, tile_bytes, alignof(std::uint32_t)},
+        {tiles, 3u, tile_bytes, alignof(std::uint64_t)},
     }};
     const std::array<EncoderReadOnlyBufferBinding, 1u> scan_inputs{{
         {resident, 1u, tiered ? resident_layer_bytes : kIntBytes, kIntBytes},

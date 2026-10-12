@@ -140,6 +140,7 @@ set(STRATA_METAL_ENGINE_SOURCES
   src/metal/engine/prefill_native_projection.mm
   src/metal/engine/prefill_moe_grouping_dispatch.mm
   src/metal/engine/prefill_moe_post_dispatch.mm
+  src/metal/engine/prefill_moe_expert_dispatch.mm
   src/metal/engine/prefill_gemm_dispatch.mm
   src/metal/engine/prefill_gemm_selector.cpp
   src/metal/engine/prefill_gr_mix_dispatch.mm

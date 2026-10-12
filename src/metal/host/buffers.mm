@@ -205,6 +205,26 @@ bool Buffers::owns(BufferRef buffer, std::uint64_t identity) const {
                                     buffer.length, buffer.offset);
 }
 
+bool Buffers::mark_tiered_slot_arena(BufferRef buffer, std::string& err) {
+    if (!impl_ || !buffer || buffer.validity_ == nullptr) {
+        err = "cannot mark an invalid buffer as tiered slot storage";
+        return false;
+    }
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+    const auto token = impl_->validity_tokens.find(buffer.handle);
+    if (token == impl_->validity_tokens.end() ||
+        token->second != buffer.validity_ ||
+        !token->second->valid_for(buffer.handle, buffer.contents,
+                                  buffer.gpu_address, buffer.length,
+                                  buffer.offset)) {
+        err = "cannot mark a buffer not owned by this Context as tiered slot storage";
+        return false;
+    }
+    token->second->tiered_slot_arena_.store(true, std::memory_order_release);
+    err.clear();
+    return true;
+}
+
 BufferRef Buffers::wrap_no_copy(const std::string& label, void* address, std::size_t bytes, std::string& err) {
     return wrap_no_copy(label, address, bytes, {}, err);
 }

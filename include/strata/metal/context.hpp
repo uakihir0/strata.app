@@ -21,6 +21,8 @@ namespace strata::metal {
 class Buffers;
 class Events;
 class Context;
+class ExpertStore;
+class TieredStorage;
 
 enum class KernelMath { safe, fast };
 
@@ -120,6 +122,7 @@ private:
     std::uint64_t gpu_address_ = 0;
     std::size_t allocation_length_ = 0;
     std::uint64_t allocation_identity_ = 0;
+    std::atomic<bool> tiered_slot_arena_{false};
     std::atomic<bool> live_{true};
 
     friend class Buffers;
@@ -138,6 +141,11 @@ struct BufferRef {
     std::uint64_t gpu_address = 0;   ///< GPU address at offset
     std::size_t length = 0;          ///< bytes available from this view
     std::size_t offset = 0;          ///< offset into handle
+    /// True only when TieredStorage issued this view from its reusable slot arena.
+    bool is_tiered_slot_arena() const noexcept {
+        return validity_ != nullptr &&
+               validity_->tiered_slot_arena_.load(std::memory_order_acquire);
+    }
 
     explicit operator bool() const noexcept {
         return validity_ != nullptr &&
@@ -208,6 +216,10 @@ public:
     }
     std::size_t length() const noexcept { return buffer_ ? buffer_.length : 0; }
     std::size_t offset() const noexcept { return buffer_ ? buffer_.offset : 0; }
+    /// True only for a view whose owning allocation was marked by TieredStorage.
+    bool is_tiered_slot_arena() const noexcept {
+        return buffer_ && buffer_.is_tiered_slot_arena();
+    }
 
     /// Return a bounded read-only subview, or an empty view on failure.
     ReadOnlyBufferRef slice(std::size_t relative_offset,
@@ -263,6 +275,8 @@ public:
     /// Run exactly once when this command buffer completes, or with false if a
     /// NotEnqueued command buffer is discarded. Register before enqueue/commit.
     bool add_completion_handler(std::function<void(bool)> handler, std::string& err);
+    /// Stable identity retained by consumers that must outlive this wrapper.
+    std::shared_ptr<const void> identity_token() const noexcept;
     /// UNSAFE escape hatch for Objective-C++ encoding and diagnostics. Never
     /// enqueue or commit the returned command buffer directly; doing so bypasses
     /// event-order validation. Submit through this wrapper.
@@ -277,6 +291,7 @@ private:
     struct CompletionState;
     explicit CommandBuffer(void* retained_handle, void* queue_handle);
     bool can_encode() const noexcept;
+    bool claim_staging_range(BufferRef range, std::string& err);
     bool add_discard_handler(std::function<void()> handler);
     bool add_submission_handler(SubmissionHandler handler, std::string& err);
     bool validate_submission(std::string& err) const;
@@ -290,11 +305,14 @@ private:
     std::uint64_t event_operation_count_ = 0;
     std::vector<std::function<void()>> discard_handlers_;
     std::vector<SubmissionHandler> submission_handlers_;
+    std::vector<BufferRef> staging_ranges_;
     std::shared_ptr<SubmissionState> submission_state_;
     std::vector<std::shared_ptr<SubmissionState>> dependencies_;
     std::shared_ptr<CompletionState> completion_state_;
     friend class Context;
     friend class Events;
+    friend class Encoder;
+    friend class ExpertStore;
 };
 
 class Context {
@@ -389,6 +407,9 @@ public:
     std::uint64_t allocation_identity(BufferRef buffer) const;
     /// Also verifies that the handle still refers to the same allocation generation.
     bool owns(BufferRef buffer, std::uint64_t identity) const;
+    /// Mark an owned allocation as reusable tiered storage. This flag is
+    /// one-way and causes expert consumers to require live slot leases.
+    bool mark_tiered_slot_arena(BufferRef buffer, std::string& err);
 
 private:
     struct Impl;
@@ -397,6 +418,7 @@ private:
     std::unique_ptr<Impl> impl_;
     friend class Context;
     friend class BufferArena;
+    friend class TieredStorage;
 };
 
 /// A fixed-address bump allocator over one shared MTLBuffer.

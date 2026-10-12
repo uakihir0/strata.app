@@ -13,6 +13,8 @@ namespace strata::metal {
 
 inline constexpr std::size_t kExpertFetchWorkers = 8;
 
+class Encoder;
+
 /// Holds slot leases for one command buffer until its registered completion callback runs.
 class ExpertLeaseSet {
 public:
@@ -23,6 +25,11 @@ public:
     /// Release a layer's slot pins after its GPU expert kernels have finished
     /// reading them, so a later layer of the same parity can reuse those slots.
     void retire_layer(std::uint32_t layer) noexcept;
+    /// Confirm the set was prepared for the command buffer being encoded.
+    bool prepared_for(const Encoder& encoder) const noexcept;
+    /// Confirm this layer still pins the complete GPU-address range.
+    bool pins(std::uint32_t layer, std::uint64_t gpu_address,
+              std::uint64_t bytes) const noexcept;
 
 private:
     struct Impl;
