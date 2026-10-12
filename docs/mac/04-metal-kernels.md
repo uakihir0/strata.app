@@ -4846,21 +4846,23 @@ foreign and submitted command buffers, foreign output/Qf views, forged or
 out-of-range output metadata, and partial aliases against either read-only
 input. The gate encoder does not schedule the output projection or a QSA layer.
 
-`encode_prefill_qsa_output` composes the gate with the native-weight
-`attn_output` projection in one ordered Encoder segment. It fixes the shape to
-6144 input values and 2560 F32 output values per row, while the caller supplies
-the native weight format, gate/dequantization scratch and output views. Before
-dispatch it validates active extents, ownership, format alignment and the
-cross-stage alias matrix. Read-only attention, Qf and weight views may overlap;
-each writable view must remain disjoint from every other active stage buffer,
-apart from the gate result's intended producer-to-consumer handoff. Serial and
-concurrent tests use a synthetic Q8_0 weight row, compare standalone and
-caller-owned results with the direct gate→native-dequantization→F16-GEMM
-chain, and verify finite nonzero output, input immutability, cross-stage alias
-rejection and late-failure rollback. The models documented in [03](03-model-reference.md)
-use Q4_K, Q5_K, Q6_K, IQ4_XS or IQ3_S for `attn_output`; this synthetic Q8_0
-case tests the shared native-format path. Production layer scheduling and
-`Prefill::run` remain pending.
+`encode_prefill_qsa_output` composes optional in-place attention FWHT256,
+the gate and the native-weight `attn_output` projection in one ordered
+Encoder segment. The caller selects `none` or `fwht256`; the latter requires
+a mutable view starting at the same address as the gate's attention view.
+The coordinator fixes the shape to 6144 input values and 2560 F32 output
+values per row, while the caller supplies the native weight format,
+gate/dequantization scratch and output views. Before dispatch it validates
+active extents, ownership, format alignment and the cross-stage alias matrix.
+With FWHT enabled, the attention view must also be disjoint from Qf and native
+weights because FWHT writes it in place. Serial and concurrent tests use a
+synthetic Q8_0 weight row, compare standalone and caller-owned results with
+the explicit FWHT→gate→native-dequantization→F16-GEMM chain, and verify
+finite nonzero output, transformed-input parity, cross-stage alias rejection
+and rollback after a late projection failure. The models documented in
+[03](03-model-reference.md) use Q4_K, Q5_K, Q6_K, IQ4_XS or IQ3_S for
+`attn_output`; this synthetic Q8_0 case tests the shared native-format path.
+Production layer scheduling and `Prefill::run` remain pending.
 
 **Not ported.** These upstream debug variables are not ported ([06](06-engine-host-port.md), section 4.3):
 - `STRATA_SEL_OVERLAP` (the overlap of neighbouring rows' selections);

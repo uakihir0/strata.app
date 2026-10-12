@@ -11480,3 +11480,60 @@ measuring L-15 remain open.
   existing planned, no-check and missing-check diagnostics; `check_drift.py`
   reported no upstream changes and valid golden files; `git diff --check`
   passed.
+
+### D-IMPL-389: Include optional attention FWHT in Prefill QSA output
+
+- **Decision:** Extend `encode_prefill_qsa_output` with an explicit
+  `none`/`fwht256` transform choice. When selected, require a mutable
+  attention view at the same starting address as the gate input, then encode
+  the in-place 24-head FWHT before gate→native dequantization→F16 GEMM in the
+  same ordered Encoder segment. Append the mutable view with a default member
+  initializer so existing four-field aggregate initializers remain warning
+  clean under the project's Clang `-Werror` flags. Keep the no-transform
+  behavior as the default.
+  Reject FWHT attention that overlaps Qf or native weights before encoding.
+- **Reason:** QSA section 5.6 places the optional O-class transform after
+  sparse attention and before the gate. Making that ordering part of the
+  output coordinator gives callers a complete attention-output tail without
+  relying on an undocumented dispatch between stages. The per-layer transform
+  decision remains explicit because not every QSA layer uses O-class rotation.
+  Preserve source compatibility for this source-derived project, but do not
+  retain binary ABI with prebuilt clients: these native interfaces are still
+  under active development and consumers build from the same source tree.
+- **Review required:** Check the transform row count and FWHT→gate barrier,
+  the mutable/read-only view correspondence, all aliases newly made writable
+  by the transform, enum validation and source compatibility for default
+  callers, including aggregate initialization under the project's strict
+  warning flags. Verify both API forms against the direct
+  FWHT→gate→projection sequence, and ensure a late projection failure
+  discards the FWHT write.
+- **Validation:** `mac-dev` built successfully. Serial and concurrent
+  `metal_prefill_dequant_test` CTests passed 2/2, including both transform
+  modes, component parity, Qf/weight alias rejection and standalone/caller-owned
+  late rollback. Adversarial findings and final checks will be recorded in
+  REV-185.
+
+### REV-185: Adversarial review of Prefill QSA attention FWHT composition
+
+- **Scope:** Check FWHT row count and ordering before gate/projection, mutable
+  view correspondence, ownership/alignment, aliases made writable by FWHT,
+  enum validation, existing aggregate/call compatibility, both API forms,
+  component parity and rollback after a late projection failure.
+- **Findings:** Follow-up compatibility compilation found that an old
+  four-field aggregate initializer triggered Clang's
+  `-Wmissing-field-initializers`, promoted to an error by project flags. This
+  was an API source-compatibility build issue, not a runtime defect.
+- **Disposition:** Added a default member initializer to the trailing mutable
+  FWHT view and retained the legacy four-field initializer in the test. The
+  adversarial follow-up confirmed this clears the warning without changing
+  runtime behavior. The reviewer also confirmed the FWHT view and
+  cross-stage alias preflight, `rows * 24` launch geometry, ordered dispatch,
+  default `none` behavior, explicit component parity and both rollback forms;
+  no further actionable issue remains. The ABI change is accepted because
+  this project exposes a source-derived, in-progress native API without a
+  prebuilt-client compatibility promise; consumers must rebuild.
+- **Validation:** `mac-dev` built successfully; serial and concurrent
+  `metal_prefill_dequant_test` CTests passed 2/2. `test_map.py` passed with
+  the repository's existing no-check, missing-check and planned diagnostics;
+  `check_drift.py` reported no upstream changes and valid golden files;
+  `git diff --check` passed.
