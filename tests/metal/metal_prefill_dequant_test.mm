@@ -7,6 +7,8 @@
 #include "strata/metal/prefill_dequant_dispatch.hpp"
 #include "strata/metal/prefill_gemm_dispatch.hpp"
 #include "strata/metal/prefill_native_projection.hpp"
+#include "strata/metal/prefill_qsa_gate_dispatch.hpp"
+#include "strata/metal/prefill_qsa_output_dispatch.hpp"
 
 #include "../../src/metal/kernels/common/types.h"
 #include "../../src/metal/kernels/common/codebooks.h"
@@ -108,6 +110,34 @@ private:
     BufferRef storage_{};
     BufferRef view_{};
     std::size_t payload_bytes_ = 0u;
+};
+
+class ScopedEnvironmentOverride {
+public:
+    ScopedEnvironmentOverride(const char* name, const char* value)
+        : name_(name) {
+        const char* const previous = std::getenv(name);
+        was_set_ = previous != nullptr;
+        if (was_set_) previous_value_ = previous;
+        ready_ = setenv(name_.c_str(), value, 1) == 0;
+    }
+
+    ~ScopedEnvironmentOverride() {
+        if (!ready_) return;
+        if (was_set_) {
+            setenv(name_.c_str(), previous_value_.c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+    bool ready() const noexcept { return ready_; }
+
+private:
+    std::string name_;
+    std::string previous_value_;
+    bool was_set_ = false;
+    bool ready_ = false;
 };
 
 bool submit_and_wait(std::unique_ptr<CommandBuffer>& command,
@@ -1758,6 +1788,368 @@ bool test_native_projection_validation(Context& context,
     return passed;
 }
 
+bool test_qsa_output(Context& context, Context& foreign_context) {
+    constexpr std::uint32_t rows = 2u;
+    constexpr std::uint32_t k = 24u * 256u;
+    constexpr std::uint32_t n = 2560u;
+    constexpr std::size_t attention_bytes =
+        static_cast<std::size_t>(rows) * k * sizeof(float);
+    constexpr std::size_t q_full_bytes =
+        static_cast<std::size_t>(rows) * 24u * 512u * sizeof(float);
+    constexpr std::size_t gate_bytes =
+        static_cast<std::size_t>(rows) * k * sizeof(std::uint16_t);
+    constexpr std::size_t weight_bytes =
+        static_cast<std::size_t>(n) * (k / 32u) * sizeof(block_q8_0);
+    constexpr std::size_t dequantized_bytes =
+        static_cast<std::size_t>(n) * k * sizeof(std::uint16_t);
+    constexpr std::size_t output_bytes =
+        static_cast<std::size_t>(rows) * n * sizeof(float);
+    const std::string prefix = "Prefill QSA output";
+    std::string error;
+    TestBuffer attention, q_full, gate, weights, dequantized, output;
+    TestBuffer foreign_weights;
+    const bool allocated =
+        attention.allocate(context, prefix + " attention", attention_bytes,
+                           error) &&
+        q_full.allocate(context, prefix + " Qf", q_full_bytes, error) &&
+        gate.allocate(context, prefix + " gated F16", gate_bytes, error) &&
+        weights.allocate(context, prefix + " Q8_0 weights", weight_bytes,
+                         error) &&
+        dequantized.allocate(context, prefix + " dequantized F16",
+                             dequantized_bytes, error) &&
+        output.allocate(context, prefix + " F32 output", output_bytes,
+                        error) &&
+        foreign_weights.allocate(foreign_context,
+                                 prefix + " foreign weights", weight_bytes,
+                                 error);
+    check(allocated, prefix + " allocate buffers", error);
+    if (!allocated) return false;
+
+    std::vector<float> attention_values(attention_bytes / sizeof(float));
+    std::vector<float> q_values(q_full_bytes / sizeof(float));
+    for (std::size_t index = 0u; index < attention_values.size(); ++index) {
+        const int centered = static_cast<int>(index % 19u) - 9;
+        attention_values[index] = static_cast<float>(centered) * 0.03125f;
+    }
+    for (std::size_t index = 0u; index < q_values.size(); ++index) {
+        const std::size_t within_head = index % 512u;
+        const int centered =
+            static_cast<int>((index * 7u + within_head * 3u) % 29u) - 14;
+        q_values[index] = static_cast<float>(centered) * 0.0625f;
+    }
+    std::memcpy(attention.payload().data(), attention_values.data(),
+                attention_bytes);
+    std::memcpy(q_full.payload().data(), q_values.data(), q_full_bytes);
+
+    constexpr std::size_t blocks_per_output = k / 32u;
+    std::vector<block_q8_0> weight_values(
+        static_cast<std::size_t>(n) * blocks_per_output);
+    for (std::uint32_t column = 0u; column < n; ++column) {
+        for (std::uint32_t block_index = 0u;
+             block_index < blocks_per_output; ++block_index) {
+            block_q8_0& block =
+                weight_values[static_cast<std::size_t>(column) *
+                                  blocks_per_output +
+                              block_index];
+            block = {};
+            block.d = static_cast<strata_half>(0x3000u);
+            for (std::uint32_t value = 0u; value < 32u; ++value) {
+                const int code = static_cast<int>(
+                                     (column * 5u + block_index * 3u +
+                                      value * 7u) %
+                                     11u) -
+                                 5;
+                block.qs[value] = static_cast<strata_i8>(code);
+            }
+        }
+    }
+    std::memcpy(weights.payload().data(), weight_values.data(), weight_bytes);
+    const std::vector<std::uint8_t> attention_before(
+        attention.payload().begin(), attention.payload().end());
+    const std::vector<std::uint8_t> q_full_before(
+        q_full.payload().begin(), q_full.payload().end());
+    const std::vector<std::uint8_t> weights_before(
+        weights.payload().begin(), weights.payload().end());
+
+    const PrefillQsaOutputBuffers buffers{
+        {context.buffers().read_only(attention.view()),
+         context.buffers().read_only(q_full.view()), gate.view()},
+        context.buffers().read_only(weights.view()), dequantized.view(),
+        output.view()};
+    const auto expect_alias_rejected =
+        [&](const PrefillQsaOutputBuffers& invalid,
+            const std::string& label) {
+            auto command = context.make_command_buffer(label, error);
+            if (!command) {
+                check(false, label + " command buffer", error);
+                return false;
+            }
+            error.clear();
+            const bool rejected = !encode_prefill_qsa_output(
+                context, *command, rows, PrefillNativeWeightFormat::Q8_0,
+                invalid, error);
+            const bool clean = rejected &&
+                command->unsafe_native_handle() == nullptr &&
+                error.find("overlap another active stage buffer") !=
+                    std::string::npos;
+            check(clean, label, error);
+            return clean;
+        };
+    PrefillQsaOutputBuffers gate_aliases_weights = buffers;
+    gate_aliases_weights.gate.attn_h =
+        weights.view().slice(0u, gate_bytes);
+    const bool gate_weight_alias_rejected =
+        expect_alias_rejected(gate_aliases_weights,
+                              prefix + " rejects gate/weight overlap");
+    PrefillQsaOutputBuffers output_aliases_q = buffers;
+    output_aliases_q.y_f32 = q_full.view().slice(0u, output_bytes);
+    const bool output_q_alias_rejected =
+        expect_alias_rejected(output_aliases_q,
+                              prefix + " rejects output/Qf overlap");
+
+    PrefillGemmBackend standalone_backend = PrefillGemmBackend::SIMD;
+    auto standalone =
+        context.make_command_buffer(prefix + " standalone", error);
+    check(standalone != nullptr, prefix + " standalone command buffer", error);
+    if (!standalone) return false;
+    const bool standalone_encoded = encode_prefill_qsa_output(
+        context, *standalone, rows, PrefillNativeWeightFormat::Q8_0, buffers,
+        error, &standalone_backend);
+    check(standalone_encoded, prefix + " standalone encode", error);
+    if (!standalone_encoded) return false;
+    const bool standalone_completed = submit_and_wait(standalone, error);
+    check(standalone_completed, prefix + " standalone completion", error);
+    if (!standalone_completed) return false;
+    const std::vector<std::uint8_t> expected_output(
+        output.payload().begin(), output.payload().end());
+    const std::vector<std::uint8_t> expected_gate(
+        gate.payload().begin(), gate.payload().end());
+
+    std::fill(gate.payload().begin(), gate.payload().end(), kPoison);
+    std::fill(dequantized.payload().begin(), dequantized.payload().end(),
+              kPoison);
+    std::fill(output.payload().begin(), output.payload().end(), kPoison);
+    PrefillGemmBackend caller_backend = PrefillGemmBackend::SIMD;
+    auto caller_owned =
+        context.make_command_buffer(prefix + " caller-owned", error);
+    check(caller_owned != nullptr,
+          prefix + " caller-owned command buffer", error);
+    if (!caller_owned) return false;
+    const bool caller_encoded = Encoder::encode(
+        context, *caller_owned, prefix + " caller-owned",
+        [&](Encoder& encoder, std::string& body_error) {
+            return encode_prefill_qsa_output(
+                context, encoder, rows, PrefillNativeWeightFormat::Q8_0,
+                buffers, body_error, &caller_backend);
+        },
+        error);
+    check(caller_encoded, prefix + " caller-owned encode", error);
+    if (!caller_encoded) return false;
+    const bool caller_completed = submit_and_wait(caller_owned, error);
+    check(caller_completed, prefix + " caller-owned completion", error);
+    if (!caller_completed) return false;
+    const bool caller_matches =
+        output.payload().size() == expected_output.size() &&
+        std::equal(expected_output.begin(), expected_output.end(),
+                   output.payload().begin()) &&
+        std::equal(expected_gate.begin(), expected_gate.end(),
+                   gate.payload().begin()) &&
+        caller_backend == standalone_backend;
+    check(caller_matches,
+          prefix + " caller-owned gate and projection match standalone");
+
+    std::fill(gate.payload().begin(), gate.payload().end(), kPoison);
+    std::fill(dequantized.payload().begin(), dequantized.payload().end(),
+              kPoison);
+    std::fill(output.payload().begin(), output.payload().end(), kPoison);
+    auto components = context.make_command_buffer(prefix + " components",
+                                                   error);
+    check(components != nullptr, prefix + " component command buffer", error);
+    if (!components) return false;
+    PrefillGemmBackend component_backend = PrefillGemmBackend::SIMD;
+    const PrefillGemmMPPParams projection_params{
+        rows, n, k, n, 0u, false};
+    const PrefillNativeProjectionBuffers projection_buffers{
+        context.buffers().read_only(gate.view()),
+        context.buffers().read_only(weights.view()), dequantized.view(),
+        output.view()};
+    const bool components_encoded = Encoder::encode(
+        context, *components, prefix + " component reference",
+        [&](Encoder& encoder, std::string& body_error) {
+            if (!encode_prefill_qsa_gate_attn(context, encoder, rows,
+                                              buffers.gate, body_error)) {
+                return false;
+            }
+            return encode_prefill_native_projection(
+                context, encoder, projection_params,
+                PrefillNativeWeightFormat::Q8_0, projection_buffers,
+                body_error, &component_backend);
+        },
+        error);
+    check(components_encoded, prefix + " component reference encode", error);
+    if (!components_encoded) return false;
+    const bool components_completed = submit_and_wait(components, error);
+    check(components_completed, prefix + " component completion", error);
+    if (!components_completed) return false;
+    const bool component_matches =
+        std::equal(expected_output.begin(), expected_output.end(),
+                   output.payload().begin()) &&
+        std::equal(expected_gate.begin(), expected_gate.end(),
+                   gate.payload().begin()) &&
+        component_backend == standalone_backend;
+    check(component_matches,
+          prefix + " composed APIs match gate then native projection");
+
+    std::vector<float> output_values(output_bytes / sizeof(float));
+    std::memcpy(output_values.data(), output.payload().data(), output_bytes);
+    bool output_finite = true;
+    bool output_nonzero = false;
+    for (const float value : output_values) {
+        output_finite &= std::isfinite(value);
+        output_nonzero |= value != 0.0f;
+    }
+    const bool input_immutable =
+        std::equal(attention_before.begin(), attention_before.end(),
+                   attention.payload().begin()) &&
+        std::equal(q_full_before.begin(), q_full_before.end(),
+                   q_full.payload().begin()) &&
+        std::equal(weights_before.begin(), weights_before.end(),
+                   weights.payload().begin());
+    check(output_nonzero, prefix + " writes a nonzero projection result");
+    check(output_finite, prefix + " projection output is finite");
+    check(input_immutable, prefix + " preserves attention, Qf and weights");
+
+    PrefillQsaOutputBuffers foreign_input = buffers;
+    foreign_input.native_weights =
+        foreign_context.buffers().read_only(foreign_weights.view());
+    std::fill(gate.payload().begin(), gate.payload().end(), kPoison);
+    std::fill(dequantized.payload().begin(), dequantized.payload().end(),
+              kPoison);
+    std::fill(output.payload().begin(), output.payload().end(), kPoison);
+    auto foreign_standalone =
+        context.make_command_buffer(prefix + " foreign-weight preflight",
+                                    error);
+    check(foreign_standalone != nullptr,
+          prefix + " foreign-weight command buffer", error);
+    if (!foreign_standalone) return false;
+    error.clear();
+    const bool foreign_standalone_rejected = !encode_prefill_qsa_output(
+        context, *foreign_standalone, rows,
+        PrefillNativeWeightFormat::Q8_0, foreign_input, error);
+    const bool foreign_standalone_clean =
+        foreign_standalone_rejected &&
+        foreign_standalone->unsafe_native_handle() == nullptr &&
+        error.find("weights are not owned by this Context") !=
+            std::string::npos &&
+        std::all_of(gate.payload().begin(), gate.payload().end(),
+                    [](std::uint8_t byte) { return byte == kPoison; }) &&
+        std::all_of(dequantized.payload().begin(), dequantized.payload().end(),
+                    [](std::uint8_t byte) { return byte == kPoison; }) &&
+        std::all_of(output.payload().begin(), output.payload().end(),
+                    [](std::uint8_t byte) { return byte == kPoison; });
+    check(foreign_standalone_clean,
+          prefix + " rejects foreign weights before dispatch", error);
+
+    auto foreign_caller =
+        context.make_command_buffer(prefix + " caller foreign-weight preflight",
+                                    error);
+    check(foreign_caller != nullptr,
+          prefix + " caller foreign-weight command buffer", error);
+    if (!foreign_caller) return false;
+    error.clear();
+    const bool foreign_caller_rejected = !Encoder::encode(
+        context, *foreign_caller, prefix + " caller foreign-weight preflight",
+        [&](Encoder& encoder, std::string& body_error) {
+            return encode_prefill_qsa_output(
+                context, encoder, rows, PrefillNativeWeightFormat::Q8_0,
+                foreign_input, body_error);
+        },
+        error);
+    const bool foreign_caller_clean =
+        foreign_caller_rejected &&
+        foreign_caller->unsafe_native_handle() == nullptr &&
+        error.find("weights are not owned by this Context") !=
+            std::string::npos &&
+        std::all_of(gate.payload().begin(), gate.payload().end(),
+                    [](std::uint8_t byte) { return byte == kPoison; }) &&
+        std::all_of(dequantized.payload().begin(), dequantized.payload().end(),
+                    [](std::uint8_t byte) { return byte == kPoison; }) &&
+        std::all_of(output.payload().begin(), output.payload().end(),
+                    [](std::uint8_t byte) { return byte == kPoison; });
+    check(foreign_caller_clean,
+          prefix + " caller-owned rejects foreign weights before dispatch",
+          error);
+
+    ScopedEnvironmentOverride invalid_selector("STRATA_METAL_GEMM",
+                                                "invalid");
+    check(invalid_selector.ready(),
+          prefix + " install late-invalid GEMM selector");
+    if (!invalid_selector.ready()) return false;
+    auto standalone_rollback =
+        context.make_command_buffer(prefix + " standalone selector rollback",
+                                    error);
+    check(standalone_rollback != nullptr,
+          prefix + " standalone selector command buffer", error);
+    if (!standalone_rollback) return false;
+    error.clear();
+    const bool standalone_rejected = !encode_prefill_qsa_output(
+        context, *standalone_rollback, rows,
+        PrefillNativeWeightFormat::Q8_0, buffers, error);
+    const bool standalone_rollback_ok =
+        standalone_rejected &&
+        standalone_rollback->unsafe_native_handle() == nullptr &&
+        error == "STRATA_METAL_GEMM must be 'mpp' or 'simd'" &&
+        std::all_of(gate.payload().begin(), gate.payload().end(),
+                    [](std::uint8_t byte) { return byte == kPoison; }) &&
+        std::all_of(dequantized.payload().begin(), dequantized.payload().end(),
+                    [](std::uint8_t byte) { return byte == kPoison; }) &&
+        std::all_of(output.payload().begin(), output.payload().end(),
+                    [](std::uint8_t byte) { return byte == kPoison; });
+    check(standalone_rollback_ok,
+          prefix + " standalone late selector failure discards both stages",
+          error);
+
+    auto caller_rollback =
+        context.make_command_buffer(prefix + " caller selector rollback",
+                                    error);
+    check(caller_rollback != nullptr,
+          prefix + " caller selector command buffer", error);
+    if (!caller_rollback) return false;
+    error.clear();
+    const bool caller_rejected = !Encoder::encode(
+        context, *caller_rollback, prefix + " caller selector rollback",
+        [&](Encoder& encoder, std::string& body_error) {
+            return encode_prefill_qsa_output(
+                context, encoder, rows, PrefillNativeWeightFormat::Q8_0,
+                buffers, body_error);
+        },
+        error);
+    const bool caller_rollback_ok =
+        caller_rejected && caller_rollback->unsafe_native_handle() == nullptr &&
+        error == "STRATA_METAL_GEMM must be 'mpp' or 'simd'" &&
+        std::all_of(gate.payload().begin(), gate.payload().end(),
+                    [](std::uint8_t byte) { return byte == kPoison; }) &&
+        std::all_of(dequantized.payload().begin(), dequantized.payload().end(),
+                    [](std::uint8_t byte) { return byte == kPoison; }) &&
+        std::all_of(output.payload().begin(), output.payload().end(),
+                    [](std::uint8_t byte) { return byte == kPoison; });
+    check(caller_rollback_ok,
+          prefix + " caller-owned late selector failure discards both stages",
+          error);
+
+    const bool guards_intact =
+        attention.guards_intact() && q_full.guards_intact() &&
+        gate.guards_intact() && weights.guards_intact() &&
+        dequantized.guards_intact() && output.guards_intact() &&
+        foreign_weights.guards_intact();
+    check(guards_intact, prefix + " buffer guards");
+    return gate_weight_alias_rejected && output_q_alias_rejected &&
+           caller_matches && component_matches && output_nonzero &&
+           output_finite && input_immutable && foreign_standalone_clean &&
+           foreign_caller_clean && standalone_rollback_ok &&
+           caller_rollback_ok && guards_intact;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1816,5 +2208,6 @@ int main(int argc, char** argv) {
     passed &= test_validation_format<block_q8_0>(*context,
                                                  *foreign_context);
     passed &= test_native_projection_validation(*context, *foreign_context);
+    passed &= test_qsa_output(*context, *foreign_context);
     return passed && g_failures == 0 ? 0 : 1;
 }
