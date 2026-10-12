@@ -3704,10 +3704,13 @@ section 6.5, in this order:
 | 5 | T % 32 |
 
 - When a remainder is 0, the last batch is full and uses the full slot.
-- A window kernel that runs over one batch of the chunk binds a slot at `buffer(0)` as its parameter block, and its
-  data at `row0 · stride`. These kernels read only `T` from the block, and every position from their `StepRow`s, so a
-  slot needs nothing else.
+- A kernel whose parameter ABI is only `{uint T}` can bind a batch slot at `buffer(0)` and its data at `row0 · stride`.
+  Such kernels read only `T` from the block, and every position from their `StepRow`s, so a slot needs nothing else.
 - Kernels that run over the whole chunk bind `PrefillParams` itself, whose first field is T.
+- Sparse QSA attention is an exception to the `{uint T}` ABI: its chunk and merge kernels bind the full
+  `QsaAttentionParams` (`token_rows`, `cell_capacity`, `id_row_stride`, `chunk_count`) at their parameter indices.
+  The Prefill coordinator constructs this block for each batch; the generic slots provide only the intended row count.
+  Window attention keeps its existing 1..8-row entry points and the same four-field shader ABI.
 
 `build_prefill_chunk_schedule` in `src/metal/engine/prefill.cpp` creates a compact, constant-space schedule for
 contiguous, non-empty ranges no larger than the configured chunk size. `range_at` derives each range's token offset,
@@ -3816,14 +3819,14 @@ F is the fixed part:
 | Item | Bytes |
 | --- | ---: |
 | Dequantisation scratch (section 6.2) | 64 MiB (32M halves) |
-| Attention partials for one 32-row batch (section 6.5) | 32 · 817,600 |
+| Attention partials for one 32-row batch (section 6.5) | 32 · 817,344 = 26,155,008 |
 | Block scores for one 256-row group (`max_blocks = max_cells / 4 + 2`, section 5.6) | 1,024 · max_blocks |
 | `PfPlan`, one per layer (section 6.6) | 48 · 6,400 |
 | The tile list's fixed part (its C-dependent part is the `8 · ⌈10C / 64⌉` term) | 8 · 512 |
 | Rounding slack: each buffer's 256-B alignment, and the last partial tile of `hist` (section 6.6) | 65,536 |
 | `PrefillParams` and the batch slots | 4,096 |
 
-At 262,144 cells, F = 160,763,904 B. The totals, in GiB, in mode 0:
+At 262,144 cells, F = 160,755,712 B. The totals, in GiB, in mode 0:
 
 | Cells | C = 1,024 | 2,048 | 4,096 | 6,144 | 8,192 | 16,384 | 32,768 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -4653,9 +4656,10 @@ below the 32-bit shader index bound. Key and indexer-query modes retain exact
 in-place operation, while the strided query input and compact output remain
 disjoint. Serial and concurrent tests compare all three modes at 65 rows with
 the scalar oracle through standalone and caller-owned Encoder forms. This
-implements the norm/RoPE substage; Prefill now also has a batched indexer
-append encoder and a selection coordinator. Prefill attention and production
-chunk scheduling remain separate work.
+implements the norm/RoPE substage; Prefill also has batched KV append,
+indexer-append, selection and sparse-attention encoders. The O-class attention
+output transform, gate/output projection composition and production chunk
+scheduling remain separate work.
 
 The four KV cache formats also expose Prefill-specific append entry points up
 to `kPrefillMaxShaderRows`; the Window append APIs retain their 1..8-row
@@ -4769,9 +4773,10 @@ stride, a clipped tail, and memory top-k above 33,792 blocks. They check
 scalar score/top-k parity, scratch contents after reuse, untouched ID
 suffixes, input immutability, guards, validation and rollback. The inclusive
 shader-row maximum reaches buffer preflight but is not dispatched because its
-views require multi-gigabyte allocations. Prefill attention and production
-chunk scheduling remain separate work. The append→selection dependency is
-also exercised in one ordered Encoder segment against the scalar oracles.
+views require multi-gigabyte allocations. A separate Prefill attention
+coordinator is implemented; production chunk scheduling remains separate
+work. The append→selection dependency is also exercised in one ordered
+Encoder segment against the scalar oracles.
 
 **The cost of selection.** Each 8-row batch reads every pooled key up to its `top` once, 512 B per block. Over a
 prompt of N tokens that is about `N/8 · N/8 · 512 = 8N²` bytes per QSA layer, `96N²` for the 12 layers:
@@ -4786,14 +4791,31 @@ L-13 measures selection's share of a chunk. If it passes the 25% of section 2.6,
 
 **Attention, step 11.** The rows go in batches of 32, upstream's `attn_batch`. For the batch at `r0` with `n` rows:
 - `strata_attn_chunk_<mode>`, grid (33, 2, n) × 256, then `strata_attn_merge`, grid (24, n) × 256;
-- both take batch slot 4 (32 rows) or 5 (T % 32) as their block;
+- the host binds `QsaAttentionParams` at chunk buffer 10 and merge buffer 4. For chunk it is
+  `{n, cell_capacity, 2051, 33}`; for merge it is `{n, 0, 2051, 33}`. Slot 4 or 5 describes the intended batch row
+  count but is not the complete parameter block;
 - the chunk kernel binds `qcur + r0`, `ids + r0 · 2051` and `pf_steps + r0`;
-- the partials go to the F scratch for 32 rows (`32 · 817,600` bytes, section 6.1), reused by each batch;
+- the partials go to the F scratch for 32 rows (`32 · 817,344 = 26,155,008` bytes, section 6.1), reused after each
+  batch's merge;
 - the output goes to `attn + r0`.
 
 This is upstream's path under `STRATA_PROMPT_ATTN_OLD=1`, which calls `qsa_decode_attn_batch` 32 queries at a time.
 Its default, `qsa_prompt_attn_batch`, runs the chunk on tensor cores and is not bitwise. Section 3.9 lists the
 difference, and `strata_pf_prompt_attn_<mode>` (section 2.6) is the Phase-2 counterpart.
+
+`encode_prefill_qsa_attention` implements this step while leaving the Window
+attention APIs limited to 1..8 rows. It accepts Prefill chunks through
+`kPrefillMaxShaderRows` and cache capacities through 262,144 cells, validates
+the fixed 2051-ID stride, contiguous `StepRow`s, all batch extents, shared
+scratch views and aliases before encoding any batch, then orders chunk and
+merge for each group of at most 32 rows. The three scratch views are sized for
+32 rows and reused only after that group's merge. Standalone transactional
+and caller-owned Encoder forms are available; the latter rejects an open
+concurrent dispatch group. Serial and concurrent tests cover T=1/31/32/33/64,
+all four KV formats at T=33, same-segment selection→attention, the 32+1
+remainder, `p0=2047` with more than 2,051 live keys, malformed late-row
+preflight, aliases, validation and rollback after a downstream failure.
+Production layer scheduling and `Prefill::run` remain pending.
 
 **`strata_pf_gate_attn`**, grid ⌈6144T/256⌉ × 256, one value per thread. `i = 256·tg.x + tid`, `t = i / 6144`,
 `h = (i % 6144) / 256`, `d = i % 256`:
@@ -5883,8 +5905,8 @@ and foreign Context ownership.
 | `metal_qsa_indexer_commit_batch_test` and `metal_qsa_indexer_commit_batch_test_concurrent` | metal | `strata_idx_snapshot`, `strata_idx_append` window/commit modes | Runs T=8 from position 1 with `n_keep=3` across all 12 layers through snapshot, speculative append and accepted-prefix replay in one Encoder segment. The accepted row at position 3 completes block 0; rejected position 7 writes pooled row 1 at the accepted `n_bid` and spare row 2 beyond it, while replay restores the visible prefix. Each layer has distinct raw keys/gamma and an independent scalar oracle; exact tails/block positions, pooled/spare rows and read-only inputs are checked. Rejects a short layer list, distinct valid StepRow/RoPE/snapshot views, cross-layer output/input alias and malformed final-layer input. It permits outputs to reuse inactive StepRow and RoPE suffixes, and caller-owned failure discards an earlier encoded replay. The two CTests exercise serial and concurrent dispatch modes |
 | `metal_qsa_selection_test` | metal | `strata_sel_scores`, `strata_sel_topk_reg`, `strata_sel_topk_mem` through their validated encoders and independent scalar oracles | Scoring: T=1..8 random, edge and fixture queries; exact ordered FMA/butterfly score bits; per-head ReLU fixture; complete and partial tail blocks; untouched score columns; one row at 131,072 cells exercises the 256-group stride. Shared Encoder scoring fixtures cover T=1/T=8 and match the same oracle; shared validation rejects invalid rows/capacity, short views, inconsistent StepRows, output/input aliases, foreign Context buffers and forged CPU/GPU metadata; a late failure verifies an encoded score dispatch is discarded. Top-k: standalone and shared-Encoder forms; direct and radix paths; register form through `max_blocks` 33,792 and memory form above it; tied threshold blocks; NaN key 0 ranked below −∞ at the selection boundary; signed-zero tie at the selection boundary prefers lower IDs; highest-scoring tail cells of widths 1..3 selected and zero-width tails ignored; a high-id fixture verifies every selected id exceeds 65,535; ±infinity and finite scores; exact register/memory equivalence; shared score→top-k in one segment. Shared validation checks invalid rows/capacities, short views, inconsistent StepRows, id/input aliases, foreign Context buffers and forged CPU/GPU metadata; a late failure verifies an encoded top-k dispatch is discarded. Both CTests run the same fixtures in serial and concurrent modes. Same-segment Prefill indexer append→selection fixtures check appended pool/dead data, scores and IDs against scalar oracles; `p0=3` covers the identity path and `p0=2047` forces top-k truncation for `n_kv > 2051`. Standalone and caller-owned Prefill selection forms also check T=1/7/8/9 and 255/256/257/300, nonzero chunk positions, both top-k kernel forms, scalar score/top-k parity, sequentially reused scratch contents across partial groups, fixed ID stride and clipped tails; validation covers Prefill metadata, aliases, ownership, open groups and late-failure rollback. The inclusive shader-row maximum is preflighted without allocating its multi-gigabyte views. Inputs, output suffixes and guards are checked; invalid rows/capacities/StepRows, short or misaligned views, output/input aliases, foreign Context resources/command buffers and submitted command buffers are rejected. |
 | `metal_qsa_selection_test_concurrent` | metal | Same binary and fixtures as `metal_qsa_selection_test` | Runs all fixtures with `STRATA_METAL_DISPATCH=concurrent`, including shared score dispatch and validation, and checks outputs against their oracles after command-buffer completion |
-| `metal_attn_test` | metal | `strata_attn_chunk_<mode>`, `strata_attn_merge`, fp16/int8/q4_0/k8v4 KV modes | All four modes: standalone random T=1..8 and edge/fixture T=8 against an ordered scalar oracle at U(32); shared-Encoder chunk→merge fixture cases at T=1 and T=8 (one and two chunks) against the same oracle; fixture row independence for T=8 versus isolated rows; ID strides 1/63/64/2051 across one- and many-chunk cases; negative, capacity-boundary and future-cell IDs are masked, including exact-zero empty chunks; shared and standalone validation cover inconsistent StepRows, short views, aliases, foreign Context and forged metadata; a late merge failure discards the earlier chunk dispatch and leaves output untouched; input immutability and guards; shared-Encoder selection scores→top-k→attention T=1/T=8 cases pass GPU-produced IDs directly to attention for all four KV modes, then apply O-class FWHT for q4_0/k8v4 and the gate; a varied-prefix T=8 fixture also covers live widths 1/2/4/5/64/65/2048/2051 and verifies untouched ID suffixes; a separate eight-cell cache exercises live widths 1..8 with the fixed 2051-ID stride; scalar score/ID/attention/gate oracles and guards are checked |
-| `metal_attn_test_concurrent` | metal | Same binary and fixtures as `metal_attn_test` | Runs shared chunk→merge composition, validation and late-failure discard with `STRATA_METAL_DISPATCH=concurrent`; the dependent passes remain ordered by the Encoder barrier; the selection→attention coordinator also rejects calls inside an open concurrent dispatch group |
+| `metal_attn_test` | metal | `strata_attn_chunk_<mode>`, `strata_attn_merge`, fp16/int8/q4_0/k8v4 KV modes | All four modes: standalone random T=1..8 and edge/fixture T=8 against an ordered scalar oracle at U(32); shared-Encoder chunk→merge fixture cases at T=1 and T=8 (one and two chunks) against the same oracle; fixture row independence for T=8 versus isolated rows; ID strides 1/63/64/2051 across one- and many-chunk cases; negative, capacity-boundary and future-cell IDs are masked, including exact-zero empty chunks; shared and standalone validation cover inconsistent StepRows, short views, aliases, foreign Context and forged metadata; a late merge failure discards the earlier chunk dispatch and leaves output untouched; input immutability and guards; shared-Encoder selection scores→top-k→attention T=1/T=8 cases pass GPU-produced IDs directly to attention for all four KV modes, then apply O-class FWHT for q4_0/k8v4 and the gate; a varied-prefix T=8 fixture also covers live widths 1/2/4/5/64/65/2048/2051 and verifies untouched ID suffixes; a separate eight-cell cache exercises live widths 1..8 with the fixed 2051-ID stride; scalar score/ID/attention/gate oracles and guards are checked; Prefill attention covers T=1/31/32/33/64, all four KV formats at T=33, same-segment Prefill selection→attention, 32-row scratch reuse after merge, p0=2047 with more than 2,051 live keys, malformed late-row preflight, validation, aliases and downstream rollback |
+| `metal_attn_test_concurrent` | metal | Same binary and fixtures as `metal_attn_test` | Runs shared chunk→merge composition, validation and late-failure discard with `STRATA_METAL_DISPATCH=concurrent`; the dependent passes remain ordered by the Encoder barrier; the selection→attention and Prefill attention coordinators reject calls inside an open concurrent dispatch group |
 | `metal_mv_test` | metal | `strata_q_q8_1`, every `strata_mv_<fmt>_n<NC>` and `_n1_x`, `strata_mv_bf16_b<BS>_n<NC>` | B. The weights' dequantisation is also checked against ggml's. Engine encoders quantize Q8_1 against the scalar oracle and check nonzero engine results for every dense quantized format and BF16 against their scalar mat-vec oracles. Engine routing covers NC=1/2/4/8, large-K Q4_0 NC=2 (R=1), BF16 NC=8 (256 threads), padded output and sink handling, and a same-command-buffer Q8_1→Q2_0 chain. The indexed draft-head encoder checks nonzero Q5_K, Q6_K and IQ4_XS results at n_in=2560 against their scalar oracles with an unsorted, non-contiguous row map; it rejects negative and out-of-range indices, invalid row counts, signed and shader-index overflow, unsupported formats, a wrong live-row value, short or misaligned maps, and output/sink overlap with the map. Guards and read-only input preservation are checked. Dense encoder rejection cases cover forged CPU/GPU-view metadata, mismatched row count, invalid NC, Q8_1 input/output overlap, and mat-vec output/sink overlap with activations, weights, active-row metadata, and each other. Both same-handle subviews and distinct no-copy handles sharing a CPU backing are covered; an adjacent Q8_1 view is accepted. A read-only Q2_0-by-Q8_1 path checks overlapping read-only views, disjoint writable output/sink ranges and a 65-block input row against its scalar oracle. The format-general read-only path also checks Q5_K, Q6_K and IQ4_XS against scalar results; Q6_K checks caller-owned failure rollback after an earlier dispatch. MTP stage 21 composes this indexed read path with draft-head projection; the L-15 indexed-read measurement and production MTP runtime-view binding remain open. |
 | `metal_moe_test`, `metal_moe_test_concurrent` | metal | `strata_moe_route` (`r16`, `r8`), exact weight-mode probe, `strata_moe_plan` (T=1..8, full/tiered), `strata_moe_swiglu` and `strata_shx_swiglu` (T=1..8), `strata_moe_combine` (T=1..8), grouped `strata_moe_gu_q2_0`, `strata_moe_gu_iq1_m`, `strata_moe_gu_iq2_xxs`, `strata_moe_gu_iq2_xs`, `strata_moe_gu_iq2_s`, `strata_moe_gu_iq3_xxs`, `strata_moe_gu_iq3_s`, `strata_moe_gu_iq4_xs`, `strata_moe_down_q2_0` and `strata_moe_down_iq4_nl` (256/512 experts, T=1..8) across random, edge and fixture inputs; a synthetic shared-expert GPU chain feeds Q8_1 input quantization through Q8_0 gate/up, shared SwiGLU, Q8_1 hidden requantization, Q8_0 down, BF16 gate and combine for T=1..8, checking each intermediate against scalar references and checking partial-batch sinks and guards; both SwiGLU entry points are checked against the scalar oracle, including the 128-value tail in the shared-expert grid; combine pins fused-rank accumulation with an analytic golden and checks the final shared multiply/add bitwise against a same-dispatch sigmoid probe; IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS check 80 unique gate/up expert groups; both down kernels check 80 permuted expert IDs and `ent_dst` restoration; IQ4_NL down also checks exact two-part FMA-sensitive answers, grouped-versus-single-entry bit parity and a weight-bit negative control; remaining L7: production shared-expert dispatch and inference integration | Exact route IDs and plan bytes, independent tie/order fixtures, route weights, routed/shared SwiGLU U(16), combine U(16) plus contraction checks, grouped gate/up and down U(16), fixed IQ4_NL two-part codebook goldens, 80-group endpoints, singleton parity, negative-control sensitivity and `ent_dst` permutation, plus address-table/guard checks; exact multiply/divide mode bits. Explicit `--input-set real` is reported as skipped (CTest exit 77) until REV-002's model pack and CUDA dump fixture are available; route oracle cases use the validated route encoder, every grouped gate/up format runs through the validated engine encoder, and validation rejects bad shapes/formats, short or misaligned views, input/output aliases and caller-owned late-failure rollback; the concurrent CTest also checks open-group refusal |
 | `metal_mtp_test` | metal | `strata_embed_rows_bf16`, `strata_rms_norm_w`, `strata_q_q8_1`, `strata_mv_q8_0_n<NC>`, MTP add-streams, indexed output-head mat-vec kernels, `strata_samp_greedy`, `strata_mtp_row_top_prob`, `strata_mtp_map_ids` | MTP stages 1–5 are composed and compared with independent BF16 gather, weighted RMS, Q8_1 and Q8_0 mat-vec oracles for K/V-only T=1,2,3,8 and full-layer selected-token T=1; checks NC=1/2/4/8, hidden-pass tails, exact in-place embedding norm, immutable inputs, active extents, guards, invalid hid/OOV/image-marker tokens, selected-token/parameter overlap, other aliases, caller-owned rollback and concurrent-group refusal. Stage 6 T=1..8 matches the independent scalar addition oracle bit for bit. Stage 21 checks full-vocabulary and mapped draft-head logits for Q5_K, Q6_K and IQ4_XS against independent Q8_1/mat-vec oracles, including one-time range/uniqueness map validation, output guards, immutable inputs, aliases and caller-owned rollback. Stage 22 checks greedy full-vocabulary and strict-subset token IDs and probabilities against independent softmax expectations, excluding logits outside the mapped rows; also checks malformed sampler/history, aliases, guards, immutable inputs, caller-owned rollback and open-group refusal in concurrent mode. Runtime bindings through stage 22 and ordered synthetic smoke coverage for stages 1–20 are covered separately by `metal_mtp_storage_test`; scheduler integration and full drafter parity remain open |

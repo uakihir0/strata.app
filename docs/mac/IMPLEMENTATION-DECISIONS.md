@@ -11332,3 +11332,47 @@ measuring L-15 remain open.
   `mac-host` passed 45/45 with the unavailable real-model fixture skipped;
   `test_map.py` passed. Final `git diff --check` results are recorded with
   the completed slice.
+
+### D-IMPL-386: Add Prefill QSA attention batching with the current shader ABI
+
+- **Decision:** Keep the existing Window sparse-attention kernels and their
+  `QsaAttentionParams` shader ABI. Add a Prefill coordinator that constructs
+  the full four-field parameter block for each batch of at most 32 rows,
+  validates every batch before dispatch, then orders chunk→merge before
+  reusing the 32-row scratch. Preserve Window's 1..8-row entry points.
+  Correct the fixed scratch estimate to 817,344 bytes per row, or
+  26,155,008 bytes for 32 rows.
+- **Reason:** The generic Prefill batch slots carry only `{uint T}`, while the
+  attention kernels also require cache capacity, the fixed 2051-ID stride and
+  the chunk count. Passing a generic slot as the entire parameter block would
+  break the existing shader ABI. The four-field block can be produced on the
+  host for each batch without changing that ABI. The scratch total is
+  811,008 accumulator bytes plus 3,168 bytes each for maxima and denominators
+  per row; the earlier 817,600-byte estimate was too high by 256 bytes per
+  row.
+- **Review required:** Independently audit the host/shader parameter indices
+  and values, `ceil(2051/64)` chunk geometry, exact partial-buffer extents,
+  empty-chunk statistics and scratch reuse after merge. Check all-group
+  preflight, active-view aliases, standalone rollback and caller-owned error
+  propagation. Verify Window's 1..8-row contract and keep production
+  `Prefill::run` integration marked pending.
+- **Validation:** `mac-dev` built successfully after the standalone rollback
+  regression was added; focused QSA, attention and selection serial/concurrent
+  CTests passed 6/6. REV-182 records final review and validation.
+
+### REV-182: Adversarial review of Prefill QSA attention batching
+
+- **Scope:** Review the four-field shader ABI, scratch-size arithmetic,
+  fixed-ID chunk geometry, empty-chunk behavior, scratch reuse, all-batch
+  preflight, aliases, both public API forms, rollback, all four KV formats,
+  the Window row limit and Prefill scheduling status.
+- **Findings:** The initial review found a P3 coverage gap: the downstream-failure test exercised caller-owned Encoder rollback, while standalone negative-validation cases explicitly discarded their command buffers. It did not directly prove that a failed standalone Prefill attention call discards earlier work already encoded in that same command buffer.
+- **Disposition:** Added a standalone regression that first encodes QSA FWHT, then calls Prefill attention with a malformed final StepRow. It verifies the attention rejection, rejected command-buffer commit, and unchanged FWHT input and attention output. The hostile follow-up confirmed that `Encoder::encode` discards the shared unsubmitted command buffer on failure and found no remaining actionable issues.
+- **Validation:** `mac-dev` built successfully after the regression; focused QSA,
+  attention and selection serial/concurrent CTests passed 6/6. Before this
+  test-only addition, the full `mac-metal` suite passed 90/90. `mac-host`
+  passed 44/45 with the real-input test skipped, and the project `.venv`
+  Python runner passed 35/35 modules. Final `test_map.py` passed with its
+  existing planned, no-check and missing-check diagnostics; `check_drift.py`
+  reported no upstream changes and valid golden files; `git diff --check`
+  passed.
