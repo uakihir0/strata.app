@@ -3,6 +3,7 @@
 
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/prefill.hpp"
+#include "strata/metal/qsa_dispatch.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -30,6 +31,13 @@ std::uint64_t gpu_address(ReadOnlyBufferRef view) {
 }
 std::uint64_t gpu_address(BufferRef view) {
     return view ? view.gpu_address : 0u;
+}
+
+bool same_view_origin(BufferRef writable, ReadOnlyBufferRef readable) {
+    return writable && readable &&
+           writable.contents == readable.contents() &&
+           writable.gpu_address == readable.gpu_address() &&
+           writable.offset == readable.offset();
 }
 
 template <class Address>
@@ -65,7 +73,8 @@ bool views_overlap(Left left, std::size_t left_bytes, Right right,
 bool validate_projection_buffers(
     Context& context, const PrefillQsaOutputBuffers& buffers,
     const PrefillNativeProjectionBufferSizes& sizes, std::size_t attention_bytes,
-    std::size_t q_full_bytes, std::string& error) {
+    std::size_t q_full_bytes,
+    PrefillQsaAttentionTransform attention_transform, std::string& error) {
     if (!buffers.gate.attn || !context.buffers().owns(buffers.gate.attn)) {
         error = "Prefill QSA output attention is not owned by this Context";
         return false;
@@ -73,6 +82,24 @@ bool validate_projection_buffers(
     if (buffers.gate.attn.length() < attention_bytes ||
         buffers.gate.attn.offset() % alignof(float) != 0u) {
         error = "Prefill QSA output attention is undersized or misaligned";
+        return false;
+    }
+    if (attention_transform == PrefillQsaAttentionTransform::fwht256) {
+        if (!buffers.attention_transform ||
+            !context.buffers().owns(buffers.attention_transform)) {
+            error = "Prefill QSA output FWHT attention is not owned by this "
+                    "Context";
+            return false;
+        }
+        if (buffers.attention_transform.length < attention_bytes ||
+            buffers.attention_transform.offset % alignof(float) != 0u ||
+            !same_view_origin(buffers.attention_transform, buffers.gate.attn)) {
+            error = "Prefill QSA output FWHT attention does not match the "
+                    "gate attention view";
+            return false;
+        }
+    } else if (attention_transform != PrefillQsaAttentionTransform::none) {
+        error = "Prefill QSA output attention transform is invalid";
         return false;
     }
     if (!buffers.gate.q_full || !context.buffers().owns(buffers.gate.q_full)) {
@@ -174,7 +201,8 @@ bool encode_prefill_qsa_output(
     Context& context, Encoder& encoder, std::uint32_t rows,
     PrefillNativeWeightFormat format,
     const PrefillQsaOutputBuffers& buffers, std::string& error,
-    PrefillGemmBackend* selected_backend) {
+    PrefillGemmBackend* selected_backend,
+    PrefillQsaAttentionTransform attention_transform) {
     error.clear();
     if (rows == 0u || rows > kPrefillMaxShaderRows) {
         error = "Prefill QSA output row count exceeds the shader-safe range";
@@ -200,8 +228,24 @@ bool encode_prefill_qsa_output(
     static_assert(kQsaHeadCount * kQsaHeadWidth == kQsaAttentionWidth);
     static_assert(kQsaHeadWidth * 2u == kQFullHeadWidth);
     if (!validate_projection_buffers(context, buffers, sizes, attention_bytes,
-                                     q_full_bytes, error)) {
+                                     q_full_bytes, attention_transform,
+                                     error)) {
         return false;
+    }
+
+    if (attention_transform == PrefillQsaAttentionTransform::fwht256) {
+        if (views_overlap(buffers.attention_transform, attention_bytes,
+                          buffers.gate.q_full, q_full_bytes) ||
+            views_overlap(buffers.attention_transform, attention_bytes,
+                          buffers.native_weights, sizes.weights_bytes)) {
+            error = "Prefill QSA output FWHT attention overlaps another active "
+                    "read-only input";
+            return false;
+        }
+        if (!encode_qsa_fwht256(context, encoder, rows * kQsaHeadCount,
+                                buffers.attention_transform, error)) {
+            return false;
+        }
     }
 
     if (!encode_prefill_qsa_gate_attn(context, encoder, rows, buffers.gate,
@@ -223,14 +267,15 @@ bool encode_prefill_qsa_output(
     Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
     PrefillNativeWeightFormat format,
     const PrefillQsaOutputBuffers& buffers, std::string& error,
-    PrefillGemmBackend* selected_backend) {
+    PrefillGemmBackend* selected_backend,
+    PrefillQsaAttentionTransform attention_transform) {
     PrefillGemmBackend selected = PrefillGemmBackend::SIMD;
     const bool encoded = Encoder::encode(
         context, command_buffer, "Prefill QSA output",
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_prefill_qsa_output(
                 context, encoder, rows, format, buffers, encode_error,
-                &selected);
+                &selected, attention_transform);
         },
         error);
     if (encoded && selected_backend != nullptr) {
