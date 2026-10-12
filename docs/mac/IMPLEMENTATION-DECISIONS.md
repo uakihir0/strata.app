@@ -12379,3 +12379,45 @@ measuring L-15 remain open.
   planned/no-check/missing-check diagnostics, `check_drift.py` reported
   unchanged upstream sources and valid golden files, and `git diff --check`
   passed.
+
+### D-IMPL-405: Add Prefill IQ3_XXS gate/up tiles
+
+- **Decision:** Extend the shared Prefill MoE gate/up tile with typed Encoder
+  and transactional CommandBuffer APIs for IQ3_XXS. Validate the full
+  640×10×98-byte expert extent (627,200 bytes). Decode its two grid bytes per
+  8-value code, expand each 7-bit sign index with the parity bit, take the
+  scale from `aux32[31:28]`, and round each decoded weight to F16.
+- **Reason:** IQ3_XXS is a documented gate/up format and already has a
+  canonical 256-entry grid, standalone packed decoder and MoE fixture. The
+  shared path retains the existing address snapshot, lease, status and
+  transaction checks. This component does not add production MoE scheduling
+  or connect `Prefill::run`.
+- **Fixture judgment:** Exercise all 256 grid indices, 128 encoded sign
+  indices and 16 scale values in deterministic packed expert weights. Check a
+  separate literal byte anchor through the block dequant oracle, compare the
+  GPU SwiGLU result to an independent scalar oracle, freeze the literal-block
+  GPU output `0x40d3`, and require the no-F16-rounding control to differ by
+  more than four ULPs.
+- **Review required:** See REV-201. Challenge packed grid addressing,
+  parity-sign expansion, scale extraction, block and expert extents, F16
+  rounding, lease and transactional behavior, fixture/oracle independence,
+  golden provenance and product-scope claims.
+- **Validation:** `mac-dev` built. The full focused serial/concurrent Prefill
+  MoE, encoder and window-storage selection passed 10/10 after IQ3_XXS was
+  added. Static test-map, drift and whitespace results are recorded in REV-201.
+
+### REV-201: Adversarial review of Prefill IQ3_XXS gate/up tiles
+
+- **Scope:** Audit the 98-byte block and 627,200-byte extent, packed grid and
+  parity-expanded sign fields, auxiliary scale, F16 conversion, API/kernel
+  dispatch, shared bounds/lease/transaction checks, scalar oracle, packed
+  coverage, literal anchor, fixed GPU golden, rounding negative control and
+  documentation scope.
+- **Findings:** No actionable findings (P0–P3). The reviewer confirmed the
+  packed decode, geometry, dispatch, tests and product-scope documentation.
+- **Disposition:** No code or documentation correction was required.
+- **Validation:** `mac-dev` built; the full focused serial/concurrent Prefill
+  MoE, encoder and window-storage selection passed 10/10. `test_map.py` passed
+  with existing planned/no-check/missing-check diagnostics, `check_drift.py`
+  reported unchanged upstream sources and valid golden files, and
+  `git diff --check` passed. The reviewer was asked to audit the same revision.

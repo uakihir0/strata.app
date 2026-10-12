@@ -308,7 +308,7 @@ column points to the specification. "Threads" is the manifest value.
 | `strata_pf_gemm_bf16` | `mpp`, `simd` | 6.2 |
 | `strata_pf_gemm_bf16_mpp` | isolated Apple10 MPP component; not the production selector | 6.2 |
 | `strata_pf_sort_count`, `strata_pf_sort_scan`, `strata_pf_sort_scatter`, `strata_pf_gather_f16` | | 6.6 |
-| `strata_pf_moe_gu_f16` | Shared Q2_0, IQ4_XS, IQ2_XXS, IQ2_XS and IQ2_S SIMD tiles implemented as isolated encoders; three other formats and MPP remain planned. The gate/up tile applies SwiGLU in its epilogue. | 6.6 |
+| `strata_pf_moe_gu_f16` | Shared Q2_0, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S and IQ3_XXS SIMD tiles implemented as isolated encoders; two other formats and MPP remain planned. The gate/up tile applies SwiGLU in its epilogue. | 6.6 |
 | `strata_pf_moe_down_f16` | Q2_0 and IQ4_NL F16-activation down tiles share the validated format-selected kernel | 6.6 |
 | `strata_pf_swiglu_pair` (the shared expert's SwiGLU) | | 6.6 |
 | `strata_pf_combine` | | 6.6 |
@@ -4985,7 +4985,7 @@ The prefill MoE computes the decode MoE's function over T rows (section 5.10). I
 | 13 | `strata_pf_combine` | `parts`, `wts`, `shared`, `gl` → `bo` |
 
 The count/scan/scatter, row-gather, shared-expert post-ops, and isolated
-Q2_0/IQ4_XS/IQ2_XXS/IQ2_XS/IQ2_S gate/up plus Q2_0 and IQ4_NL down tiles now have typed GPU
+Q2_0/IQ4_XS/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS gate/up plus Q2_0 and IQ4_NL down tiles now have typed GPU
 encoders and synthetic oracle coverage. Both expert encoders copy the selected address row
 into caller-owned scratch before dispatch. Use a unique range for each pending expert dispatch
 and keep it unchanged through completion. The `CommandBuffer` rejects a
@@ -5978,8 +5978,8 @@ Context ownership, active-range aliases and open concurrent groups. These
 post-ops remain independently tested.
 
 `metal_prefill_moe_expert_test` and its concurrent CTest compose grouping,
-F16 row gathering, Q2_0/IQ4_XS/IQ2_XXS/IQ2_XS/IQ2_S gate/up tiles and the fused SwiGLU
-epilogue. All five formats run at T=1 and T=7, route to two experts with different weight
+F16 row gathering, Q2_0/IQ4_XS/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS gate/up tiles and the fused SwiGLU
+epilogue. All six formats run at T=1 and T=7, route to two experts with different weight
 addresses and signed inputs;
 at T=7, the first expert has 65 entries and its tile splits at row 64. An
 independent GPU decode probe checks every F16 weight bit for all four Q2_0
@@ -5987,16 +5987,17 @@ codes; the IQ4_XS fixture covers all 16 nonlinear codes and all 64 packed
 scale values, the IQ2_XXS fixture covers all 256 grid indices, 16 scale codes
 and 128 sign indices, IQ2_XS covers all 512 grid indices, both 16-value scale
 nibbles and 128 sign indices, and IQ2_S covers all 1,024 grid indices, both
-16-value scale nibbles and all 256 sign masks. The IQ4_XS FP64-dot oracle
+16-value scale nibbles and all 256 sign masks; IQ3_XXS covers all 256 grid indices, 128 parity-expanded sign indices and all 16 auxiliary scale values. The IQ4_XS FP64-dot oracle
 dequantizes raw blocks through the independent `strata::dequantize_iq4_xs`
-reference, while the IQ2 formats use their canonical `dq_iq2_*`
-dequantization contracts; all round weights to F16 before the dot. Literal
-fixtures anchor the IQ4_XS nibble placement and IQ2 packed fields. IQ2_XXS,
-IQ2_XS and IQ2_S each feed a fixed packed block through the Prefill GPU tile
-and check frozen F16 SwiGLU goldens `0x2c29`, `0x2738` and `0x1d33` over
-multiple code slots and parts.
+reference, while IQ2 formats use their canonical `dq_iq2_*` dequantization
+contracts and IQ3_XXS uses its canonical grid/sign/scale decoder; all round
+weights to F16 before the dot. Literal fixtures anchor the IQ4_XS nibble
+placement and IQ2/IQ3_XXS packed fields. IQ2_XXS, IQ2_XS, IQ2_S and IQ3_XXS
+each feed a fixed packed block through the Prefill GPU tile and check frozen
+F16 SwiGLU goldens `0x2c29`, `0x2738`, `0x1d33` and `0x40d3` over multiple
+code slots and parts.
 Hidden outputs are checked against these format-aware oracles within four
-F16 ULPs, with unrounded-weight negative controls for all four nonlinear
+F16 ULPs, with unrounded-weight negative controls for all five nonlinear
 formats. The
 expert fixtures also verify missing addresses and malformed plan/tile data
 set distinct GPU status bits and zero affected output, and that both preflight
@@ -6015,8 +6016,8 @@ slot coverage and that an unpinned tiered address sets its status bit and
 zeros output without dereferencing the address. The T=7 expert fixture also
 fails the first expert's address and confirms its 65-entry group is zeroed
 without erasing the following expert's five outputs.
-Q2_0, IQ4_XS, IQ2_XXS, IQ2_XS and IQ2_S gate/up formats are implemented through
-the shared format-selected SIMD tile; the other three gate/up formats and MPP remain
+Q2_0, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S and IQ3_XXS gate/up formats are
+implemented through the shared format-selected SIMD tile; the other two gate/up formats and MPP remain
 planned. Q2_0 and IQ4_NL down formats are implemented in the shared
 F16-activation tile. Production Prefill scheduling, tiered schedule
 integration and model-backed parity remain pending.
