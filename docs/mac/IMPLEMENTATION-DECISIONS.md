@@ -12675,3 +12675,87 @@ measuring L-15 remain open.
   fixtures. The full `mac-host` suite passed 45/45 with one real-model-input
   test skipped, all 35 Python modules passed under `.venv`, and `test_map.py`
   plus `git diff --check` passed.
+
+### D-IMPL-410: Compose all full-mode Prefill MoE layer stages
+
+- **Decision:** Add transactional standalone and caller-owned Encoder forms
+  that order Prefill MoE steps 1–13: BF16X2 routing, stable GPU grouping and
+  gather, shared native FFN/gate, routed gate/up and down projections, and
+  weighted combine. Support T=1..8, 256/512 experts, BF16X2 modes 1/2, the
+  eight implemented routed gate/up formats, both routed down formats, and the
+  existing shared native formats. Restrict the composition to full-residency
+  expert storage; do not combine the tiered event/lease boundary with this
+  single segment. Accept producer-to-consumer active-range overlap only when
+  both views begin at the same CPU and GPU address where available and the
+  consumer range fits inside the producer range. Reject other cross-stage
+  writable overlaps and invalid formats before dispatch. Callers using the
+  shared Encoder form must propagate failure and check both expert status
+  words plus `PfPlan.bad` before consuming results.
+- **Reason:** The individual encoders already implement the arithmetic and
+  validation contracts for each stage. A typed compositor provides a
+  reviewable full-mode execution boundary without duplicating those kernels.
+  Tiered execution still requires host-visible plan handling and event/lease
+  ordering. Requiring an identical start address prevents a shifted consumer
+  subview from reading bytes the producer never wrote; checking the active
+  extents still permits the plan/tile prefixes used by downstream encoders.
+- **Fixture judgment:** Use a single synthetic full-residency weight backing
+  view for all expert addresses to keep the 512-expert T=7 case compact. Make
+  Q2_0 scales and packed codes vary by output row, K block and packed lane;
+  independently validate every grouped route, its gathered token row, F16
+  SwiGLU and restored destination output. Separate component tests continue
+  to cover distinct expert backing addresses and the other formats. No real
+  model input is used, and this fixture does not establish model parity.
+- **Review required:** See REV-206. Challenge the 13-stage ordering, supported
+  shape/mode/format boundary, same-start alias rule, per-stage active extents,
+  route/group/destination mapping, scalar-oracle independence, failure
+  rollback and the synthetic full-residency-only product boundary.
+- **Validation:** The `mac-dev` build passed and the focused serial/concurrent
+  full-mode compositor CTests passed 2/2 after the final BF16X2 oracle,
+  all-route scalar checks and shifted-alias regression. The focused Prefill
+  MoE suite passed 14/14; the full `mac-metal` suite passed 106/106 before
+  the final test-only BF16X2 oracle addition. `test_map.py` and
+  `git diff --check` passed. See REV-206 for hostile findings and disposition.
+
+### REV-206: Adversarial review of full-mode Prefill MoE composition
+
+- **Scope:** Review the 13-stage ordering and its API boundary; checked active
+  extents, same-start producer/consumer aliases, cross-stage writable overlap,
+  full-residency restrictions, format and mode preflight, route/group/
+  destination ordering, BF16X2 and Q2_0 oracle independence, standalone and
+  caller-owned rollback, CMake/test-map registration, documentation claims,
+  and the explicit synthetic-only boundary.
+- **Findings:** The first review found that range containment accepted shifted
+  producer/consumer subviews, the T=7 scalar route check initially confused
+  token-row indices with flattened route-entry indices, and the original
+  integration test reused GPU outputs for its downstream combine reference
+  without independent shared/routed projection oracles. It also identified
+  missing invalid-format regressions and stale statements that routed tiles
+  and combine were not composed. Follow-up review found no direct ordering,
+  range, or destination-indexing defect, but noted the compositor still
+  needed independent BF16X2 router-logit, route-weight and shared-gate
+  references, and that the review result itself needed a log entry.
+- **Disposition:** Producer/consumer overlap is now accepted only at the same
+  start address with the consumer's active range contained; a shifted slice
+  test verifies rejection before dispatch. The scalar test now walks every
+  PfPlan group, uses source rows and flattened destinations, checks every
+  gathered row against its input token, and validates each routed hidden and
+  down output with independent Q2_0 references whose packed codes and scales
+  vary by output row, K block and lane. Shared projections and F16 SwiGLU are
+  checked independently as well. Every BF16X2 router logit, divide-mode
+  route weight and shared-gate logit is now compared with FP64 expectations
+  in both tested modes. Invalid gate/up, down and shared formats are rejected
+  before dispatch with output preservation. Updated the README, kernel/host
+  port inventory, test plan and test map to distinguish this synthetic
+  full-residency composition from tiered execution and production
+  `Prefill::run`. The compositor decision and this review outcome are now
+  recorded in this file. A final hostile follow-up confirmed that the new
+  BF16X2 oracles run in both tested modes and found no remaining actionable
+  issue.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a),
+  `mac-dev` built. After the final BF16X2 oracle changes, the standalone and
+  caller-owned full-pipeline CTests passed 2/2 and the focused Prefill MoE
+  suite passed 14/14. The full `mac-metal` suite passed 106/106 before that
+  final test-only addition. `STRATA_BUILD_DIR=build-dev python3
+  tools/metal/test_map.py` passed with its existing planned and missing
+  requirement diagnostics; `git diff --check` passed. All inputs were
+  synthetic; this does not establish model parity or production inference.

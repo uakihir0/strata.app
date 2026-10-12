@@ -12,15 +12,18 @@ IQ4_NL, Q2_0, Q3_K, IQ4_XS, Q4_0, Q4_K, Q5_K, Q5_0, Q6_K, Q8_0 and
 IQ3_S weight-to-K-major-F16 dequantizers. Prefill MoE now also has isolated
 stable route grouping/gather and shared SwiGLU/weighted-combine post-ops,
 Q2_0/IQ4_XS/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ1_M gate/up tiles and
-Q2_0/IQ4_NL down tiles. A full-mode typed compositor now orders the BF16X2
-router, divide-mode top-10 route, grouping and F16 row gather (steps 1–6) in
-one transactional segment. Its serial and concurrent tests use synthetic
-inputs at T=1/7 and 256/512 experts. The shared-expert stages 7–10 now have a
-separate typed coordinator and synthetic serial/concurrent tests. Callers
-still schedule the two compositions and must keep each writable active view
-disjoint from every active view of the other composition; routed expert tile
-consumers and combine, tiered scheduling and `Prefill::run` integration
-remain open.
+Q2_0/IQ4_NL down tiles. A full-mode typed compositor orders BF16X2 routing, stable grouping and
+F16 gather (steps 1–6), and a shared-expert coordinator covers steps 7–10. The
+new `encode_prefill_moe_full_mode_layer` composes all 13 steps through routed
+gate/up and down tiles and weighted combine in one full-residency segment.
+Focused serial/concurrent tests pass for standalone T=1/mode 1/256 experts and
+caller-owned T=7/mode 2/512 experts. They use synthetic inputs, independent
+FP64 references for every BF16X2 router/shared-gate output and route weight,
+plus Q2_0 references for each projection and SwiGLU. They check every grouped
+route and gather, reject shifted producer/consumer aliases and invalid formats,
+and verify rollback after late address validation fails. These are component-level
+checks, not model inference. Tiered residency/event coordination,
+model-backed parity and production `Prefill::run` integration remain open.
 MPP requires
 Apple10; the SIMD paths use F32 SIMD-group matrices and are intended for all
 Apple GPU families, but have only been exercised on the current Apple10 Mac.

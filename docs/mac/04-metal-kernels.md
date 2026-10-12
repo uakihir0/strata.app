@@ -5004,8 +5004,24 @@ before encoding, and trigger a GEMM-selector failure after dequant encoding
 to verify rollback for both API forms. A caller can
 place the two full-mode compositions in the same ordered Encoder segment,
 provided every active writable view in either composition is disjoint from
-every active view in the other; read-only inputs may alias. The expert tile
-consumers and combine are not yet joined to that path.
+every active view in the other; read-only inputs may alias.
+`encode_prefill_moe_full_mode_layer` now composes steps 1–13 in one typed
+full-residency segment: route/gather, shared FFN/gate, routed gate/up and down,
+then weighted combine. It supports T=1..8, 256/512 experts, BF16X2 modes 1/2,
+all eight implemented gate/up formats, both down formats, and the supported
+shared native formats. The compositor preflights active ranges; producer to
+consumer aliases are accepted only when their starts match and the consumer's
+active range fits inside the producer's active range. Other cross-stage
+writable aliases and unsupported formats are rejected before dispatch. The
+serial/concurrent T=1/7 tests independently check every BF16X2 router logit,
+divide-mode route weight and shared-gate logit, plus shared outputs, every
+grouped route's gathered row, routed F16 SwiGLU and down output with
+row- and K-block-varying Q2_0 weights. They also check combine, invalid-format
+preflight, shifted-view alias rejection and rollback after a late expert
+address failure. Callers must still inspect both expert status words and
+`PfPlan.bad` before using the output. This synthetic full-mode compositor
+does not schedule tiered residency or integrate with production
+`Prefill::run`; those remain pending.
 The count/scan/scatter, row-gather, shared-expert post-ops, and isolated
 Q2_0/IQ4_XS/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ1_M gate/up plus Q2_0 and IQ4_NL down tiles now have typed GPU
 encoders and synthetic oracle coverage. Both expert encoders copy the selected address row
