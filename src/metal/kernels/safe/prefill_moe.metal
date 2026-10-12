@@ -1,5 +1,6 @@
 // Prefill MoE route grouping and F16 row gather (docs/mac/04 §6.6).
 #include <metal_stdlib>
+#include "../common/math.h"
 
 using namespace metal;
 
@@ -301,4 +302,43 @@ kernel void strata_pf_gather_f16(
     const device uint4* mixed_vectors =
         reinterpret_cast<device const uint4*>(mixed_h);
     Xs[vector_index] = mixed_vectors[input_vector];
+}
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void strata_pf_swiglu_pair(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    if (!pf_moe_rows_valid(rows)) return;
+    const ulong index = ulong(group.x) * 256ul + ulong(tid);
+    const ulong values = ulong(rows) * 640ul;
+    if (index < values) {
+        output[index] = half_sat(silu_k(gate[index]) * up[index]);
+    }
+}
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void strata_pf_combine(
+    device const float* parts [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device const float* shared [[buffer(2)]],
+    device const float* gate [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    const uint row = group.y;
+    const uint column = group.x * 256u + tid;
+    const ulong row_index = ulong(row);
+    const ulong value_index = row_index * 2560ul + ulong(column);
+    float sum = 0.0f;
+    for (uint rank = 0u; rank < 10u; ++rank) {
+        const ulong route_index = row_index * 10ul + ulong(rank);
+        sum = fma(weights[route_index],
+                  parts[route_index * 2560ul + ulong(column)], sum);
+    }
+    output[value_index] =
+        fma(shared[value_index], sigmoid_k(gate[row_index]), sum);
 }
