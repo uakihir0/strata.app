@@ -23,4 +23,8 @@ bool iq2_xxs_matvec_tf_reference(std::span<const block_iq2_xxs> weights,
                                  std::uint32_t nc, std::uint32_t live_rows,
                                  std::vector<tf>& output, std::string& err);
 
+/// Canonical IQ2_XXS block dequantization, following ggml's dq_iq2_xxs.
+void iq2_xxs_dequantize_reference(
+    const block_iq2_xxs& weight, std::span<float, 256u> output);
+
 }  // namespace twin

@@ -1,4 +1,4 @@
-// GPU twin for isolated Prefill MoE Q2_0/IQ4_XS gate/up tiles (docs/mac/04 §6.6).
+// GPU twin for isolated Prefill MoE Q2_0/IQ4_XS/IQ2_XXS gate/up tiles (docs/mac/04 §6.6).
 #include "metallib_sha256.inc"
 
 #include "strata/artifact/dequant.hpp"
@@ -10,6 +10,8 @@
 #include "strata/metal/prefill.hpp"
 #include "../../src/metal/kernels/common/types.h"
 #include "oracles/iq4_xs_moe_fixture.hpp"
+#include "oracles/iq2_xxs_moe_fixture.hpp"
+#include "oracles/iq2_xxs_mv.hpp"
 #include "twin.hpp"
 
 #include <algorithm>
@@ -38,6 +40,8 @@ constexpr std::size_t kQ2BlocksPerRow = 40u;
 constexpr std::size_t kQ2BlockBytes = 18u;
 constexpr std::size_t kIQ4XSBlocksPerRow = 10u;
 constexpr std::size_t kIQ4XSBlockBytes = 136u;
+constexpr std::size_t kIQ2XXSBlocksPerRow = 10u;
+constexpr std::size_t kIQ2XXSBlockBytes = 66u;
 constexpr std::uint8_t kPoison = 0xa5u;
 constexpr std::uint8_t kGuardPoison = 0xffu;
 
@@ -61,7 +65,28 @@ struct Tile {
 };
 static_assert(sizeof(Tile) == 8u);
 
-enum class WeightFormat { q2_0, iq4_xs };
+enum class WeightFormat { q2_0, iq4_xs, iq2_xxs };
+
+std::string_view weight_format_name(WeightFormat format) {
+    switch (format) {
+        case WeightFormat::q2_0: return "Q2_0";
+        case WeightFormat::iq4_xs: return "IQ4_XS";
+        case WeightFormat::iq2_xxs: return "IQ2_XXS";
+    }
+    return "unknown";
+}
+
+std::size_t weight_format_expert_bytes(WeightFormat format) {
+    switch (format) {
+        case WeightFormat::q2_0:
+            return kHidden * kQ2BlocksPerRow * kQ2BlockBytes;
+        case WeightFormat::iq4_xs:
+            return kHidden * kIQ4XSBlocksPerRow * kIQ4XSBlockBytes;
+        case WeightFormat::iq2_xxs:
+            return kHidden * kIQ2XXSBlocksPerRow * kIQ2XXSBlockBytes;
+    }
+    return 0u;
+}
 
 struct PrefillMoeExpertAddress {
     std::uint64_t role[3]{};
@@ -244,12 +269,68 @@ void fill_iq4_xs_weights(twin::GuardedBuffer& buffer, std::uint32_t role,
     }
 }
 
+void fill_iq2_xxs_weights(twin::GuardedBuffer& buffer, std::uint32_t role,
+                          std::uint32_t expert) {
+    auto blocks = typed<block_iq2_xxs>(buffer);
+    for (std::uint32_t row = 0u; row < kHidden; ++row) {
+        for (std::size_t block_index = 0u;
+             block_index < kIQ2XXSBlocksPerRow; ++block_index) {
+            block_iq2_xxs& block =
+                blocks[static_cast<std::size_t>(row) * kIQ2XXSBlocksPerRow +
+                       block_index];
+            if (expert == 0u && row == 0u) {
+                block.d = 0u;
+                std::fill(std::begin(block.qs), std::end(block.qs), 0u);
+                if (block_index == 0u) {
+                    block.d = 0x2a00u;  // F16 0.046875.
+                    std::copy(twin::kIQ2XXSMoePackedWords.begin(),
+                              twin::kIQ2XXSMoePackedWords.end(), block.qs);
+                }
+                continue;
+            }
+            block.d = 0x2a00u;  // F16 0.046875.
+            for (std::uint32_t part = 0u; part < 8u; ++part) {
+                std::uint32_t indices = 0u;
+                std::uint32_t auxiliary = 0u;
+                for (std::uint32_t code_slot = 0u; code_slot < 4u;
+                     ++code_slot) {
+                    const std::uint32_t code =
+                        (row * 97u + block_index * 23u + part * 41u +
+                         code_slot * 67u + role * 31u + expert * 19u) &
+                        0xffu;
+                    indices |= code << (8u * code_slot);
+                    const std::uint32_t signs =
+                        (row * 13u + block_index * 17u + part * 29u +
+                         code_slot * 37u + role * 43u + expert * 53u) &
+                        0x7fu;
+                    auxiliary |= signs << (7u * code_slot);
+                }
+                const std::uint32_t scale_code =
+                    (row * 7u + block_index * 11u + part * 13u +
+                     role * 5u + expert * 3u) &
+                    0x0fu;
+                auxiliary |= scale_code << 28u;
+                block.qs[4u * part] =
+                    static_cast<std::uint16_t>(indices & 0xffffu);
+                block.qs[4u * part + 1u] =
+                    static_cast<std::uint16_t>(indices >> 16u);
+                block.qs[4u * part + 2u] =
+                    static_cast<std::uint16_t>(auxiliary & 0xffffu);
+                block.qs[4u * part + 3u] =
+                    static_cast<std::uint16_t>(auxiliary >> 16u);
+            }
+        }
+    }
+}
+
 void fill_weights(twin::GuardedBuffer& buffer, std::uint32_t role,
                   std::uint32_t expert, WeightFormat format) {
     if (format == WeightFormat::q2_0) {
         fill_q2_weights(buffer, role, expert);
-    } else {
+    } else if (format == WeightFormat::iq4_xs) {
         fill_iq4_xs_weights(buffer, role, expert);
+    } else {
+        fill_iq2_xxs_weights(buffer, role, expert);
     }
 }
 
@@ -282,6 +363,41 @@ bool iq4_xs_fixture_covers_codes_and_scales(
                        [](bool observed) { return observed; });
 }
 
+bool iq2_xxs_fixture_covers_codes_scales_and_signs(
+    const std::array<const twin::GuardedBuffer*, 4u>& weight_buffers) {
+    std::array<bool, 256u> observed_codes{};
+    std::array<bool, 16u> observed_scales{};
+    std::array<bool, 128u> observed_signs{};
+    for (const twin::GuardedBuffer* weight_buffer : weight_buffers) {
+        for (const block_iq2_xxs& block :
+             typed<block_iq2_xxs>(*weight_buffer)) {
+            for (std::uint32_t part = 0u; part < 8u; ++part) {
+                const std::uint32_t word = 4u * part;
+                const std::uint32_t indices =
+                    static_cast<std::uint32_t>(block.qs[word]) |
+                    (static_cast<std::uint32_t>(block.qs[word + 1u]) << 16u);
+                const std::uint32_t auxiliary =
+                    static_cast<std::uint32_t>(block.qs[word + 2u]) |
+                    (static_cast<std::uint32_t>(block.qs[word + 3u]) << 16u);
+                observed_scales[auxiliary >> 28u] = true;
+                for (std::uint32_t code_slot = 0u; code_slot < 4u;
+                     ++code_slot) {
+                    observed_codes[(indices >> (8u * code_slot)) & 0xffu] =
+                        true;
+                    observed_signs[(auxiliary >> (7u * code_slot)) & 0x7fu] =
+                        true;
+                }
+            }
+        }
+    }
+    return std::all_of(observed_codes.begin(), observed_codes.end(),
+                       [](bool observed) { return observed; }) &&
+           std::all_of(observed_scales.begin(), observed_scales.end(),
+                       [](bool observed) { return observed; }) &&
+           std::all_of(observed_signs.begin(), observed_signs.end(),
+                       [](bool observed) { return observed; });
+}
+
 float q2_value(std::span<const block_q2_0> blocks, std::size_t row,
                std::size_t k) {
     const block_q2_0& block =
@@ -294,7 +410,7 @@ float q2_value(std::span<const block_q2_0> blocks, std::size_t row,
 
 double dot_oracle(std::span<const std::uint16_t> x,
                   const twin::GuardedBuffer& weights, WeightFormat format,
-                  std::size_t row, bool round_iq4_xs_weights = true) {
+                  std::size_t row, bool round_weights = true) {
     double result = 0.0;
     if (format == WeightFormat::q2_0) {
         const auto blocks = typed<block_q2_0>(weights);
@@ -302,7 +418,7 @@ double dot_oracle(std::span<const std::uint16_t> x,
             result += static_cast<double>(f32(x[k])) *
                       static_cast<double>(q2_value(blocks, row, k));
         }
-    } else {
+    } else if (format == WeightFormat::iq4_xs) {
         const auto blocks = typed<block_iq4_xs>(weights);
         std::array<float, 256u> decoded{};
         for (std::size_t block_index = 0u;
@@ -315,8 +431,25 @@ double dot_oracle(std::span<const std::uint16_t> x,
             const std::size_t first_k = block_index * decoded.size();
             for (std::size_t offset = 0u; offset < decoded.size(); ++offset) {
                 const float weight =
-                    round_iq4_xs_weights ? f32(half(decoded[offset]))
-                                         : decoded[offset];
+                    round_weights ? f32(half(decoded[offset]))
+                                  : decoded[offset];
+                result += static_cast<double>(f32(x[first_k + offset])) *
+                          static_cast<double>(weight);
+            }
+        }
+    } else {
+        const auto blocks = typed<block_iq2_xxs>(weights);
+        std::array<float, 256u> decoded{};
+        for (std::size_t block_index = 0u;
+             block_index < kIQ2XXSBlocksPerRow; ++block_index) {
+            const block_iq2_xxs& block =
+                blocks[row * kIQ2XXSBlocksPerRow + block_index];
+            twin::iq2_xxs_dequantize_reference(block, decoded);
+            const std::size_t first_k = block_index * decoded.size();
+            for (std::size_t offset = 0u; offset < decoded.size(); ++offset) {
+                const float weight =
+                    round_weights ? f32(half(decoded[offset]))
+                                  : decoded[offset];
                 result += static_cast<double>(f32(x[first_k + offset])) *
                           static_cast<double>(weight);
             }
@@ -339,6 +472,22 @@ bool test_iq4_xs_literal_decode_anchor() {
     return matches;
 }
 
+bool test_iq2_xxs_literal_decode_anchor() {
+    block_iq2_xxs block{};
+    block.d = 0x3c00u;  // F16 1.
+    block.qs[2] = 0x0001u;  // Sign index 1: components 0 and 7 are negative.
+    block.qs[3] = 0x1000u;  // Part scale code 1.
+    std::array<float, 256u> decoded{};
+    twin::iq2_xxs_dequantize_reference(block, decoded);
+    const bool matches =
+        decoded[0] == -3.0f && decoded[1] == 3.0f &&
+        decoded[7] == -3.0f;
+    check(matches,
+          "canonical IQ2_XXS decoder honors literal grid, scale, and sign bits",
+          "grid index 0, scale code 1, sign index 1");
+    return matches;
+}
+
 std::size_t round_up_div(std::size_t value, std::size_t divisor) {
     return value / divisor +
            static_cast<std::size_t>(value % divisor != 0u);
@@ -353,7 +502,11 @@ bool encode_expert(WeightFormat format, Context& context, Encoder& encoder,
         return encode_prefill_moe_gu_q2_0(
             context, encoder, rows, experts, layer, buffers, error);
     }
-    return encode_prefill_moe_gu_iq4_xs(
+    if (format == WeightFormat::iq4_xs) {
+        return encode_prefill_moe_gu_iq4_xs(
+            context, encoder, rows, experts, layer, buffers, error);
+    }
+    return encode_prefill_moe_gu_iq2_xxs(
         context, encoder, rows, experts, layer, buffers, error);
 }
 
@@ -366,7 +519,11 @@ bool encode_expert(WeightFormat format, Context& context,
         return encode_prefill_moe_gu_q2_0(
             context, command_buffer, rows, experts, layer, buffers, error);
     }
-    return encode_prefill_moe_gu_iq4_xs(
+    if (format == WeightFormat::iq4_xs) {
+        return encode_prefill_moe_gu_iq4_xs(
+            context, command_buffer, rows, experts, layer, buffers, error);
+    }
+    return encode_prefill_moe_gu_iq2_xxs(
         context, command_buffer, rows, experts, layer, buffers, error);
 }
 
@@ -374,8 +531,7 @@ bool run_case(Context& context, WeightFormat format, std::uint32_t rows,
               bool caller_owned,
               bool missing_second_expert = false,
               bool missing_first_expert = false) {
-    const std::string format_name =
-        format == WeightFormat::q2_0 ? "Q2_0" : "IQ4_XS";
+    const std::string format_name(weight_format_name(format));
     const std::string label =
         "Prefill " + format_name + " expert tile T=" + std::to_string(rows) +
         (caller_owned ? " caller-owned" : " standalone") +
@@ -399,10 +555,7 @@ bool run_case(Context& context, WeightFormat format, std::uint32_t rows,
     const std::size_t address_table_bytes =
         (static_cast<std::size_t>(kLayer) + 1u) * kExperts *
         sizeof(PrefillMoeExpertAddress);
-    const std::size_t weight_bytes =
-        format == WeightFormat::q2_0
-            ? kHidden * kQ2BlocksPerRow * kQ2BlockBytes
-            : kHidden * kIQ4XSBlocksPerRow * kIQ4XSBlockBytes;
+    const std::size_t weight_bytes = weight_format_expert_bytes(format);
 
     twin::GuardedBuffer ids, resident, mixed, histogram, plans, tiles;
     twin::GuardedBuffer source, destination, gathered, addresses;
@@ -754,16 +907,23 @@ bool run_case(Context& context, WeightFormat format, std::uint32_t rows,
         check(iq4_xs_fixture_covers_codes_and_scales(role_weights),
               label + " fixture covers all nonlinear codes and six-bit scales");
     }
+    if (format == WeightFormat::iq2_xxs && rows == 1u && caller_owned &&
+        !missing_second_expert && !missing_first_expert) {
+        check(iq2_xxs_fixture_covers_codes_scales_and_signs(role_weights),
+              label + " fixture covers every code, scale, and sign index");
+    }
     const auto actual = typed<std::uint16_t>(hidden);
     bool oracle_matches = true;
     bool gather_matches = true;
     std::uint16_t maximum_distance = 0u;
     std::vector<std::uint16_t> row_expected(
         static_cast<std::size_t>(rows) * 2u * kHidden);
-    const bool check_iq4_xs_rounding =
-        format == WeightFormat::iq4_xs && rows == 1u && caller_owned &&
-        !missing_second_expert && !missing_first_expert;
-    bool iq4_xs_rounding_changes_output = !check_iq4_xs_rounding;
+    const bool check_weight_rounding =
+        (format == WeightFormat::iq4_xs ||
+         format == WeightFormat::iq2_xxs) &&
+        rows == 1u && caller_owned && !missing_second_expert &&
+        !missing_first_expert;
+    bool weight_rounding_changes_output = !check_weight_rounding;
     const auto input_view = typed<std::uint16_t>(mixed);
     for (std::uint32_t row = 0u; row < rows; ++row) {
         const auto x = std::span<const std::uint16_t>(
@@ -786,7 +946,7 @@ bool run_case(Context& context, WeightFormat format, std::uint32_t rows,
                               expert_slot) *
                                  kHidden +
                              column] = expected;
-                if (check_iq4_xs_rounding) {
+                if (check_weight_rounding) {
                     const double unrounded_gate_sum =
                         dot_oracle(x, gate_weights, format, column, false);
                     const double unrounded_up_sum =
@@ -796,14 +956,14 @@ bool run_case(Context& context, WeightFormat format, std::uint32_t rows,
                         (1.0 + std::exp(-unrounded_gate_sum));
                     const std::uint16_t unrounded_expected =
                         output_half(unrounded_silu * unrounded_up_sum);
-                    iq4_xs_rounding_changes_output |=
+                    weight_rounding_changes_output |=
                         half_ulp_distance(expected, unrounded_expected) > 4u;
                 }
             }
         }
     }
-    if (check_iq4_xs_rounding) {
-        check(iq4_xs_rounding_changes_output,
+    if (check_weight_rounding) {
+        check(weight_rounding_changes_output,
               label + " F16 weight rounding changes the scalar SwiGLU output "
                       "beyond the four-ULP tolerance");
     }
@@ -839,6 +999,17 @@ bool run_case(Context& context, WeightFormat format, std::uint32_t rows,
                               "/SwiGLU oracle",
           "maximum F16 distance=" + std::to_string(maximum_distance) +
               " ULP (limit 4)");
+    if (format == WeightFormat::iq2_xxs && rows == 1u && caller_owned &&
+        !missing_second_expert && !missing_first_expert) {
+        // Frozen from the literal 32-word block, ggml dq_iq2_xxs semantics,
+        // and an FP64 dot over the first 256 synthetic F16 activation values.
+        const std::uint16_t literal_expected = 0x2c29u;
+        const std::uint16_t distance =
+            half_ulp_distance(actual[0], literal_expected);
+        check(distance <= 4u,
+              label + " matches the fixed packed-block Prefill golden",
+              "F16 ULP distance=" + std::to_string(distance));
+    }
     const auto status_values = typed<std::uint32_t>(status);
     const bool status_matches =
         status_values[0] ==
@@ -1256,12 +1427,8 @@ bool test_decode_probe(Context& context) {
 
 bool test_validation(Context& context, Context& foreign_context,
                      WeightFormat format) {
-    const std::string format_name =
-        format == WeightFormat::q2_0 ? "Q2_0" : "IQ4_XS";
-    const std::size_t weight_bytes =
-        format == WeightFormat::q2_0
-            ? kHidden * kQ2BlocksPerRow * kQ2BlockBytes
-            : kHidden * kIQ4XSBlocksPerRow * kIQ4XSBlockBytes;
+    const std::string format_name(weight_format_name(format));
+    const std::size_t weight_bytes = weight_format_expert_bytes(format);
     twin::GuardedBuffer addresses, gathered, plan, tiles, hidden, status, foreign;
     twin::GuardedBuffer weight_storage, address_snapshot;
     std::string error;
@@ -1486,13 +1653,16 @@ int main(int argc, char** argv) {
 
     bool passed = true;
     for (const WeightFormat format :
-         {WeightFormat::q2_0, WeightFormat::iq4_xs}) {
+         {WeightFormat::q2_0, WeightFormat::iq4_xs,
+          WeightFormat::iq2_xxs}) {
         passed &= test_validation(*context, *foreign, format);
     }
     passed &= test_decode_probe(*context);
     passed &= test_iq4_xs_literal_decode_anchor();
+    passed &= test_iq2_xxs_literal_decode_anchor();
     for (const WeightFormat format :
-         {WeightFormat::q2_0, WeightFormat::iq4_xs}) {
+         {WeightFormat::q2_0, WeightFormat::iq4_xs,
+          WeightFormat::iq2_xxs}) {
         passed &= run_case(*context, format, 1u, true);
         passed &= run_case(*context, format, 7u, false);
         passed &= run_case(*context, format, 1u, false, true);

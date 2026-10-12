@@ -30,8 +30,14 @@ constexpr std::size_t kQ2BlockBytes = 18u;
 constexpr std::size_t kQ2BlocksPerRow = kModelWidth / 64u;
 constexpr std::size_t kIQ4XSBlockBytes = 136u;
 constexpr std::size_t kIQ4XSBlocksPerRow = kModelWidth / 256u;
+constexpr std::size_t kIQ2XXSBlockBytes = 66u;
+constexpr std::size_t kIQ2XXSBlocksPerRow = kModelWidth / 256u;
 
-enum class WeightFormat : std::uint32_t { q2_0 = 0u, iq4_xs = 1u };
+enum class WeightFormat : std::uint32_t {
+    q2_0 = 0u,
+    iq4_xs = 1u,
+    iq2_xxs = 2u,
+};
 
 struct PrefillMoeExpertAddress {
     std::uint64_t role[3]{};
@@ -195,15 +201,29 @@ bool validate_dispatch(Context& context, std::uint32_t rows,
     tile_capacity =
         round_up_div(entries, kTileRows) +
         std::min<std::size_t>(n_experts, entries);
-    const std::size_t blocks_per_row =
-        format == WeightFormat::q2_0 ? kQ2BlocksPerRow
-                                     : kIQ4XSBlocksPerRow;
-    const std::size_t block_bytes =
-        format == WeightFormat::q2_0 ? kQ2BlockBytes : kIQ4XSBlockBytes;
-      if (!checked_product(
-              {static_cast<std::size_t>(layer) + 1u, n_experts,
-               sizeof(PrefillMoeExpertAddress)},
-              address_bytes) ||
+    std::size_t blocks_per_row = 0u;
+    std::size_t block_bytes = 0u;
+    switch (format) {
+        case WeightFormat::q2_0:
+            blocks_per_row = kQ2BlocksPerRow;
+            block_bytes = kQ2BlockBytes;
+            break;
+        case WeightFormat::iq4_xs:
+            blocks_per_row = kIQ4XSBlocksPerRow;
+            block_bytes = kIQ4XSBlockBytes;
+            break;
+        case WeightFormat::iq2_xxs:
+            blocks_per_row = kIQ2XXSBlocksPerRow;
+            block_bytes = kIQ2XXSBlockBytes;
+            break;
+        default:
+            error = "Prefill MoE gate/up tile format is unsupported";
+            return false;
+    }
+    if (!checked_product(
+            {static_cast<std::size_t>(layer) + 1u, n_experts,
+             sizeof(PrefillMoeExpertAddress)},
+            address_bytes) ||
         !checked_product({static_cast<std::size_t>(layer), n_experts,
                          sizeof(PrefillMoeExpertAddress)},
                         selected_address_offset) ||
@@ -528,6 +548,14 @@ bool encode_prefill_moe_gu_iq4_xs(
                        WeightFormat::iq4_xs, buffers, error);
 }
 
+bool encode_prefill_moe_gu_iq2_xxs(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    std::uint32_t n_experts, std::uint32_t layer,
+    const PrefillMoeExpertTileBuffers& buffers, std::string& error) {
+    return encode_impl(context, encoder, rows, n_experts, layer,
+                       WeightFormat::iq2_xxs, buffers, error);
+}
+
 bool encode_prefill_moe_gu_q2_0(
     Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
     std::uint32_t n_experts, std::uint32_t layer,
@@ -550,6 +578,19 @@ bool encode_prefill_moe_gu_iq4_xs(
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_impl(context, encoder, rows, n_experts, layer,
                                WeightFormat::iq4_xs, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_prefill_moe_gu_iq2_xxs(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    std::uint32_t n_experts, std::uint32_t layer,
+    const PrefillMoeExpertTileBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Prefill MoE IQ2_XXS gate/up tiles",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_impl(context, encoder, rows, n_experts, layer,
+                               WeightFormat::iq2_xxs, buffers, encode_error);
         },
         error);
 }

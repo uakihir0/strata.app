@@ -76,6 +76,38 @@ int iq2_xxs_integer_dot(const block_iq2_xxs& weight, std::uint32_t part,
 
 }  // namespace
 
+void iq2_xxs_dequantize_reference(
+    const block_iq2_xxs& weight, std::span<float, 256u> output) {
+    const float block_scale = strata::kernels::f32_from_f16(weight.d);
+    for (std::uint32_t part = 0u; part < 8u; ++part) {
+        const std::uint32_t indices = indices_for_part(weight, part);
+        const std::uint32_t auxiliary = aux_for_part(weight, part);
+        const std::uint32_t scale_code = auxiliary >> 28u;
+        const float scale =
+            block_scale * (0.5f + static_cast<float>(scale_code)) * 0.25f;
+        for (std::uint32_t code_slot = 0u; code_slot < 4u; ++code_slot) {
+            const std::uint32_t code =
+                (indices >> (8u * code_slot)) & 0xffu;
+            const std::uint32_t sign_index =
+                (auxiliary >> (7u * code_slot)) & 0x7fu;
+            const std::uint32_t signs =
+                static_cast<std::uint32_t>(ksigns_iq2xs[sign_index]);
+            const std::uint64_t grid = iq2xxs_grid[code];
+            for (std::uint32_t component = 0u; component < 8u;
+                 ++component) {
+                const float magnitude = static_cast<float>(
+                    (grid >> (8u * component)) & 0xffu);
+                const float sign =
+                    (signs & uint32_t(kmask_iq2xs[component])) != 0u
+                        ? -1.0f
+                        : 1.0f;
+                output[part * 32u + code_slot * 8u + component] =
+                    scale * magnitude * sign;
+            }
+        }
+    }
+}
+
 bool iq2_xxs_matvec_reference(std::span<const block_iq2_xxs> weights,
                               std::span<const Q81> activations,
                               std::uint32_t n_in, std::uint32_t n_out,

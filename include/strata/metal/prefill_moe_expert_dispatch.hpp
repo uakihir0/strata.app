@@ -63,6 +63,12 @@ bool encode_prefill_moe_gu_iq4_xs(
     std::uint32_t n_experts, std::uint32_t layer,
     const PrefillMoeExpertTileBuffers& buffers, std::string& error);
 
+/// Encode the IQ2_XXS 64x64 SIMD-group gate/up tile and fused SwiGLU epilogue.
+bool encode_prefill_moe_gu_iq2_xxs(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    std::uint32_t n_experts, std::uint32_t layer,
+    const PrefillMoeExpertTileBuffers& buffers, std::string& error);
+
 /// Transactional standalone wrapper for `encode_prefill_moe_gu_q2_0`.
 bool encode_prefill_moe_gu_q2_0(
     Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
@@ -71,6 +77,12 @@ bool encode_prefill_moe_gu_q2_0(
 
 /// Transactional standalone wrapper for `encode_prefill_moe_gu_iq4_xs`.
 bool encode_prefill_moe_gu_iq4_xs(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    std::uint32_t n_experts, std::uint32_t layer,
+    const PrefillMoeExpertTileBuffers& buffers, std::string& error);
+
+/// Transactional standalone wrapper for `encode_prefill_moe_gu_iq2_xxs`.
+bool encode_prefill_moe_gu_iq2_xxs(
     Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
     std::uint32_t n_experts, std::uint32_t layer,
     const PrefillMoeExpertTileBuffers& buffers, std::string& error);
