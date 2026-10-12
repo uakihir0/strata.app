@@ -374,6 +374,29 @@ bool Encoder::dispatch(
         return fail("Metal dispatch exceeds the device threadgroup-memory limit");
     }
 
+    std::vector<BufferRef> access_ranges;
+    std::vector<BufferRef> write_ranges;
+    access_ranges.reserve(buffers.size() + read_only_buffers.size());
+    write_ranges.reserve(buffers.size());
+    for (const EncoderBufferBinding& binding : buffers) {
+        const BufferRef active =
+            binding.buffer.slice(0u, binding.required_bytes);
+        if (!active) return fail("Metal dispatch writable range is invalid");
+        access_ranges.push_back(active);
+        write_ranges.push_back(active);
+    }
+    for (const EncoderReadOnlyBufferBinding& binding : read_only_buffers) {
+        const BufferRef active =
+            binding.buffer.buffer_.slice(0u, binding.required_bytes);
+        if (!active) return fail("Metal dispatch read-only range is invalid");
+        access_ranges.push_back(active);
+    }
+    if (!impl_->command_buffer->track_access_ranges(access_ranges,
+                                                    write_ranges, error)) {
+        impl_->failed = true;
+        return false;
+    }
+
     for (const std::uint32_t index : impl_->active_buffer_indices) {
         if (std::find(argument_indices.begin(), argument_indices.end(), index) ==
             argument_indices.end()) {
@@ -442,6 +465,8 @@ bool Encoder::use_resources(
     }
     std::vector<void*> used_handles;
     used_handles.reserve(resources.size());
+    std::vector<BufferRef> access_ranges;
+    access_ranges.reserve(resources.size());
     for (const EncoderResourceBinding& resource : resources) {
         const EncoderBufferBinding validation_binding{
             resource.buffer.buffer_, 0u, resource.required_bytes,
@@ -450,6 +475,17 @@ bool Encoder::use_resources(
             impl_->failed = true;
             return false;
         }
+        // `required_bytes` validates the minimum slice expected by the
+        // caller, but indirect shader addresses may reach any byte in the
+        // declared view. Track that complete range for future scratch claims.
+        access_ranges.push_back(resource.buffer.buffer_);
+    }
+    if (!impl_->command_buffer->track_access_ranges(
+            access_ranges, std::span<const BufferRef>{}, error)) {
+        impl_->failed = true;
+        return false;
+    }
+    for (const EncoderResourceBinding& resource : resources) {
         void* const handle = resource.buffer.buffer_.handle;
         if (std::find(used_handles.begin(), used_handles.end(), handle) !=
             used_handles.end()) {
@@ -475,11 +511,47 @@ bool CommandBuffer::claim_staging_range(BufferRef range,
             return false;
         }
     }
+    for (const BufferRef& existing : access_ranges_) {
+        if (buffer_views_overlap(existing, range)) {
+            error = "staging scratch overlaps an earlier GPU buffer access";
+            return false;
+        }
+    }
     staging_ranges_.push_back(range);
     error.clear();
     return true;
 }
 
+bool CommandBuffer::track_access_ranges(
+    std::span<const BufferRef> ranges, std::span<const BufferRef> writes,
+    std::string& error) {
+    std::lock_guard<std::recursive_mutex> lock(encoding_mutex_);
+    if (!can_encode()) {
+        error = "cannot track GPU buffer access on an unavailable command buffer";
+        return false;
+    }
+    for (const BufferRef& write : writes) {
+        if (!write) {
+            error = "cannot track an invalid GPU writable range";
+            return false;
+        }
+        for (const BufferRef& staging : staging_ranges_) {
+            if (buffer_views_overlap(write, staging)) {
+                error = "GPU dispatch write overlaps reserved staging scratch";
+                return false;
+            }
+        }
+    }
+    for (const BufferRef& range : ranges) {
+        if (!range) {
+            error = "cannot track an invalid GPU buffer range";
+            return false;
+        }
+    }
+    access_ranges_.insert(access_ranges_.end(), ranges.begin(), ranges.end());
+    error.clear();
+    return true;
+}
 bool Encoder::claim_unique_staging_range(BufferRef buffer,
                                          std::size_t required_bytes,
                                          std::size_t alignment,

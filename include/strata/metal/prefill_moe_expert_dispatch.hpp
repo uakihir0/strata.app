@@ -23,9 +23,10 @@ struct PrefillMoeExpertTileBuffers {
     /// Dedicated caller-owned scratch for one selected address row. Encoding
     /// copies the validated row here before dispatch, so earlier GPU writes
     /// to the source table cannot change the addresses used by this consumer.
-    /// Use a distinct range for every pending expert dispatch, keep it
-    /// disjoint from earlier writes in the same Encoder, and leave it
-    /// unchanged until command completion. Reuse after that command completes.
+    /// Use a distinct range for every pending expert dispatch. The
+    /// CommandBuffer rejects ranges used by prior GPU accesses and later GPU
+    /// writes to reserved scratch; leave it unchanged until command completion.
+    /// Reuse after that command completes.
     BufferRef address_snapshot;
     /// Context-owned allocations backing every non-null gate/up address.
     std::span<const PrefillMoeWeightStorageView> weight_storage;

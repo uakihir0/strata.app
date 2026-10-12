@@ -262,6 +262,75 @@ bool expect_encode_failure(Context& context, const char* label,
     return rejected_and_discarded;
 }
 
+bool test_staging_range_tracking(Context& context) {
+    std::string error;
+    BufferRef input = allocate(context, "encoder staging tracking input",
+                               kFloatBytes, error);
+    BufferRef output = allocate(context, "encoder staging tracking output",
+                                kFloatBytes, error);
+    check(input && output, "allocate staging tracking buffers", error);
+    if (!input || !output) return false;
+
+    const ReadOnlyBufferRef readonly = context.buffers().read_only(input);
+    const EncoderReadOnlyBufferBinding read{
+        readonly, 0u, kFloatBytes, alignof(std::uint32_t)};
+    const EncoderBufferBinding write{
+        output, 1u, kFloatBytes, alignof(std::uint32_t)};
+    const auto dispatch_copy = [read, write](Encoder& encoder,
+                                             std::string& encode_error) {
+        return encoder.dispatch(
+            "strata_selftest_copy_u32", {4u, 1u, 1u}, {256u, 1u, 1u},
+            std::span<const EncoderBufferBinding>(&write, 1u),
+            std::span<const EncoderReadOnlyBufferBinding>(&read, 1u), {}, {},
+            encode_error);
+    };
+
+    const bool prior_input_rejected = expect_encode_failure(
+        context, "reject scratch overlapping prior dispatch input",
+        [dispatch_copy, input](Encoder& encoder, std::string& encode_error) {
+            return dispatch_copy(encoder, encode_error) &&
+                   encoder.claim_unique_staging_range(
+                       input, kFloatBytes, alignof(std::uint32_t),
+                       encode_error);
+        },
+        "serial", "earlier GPU buffer access");
+    const bool prior_output_rejected = expect_encode_failure(
+        context, "reject scratch overlapping prior dispatch output",
+        [dispatch_copy, output](Encoder& encoder, std::string& encode_error) {
+            return dispatch_copy(encoder, encode_error) &&
+                   encoder.claim_unique_staging_range(
+                       output, kFloatBytes, alignof(std::uint32_t),
+                       encode_error);
+        },
+        "serial", "earlier GPU buffer access");
+    const bool prior_resource_rejected = expect_encode_failure(
+        context, "reject scratch overlapping prior indirect resource",
+        [readonly, input](Encoder& encoder, std::string& encode_error) {
+            const EncoderResourceBinding resource{
+                readonly, 1u, alignof(std::uint32_t)};
+            return encoder.use_resources(
+                       std::span<const EncoderResourceBinding>(&resource, 1u),
+                       encode_error) &&
+                   encoder.claim_unique_staging_range(
+                       input, kFloatBytes, alignof(std::uint32_t),
+                       encode_error);
+        },
+        "serial", "earlier GPU buffer access");
+    const bool future_write_rejected = expect_encode_failure(
+        context, "reject later dispatch write to reserved scratch",
+        [dispatch_copy, output](Encoder& encoder,
+                                std::string& encode_error) {
+            return encoder.claim_unique_staging_range(
+                       output, kFloatBytes, alignof(std::uint32_t),
+                       encode_error) &&
+                   dispatch_copy(encoder, encode_error);
+        },
+        "serial", "write overlaps reserved staging scratch");
+
+    return prior_input_rejected && prior_output_rejected &&
+           prior_resource_rejected && future_write_rejected;
+}
+
 bool test_inline_byte_segment_limit(Context& context, BufferRef buffer) {
     EnvironmentRestore environment("STRATA_METAL_DISPATCH");
     if (!environment.set("serial")) {
@@ -737,6 +806,7 @@ int main(int argc, char** argv) {
     passed &= serial_outputs == default_outputs;
     passed &= run_inline_and_threadgroup_bindings(*context);
     passed &= run_read_only_input_binding(*context);
+    passed &= test_staging_range_tracking(*context);
 
     BufferRef valid = allocate(*context, "encoder validation buffer", kFloatBytes, error);
     BufferRef short_buffer = allocate(*context, "encoder short buffer", 64, error);

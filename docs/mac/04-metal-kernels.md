@@ -4987,13 +4987,15 @@ The prefill MoE computes the decode MoE's function over T rows (section 5.10). I
 The count/scan/scatter, row-gather, shared-expert post-ops and isolated Q2_0
 gate/up tile now have typed GPU encoders and synthetic oracle coverage. The
 expert encoder copies the validated selected address row into caller-owned
-scratch before dispatch. Use a unique range for each pending expert dispatch,
-keep it unchanged through completion, and keep it disjoint from earlier writes
-in the same `Encoder`. The `CommandBuffer` rejects overlapping snapshot ranges
-within its pending work. The GPU test deliberately aliases an earlier grouping
-histogram write with the source address row to verify that the expert consumes
-the snapshot. Other gate/up formats, both down formats, full scheduling and
-`Prefill::run` integration remain planned.
+scratch before dispatch. Use a unique range for each pending expert dispatch
+and keep it unchanged through completion. The `CommandBuffer` rejects a
+snapshot range used by any earlier GPU dispatch or indirect resource access,
+rejects later GPU writes to reserved scratch, and rejects overlapping snapshot
+ranges within its pending work. Use distinct ranges across concurrently
+pending command buffers. The GPU test deliberately aliases an earlier
+grouping histogram write with the source address row to verify that the expert
+consumes the snapshot. Other gate/up formats, both down formats, full
+scheduling and `Prefill::run` integration remain planned.
 
 - Upstream runs the shared expert and its gate before the grouping. The Mac runs the grouping first, so the shared
   expert overlaps the `MissResolver` in tiered mode, as in decode (section 8.3). No step reads another's output

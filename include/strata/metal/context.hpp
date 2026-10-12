@@ -291,6 +291,9 @@ private:
     struct CompletionState;
     explicit CommandBuffer(void* retained_handle, void* queue_handle);
     bool can_encode() const noexcept;
+    bool track_access_ranges(std::span<const BufferRef> ranges,
+                             std::span<const BufferRef> writes,
+                             std::string& err);
     bool claim_staging_range(BufferRef range, std::string& err);
     bool add_discard_handler(std::function<void()> handler);
     bool add_submission_handler(SubmissionHandler handler, std::string& err);
@@ -305,6 +308,7 @@ private:
     std::uint64_t event_operation_count_ = 0;
     std::vector<std::function<void()>> discard_handlers_;
     std::vector<SubmissionHandler> submission_handlers_;
+    std::vector<BufferRef> access_ranges_;
     std::vector<BufferRef> staging_ranges_;
     std::shared_ptr<SubmissionState> submission_state_;
     std::vector<std::shared_ptr<SubmissionState>> dependencies_;

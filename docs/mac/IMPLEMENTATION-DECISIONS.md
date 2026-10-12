@@ -11982,11 +11982,11 @@ measuring L-15 remain open.
   `ExpertLeaseSet` for the same command buffer and check that each gate/up
   range used by an expert is covered by a live lease for the selected layer.
   Copy the validated address row into caller-owned scratch before dispatch;
-  require this scratch to be disjoint from active data and prior writes in the
-  same Encoder, unique across pending dispatches, and unchanged through
-  command completion, so earlier GPU stages cannot alter the indirect
-  pointers. The CommandBuffer rejects overlapping snapshot ranges within its
-  pending work; concurrent command buffers require distinct scratch ranges.
+  require this scratch to be disjoint from active data, reject overlap with
+  earlier GPU accesses and later GPU writes in the pending CommandBuffer, make
+  it unique across pending dispatches, and keep it unchanged through command
+  completion, so other GPU stages cannot alter the indirect pointers.
+  Concurrent command buffers require distinct scratch ranges.
   The GPU plan validator clears status and checks plan boundaries, strictly
   increasing expert IDs, exact tile count and tile order before expert work.
   The status word
@@ -12057,3 +12057,40 @@ measuring L-15 remain open.
   expected skip. `test_map.py` reported all checks passed with its documented
   planned/no-check diagnostics; `check_drift.py` found no upstream changes and
   valid golden files; `git diff --check` passed.
+
+### D-IMPL-398: Track GPU accesses around encoder staging scratch
+
+- **Decision:** Record the declared active ranges of every dispatch input and
+  output, and the complete resource views passed to `use_resources`. Reject a
+  staging scratch claim if it overlaps any earlier GPU access. Reject later
+  dispatch writes that overlap scratch already reserved in the same pending
+  CommandBuffer. Keep `required_bytes` as a minimum binding check; indirect
+  shaders may access any byte in the full resource view.
+- **Reason:** Address snapshots are copied by the CPU while GPU work is
+  pending. A later host copy could otherwise alter an input or output already
+  consumed by queued work, and subsequent GPU work could overwrite a reserved
+  snapshot before its consumer runs. Indirect expert pointers make the minimum
+  binding size insufficient to describe the declared resource's access range.
+- **Review required:** See REV-194. Challenge access-range coverage, resource
+  view semantics, lock ordering, and rejection of both prior-access aliases
+  and future GPU writes.
+- **Validation:** `metal_encoder_test` covers earlier dispatch input/output,
+  an indirect resource declared with `required_bytes = 1`, and a later write
+  to reserved scratch. The Prefill expert and window-storage tests also verify
+  their scratch-claim behavior.
+
+### REV-194: Adversarial review of encoder staging access tracking
+
+- **Scope:** Audit whether scratch claims conflict with all prior dispatch
+  accesses and `use_resources` views, whether later writes can overwrite
+  reserved scratch, and whether transaction locking and test evidence match
+  the implementation.
+- **Findings:** The first pass found that earlier dispatch accesses and later
+  writes were not tracked. A follow-up found that resource tracking used only
+  `required_bytes`, even though an indirect shader may reach the full declared
+  view. Both findings were fixed. The final source-only follow-up found no
+  actionable issue.
+- **Disposition:** Track dispatch reads and writes, track the complete declared
+  resource view, reject earlier-access aliases and future writes, and add
+  regression cases including a one-byte minimum resource binding. The reviewer
+  did not run tests; local validation is recorded with D-IMPL-398.
