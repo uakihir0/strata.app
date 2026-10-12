@@ -134,6 +134,7 @@ set(STRATA_METAL_ENGINE_SOURCES
   src/metal/engine/prefill_qsa_output_dispatch.mm
   src/metal/engine/prefill_qsa_prepare_dispatch.mm
   src/metal/engine/prefill_qsa_tail_dispatch.mm
+  src/metal/engine/prefill_qsa_layer_dispatch.mm
   src/metal/engine/prefill_dequant_dispatch.mm
   src/metal/engine/prefill_native_projection.mm
   src/metal/engine/prefill_gemm_dispatch.mm
