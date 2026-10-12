@@ -11376,3 +11376,56 @@ measuring L-15 remain open.
   existing planned, no-check and missing-check diagnostics; `check_drift.py`
   reported no upstream changes and valid golden files; `git diff --check`
   passed.
+
+### D-IMPL-387: Add a Prefill-specific F16 QSA attention gate
+
+- **Decision:** Implement `strata_pf_gate_attn` as a separate Prefill QSA
+  encoder. Read F32 attention and the second 256-value half of each F32 Qf
+  head, evaluate `attention * sigmoid(gate)` in F32, then convert once to
+  unsaturated F16. Keep the one-word row-count ABI at buffer 3 and the decode
+  gate API unchanged. Permit read-only input overlap, but reject output/input
+  overlap before dispatch. Require an ordered Encoder boundary.
+- **Reason:** Prefill attention is F32 and feeds an F16 `attn_output` GEMM,
+  while the existing QSA gate produces F32 and has a Window-sized interface.
+  A separate stage preserves those distinct output/row contracts and can be
+  validated without claiming production layer scheduling.
+- **Review required:** Independently check the Qf half offset and flattened
+  `[T][24][256]` address math, one-word MSL/host ABI, F32 operation order and
+  unsaturated F16 conversion. Audit maximum-row extent checks, alignment,
+  Context ownership, output/input overlap via CPU/GPU backing, read-only
+  overlap, foreign/submitted command buffers, forged/out-of-range views,
+  partial aliases, concurrent-group refusal and rollback after both failed
+  gate validation and a successful gate followed by downstream GEMM failure.
+  Verify that optional attention FWHT precedes this stage and keep
+  output-GEMM and production scheduling status explicit.
+- **Validation:** `mac-dev` built successfully. The serial and concurrent
+  `metal_attn_test` CTests passed 2/2 with T=1/9/65 scalar-oracle cases and
+  exact F16 overflow, subnormal tie and signed-zero assertions. Final hostile
+  review, `test_map.py` and `git diff --check` results are recorded in REV-183.
+
+### REV-183: Adversarial review of the Prefill QSA attention gate
+
+- **Scope:** Review F32 gate arithmetic and F16 conversion, Qf addressing,
+  shader ABI and launch geometry, active extents and aliases, ordering after
+  optional FWHT, standalone/caller-owned failure handling, and serial plus
+  concurrent test coverage.
+- **Findings:** The initial review found two P2 coverage gaps: foreign Qf and
+  output views, forged/out-of-range output metadata, partial output/Qf aliasing,
+  foreign or submitted command buffers, and rollback after a successful gate
+  followed by invalid GEMM were not all directly covered. Follow-up review
+  found that the downstream rollback checks did not distinguish the intended
+  GEMM selector rejection from another false return (P3), and then requested
+  full diagnostic equality instead of substring matching (P3). No functional
+  defect was reported.
+- **Disposition:** Added the missing ownership, metadata, alias and command
+  buffer cases. Standalone and caller-owned tests now encode the gate, assert
+  the exact `STRATA_METAL_GEMM selection requires n > 0` diagnostic, reject
+  commit after the later failure, and check that output remains unchanged.
+  The hostile follow-ups confirmed both P2 gaps were closed and the exact
+  diagnostic checks addressed the remaining test-precision finding; no
+  actionable issue remains.
+- **Validation:** `mac-dev` built successfully after the final test change.
+  Focused serial and concurrent `metal_attn_test` CTests passed 2/2.
+  `test_map.py` passed with the repository's existing planned, no-check and
+  missing-check diagnostics; `check_drift.py` reported no upstream changes and
+  valid golden files; `git diff --check` passed.
