@@ -12239,3 +12239,49 @@ measuring L-15 remain open.
   `test_map.py` passed with the documented planned/no-check diagnostics,
   `check_drift.py` reported no upstream changes and valid golden files, and
   `git diff --check` passed.
+
+### D-IMPL-402: Add Prefill IQ2_XXS gate/up tiles
+
+- **Decision:** Extend the shared Prefill MoE gate/up SIMD tile with IQ2_XXS
+  through the typed caller-owned Encoder and transactional CommandBuffer APIs.
+  Validate each expert's 640×10×66-byte weight extent (422,400 bytes), decode
+  eight 32-value parts using the four packed 8-value grid indices, sign masks
+  and per-part scale, then round each weight to F16 before accumulation.
+- **Reason:** IQ2_XXS appears in the documented model inventory, and its
+  canonical dequantization table and source contract are already available in
+  the repository. This adds another required isolated format while retaining
+  the established kernel, address snapshot, lease, status and rollback
+  behavior. The production expert schedule and Prefill integration are still
+  unfinished, so this is not model inference.
+- **Fixture judgment:** Exercise T=1/7, all 256 grid indices, 16 scale codes
+  and 128 sign indices. Use the canonical `dq_iq2_xxs` CPU dequantization
+  contract for the FP64 dot oracle, anchor raw packed fields with literal
+  expected values, and add a fixed Prefill GPU SwiGLU half result (`0x2c29`)
+  for a literal 32-word block. Check that omitting F16 weight rounding changes
+  the result by more than the four-ULP tolerance.
+- **Review required:** See REV-198. Challenge grid and part indexing, sign and
+  scale extraction, F16 rounding, the 66-byte block and expert extents, lease
+  coverage, shared kernel selection and failure handling, oracle independence,
+  fixed GPU golden provenance, and the distinction between isolated tiles
+  and production scheduling.
+- **Validation:** See REV-198 for adversarial findings and final build,
+  focused serial/concurrent CTests, test-map, drift and whitespace results.
+
+### REV-198: Adversarial review of Prefill IQ2_XXS gate/up tiles
+
+- **Scope:** Audit IQ2_XXS decoding, packed-field and block indexing, F16
+  conversion, format-specific address extents and tiered lease coverage,
+  shared-kernel bindings, transactional behavior, oracle and fixture
+  independence, fixed GPU golden, and implementation claims.
+- **Findings:** The first review found a P2 test-independence gap: the CPU
+  literal decode anchor did not independently establish that the Prefill GPU
+  tile decoded and accumulated IQ2_XXS correctly. The follow-up found no
+  remaining actionable issue.
+- **Disposition:** Add a frozen Prefill GPU F16 SwiGLU golden (`0x2c29`) for
+  the literal packed block and signed half inputs. The reviewer confirmed it
+  exercises all four code slots and eight parts independently of the CPU
+  oracle.
+- **Validation:** The reviewer did not run tests. `mac-dev` built, all 10
+  focused serial/concurrent Prefill MoE CTests passed, `test_map.py` passed
+  with its documented planned/no-check diagnostics, `check_drift.py` reported
+  no upstream changes and valid golden files, and `git diff --check` passed.
