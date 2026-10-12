@@ -30,6 +30,7 @@ using namespace strata::metal;
 namespace {
 
 constexpr std::uint32_t kCellCapacity = 64u;
+constexpr std::uint32_t kPrefillSelectionRowsPerGroup = 256u;
 constexpr float kUntouchedScore = -9876.5f;
 constexpr std::int32_t kUntouchedId = -987654321;
 constexpr std::array<std::uint32_t, VERIFY_MAX_T> kPositions{
@@ -104,6 +105,53 @@ struct TopkBuffers {
         return {scores.view(), steps.view(), ids.view()};
     }
 };
+
+struct PrefillSelectionBuffers {
+    twin::GuardedBuffer pooled;
+    twin::GuardedBuffer dead;
+    twin::GuardedBuffer queries;
+    twin::GuardedBuffer steps;
+    twin::GuardedBuffer scores;
+    twin::GuardedBuffer ids;
+
+    QsaPrefillSelectionBuffers views() const {
+        return {pooled.view(), dead.view(), queries.view(), steps.view(),
+                scores.view(), ids.view()};
+    }
+};
+
+bool allocate_prefill_selection_buffers(
+    Context& context, std::uint32_t rows, std::uint32_t cell_capacity,
+    PrefillSelectionBuffers& buffers, std::string& error) {
+    constexpr std::size_t key_row_bytes =
+        static_cast<std::size_t>(INDEXER_HEAD_DIM) * sizeof(float);
+    constexpr std::size_t query_row_bytes =
+        static_cast<std::size_t>(INDEXER_HEADS) * key_row_bytes;
+    constexpr std::size_t id_row_bytes =
+        static_cast<std::size_t>(INDEXER_SELECTION_WIDTH_MAX) *
+        sizeof(std::int32_t);
+    const std::size_t max_blocks =
+        static_cast<std::size_t>(cell_capacity / INDEXER_BLOCK_CELLS) + 2u;
+    return buffers.pooled.allocate(
+               context, "Prefill selection pooled",
+               max_blocks * key_row_bytes, error) &&
+           buffers.dead.allocate(
+               context, "Prefill selection dead", key_row_bytes, error) &&
+           buffers.queries.allocate(
+               context, "Prefill selection queries",
+               static_cast<std::size_t>(rows) * query_row_bytes, error) &&
+           buffers.steps.allocate(
+               context, "Prefill selection steps",
+               static_cast<std::size_t>(rows) * sizeof(StepRow), error) &&
+           buffers.scores.allocate(
+               context, "Prefill selection reusable scores",
+               static_cast<std::size_t>(kPrefillSelectionRowsPerGroup) *
+                   max_blocks * sizeof(float),
+               error) &&
+           buffers.ids.allocate(
+               context, "Prefill selection ids",
+               static_cast<std::size_t>(rows) * id_row_bytes, error);
+}
 
 bool allocate_topk_buffers(Context& context, std::uint32_t rows,
                            std::uint32_t cell_capacity,
@@ -330,6 +378,460 @@ bool run_score_case(Context& context, std::uint32_t rows,
         !buffers.scores.first_unwritten_change(written_ranges);
     check(output_guards, label + " output guards are intact");
     return !difference && inputs_unchanged && output_guards;
+}
+
+bool run_prefill_selection_case(
+    Context& context, std::uint32_t rows, std::uint32_t pos0,
+    std::uint32_t cell_capacity, const twin::Options& options,
+    bool shared_encoder) {
+    const std::string label =
+        "Prefill QSA selection T=" + std::to_string(rows) +
+        " p0=" + std::to_string(pos0) +
+        " capacity=" + std::to_string(cell_capacity) +
+        (shared_encoder ? " shared Encoder" : "");
+    std::vector<std::uint32_t> tokens(rows, 1u);
+    PrefillChunkMetadata metadata;
+    std::string error;
+    if (!build_prefill_chunk_metadata(pos0, tokens, metadata, error)) {
+        check(false, label + " metadata", error);
+        return false;
+    }
+    std::vector<StepRow> steps;
+    steps.reserve(rows);
+    for (const PrefillStepRow& step : metadata.steps) {
+        steps.push_back(
+            StepRow{step.pos, step.n_kv, step.n_bid, step.width});
+    }
+    const std::size_t max_blocks =
+        static_cast<std::size_t>(cell_capacity / INDEXER_BLOCK_CELLS) + 2u;
+    constexpr std::size_t key_row_elements = INDEXER_HEAD_DIM;
+    constexpr std::size_t query_row_elements =
+        INDEXER_HEADS * INDEXER_HEAD_DIM;
+    std::mt19937_64 rng(options.seed ^
+                        (static_cast<std::uint64_t>(rows) << 32u) ^
+                        (static_cast<std::uint64_t>(pos0) << 8u) ^
+                        cell_capacity);
+    std::vector<float> pooled(max_blocks * key_row_elements);
+    std::vector<float> dead(key_row_elements);
+    std::vector<float> queries(
+        static_cast<std::size_t>(rows) * query_row_elements);
+    for (std::size_t i = 0u; i < pooled.size(); ++i) {
+        pooled[i] = input_value(options.input_set, i + 0x3101u, rng);
+    }
+    for (std::size_t i = 0u; i < dead.size(); ++i) {
+        dead[i] = input_value(options.input_set, i + 0x4103u, rng);
+    }
+    for (std::size_t i = 0u; i < queries.size(); ++i) {
+        queries[i] = input_value(
+            options.input_set, i + 0x5107u, rng);
+    }
+
+    PrefillSelectionBuffers buffers;
+    const bool allocated = allocate_prefill_selection_buffers(
+        context, rows, cell_capacity, buffers, error);
+    check(allocated, label + " allocations", error);
+    if (!allocated || !buffers.pooled.view() || !buffers.dead.view() ||
+        !buffers.queries.view() || !buffers.steps.view() ||
+        !buffers.scores.view() || !buffers.ids.view()) {
+        return false;
+    }
+    std::memcpy(buffers.pooled.payload().data(), pooled.data(),
+                pooled.size() * sizeof(float));
+    std::memcpy(buffers.dead.payload().data(), dead.data(),
+                dead.size() * sizeof(float));
+    std::memcpy(buffers.queries.payload().data(), queries.data(),
+                queries.size() * sizeof(float));
+    std::memcpy(buffers.steps.payload().data(), steps.data(),
+                steps.size() * sizeof(StepRow));
+    std::fill(typed<float>(buffers.scores).begin(),
+              typed<float>(buffers.scores).end(), kUntouchedScore);
+    std::fill(typed<std::int32_t>(buffers.ids).begin(),
+              typed<std::int32_t>(buffers.ids).end(), kUntouchedId);
+
+    std::vector<std::int32_t> n_kv(rows), n_bid(rows);
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        n_kv[row] = steps[row].n_kv;
+        n_bid[row] = steps[row].n_bid;
+    }
+    std::vector<twin::tf> expected_scores;
+    oracle::qsa_selection_scores(
+        pooled, dead, queries, n_kv, n_bid,
+        static_cast<std::uint32_t>(max_blocks), kUntouchedScore,
+        expected_scores);
+    std::vector<float> expected_score_values;
+    expected_score_values.reserve(expected_scores.size());
+    for (const twin::tf value : expected_scores) {
+        expected_score_values.push_back(value.value);
+    }
+    std::vector<std::int32_t> expected_ids;
+    oracle::qsa_selection_topk(
+        expected_score_values, n_kv, n_bid,
+        static_cast<std::uint32_t>(max_blocks), kUntouchedId, expected_ids);
+
+    const std::uint32_t last_group_base =
+        ((rows - 1u) / kPrefillSelectionRowsPerGroup) *
+        kPrefillSelectionRowsPerGroup;
+    const std::uint32_t last_group_rows = rows - last_group_base;
+    buffers.pooled.capture_before_dispatch();
+    buffers.dead.capture_before_dispatch();
+    buffers.queries.capture_before_dispatch();
+    buffers.steps.capture_before_dispatch();
+    buffers.scores.capture_before_dispatch();
+    buffers.ids.capture_before_dispatch();
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    bool encoded = false;
+    if (shared_encoder) {
+        encoded = Encoder::encode(
+            context, *command, label,
+            [&](Encoder& encoder, std::string& encode_error) {
+                return encode_prefill_qsa_selection(
+                    context, encoder, metadata.params, cell_capacity,
+                    buffers.views(), encode_error);
+            },
+            error);
+    } else {
+        encoded = encode_prefill_qsa_selection(
+            context, *command, metadata.params, cell_capacity,
+            buffers.views(), error);
+    }
+    check(encoded, label + " encode", error);
+    if (!encoded || !submit_and_wait(command, label, error)) {
+        check(false, label + " GPU completion", error);
+        if (!shared_encoder) command->discard();
+        return false;
+    }
+
+    const std::size_t last_score_count =
+        static_cast<std::size_t>(last_group_rows) * max_blocks;
+    const twin::Tolerance exact{twin::Comparison::bits, 0.0, 0.0, 0u};
+    std::vector<twin::tf> expected_reusable_scores(
+        static_cast<std::size_t>(kPrefillSelectionRowsPerGroup) * max_blocks,
+        twin::tf{kUntouchedScore});
+    if (last_group_base != 0u) {
+        const std::uint32_t previous_group_base =
+            last_group_base - kPrefillSelectionRowsPerGroup;
+        std::copy_n(
+            expected_scores.begin() +
+                static_cast<std::ptrdiff_t>(
+                    static_cast<std::size_t>(previous_group_base) *
+                    max_blocks),
+            expected_reusable_scores.size(),
+            expected_reusable_scores.begin());
+    }
+    std::copy_n(
+        expected_scores.begin() +
+            static_cast<std::ptrdiff_t>(
+                static_cast<std::size_t>(last_group_base) * max_blocks),
+        last_score_count, expected_reusable_scores.begin());
+    const auto score_difference = twin::compare_floats(
+        typed<float>(buffers.scores), expected_reusable_scores, exact);
+    if (score_difference) {
+        twin::report_failure(label.c_str(), options, rows,
+                             *score_difference);
+    }
+    check(!score_difference,
+          label +
+              " reusable score scratch matches sequential batch oracle");
+    const auto actual_ids = typed<std::int32_t>(buffers.ids);
+    const auto id_mismatch =
+        std::mismatch(actual_ids.begin(), actual_ids.end(),
+                      expected_ids.begin());
+    const bool ids_match = id_mismatch.first == actual_ids.end();
+    check(ids_match, label + " all IDs and untouched suffixes match oracle",
+          ids_match
+              ? std::string{}
+              : "first differing id index " +
+                    std::to_string(id_mismatch.first - actual_ids.begin()));
+
+    const std::span<const twin::ByteRange> no_writes;
+    const bool inputs_unchanged =
+        !buffers.pooled.first_unwritten_change(no_writes) &&
+        !buffers.dead.first_unwritten_change(no_writes) &&
+        !buffers.queries.first_unwritten_change(no_writes) &&
+        !buffers.steps.first_unwritten_change(no_writes);
+    check(inputs_unchanged, label + " read-only inputs are unchanged");
+    const std::array score_written{
+        twin::ByteRange{0u, buffers.scores.payload().size()}};
+    const std::array ids_written{
+        twin::ByteRange{0u, buffers.ids.payload().size()}};
+    const bool output_guards =
+        !buffers.scores.first_unwritten_change(score_written) &&
+        !buffers.ids.first_unwritten_change(ids_written);
+    check(output_guards, label + " output guards are intact");
+    return !score_difference && ids_match && inputs_unchanged &&
+           output_guards;
+}
+
+bool test_prefill_indexer_selection_composition(
+    Context& context, const twin::Options& options, std::uint32_t pos0,
+    std::uint32_t cell_capacity) {
+    constexpr std::uint32_t rows = 9u;
+    constexpr std::size_t key_row_elements = INDEXER_HEAD_DIM;
+    constexpr std::size_t query_row_elements =
+        INDEXER_HEADS * INDEXER_HEAD_DIM;
+    constexpr std::size_t tail_elements = 3u * key_row_elements;
+    constexpr float rope_zero_cos = 1.125f;
+    constexpr float rope_zero_sin = -0.0f;
+    const std::size_t max_blocks =
+        static_cast<std::size_t>(
+            cell_capacity / INDEXER_BLOCK_CELLS) + 2u;
+    const std::string label =
+        "Prefill QSA indexer append then selection in one Encoder p0=" +
+        std::to_string(pos0) + " capacity=" +
+        std::to_string(cell_capacity);
+
+    std::vector<std::uint32_t> tokens(rows);
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        tokens[row] = row * 11u + 5u;
+    }
+    PrefillChunkMetadata metadata;
+    std::string error;
+    if (!build_prefill_chunk_metadata(pos0, tokens, metadata, error)) {
+        check(false, label + " metadata", error);
+        return false;
+    }
+
+    std::mt19937_64 rng(options.seed ^ 0x5a17c0deu);
+    std::vector<float> raw_keys(
+        static_cast<std::size_t>(rows) * key_row_elements);
+    std::vector<float> gamma(key_row_elements);
+    std::vector<float> rope(
+        static_cast<std::size_t>(cell_capacity) * 32u * 2u);
+    std::vector<float> queries(
+        static_cast<std::size_t>(rows) * query_row_elements);
+    for (std::size_t i = 0u; i < raw_keys.size(); ++i) {
+        raw_keys[i] = input_value(options.input_set, i + 0x1103u, rng) * 2.75f;
+    }
+    for (std::size_t i = 0u; i < gamma.size(); ++i) {
+        gamma[i] = 1.0f +
+            input_value(options.input_set, i + 0x2101u, rng) * 0.375f;
+    }
+    for (std::uint32_t cell = 0u; cell < cell_capacity; ++cell) {
+        for (std::uint32_t pair = 0u; pair < 32u; ++pair) {
+            const float angle =
+                static_cast<float>((cell * 13u + pair * 7u) % 257u) *
+                0.013f;
+            const std::size_t offset =
+                (static_cast<std::size_t>(cell) * 32u + pair) * 2u;
+            rope[offset] = std::cos(angle) * 1.0625f;
+            rope[offset + 1u] = std::sin(angle) * 1.0625f;
+        }
+    }
+    for (std::size_t i = 0u; i < queries.size(); ++i) {
+        queries[i] =
+            input_value(options.input_set, i + 0x3109u, rng) * 0.75f;
+    }
+
+    std::vector<std::int32_t> positions(rows);
+    std::vector<StepRow> steps(rows);
+    std::vector<std::int32_t> n_kv(rows);
+    std::vector<std::int32_t> n_bid(rows);
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        const std::int32_t position =
+            static_cast<std::int32_t>(pos0 + row);
+        positions[row] = position;
+        const std::int32_t count = position + 1;
+        steps[row] = StepRow{
+            position, count,
+            count / static_cast<std::int32_t>(INDEXER_BLOCK_CELLS),
+            std::min<std::int32_t>(
+                count,
+                static_cast<std::int32_t>(INDEXER_SELECTION_WIDTH_MAX))};
+        n_kv[row] = count;
+        n_bid[row] = steps[row].n_bid;
+    }
+
+    oracle::QsaIndexerState initial;
+    initial.tail.assign(tail_elements, -13.25f);
+    initial.dead.assign(key_row_elements, -17.5f);
+    initial.pooled.assign(max_blocks * key_row_elements, -19.75f);
+    initial.block_position = -23;
+    std::vector<std::int32_t> prefix_positions(pos0);
+    std::vector<float> prefix_keys(
+        static_cast<std::size_t>(pos0) * key_row_elements);
+    for (std::uint32_t row = 0u; row < pos0; ++row) {
+        prefix_positions[row] = static_cast<std::int32_t>(row);
+        for (std::size_t dimension = 0u;
+             dimension < key_row_elements; ++dimension) {
+            const std::size_t index =
+                static_cast<std::size_t>(row) * key_row_elements + dimension;
+            prefix_keys[index] = input_value(
+                options.input_set, index + 0x4103u, rng) * 2.75f;
+        }
+    }
+    oracle::qsa_indexer_append(
+        prefix_keys, prefix_positions, gamma, rope,
+        rope_zero_cos, rope_zero_sin, initial);
+    oracle::QsaIndexerState expected_indexer = initial;
+    oracle::qsa_indexer_append(
+        raw_keys, positions, gamma, rope,
+        rope_zero_cos, rope_zero_sin, expected_indexer);
+
+    std::vector<twin::tf> expected_scores;
+    oracle::qsa_selection_scores(
+        expected_indexer.pooled, expected_indexer.dead, queries, n_kv, n_bid,
+        static_cast<std::uint32_t>(max_blocks), kUntouchedScore,
+        expected_scores);
+    std::vector<float> expected_score_values;
+    expected_score_values.reserve(expected_scores.size());
+    for (const twin::tf value : expected_scores) {
+        expected_score_values.push_back(value.value);
+    }
+    std::vector<std::int32_t> expected_ids;
+    oracle::qsa_selection_topk(
+        expected_score_values, n_kv, n_bid,
+        static_cast<std::uint32_t>(max_blocks), kUntouchedId, expected_ids);
+
+    PrefillSelectionBuffers selection;
+    twin::GuardedBuffer raw_buffer, gamma_buffer, rope_buffer, tail_buffer,
+        block_position_buffer;
+    const std::size_t tail_bytes = tail_elements * sizeof(float);
+    const bool allocated =
+        allocate_prefill_selection_buffers(
+            context, rows, cell_capacity, selection, error) &&
+        raw_buffer.allocate(context, label + " raw keys",
+                            raw_keys.size() * sizeof(float), error) &&
+        gamma_buffer.allocate(context, label + " gamma",
+                              gamma.size() * sizeof(float), error) &&
+        rope_buffer.allocate(context, label + " RoPE",
+                             rope.size() * sizeof(float), error) &&
+        tail_buffer.allocate(context, label + " tail", tail_bytes, error) &&
+        block_position_buffer.allocate(
+            context, label + " block position", sizeof(std::int32_t), error);
+    check(allocated, label + " allocations", error);
+    if (!allocated || !selection.pooled.view() || !selection.dead.view() ||
+        !selection.queries.view() || !selection.steps.view() ||
+        !selection.scores.view() || !selection.ids.view() ||
+        !raw_buffer.view() || !gamma_buffer.view() || !rope_buffer.view() ||
+        !tail_buffer.view() || !block_position_buffer.view()) {
+        return false;
+    }
+
+    std::memcpy(selection.pooled.payload().data(),
+                initial.pooled.data(), initial.pooled.size() * sizeof(float));
+    std::memcpy(selection.dead.payload().data(),
+                initial.dead.data(), initial.dead.size() * sizeof(float));
+    std::memcpy(selection.queries.payload().data(),
+                queries.data(), queries.size() * sizeof(float));
+    std::memcpy(selection.steps.payload().data(),
+                steps.data(), steps.size() * sizeof(StepRow));
+    std::fill(typed<float>(selection.scores).begin(),
+              typed<float>(selection.scores).end(), kUntouchedScore);
+    std::fill(typed<std::int32_t>(selection.ids).begin(),
+              typed<std::int32_t>(selection.ids).end(), kUntouchedId);
+    std::memcpy(raw_buffer.payload().data(),
+                raw_keys.data(), raw_keys.size() * sizeof(float));
+    std::memcpy(gamma_buffer.payload().data(),
+                gamma.data(), gamma.size() * sizeof(float));
+    std::memcpy(rope_buffer.payload().data(),
+                rope.data(), rope.size() * sizeof(float));
+    std::memcpy(tail_buffer.payload().data(),
+                initial.tail.data(), tail_bytes);
+    std::memcpy(block_position_buffer.payload().data(),
+                &initial.block_position, sizeof(initial.block_position));
+
+    raw_buffer.capture_before_dispatch();
+    gamma_buffer.capture_before_dispatch();
+    rope_buffer.capture_before_dispatch();
+    selection.queries.capture_before_dispatch();
+    selection.steps.capture_before_dispatch();
+    tail_buffer.capture_before_dispatch();
+    selection.dead.capture_before_dispatch();
+    selection.pooled.capture_before_dispatch();
+    block_position_buffer.capture_before_dispatch();
+    selection.scores.capture_before_dispatch();
+    selection.ids.capture_before_dispatch();
+
+    const QsaPrefillIndexerAppendBuffers append_buffers{
+        raw_buffer.view(), gamma_buffer.view(), rope_buffer.view(),
+        tail_buffer.view(), selection.dead.view(), selection.pooled.view(),
+        block_position_buffer.view()};
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    const bool encoded = Encoder::encode(
+        context, *command, label,
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_prefill_qsa_indexer_append(
+                       context, encoder, metadata.params, cell_capacity,
+                       rope_zero_cos, rope_zero_sin, append_buffers,
+                       encode_error) &&
+                encode_prefill_qsa_selection(
+                    context, encoder, metadata.params, cell_capacity,
+                    selection.views(), encode_error);
+        },
+        error);
+    check(encoded, label + " encode", error);
+    if (!encoded || !submit_and_wait(command, label, error)) {
+        check(false, label + " GPU completion", error);
+        return false;
+    }
+
+    const twin::Tolerance exact{twin::Comparison::bits, 0.0, 0.0, 0u};
+    const auto actual_score_count =
+        static_cast<std::size_t>(rows) * max_blocks;
+    const auto score_difference = twin::compare_floats(
+        typed<float>(selection.scores).first(actual_score_count),
+        expected_scores, exact);
+    const auto exact_float_match = [](
+        std::span<const float> actual, std::span<const float> expected) {
+        return actual.size() == expected.size() &&
+            std::memcmp(actual.data(), expected.data(),
+                        actual.size_bytes()) == 0;
+    };
+    const bool dead_matches = exact_float_match(
+        typed<float>(selection.dead), expected_indexer.dead);
+    const bool pool_matches = exact_float_match(
+        typed<float>(selection.pooled), expected_indexer.pooled);
+    const bool tail_matches = exact_float_match(
+        typed<float>(tail_buffer), expected_indexer.tail);
+    if (score_difference) {
+        twin::report_failure(label.c_str(), options, rows, *score_difference);
+    }
+    const auto actual_ids = typed<std::int32_t>(selection.ids);
+    const bool ids_match =
+        std::equal(actual_ids.begin(), actual_ids.end(), expected_ids.begin());
+    check(!score_difference,
+          label + " selection scores use appended indexer keys");
+    check(dead_matches && pool_matches && tail_matches,
+          label + " append outputs match scalar oracle");
+    check(ids_match, label + " selected IDs and untouched suffix match oracle");
+
+    const std::span<const twin::ByteRange> no_writes;
+    const bool inputs_unchanged =
+        !raw_buffer.first_unwritten_change(no_writes) &&
+        !gamma_buffer.first_unwritten_change(no_writes) &&
+        !rope_buffer.first_unwritten_change(no_writes) &&
+        !selection.queries.first_unwritten_change(no_writes) &&
+        !selection.steps.first_unwritten_change(no_writes);
+    check(inputs_unchanged, label + " read-only inputs are unchanged");
+    const std::array tail_written{twin::ByteRange{0u, tail_bytes}};
+    const std::array key_written{
+        twin::ByteRange{0u, selection.dead.payload().size()}};
+    const std::array pool_written{
+        twin::ByteRange{0u, selection.pooled.payload().size()}};
+    const std::array block_written{
+        twin::ByteRange{0u, sizeof(std::int32_t)}};
+    const std::array score_written{
+        twin::ByteRange{0u, selection.scores.payload().size()}};
+    const std::array ids_written{
+        twin::ByteRange{0u, selection.ids.payload().size()}};
+    const bool guards_intact =
+        !tail_buffer.first_unwritten_change(tail_written) &&
+        !selection.dead.first_unwritten_change(key_written) &&
+        !selection.pooled.first_unwritten_change(pool_written) &&
+        !block_position_buffer.first_unwritten_change(block_written) &&
+        !selection.scores.first_unwritten_change(score_written) &&
+        !selection.ids.first_unwritten_change(ids_written);
+    check(guards_intact, label + " guards are intact");
+    return !score_difference && dead_matches && pool_matches &&
+           tail_matches && ids_match && inputs_unchanged && guards_intact;
 }
 
 float topk_score_value(twin::InputSet set, std::uint32_t row,
@@ -977,6 +1479,227 @@ bool test_topk_encoder_validation(Context& context,
     return passed;
 }
 
+bool prefill_concurrent_dispatch_mode() {
+    const char* const value = std::getenv("STRATA_METAL_DISPATCH");
+    return value != nullptr && std::string_view(value) == "concurrent";
+}
+
+bool test_prefill_qsa_selection_validation(
+    Context& context, Context& foreign_context) {
+    constexpr std::uint32_t rows = 9u;
+    constexpr std::uint32_t capacity = 64u;
+    const std::vector<std::uint32_t> tokens(rows, 1u);
+    PrefillChunkMetadata metadata;
+    std::string error;
+    if (!build_prefill_chunk_metadata(3u, tokens, metadata, error)) {
+        check(false, "Prefill selection validation metadata", error);
+        return false;
+    }
+    PrefillSelectionBuffers storage;
+    if (!allocate_prefill_selection_buffers(
+            context, rows, capacity, storage, error)) {
+        check(false, "Prefill selection validation allocations", error);
+        return false;
+    }
+    std::vector<StepRow> steps;
+    for (const PrefillStepRow& step : metadata.steps) {
+        steps.push_back(
+            StepRow{step.pos, step.n_kv, step.n_bid, step.width});
+    }
+    std::memcpy(storage.steps.payload().data(), steps.data(),
+                steps.size() * sizeof(StepRow));
+    std::fill(typed<float>(storage.scores).begin(),
+              typed<float>(storage.scores).end(), kUntouchedScore);
+    std::fill(typed<std::int32_t>(storage.ids).begin(),
+              typed<std::int32_t>(storage.ids).end(), kUntouchedId);
+    const QsaPrefillSelectionBuffers valid = storage.views();
+
+    const auto rejected = [&](const std::string& label,
+                              const strata::metal::PrefillParams& params,
+                              std::uint32_t cell_capacity,
+                              const QsaPrefillSelectionBuffers& buffers,
+                              std::string_view expected_error) {
+        error.clear();
+        auto command = context.make_command_buffer(label, error);
+        if (!command) {
+            check(false, label + " command buffer", error);
+            return false;
+        }
+        const bool encoded = encode_prefill_qsa_selection(
+            context, *command, params, cell_capacity, buffers, error);
+        const bool is_rejected =
+            !encoded && command->unsafe_native_handle() == nullptr &&
+            error.find(expected_error) != std::string::npos;
+        check(is_rejected, label, error);
+        return is_rejected;
+    };
+
+    bool passed = true;
+    strata::metal::PrefillParams invalid = metadata.params;
+    invalid.idx_f += INDEXER_BLOCK_CELLS;
+    passed &= rejected("Prefill selection rejects mismatched idx_f", invalid,
+                       capacity, valid, "parameters do not match");
+    invalid = metadata.params;
+    invalid.idx_e += INDEXER_BLOCK_CELLS;
+    passed &= rejected("Prefill selection rejects mismatched idx_e", invalid,
+                       capacity, valid, "parameters do not match");
+    invalid = metadata.params;
+    invalid.T = 0u;
+    passed &= rejected("Prefill selection rejects zero rows", invalid,
+                       capacity, valid, "row count");
+    invalid = metadata.params;
+    invalid.T = kPrefillMaxShaderRows + 1u;
+    passed &= rejected("Prefill selection rejects rows above shader limit",
+                       invalid, capacity, valid, "row count");
+    invalid = metadata.params;
+    invalid.p0 = 60u;
+    passed &= rejected("Prefill selection rejects chunk beyond capacity",
+                       invalid, capacity, valid, "exceeds the cell capacity");
+    passed &= rejected("Prefill selection rejects unaligned cell capacity",
+                       metadata.params, capacity - 1u, valid,
+                       "cell capacity is invalid");
+    strata::metal::PrefillParams at_limit{
+        kPrefillMaxShaderRows,
+        0u,
+        INDEXER_BLOCK_CELLS,
+        kPrefillMaxShaderRows &
+            ~(INDEXER_BLOCK_CELLS - 1u),
+    };
+    const std::uint32_t limit_capacity =
+        (at_limit.T + INDEXER_BLOCK_CELLS - 1u) &
+        ~(INDEXER_BLOCK_CELLS - 1u);
+    passed &= rejected("Prefill selection accepts inclusive shader row limit",
+                       at_limit, limit_capacity,
+                       valid, "pooled keys");
+
+    QsaPrefillSelectionBuffers short_scores = valid;
+    short_scores.scores.length -= sizeof(float);
+    passed &= rejected("Prefill selection rejects short score scratch",
+                       metadata.params, capacity, short_scores,
+                       "undersized or misaligned");
+    QsaPrefillSelectionBuffers short_ids = valid;
+    short_ids.ids.length -= sizeof(std::int32_t);
+    passed &= rejected("Prefill selection rejects short ID output",
+                       metadata.params, capacity, short_ids,
+                       "undersized or misaligned");
+    QsaPrefillSelectionBuffers output_input_alias = valid;
+    output_input_alias.pooled = valid.scores;
+    passed &= rejected("Prefill selection rejects score/input alias",
+                       metadata.params, capacity, output_input_alias,
+                       "outputs must not overlap inputs");
+    QsaPrefillSelectionBuffers output_alias = valid;
+    output_alias.scores = valid.ids;
+    passed &= rejected("Prefill selection rejects score/ID output alias",
+                       metadata.params, capacity, output_alias,
+                       "score and ID outputs must be disjoint");
+
+    twin::GuardedBuffer foreign_scores;
+    if (!foreign_scores.allocate(
+            foreign_context, "foreign Prefill selection scratch",
+            storage.scores.payload().size(), error)) {
+        check(false, "Prefill selection foreign allocation", error);
+        return false;
+    }
+    QsaPrefillSelectionBuffers foreign_view = valid;
+    foreign_view.scores = foreign_scores.view();
+    passed &= rejected("Prefill selection rejects foreign Context buffer",
+                       metadata.params, capacity, foreign_view, "not owned");
+
+    StepRow invalid_step = steps[4u];
+    ++invalid_step.pos;
+    std::memcpy(storage.steps.payload().data() +
+                    4u * sizeof(StepRow),
+                &invalid_step, sizeof(invalid_step));
+    passed &= rejected("Prefill selection rejects noncontiguous StepRows",
+                       metadata.params, capacity, valid,
+                       "contiguous positions");
+    std::memcpy(storage.steps.payload().data(), steps.data(),
+                steps.size() * sizeof(StepRow));
+
+    if (prefill_concurrent_dispatch_mode()) {
+        auto group_command = context.make_command_buffer(
+            "Prefill selection open-group validation", error);
+        if (!group_command) {
+            check(false, "Prefill selection open-group command buffer",
+                  error);
+            return false;
+        }
+        bool rejected_in_group = false;
+        const bool group_encoded = Encoder::encode(
+            context, *group_command, "Prefill selection open group",
+            [&](Encoder& encoder, std::string& encode_error) {
+                if (!encoder.group_begin(encode_error)) return false;
+                std::string selection_error;
+                rejected_in_group =
+                    !encode_prefill_qsa_selection(
+                        context, encoder, metadata.params, capacity, valid,
+                        selection_error) &&
+                    selection_error.find("ordered concurrent-group") !=
+                        std::string::npos;
+                const bool group_closed = encoder.group_end(encode_error);
+                return rejected_in_group && group_closed;
+            },
+            error);
+        check(group_encoded && rejected_in_group,
+              "Prefill selection rejects an open concurrent group", error);
+        passed &= group_encoded && rejected_in_group;
+        group_command->discard();
+    }
+
+    const std::size_t max_blocks =
+        static_cast<std::size_t>(capacity / INDEXER_BLOCK_CELLS) + 2u;
+    const QsaSelectionScoresBuffers earlier_scores{
+        valid.pooled,
+        valid.dead,
+        valid.indexer_queries,
+        valid.steps,
+        valid.scores.slice(
+            0u, static_cast<std::size_t>(rows) * max_blocks *
+                    sizeof(float)),
+    };
+    strata::metal::PrefillParams late_invalid = metadata.params;
+    late_invalid.idx_f += INDEXER_BLOCK_CELLS;
+    auto rollback_command = context.make_command_buffer(
+        "Prefill selection shared rollback", error);
+    if (!rollback_command) {
+        check(false, "Prefill selection rollback command buffer", error);
+        return false;
+    }
+    bool earlier_dispatch_encoded = false;
+    const bool late_failure_propagated = !Encoder::encode(
+            context, *rollback_command, "Prefill selection shared rollback",
+        [&](Encoder& encoder, std::string& encode_error) {
+            earlier_dispatch_encoded = encode_qsa_selection_scores(
+                context, encoder, VERIFY_MAX_T, capacity, earlier_scores,
+                encode_error);
+            return earlier_dispatch_encoded &&
+                encode_prefill_qsa_selection(
+                    context, encoder, late_invalid, capacity, valid,
+                    encode_error);
+        },
+        error) &&
+        earlier_dispatch_encoded &&
+        error.find("parameters do not match") != std::string::npos;
+    check(late_failure_propagated && earlier_dispatch_encoded,
+          "Prefill selection propagates late metadata failure", error);
+    passed &= late_failure_propagated && earlier_dispatch_encoded;
+    const bool scores_unchanged = std::all_of(
+        typed<float>(storage.scores).begin(),
+        typed<float>(storage.scores).end(),
+        [](float value) { return value == kUntouchedScore; });
+    check(scores_unchanged,
+          "Prefill selection rollback preserves prior score output");
+    passed &= scores_unchanged;
+    error.clear();
+    const bool rollback_discarded =
+        !rollback_command->commit(error) &&
+        error.find("discarded") != std::string::npos;
+    check(rollback_discarded,
+          "Prefill selection rollback discards prior score dispatch", error);
+    passed &= rollback_discarded;
+    return passed;
+}
+
 bool test_scores_then_topk_same_command(
     Context& context, const twin::Options& options,
     bool shared_encoder = false) {
@@ -1527,6 +2250,8 @@ int main(int argc, char** argv) {
 
     bool passed = test_encoder_validation(*context, *foreign_context);
     passed &= test_topk_encoder_validation(*context, *foreign_context);
+    passed &= test_prefill_qsa_selection_validation(
+        *context, *foreign_context);
     passed &= test_topk_correctness(*context, options);
     passed &= test_scores_then_topk_same_command(*context, options);
     passed &= test_scores_then_topk_same_command(*context, options, true);
@@ -1548,6 +2273,36 @@ int main(int argc, char** argv) {
     passed &= run_score_case(*context, 1u, 131072u,
                              twin::InputSet::fixture, options,
                              " grid-stride");
+    struct PrefillSelectionCase {
+        std::uint32_t pos0;
+        std::uint32_t rows;
+        std::uint32_t capacity;
+    };
+    constexpr std::array prefill_selection_cases{
+        PrefillSelectionCase{0u, 1u, 1024u},
+        PrefillSelectionCase{1u, 7u, 1024u},
+        PrefillSelectionCase{3u, 8u, 1024u},
+        PrefillSelectionCase{4u, 9u, 1024u},
+        PrefillSelectionCase{6u, 255u, 1024u},
+        PrefillSelectionCase{0u, 256u, 1024u},
+        PrefillSelectionCase{3u, 257u, 1024u},
+        PrefillSelectionCase{6u, 300u, 1024u},
+        PrefillSelectionCase{2200u, 9u, 4096u},
+        PrefillSelectionCase{100000u, 1u, 135168u},
+    };
+    for (const PrefillSelectionCase& prefill_case :
+         prefill_selection_cases) {
+        passed &= run_prefill_selection_case(
+            *context, prefill_case.rows, prefill_case.pos0,
+            prefill_case.capacity, options, false);
+        passed &= run_prefill_selection_case(
+            *context, prefill_case.rows, prefill_case.pos0,
+            prefill_case.capacity, options, true);
+    }
+    passed &= test_prefill_indexer_selection_composition(
+        *context, options, 3u, 64u);
+    passed &= test_prefill_indexer_selection_composition(
+        *context, options, 2047u, 4096u);
     check(passed && g_failures == 0,
           "QSA selection score and top-k Metal encoder/kernel twins");
     std::printf("metal_qsa_selection_test: %d failures\n", g_failures);
