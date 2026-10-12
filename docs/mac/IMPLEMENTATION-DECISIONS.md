@@ -12137,7 +12137,9 @@ measuring L-15 remain open.
   destination bitset in the output prefix. The validation detects out-of-range
   and duplicate values before down projection, sets status bit 1 and makes the
   tile kernel zero all active output. Add GPU fixtures for an odd-index
-  out-of-range destination and an odd-index duplicate.
+  out-of-range destination and an odd-index duplicate. The hostile follow-up
+  found no further actionable issue in ordering, aliases or resource/scratch
+  lifetime.
 - **Validation:** The reviewer did not run tests. After the fix, the full
   `mac-dev` build, all 10 focused Metal CTests, all 45 `mac-host` CTests (one
   expected skip), `test_map.py`, `check_drift.py` and `git diff --check` passed.
