@@ -505,6 +505,54 @@ static inline half pf_moe_iq3_s_value(
     return half(weight);
 }
 
+static inline uint pf_moe_iq1_m_half_scale_bits(
+    device const block_iq1_m* block) {
+    uint result = 0u;
+    for (uint word = 0u; word < 4u; ++word) {
+        const uint byte_offset = 2u * word;
+        const uint packed = uint(block->scales[byte_offset]) |
+                            (uint(block->scales[byte_offset + 1u]) << 8u);
+        result |= ((packed >> 12u) & 0x0fu) << (4u * word);
+    }
+    return result;
+}
+
+static inline uint pf_moe_iq1_m_packed_scale(
+    device const block_iq1_m* block, uint part) {
+    const uint word_index = part / 2u;
+    const uint byte_offset = 2u * word_index;
+    const uint packed = uint(block->scales[byte_offset]) |
+                        (uint(block->scales[byte_offset + 1u]) << 8u);
+    return packed >> (6u * (part & 1u));
+}
+
+static inline half pf_moe_iq1_m_value(
+    device const block_iq1_m* row_weights, uint k) {
+    const device block_iq1_m* block = row_weights + k / 256u;
+    const uint within_block = k % 256u;
+    const uint part = within_block / 32u;
+    const uint within_part = within_block % 32u;
+    const uint codeword = within_part / 8u;
+    const uint lane = within_part % 8u;
+    const uint qh_byte = uint(block->qh[2u * part + codeword / 2u]);
+    const uint selector =
+        (qh_byte >> (4u * (codeword & 1u))) & 0x0fu;
+    const uint grid_index =
+        uint(block->qs[4u * part + codeword]) |
+        ((selector & 0x07u) << 8u);
+    const uint packed_grid = iq1s_grid_gpu[grid_index];
+    const uint code = (packed_grid >> (4u * lane)) & 0x0fu;
+    const uint packed_scale = pf_moe_iq1_m_packed_scale(block, part);
+    const uint local_scale =
+        2u * ((packed_scale >> (3u * (codeword / 2u))) & 0x07u) + 1u;
+    const float delta =
+        (selector & 0x08u) != 0u ? -0.125f : 0.125f;
+    const float d = float(as_type<half>(
+        ushort(pf_moe_iq1_m_half_scale_bits(block))));
+    const float scaled_d = d * float(local_scale);
+    return half(scaled_d * (float(code) - 1.0f + delta));
+}
+
 static inline void pf_moe_zero_output_tile(
     device half* output, uint total_entries, uint first_entry,
     uint end_entry, uint column_group, uint tid) {
@@ -708,6 +756,18 @@ kernel void strata_pf_iq3_s_decode_probe(
     if (index < values) decoded[index] = pf_moe_iq3_s_value(weights, index);
 }
 
+// Exhaustive packed-field twin probe for the IQ1_M in-place decoder.
+[[max_total_threads_per_threadgroup(256)]]
+kernel void strata_pf_iq1_m_decode_probe(
+    device const block_iq1_m* weights [[buffer(0)]],
+    device half* decoded [[buffer(1)]],
+    constant uint& values [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    const uint index = group.x * 256u + tid;
+    if (index < values) decoded[index] = pf_moe_iq1_m_value(weights, index);
+}
+
 // One 64-entry x 64-column simdgroup matrix tile. Each 64-column tile
 // interleaves 32 gate and 32 up columns; the epilogue applies SwiGLU and
 // writes the resulting hidden row directly.
@@ -745,7 +805,7 @@ kernel void strata_pf_moe_gu_f16(
             params.rows * kPfMoeRoutesPerRow, group.x, tid);
         return;
     }
-    if (weight_format > 6u) {
+    if (weight_format > 7u) {
         if (tid == 0u) {
             atomic_fetch_or_explicit(status, 2u, memory_order_relaxed);
         }
@@ -878,12 +938,18 @@ kernel void strata_pf_moe_gu_f16(
                         address.role[role]) +
                     output_column * 10u;
                 sw[i] = pf_moe_iq3_xxs_value(row_weights, k0 + tile_k);
-            } else {
+            } else if (weight_format == 6u) {
                 const device block_iq3_s* row_weights =
                     reinterpret_cast<device const block_iq3_s*>(
                         address.role[role]) +
                     output_column * 10u;
                 sw[i] = pf_moe_iq3_s_value(row_weights, k0 + tile_k);
+            } else {
+                const device block_iq1_m* row_weights =
+                    reinterpret_cast<device const block_iq1_m*>(
+                        address.role[role]) +
+                    output_column * 10u;
+                sw[i] = pf_moe_iq1_m_value(row_weights, k0 + tile_k);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

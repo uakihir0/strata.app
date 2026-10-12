@@ -10,6 +10,10 @@
 
 namespace twin {
 
+/// Decode one canonical 256-value IQ1_M block for the F16 Prefill oracle.
+void iq1_m_dequantize_reference(const block_iq1_m& weight,
+                                std::span<float, 256u> output);
+
 bool iq1_m_matvec_reference(std::span<const block_iq1_m> weights,
                             std::span<const Q81> activations,
                             std::uint32_t n_in, std::uint32_t n_out,

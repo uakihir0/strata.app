@@ -20,6 +20,8 @@
 #include "oracles/iq3_xxs_mv.hpp"
 #include "oracles/iq3_s_moe_fixture.hpp"
 #include "oracles/iq3_s_mv.hpp"
+#include "oracles/iq1_m_tool_fixture.hpp"
+#include "oracles/iq1_m_mv.hpp"
 #include "twin.hpp"
 
 #include <algorithm>
@@ -59,6 +61,11 @@ constexpr std::size_t kIQ3XXSBlockBytes = 98u;
 constexpr std::uint32_t kIQ3XXSPrefillAux = 0x154a952au;
 constexpr std::size_t kIQ3SBlocksPerRow = 10u;
 constexpr std::size_t kIQ3SBlockBytes = 110u;
+constexpr std::size_t kIQ1MBlocksPerRow = 10u;
+constexpr std::size_t kIQ1MBlockBytes = 56u;
+constexpr std::array<std::uint16_t, 8u> kIQ1MSuperScales{
+    0x3555u, 0x379bu, 0x3a53u, 0x3c25u,
+    0x3821u, 0x39a7u, 0x3b19u, 0x3d01u};
 constexpr std::uint8_t kPoison = 0xa5u;
 constexpr std::uint8_t kGuardPoison = 0xffu;
 
@@ -89,7 +96,8 @@ enum class WeightFormat {
     iq2_xs,
     iq2_s,
     iq3_xxs,
-    iq3_s
+    iq3_s,
+    iq1_m
 };
 
 std::string_view weight_format_name(WeightFormat format) {
@@ -101,6 +109,7 @@ std::string_view weight_format_name(WeightFormat format) {
         case WeightFormat::iq2_s: return "IQ2_S";
         case WeightFormat::iq3_xxs: return "IQ3_XXS";
         case WeightFormat::iq3_s: return "IQ3_S";
+        case WeightFormat::iq1_m: return "IQ1_M";
     }
     return "unknown";
 }
@@ -121,6 +130,8 @@ std::size_t weight_format_expert_bytes(WeightFormat format) {
             return kHidden * kIQ3XXSBlocksPerRow * kIQ3XXSBlockBytes;
         case WeightFormat::iq3_s:
             return kHidden * kIQ3SBlocksPerRow * kIQ3SBlockBytes;
+        case WeightFormat::iq1_m:
+            return kHidden * kIQ1MBlocksPerRow * kIQ1MBlockBytes;
     }
     return 0u;
 }
@@ -625,6 +636,82 @@ void fill_iq3_s_weights(twin::GuardedBuffer& buffer, std::uint32_t role,
     }
 }
 
+void fill_iq1_m_weights(twin::GuardedBuffer& buffer, std::uint32_t role,
+                        std::uint32_t expert) {
+    auto blocks = typed<block_iq1_m>(buffer);
+    for (std::uint32_t row = 0u; row < kHidden; ++row) {
+        for (std::size_t block_index = 0u;
+             block_index < kIQ1MBlocksPerRow; ++block_index) {
+            block_iq1_m& block =
+                blocks[static_cast<std::size_t>(row) * kIQ1MBlocksPerRow +
+                       block_index];
+            if (expert == 0u && row == 0u && block_index == 0u) {
+                std::memcpy(&block, twin::kIQ1MToolFixture[0].data(),
+                            sizeof(block));
+                continue;
+            }
+
+            std::fill(std::begin(block.qs), std::end(block.qs), 0u);
+            std::fill(std::begin(block.qh), std::end(block.qh), 0u);
+            std::fill(std::begin(block.scales), std::end(block.scales), 0u);
+            const std::uint32_t scale_index =
+                row * 7u + static_cast<std::uint32_t>(block_index) * 3u +
+                role * 5u + expert * 11u;
+            const std::uint16_t d_bits =
+                kIQ1MSuperScales[scale_index % kIQ1MSuperScales.size()];
+            for (std::uint32_t part = 0u; part < 8u; ++part) {
+                const std::uint32_t scale0 =
+                    (scale_index + part * 3u) & 0x07u;
+                const std::uint32_t scale1 =
+                    (scale_index * 3u + part * 5u) & 0x07u;
+                const std::uint32_t word_index = part / 2u;
+                std::uint16_t packed =
+                    static_cast<std::uint16_t>(
+                        (scale0 | (scale1 << 3u)) << (6u * (part & 1u)));
+                const std::uint16_t existing =
+                    static_cast<std::uint16_t>(block.scales[2u * word_index]) |
+                    (static_cast<std::uint16_t>(
+                         block.scales[2u * word_index + 1u])
+                     << 8u);
+                packed |= existing;
+                block.scales[2u * word_index] =
+                    static_cast<std::uint8_t>(packed);
+                block.scales[2u * word_index + 1u] =
+                    static_cast<std::uint8_t>(packed >> 8u);
+            }
+            for (std::uint32_t word_index = 0u; word_index < 4u;
+                 ++word_index) {
+                const std::uint16_t d_nibble = static_cast<std::uint16_t>(
+                    (d_bits >> (4u * word_index)) & 0x0fu);
+                block.scales[2u * word_index + 1u] |=
+                    static_cast<std::uint8_t>(d_nibble << 4u);
+            }
+            for (std::uint32_t part = 0u; part < 8u; ++part) {
+                for (std::uint32_t codeword = 0u; codeword < 4u;
+                     ++codeword) {
+                    const std::uint32_t grid =
+                        (row * 197u +
+                         static_cast<std::uint32_t>(block_index) * 83u +
+                         part * 29u + codeword * 17u + role * 31u +
+                         expert * 43u) &
+                        0x7ffu;
+                    block.qs[4u * part + codeword] =
+                        static_cast<std::uint8_t>(grid & 0xffu);
+                    const std::uint32_t selector =
+                        ((grid >> 8u) & 0x07u) |
+                        (((grid + part + codeword + role + expert) & 1u)
+                         << 3u);
+                    const std::uint32_t qh_index =
+                        2u * part + codeword / 2u;
+                    const std::uint32_t shift = 4u * (codeword & 1u);
+                    block.qh[qh_index] |=
+                        static_cast<std::uint8_t>(selector << shift);
+                }
+            }
+        }
+    }
+}
+
 void fill_weights(twin::GuardedBuffer& buffer, std::uint32_t role,
                   std::uint32_t expert, WeightFormat format) {
     if (format == WeightFormat::q2_0) {
@@ -639,8 +726,10 @@ void fill_weights(twin::GuardedBuffer& buffer, std::uint32_t role,
         fill_iq2_s_weights(buffer, role, expert);
     } else if (format == WeightFormat::iq3_xxs) {
         fill_iq3_xxs_weights(buffer, role, expert);
-    } else {
+    } else if (format == WeightFormat::iq3_s) {
         fill_iq3_s_weights(buffer, role, expert);
+    } else {
+        fill_iq1_m_weights(buffer, role, expert);
     }
 }
 
@@ -862,6 +951,74 @@ bool iq3_s_fixture_covers_codes_scales_and_signs(
                        [](bool observed) { return observed; });
 }
 
+bool iq1_m_fixture_covers_codes_scales_and_deltas(
+    const std::array<const twin::GuardedBuffer*, 4u>& weight_buffers) {
+    std::array<bool, 2048u> observed_grids{};
+    std::array<bool, 8u> observed_scale0{};
+    std::array<bool, 8u> observed_scale1{};
+    std::array<bool, 2u> observed_deltas{};
+    std::array<bool, 8u> observed_super_scales{};
+    for (const twin::GuardedBuffer* weight_buffer : weight_buffers) {
+        for (const block_iq1_m& block :
+             typed<block_iq1_m>(*weight_buffer)) {
+            std::uint16_t d_bits = 0u;
+            for (std::uint32_t word_index = 0u; word_index < 4u;
+                 ++word_index) {
+                const std::uint16_t word =
+                    static_cast<std::uint16_t>(
+                        block.scales[2u * word_index]) |
+                    (static_cast<std::uint16_t>(
+                         block.scales[2u * word_index + 1u])
+                     << 8u);
+                d_bits |= static_cast<std::uint16_t>(
+                    ((word >> 12u) & 0x0fu) << (4u * word_index));
+            }
+            for (std::size_t i = 0u; i < kIQ1MSuperScales.size(); ++i) {
+                if (d_bits == kIQ1MSuperScales[i]) {
+                    observed_super_scales[i] = true;
+                }
+            }
+            for (std::uint32_t part = 0u; part < 8u; ++part) {
+                const std::uint32_t word_index = part / 2u;
+                const std::uint16_t word =
+                    static_cast<std::uint16_t>(
+                        block.scales[2u * word_index]) |
+                    (static_cast<std::uint16_t>(
+                         block.scales[2u * word_index + 1u])
+                     << 8u);
+                const std::uint32_t packed =
+                    static_cast<std::uint32_t>(word) >>
+                    (6u * (part & 1u));
+                observed_scale0[packed & 0x07u] = true;
+                observed_scale1[(packed >> 3u) & 0x07u] = true;
+                for (std::uint32_t codeword = 0u; codeword < 4u;
+                     ++codeword) {
+                    const std::uint32_t qh =
+                        (block.qh[2u * part + codeword / 2u] >>
+                         (4u * (codeword & 1u))) &
+                        0x0fu;
+                    const std::uint32_t grid =
+                        block.qs[4u * part + codeword] |
+                        ((qh & 0x07u) << 8u);
+                    observed_grids[grid] = true;
+                    observed_deltas[(qh >> 3u) & 1u] = true;
+                }
+            }
+        }
+    }
+    return std::all_of(observed_grids.begin(), observed_grids.end(),
+                       [](bool observed) { return observed; }) &&
+           std::all_of(observed_scale0.begin(), observed_scale0.end(),
+                       [](bool observed) { return observed; }) &&
+           std::all_of(observed_scale1.begin(), observed_scale1.end(),
+                       [](bool observed) { return observed; }) &&
+           std::all_of(observed_deltas.begin(), observed_deltas.end(),
+                       [](bool observed) { return observed; }) &&
+           std::all_of(observed_super_scales.begin(),
+                       observed_super_scales.end(),
+                       [](bool observed) { return observed; });
+}
+
 float q2_value(std::span<const block_q2_0> blocks, std::size_t row,
                std::size_t k) {
     const block_q2_0& block =
@@ -960,6 +1117,23 @@ double dot_oracle(std::span<const std::uint16_t> x,
             const block_iq3_xxs& block =
                 blocks[row * kIQ3XXSBlocksPerRow + block_index];
             twin::iq3_xxs_dequantize_reference(block, decoded);
+            const std::size_t first_k = block_index * decoded.size();
+            for (std::size_t offset = 0u; offset < decoded.size(); ++offset) {
+                const float weight =
+                    round_weights ? f32(half(decoded[offset]))
+                                  : decoded[offset];
+                result += static_cast<double>(f32(x[first_k + offset])) *
+                          static_cast<double>(weight);
+            }
+        }
+    } else if (format == WeightFormat::iq1_m) {
+        const auto blocks = typed<block_iq1_m>(weights);
+        std::array<float, 256u> decoded{};
+        for (std::size_t block_index = 0u;
+             block_index < kIQ1MBlocksPerRow; ++block_index) {
+            const block_iq1_m& block =
+                blocks[row * kIQ1MBlocksPerRow + block_index];
+            twin::iq1_m_dequantize_reference(block, decoded);
             const std::size_t first_k = block_index * decoded.size();
             for (std::size_t offset = 0u; offset < decoded.size(); ++offset) {
                 const float weight =
@@ -1094,6 +1268,26 @@ bool test_iq3_s_literal_decode_anchor() {
     return matches;
 }
 
+bool test_iq1_m_literal_decode_anchor() {
+    block_iq1_m block{};
+    std::memcpy(&block, twin::kIQ1MToolFixture[0].data(), sizeof(block));
+    std::array<float, 256u> decoded{};
+    twin::iq1_m_dequantize_reference(block, decoded);
+    const bool matches =
+        block.qs[0] == 0x69u && (block.qh[0] & 0x0fu) == 0u &&
+        decoded[0] == 1.875f;
+    check(matches,
+          "canonical IQ1_M decoder honors literal grid, delta, scale, and super-scale fields",
+          "qs[0]=0x69, qh[0].low=0, grid digit=1 (signed value 0), d=1, local scale=15, output=1.875");
+    block.qh[0] |= 0x08u;
+    twin::iq1_m_dequantize_reference(block, decoded);
+    const bool negative_delta_matches = decoded[0] == -1.875f;
+    check(negative_delta_matches,
+          "canonical IQ1_M decoder applies the negative delta to the signed grid value",
+          "qs[0]=0x69, qh[0].low=8, grid digit=1 (signed value 0), d=1, local scale=15, output=-1.875");
+    return matches && negative_delta_matches;
+}
+
 std::size_t round_up_div(std::size_t value, std::size_t divisor) {
     return value / divisor +
            static_cast<std::size_t>(value % divisor != 0u);
@@ -1128,7 +1322,11 @@ bool encode_expert(WeightFormat format, Context& context, Encoder& encoder,
         return encode_prefill_moe_gu_iq3_xxs(
             context, encoder, rows, experts, layer, buffers, error);
     }
-    return encode_prefill_moe_gu_iq3_s(
+    if (format == WeightFormat::iq3_s) {
+        return encode_prefill_moe_gu_iq3_s(
+            context, encoder, rows, experts, layer, buffers, error);
+    }
+    return encode_prefill_moe_gu_iq1_m(
         context, encoder, rows, experts, layer, buffers, error);
 }
 
@@ -1161,7 +1359,11 @@ bool encode_expert(WeightFormat format, Context& context,
         return encode_prefill_moe_gu_iq3_xxs(
             context, command_buffer, rows, experts, layer, buffers, error);
     }
-    return encode_prefill_moe_gu_iq3_s(
+    if (format == WeightFormat::iq3_s) {
+        return encode_prefill_moe_gu_iq3_s(
+            context, command_buffer, rows, experts, layer, buffers, error);
+    }
+    return encode_prefill_moe_gu_iq1_m(
         context, command_buffer, rows, experts, layer, buffers, error);
 }
 
@@ -1262,6 +1464,12 @@ bool run_case(Context& context, WeightFormat format, std::uint32_t rows,
                     0.004f +
                     static_cast<float>((hash >> 16u) & 0x7fu) * 0.0002f;
                 value = (hash & 0x8000u) == 0u ? magnitude : -magnitude;
+            } else if (format == WeightFormat::iq1_m) {
+                const std::uint32_t hash =
+                    column * 1103515245u + row * 12345u + 0x9e3779b9u;
+                value =
+                    0.00008f +
+                    static_cast<float>((hash >> 16u) % 101u) * 0.0000002f;
             } else {
                 const float magnitude =
                     0.005f +
@@ -1325,6 +1533,48 @@ bool run_case(Context& context, WeightFormat format, std::uint32_t rows,
         std::fill(input.begin(), input.begin() + kWidth, 0u);
         input[first] = half(direction * f32(half(decoded[second])));
         input[second] = half(-direction * f32(half(decoded[first])));
+    } else if (format == WeightFormat::iq1_m && rows == 1u &&
+               caller_owned && !missing_second_expert &&
+               !missing_first_expert) {
+        constexpr std::size_t block_index = 1u;
+        auto gate_blocks = typed<block_iq1_m>(gate0);
+        auto up_blocks = typed<block_iq1_m>(up0);
+        std::memcpy(&up_blocks[block_index], &gate_blocks[block_index],
+                    sizeof(block_iq1_m));
+        std::array<float, 256u> decoded{};
+        twin::iq1_m_dequantize_reference(gate_blocks[block_index], decoded);
+        std::size_t first = 0u;
+        std::size_t second = 1u;
+        double best_determinant = 0.0;
+        double best_signed_determinant = 0.0;
+        for (std::size_t i = 0u; i < decoded.size(); ++i) {
+            const float rounded_i = f32(half(decoded[i]));
+            if (rounded_i == 0.0f) continue;
+            for (std::size_t j = i + 1u; j < decoded.size(); ++j) {
+                const float rounded_j = f32(half(decoded[j]));
+                if (rounded_j == 0.0f) continue;
+                const double signed_determinant =
+                    static_cast<double>(decoded[i]) * rounded_j -
+                    static_cast<double>(decoded[j]) * rounded_i;
+                const double determinant = std::abs(signed_determinant);
+                if (determinant > best_determinant) {
+                    first = i;
+                    second = j;
+                    best_determinant = determinant;
+                    best_signed_determinant = signed_determinant;
+                }
+            }
+        }
+        check(best_determinant > 0.0,
+              "IQ1_M generated fixture has distinguishable weight-rounding pairs");
+        const float direction =
+            best_signed_determinant < 0.0 ? -1.0f : 1.0f;
+        std::fill(input.begin(), input.begin() + kWidth, 0u);
+        const std::size_t block_offset = block_index * 256u;
+        input[block_offset + first] =
+            half(8.0f * direction * f32(half(decoded[second])));
+        input[block_offset + second] =
+            half(-8.0f * direction * f32(half(decoded[first])));
     }
     auto route_ids = typed<std::int32_t>(ids);
     for (std::size_t entry = 0u; entry < entries; ++entry) {
@@ -1627,6 +1877,11 @@ bool run_case(Context& context, WeightFormat format, std::uint32_t rows,
         check(iq3_s_fixture_covers_codes_scales_and_signs(role_weights),
               label + " fixture covers grids, qh bits, signs, and scales");
     }
+    if (format == WeightFormat::iq1_m && rows == 1u && caller_owned &&
+        !missing_second_expert && !missing_first_expert) {
+        check(iq1_m_fixture_covers_codes_scales_and_deltas(role_weights),
+              label + " fixture covers every grid, local scale, delta, and super-scale");
+    }
     const auto actual = typed<std::uint16_t>(hidden);
     bool oracle_matches = true;
     bool gather_matches = true;
@@ -1639,13 +1894,15 @@ bool run_case(Context& context, WeightFormat format, std::uint32_t rows,
          format == WeightFormat::iq2_xs ||
          format == WeightFormat::iq2_s ||
          format == WeightFormat::iq3_xxs ||
-         format == WeightFormat::iq3_s) &&
+         format == WeightFormat::iq3_s ||
+         format == WeightFormat::iq1_m) &&
         rows == 1u && caller_owned && !missing_second_expert &&
         !missing_first_expert;
     bool weight_rounding_changes_output = !check_weight_rounding;
     std::uint16_t maximum_rounding_distance = 0u;
     std::size_t maximum_rounding_index = 0u;
     std::uint16_t iq3_s_golden_rounding_distance = 0u;
+    std::uint16_t iq1_m_golden_rounding_distance = 0u;
     const auto input_view = typed<std::uint16_t>(mixed);
     for (std::uint32_t row = 0u; row < rows; ++row) {
         const auto x = std::span<const std::uint16_t>(
@@ -1687,6 +1944,9 @@ bool run_case(Context& context, WeightFormat format, std::uint32_t rows,
                     if (format == WeightFormat::iq3_s && oracle_index == 0u) {
                         iq3_s_golden_rounding_distance = rounding_distance;
                     }
+                    if (format == WeightFormat::iq1_m && oracle_index == 0u) {
+                        iq1_m_golden_rounding_distance = rounding_distance;
+                    }
                     if (rounding_distance > maximum_rounding_distance) {
                         maximum_rounding_distance = rounding_distance;
                         maximum_rounding_index = oracle_index;
@@ -1699,14 +1959,20 @@ bool run_case(Context& context, WeightFormat format, std::uint32_t rows,
     }
     if (check_weight_rounding) {
         const std::uint16_t required_rounding_distance =
-            format == WeightFormat::iq3_s ? 30000u : 4u;
+            format == WeightFormat::iq3_s
+                ? 30000u
+                : format == WeightFormat::iq1_m ? 10000u : 4u;
         const std::uint16_t checked_rounding_distance =
             format == WeightFormat::iq3_s
                 ? iq3_s_golden_rounding_distance
+                : format == WeightFormat::iq1_m
+                      ? iq1_m_golden_rounding_distance
                 : maximum_rounding_distance;
         const std::string rounding_location =
             format == WeightFormat::iq3_s
                 ? " at golden output 0"
+                : format == WeightFormat::iq1_m
+                      ? " at golden output 0"
                 : " at output " + std::to_string(maximum_rounding_index);
         check(weight_rounding_changes_output &&
                   checked_rounding_distance > required_rounding_distance,
@@ -1799,6 +2065,17 @@ bool run_case(Context& context, WeightFormat format, std::uint32_t rows,
         // The selected signed pair cancels the F16-rounded gate dot exactly;
         // the unrounded-weight control is nonzero and differs by over 30,000
         // F16 ULPs after SwiGLU on the same literal block.
+        constexpr std::uint16_t literal_gpu_golden = 0x0000u;
+        const std::uint16_t distance =
+            half_ulp_distance(actual[0], literal_gpu_golden);
+        check(distance <= 4u,
+              label + " matches the fixed literal-block GPU golden",
+              "F16 ULP distance=" + std::to_string(distance));
+    }
+    if (format == WeightFormat::iq1_m && rows == 1u && caller_owned &&
+        !missing_second_expert && !missing_first_expert) {
+        // The selected pair cancels both rounded IQ1_M dots; the unrounded
+        // gate and up dots match and produce a large positive control.
         constexpr std::uint16_t literal_gpu_golden = 0x0000u;
         const std::uint16_t distance =
             half_ulp_distance(actual[0], literal_gpu_golden);
@@ -2344,6 +2621,160 @@ bool test_iq3_s_decode_probe(Context& context) {
            signs_covered && tail && guards;
 }
 
+bool test_iq1_m_decode_probe(Context& context) {
+    constexpr std::size_t block_count = 128u;
+    constexpr std::uint32_t values =
+        static_cast<std::uint32_t>(block_count * 256u);
+    constexpr std::size_t weight_bytes = block_count * kIQ1MBlockBytes;
+    const std::size_t output_bytes =
+        static_cast<std::size_t>(values) * sizeof(std::uint16_t);
+    twin::GuardedBuffer weights, decoded;
+    std::string error;
+    const bool allocated =
+        weights.allocate(context, "IQ1_M decoder probe weights",
+                         weight_bytes, error) &&
+        decoded.allocate(context, "IQ1_M decoder probe output",
+                         output_bytes + 64u, error);
+    check(allocated, "IQ1_M decoder probe allocate", error);
+    if (!allocated) return false;
+
+    auto blocks = typed<block_iq1_m>(weights);
+    std::array<bool, 2048u> observed_grids{};
+    std::array<std::array<bool, 2u>, 2048u> observed_grid_deltas{};
+    std::array<std::array<bool, 2u>, 3u> observed_grid_high{};
+    std::array<bool, 2u> observed_deltas{};
+    std::array<bool, 8u> observed_scale0{};
+    std::array<bool, 8u> observed_scale1{};
+    std::array<bool, 8u> observed_super_scales{};
+    for (std::size_t block_index = 0u; block_index < block_count;
+         ++block_index) {
+        block_iq1_m& block = blocks[block_index];
+        std::fill(std::begin(block.qs), std::end(block.qs), 0u);
+        std::fill(std::begin(block.qh), std::end(block.qh), 0u);
+        std::fill(std::begin(block.scales), std::end(block.scales), 0u);
+        std::array<std::uint16_t, 4u> scale_words{};
+        const std::uint16_t d_bits =
+            kIQ1MSuperScales[block_index % kIQ1MSuperScales.size()];
+        observed_super_scales[block_index % kIQ1MSuperScales.size()] = true;
+
+        for (std::uint32_t part = 0u; part < 8u; ++part) {
+            const std::uint32_t scale0 =
+                (static_cast<std::uint32_t>(block_index) + part) & 0x07u;
+            const std::uint32_t scale1 =
+                (static_cast<std::uint32_t>(block_index) * 3u + part * 5u) &
+                0x07u;
+            scale_words[part / 2u] |= static_cast<std::uint16_t>(
+                (scale0 | (scale1 << 3u)) << (6u * (part & 1u)));
+            observed_scale0[scale0] = true;
+            observed_scale1[scale1] = true;
+
+            for (std::uint32_t codeword = 0u; codeword < 4u;
+                 ++codeword) {
+                const std::uint32_t grid_index =
+                    static_cast<std::uint32_t>(block_index / 2u) * 32u +
+                    part * 4u + codeword;
+                const std::uint32_t delta_selector =
+                    static_cast<std::uint32_t>(block_index & 1u);
+                const std::uint32_t selector =
+                    ((grid_index >> 8u) & 0x07u) |
+                    (delta_selector << 3u);
+                block.qs[4u * part + codeword] =
+                    static_cast<std::uint8_t>(grid_index & 0xffu);
+                block.qh[2u * part + codeword / 2u] |=
+                    static_cast<std::uint8_t>(
+                        selector << (4u * (codeword & 1u)));
+                observed_grids[grid_index] = true;
+                observed_grid_deltas[grid_index][delta_selector] = true;
+                for (std::uint32_t bit = 0u; bit < 3u; ++bit) {
+                    observed_grid_high[bit][(grid_index >> (8u + bit)) & 1u] =
+                        true;
+                }
+                observed_deltas[delta_selector] = true;
+            }
+        }
+
+        for (std::uint32_t word_index = 0u; word_index < 4u;
+             ++word_index) {
+            scale_words[word_index] |= static_cast<std::uint16_t>(
+                ((d_bits >> (4u * word_index)) & 0x0fu) << 12u);
+            block.scales[2u * word_index] =
+                static_cast<std::uint8_t>(scale_words[word_index]);
+            block.scales[2u * word_index + 1u] =
+                static_cast<std::uint8_t>(scale_words[word_index] >> 8u);
+        }
+    }
+    std::fill(decoded.payload().begin(), decoded.payload().end(), kPoison);
+    decoded.capture_before_dispatch();
+
+    twin::Dispatch work;
+    work.label = "IQ1_M packed decoder exhaustive bitwise probe";
+    work.buffers = {{0u, weights.view()}, {1u, decoded.view()}};
+    work.grid_mode = twin::GridMode::threadgroups;
+    work.grid = {
+        static_cast<std::uint32_t>(round_up_div(values, 256u)), 1u, 1u};
+    work.threads_per_group = {256u, 1u, 1u};
+    work.parameters = &values;
+    work.parameter_bytes = sizeof(values);
+    work.parameter_index = 2u;
+    const bool dispatched = twin::dispatch_manifest(
+        context, "strata_pf_iq1_m_decode_probe", work, error);
+    check(dispatched, "IQ1_M decoder probe GPU completion", error);
+    if (!dispatched) return false;
+
+    const auto actual = typed<std::uint16_t>(decoded);
+    bool matches = true;
+    for (std::size_t block_index = 0u; block_index < block_count;
+         ++block_index) {
+        std::array<float, 256u> expected_values{};
+        twin::iq1_m_dequantize_reference(blocks[block_index], expected_values);
+        for (std::size_t offset = 0u; offset < expected_values.size(); ++offset) {
+            const std::uint16_t expected = half(expected_values[offset]);
+            if (actual[block_index * 256u + offset] != expected) {
+                matches = false;
+            }
+        }
+    }
+    const bool grids_covered = std::all_of(
+        observed_grids.begin(), observed_grids.end(),
+        [](bool seen) { return seen; });
+    const bool grid_delta_combinations_covered = std::all_of(
+        observed_grid_deltas.begin(), observed_grid_deltas.end(),
+        [](const auto& deltas_for_grid) {
+            return std::all_of(deltas_for_grid.begin(), deltas_for_grid.end(),
+                               [](bool seen) { return seen; });
+        });
+    const bool high_bits_covered = std::all_of(
+        observed_grid_high.begin(), observed_grid_high.end(),
+        [](const auto& values_for_bit) {
+            return std::all_of(values_for_bit.begin(), values_for_bit.end(),
+                               [](bool seen) { return seen; });
+        });
+    const bool deltas_covered = std::all_of(
+        observed_deltas.begin(), observed_deltas.end(),
+        [](bool seen) { return seen; });
+    const bool scales_covered =
+        std::all_of(observed_scale0.begin(), observed_scale0.end(),
+                    [](bool seen) { return seen; }) &&
+        std::all_of(observed_scale1.begin(), observed_scale1.end(),
+                    [](bool seen) { return seen; });
+    const bool super_scales_covered = std::all_of(
+        observed_super_scales.begin(), observed_super_scales.end(),
+        [](bool seen) { return seen; });
+    check(matches,
+          "IQ1_M GPU decoder matches independent CPU F16 bits for every value");
+    check(grids_covered && grid_delta_combinations_covered &&
+              high_bits_covered && deltas_covered &&
+              scales_covered && super_scales_covered,
+          "IQ1_M decoder probe covers every grid with both delta signs, all high bits, local scales, and super-scales");
+    const bool tail = tail_is_poison(decoded, output_bytes);
+    check(tail, "IQ1_M decoder probe preserves output tail");
+    const bool guards = guards_intact(weights) && guards_intact(decoded);
+    check(guards, "IQ1_M decoder probe preserves allocation guards");
+    return matches && grids_covered && grid_delta_combinations_covered &&
+           high_bits_covered && deltas_covered && scales_covered &&
+           super_scales_covered && tail && guards;
+}
+
 bool test_validation(Context& context, Context& foreign_context,
                      WeightFormat format) {
     const std::string format_name(weight_format_name(format));
@@ -2575,22 +3006,24 @@ int main(int argc, char** argv) {
          {WeightFormat::q2_0, WeightFormat::iq4_xs,
           WeightFormat::iq2_xxs, WeightFormat::iq2_xs,
           WeightFormat::iq2_s, WeightFormat::iq3_xxs,
-          WeightFormat::iq3_s}) {
+          WeightFormat::iq3_s, WeightFormat::iq1_m}) {
         passed &= test_validation(*context, *foreign, format);
     }
     passed &= test_decode_probe(*context);
     passed &= test_iq3_s_decode_probe(*context);
+    passed &= test_iq1_m_decode_probe(*context);
     passed &= test_iq4_xs_literal_decode_anchor();
     passed &= test_iq2_xxs_literal_decode_anchor();
     passed &= test_iq2_xs_literal_decode_anchor();
     passed &= test_iq2_s_literal_decode_anchor();
     passed &= test_iq3_xxs_literal_decode_anchor();
     passed &= test_iq3_s_literal_decode_anchor();
+    passed &= test_iq1_m_literal_decode_anchor();
     for (const WeightFormat format :
          {WeightFormat::q2_0, WeightFormat::iq4_xs,
           WeightFormat::iq2_xxs, WeightFormat::iq2_xs,
           WeightFormat::iq2_s, WeightFormat::iq3_xxs,
-          WeightFormat::iq3_s}) {
+          WeightFormat::iq3_s, WeightFormat::iq1_m}) {
         passed &= run_case(*context, format, 1u, true);
         passed &= run_case(*context, format, 7u, false);
         passed &= run_case(*context, format, 1u, false, true);

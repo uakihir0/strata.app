@@ -153,6 +153,41 @@ tf butterfly_sum_tf(std::array<tf, 32> values) {
 
 }  // namespace
 
+void iq1_m_dequantize_reference(const block_iq1_m& weight,
+                                std::span<float, 256u> output) {
+    const float d = strata::kernels::f32_from_f16(
+        iq1_m_half_scale_bits(weight));
+    for (std::uint32_t part = 0u; part < 8u; ++part) {
+        const std::uint32_t packed_scale = iq1_m_packed_scale(weight, part);
+        const std::array<std::uint32_t, 2u> local_scales = {
+            2u * (packed_scale & 0x07u) + 1u,
+            2u * ((packed_scale >> 3u) & 0x07u) + 1u};
+        for (std::uint32_t codeword = 0u; codeword < 4u; ++codeword) {
+            const std::uint32_t qh =
+                weight.qh[2u * part + codeword / 2u];
+            const std::uint32_t selector =
+                (qh >> (4u * (codeword & 1u))) & 0x0fu;
+            const std::uint32_t grid_index =
+                static_cast<std::uint32_t>(
+                    weight.qs[4u * part + codeword]) |
+                ((selector & 0x07u) << 8u);
+            const std::uint32_t packed_grid = iq1s_grid_gpu[grid_index];
+            const float delta =
+                (selector & 0x08u) != 0u ? -0.125f : 0.125f;
+            const std::uint32_t scale =
+                local_scales[codeword / 2u];
+            const float scaled_d = d * static_cast<float>(scale);
+            for (std::uint32_t lane = 0u; lane < 8u; ++lane) {
+                const std::uint32_t code =
+                    (packed_grid >> (4u * lane)) & 0x0fu;
+                output[32u * part + 8u * codeword + lane] =
+                    scaled_d *
+                    (static_cast<float>(code) - 1.0f + delta);
+            }
+        }
+    }
+}
+
 bool iq1_m_matvec_reference(std::span<const block_iq1_m> weights,
                             std::span<const Q81> activations,
                             std::uint32_t n_in, std::uint32_t n_out,
