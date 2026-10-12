@@ -5948,6 +5948,14 @@ These synthetic fixtures verify the grouping and row gather in isolation;
 production MoE scheduling, expert execution and model-backed Prefill remain
 pending.
 
+`metal_prefill_moe_post_test` and its concurrent CTest compare the shared
+expert's SwiGLU against an independent scalar oracle and the routed/shared
+combine against an ordered host FMA oracle. They cover row tails, saturated
+F16 outputs, rank-order cancellation, input immutability, output guards,
+Context ownership, active-range aliases and open concurrent groups. These
+post-ops remain isolated; expert tile execution, Prefill scheduling and
+production `Prefill::run` are still pending.
+
 The `metal_ple_test` fixture executes the documented weighted-norm, gate,
 broadcast, convolution-residual and history chain at T=1, 2 and 8. The
 distinct-buffer reference chain uses `encode_ple_post_projection` and checks

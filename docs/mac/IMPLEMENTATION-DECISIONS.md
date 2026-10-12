@@ -11918,3 +11918,52 @@ measuring L-15 remain open.
   review fixes. The full `mac-dev` build succeeded. `test_map.py` passed with
   its existing planned/no-check diagnostics; `check_drift.py` found no
   upstream changes and valid golden files; `git diff --check` passed.
+
+### D-IMPL-396: Implement isolated Prefill MoE post-ops
+
+- **Decision:** Add the documented shared-expert F32 SwiGLU with saturated
+  F16 output and the routed/shared ten-rank F32 combine as isolated Metal
+  kernels. Expose caller-owned Encoder and transactional CommandBuffer
+  wrappers. Validate checked active extents, row limits, alignment, Context
+  ownership and output/input disjointness, then bind active-length slices.
+  Use 64-bit shader indexing for flattened routed-part extents. Keep expert
+  tile execution, Prefill scheduling and production `Prefill::run` outside
+  this slice.
+- **Reason:** These post-ops have fixed arithmetic and storage contracts and
+  can be checked independently while the expert tile kernels and production
+  scheduler remain incomplete. Active slices allow disjoint live ranges to
+  share the Prefill arena without allowing the Encoder to bind oversized
+  overlapping views.
+- **Fixture judgment:** Exercise T=1/2/3/7/65 through both wrapper forms and
+  serial/concurrent dispatch. Compare SwiGLU with an independent scalar
+  equation within one F16 ULP, including both saturation signs. Compare
+  combine with ordered host FMA evaluation and include a rank-order
+  cancellation case whose reversed-order control differs. Cover immutable
+  inputs, guards, tails, foreign ownership, overlap rejection, disjoint
+  active ranges in shared arenas and concurrent-group policy. These synthetic
+  fixtures do not claim expert tile or model parity.
+- **Review required:** Challenge the SwiGLU conversion and saturation,
+  combine FMA order and shared-gate formula, grid/index bounds, checked
+  extents, active-range alias handling, buffer ownership and the scope of the
+  test/documentation claims.
+- **Validation:** The full `mac-dev` build succeeded. Serial and concurrent
+  `metal_prefill_moe_post_test` passed 2/2; together with both grouping CTests,
+  the focused MoE suite passed 4/4. `test_map.py` passed with the existing
+  planned/no-check diagnostics; `check_drift.py` reported no upstream changes
+  and valid golden files; `git diff --check` passed. REV-192 records the
+  adversarial source review.
+
+### REV-192: Adversarial review of Prefill MoE post-ops
+
+- **Scope:** Audit the SwiGLU and combine kernels, host ABI and launch
+  geometry, arithmetic and conversion, checked extents and shader indexing,
+  ownership/alignment/aliases, concurrent-group boundaries, test coverage,
+  and CMake, manifest and documentation wiring.
+- **Findings:** The reviewer reported no actionable issue. The review was
+  source-only and did not independently build or run tests.
+- **Disposition:** No code changes were required from this review.
+- **Validation:** The full `mac-dev` build succeeded. Both serial and
+  concurrent post-op CTests passed, as did the serial and concurrent grouping
+  CTests (4/4 combined). `test_map.py` passed with its documented
+  planned/no-check diagnostics; `check_drift.py` found no upstream changes
+  and valid golden files; `git diff --check` passed.
