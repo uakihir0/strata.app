@@ -11967,3 +11967,93 @@ measuring L-15 remain open.
   CTests (4/4 combined). `test_map.py` passed with its documented
   planned/no-check diagnostics; `check_drift.py` found no upstream changes
   and valid golden files; `git diff --check` passed.
+
+### D-IMPL-397: Implement isolated Prefill Q2_0 MoE gate/up expert tiles
+
+- **Decision:** Add a typed, transactional encoder for the Q2_0 gate/up
+  expert tile and saturated F16 SwiGLU epilogue. Keep the slice limited to
+  this weight format and accept 1..`kPrefillMaxShaderRows` rows (419,430),
+  256/512 expert tables and the selected layer's validated address row.
+  Validate every indirect weight address against Context-owned backing
+  storage, bind those resources to Metal, and reject output aliases before
+  dispatch. `TieredStorage` marks its reusable slot arena in the owning
+  allocation's validity token; callers cannot claim that a tiered allocation
+  is stable full-mode storage. For tiered storage, require a prepared
+  `ExpertLeaseSet` for the same command buffer and check that each gate/up
+  range used by an expert is covered by a live lease for the selected layer.
+  Copy the validated address row into caller-owned scratch before dispatch;
+  require this scratch to be disjoint from active data and prior writes in the
+  same Encoder, unique across pending dispatches, and unchanged through
+  command completion, so earlier GPU stages cannot alter the indirect
+  pointers. The CommandBuffer rejects overlapping snapshot ranges within its
+  pending work; concurrent command buffers require distinct scratch ranges.
+  The GPU plan validator clears status and checks plan boundaries, strictly
+  increasing expert IDs, exact tile count and tile order before expert work.
+  The status word
+  distinguishes a missing active address (bit 0), malformed plan/tile
+  (bit 1) and missing tiered lease (bit 2); failed GPU tiles are zeroed
+  without reading missing or unpinned weights, and a short failed group
+  cannot zero the following expert's output. Retain the actual command-buffer
+  identity token in its lease set so destroying a wrapper cannot make a
+  later wrapper appear to be the same command.
+- **Reason:** The Q2_0 matrix tile and decode contract can be validated
+  against an independent GPU bit probe and FP64 dot oracle while preserving
+  the documented dispatch shape. Indirect addresses need explicit backing
+  and resource lifetime checks, and merely preparing a lease set does not
+  prove that it owns the slots named by an active address table. A bitmask
+  provides deterministic fail-closed behavior when GPU-produced plan or
+  tiered state cannot be inspected on the CPU. Full tiered scheduling and
+  production `Prefill::run` are still incomplete, so this encoder does not
+  claim end-to-end inference.
+- **Fixture judgment:** Compose grouping, F16 gather, expert tiles and
+  SwiGLU at T=1 and T=7 with different weights for experts 0 and 3. Route
+  65 entries to expert 0 and 5 to expert 3 at T=7 to cross the 64-row tile
+  boundary. Compare all four Q2_0 codes bitwise in a decode probe and
+  compare outputs with an independent FP64 dot oracle. Cover signed inputs,
+  missing addresses on either group, malformed plans, duplicate/out-of-order
+  expert IDs, missing tile lists and malformed tiles with a valid header,
+  guards, tails, immutable inputs/weights, bounded backing views, range
+  aliases, a same-command grouping write that overwrites the source address
+  row, snapshot-scratch aliases, reuse of one scratch range across different
+  layer calls, and rollback after both preflight and later caller-owned
+  failures.
+  Keep the live-slot coverage and unpinned nonzero-weight probe in
+  `metal_window_storage_test`, where the real ExpertStore lifecycle is
+  exercised.
+- **Review required:** See REV-193. Challenge Q2 decoding and epilogue math,
+  threadgroup indexing, shader bounds, malformed-plan zeroing, status
+  ordering, resource lifetime, stable command identity, tiered-source
+  provenance, exact lease coverage, transaction rollback, fixture independence
+  and all production-readiness claims. Confirm the tiered behavior is
+  documented as fail-closed pending schedule integration.
+- **Validation:** Build and focused tests passed; see REV-193 for the
+  verification results and hostile-review disposition.
+
+### REV-193: Adversarial review of Prefill Q2_0 expert tiles
+
+- **Scope:** Audit Q2_0 decode and tiled GEMM indexing, SwiGLU conversion,
+  malformed-plan handling, indirect address bounds and resource lifetime,
+  tiered lease provenance, command-buffer identity, transaction rollback,
+  scratch aliasing/reuse, test-oracle independence and production-readiness
+  claims.
+- **Findings:** Earlier review passes found issues with command-buffer wrapper
+  identity reuse, caller-forgeable tiered provenance, tile-count and tile-order
+  validation, failed-tile zeroing boundaries, duplicate expert IDs, a preceding
+  GPU write changing the source address row, and reusing one snapshot range for
+  multiple pending layer dispatches. A few test/documentation claims also needed
+  tighter evidence. After the fixes, the hostile follow-up found no actionable
+  findings. That follow-up was source-only and did not run tests.
+- **Disposition:** Retain a shared command identity token; stamp tiered-arena
+  provenance in the owning allocation; validate exact ordered tiles and strict
+  expert IDs on GPU; bound zeroing to the failed tile/group; snapshot the
+  selected address row into caller scratch; reserve snapshot ranges across
+  pending Encoder segments and reject reuse; and narrow claims to evidence the
+  fixtures observe. The API records the remaining caller lifetime rule for
+  distinct pending command buffers. No production scheduler or model parity is
+  claimed.
+- **Validation:** The full `mac-dev` build succeeded. The serial and
+  concurrent `metal_prefill_moe_expert_test` cases and
+  `metal_window_storage_test` passed 3/3; `mac-host` passed 45 tests with one
+  expected skip. `test_map.py` reported all checks passed with its documented
+  planned/no-check diagnostics; `check_drift.py` found no upstream changes and
+  valid golden files; `git diff --check` passed.

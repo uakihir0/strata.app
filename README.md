@@ -30,6 +30,11 @@ up projection, injection and four-stream mixing. Serial and concurrent
 synthetic tests cover all BF16X2 modes; layer scheduling, MoE integration and
 production chunk execution are still unimplemented.
 
+A synthetic Prefill MoE path now composes expert grouping and row gathering
+with Q2_0 gate/up SIMD-group tiles and their SwiGLU output. The other expert
+formats, down projections, MoE scheduling and production `Prefill::run`
+integration are still in progress.
+
 ## Build and test entry points
 
 The CMake presets target arm64 and macOS 27. The `mac-dev` preset enables the Metal backend and

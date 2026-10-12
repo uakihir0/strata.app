@@ -308,7 +308,8 @@ column points to the specification. "Threads" is the manifest value.
 | `strata_pf_gemm_bf16` | `mpp`, `simd` | 6.2 |
 | `strata_pf_gemm_bf16_mpp` | isolated Apple10 MPP component; not the production selector | 6.2 |
 | `strata_pf_sort_count`, `strata_pf_sort_scan`, `strata_pf_sort_scatter`, `strata_pf_gather_f16` | | 6.6 |
-| `strata_pf_moe_gu_<fmt>`, `strata_pf_moe_down_<fmt>` | the 8 gate/up and 2 down formats; `mpp`, `simd`. The gate/up tile applies the SwiGLU in its epilogue. | 6.6 |
+| `strata_pf_moe_gu_<fmt>` | Q2_0 SIMD tile implemented as an isolated encoder; seven other formats and MPP remain planned. The gate/up tile applies SwiGLU in its epilogue. | 6.6 |
+| `strata_pf_moe_down_<fmt>` | the Q2_0 and IQ4_NL formats; planned | 6.6 |
 | `strata_pf_swiglu_pair` (the shared expert's SwiGLU) | | 6.6 |
 | `strata_pf_combine` | | 6.6 |
 
@@ -4983,6 +4984,17 @@ The prefill MoE computes the decode MoE's function over T rows (section 5.10). I
 | 12 | `strata_pf_moe_down_<fmt>` | `eh`, `plan[l]`, `tiles`, `dst`, `addr[l]` → `parts[T][10][2560]` |
 | 13 | `strata_pf_combine` | `parts`, `wts`, `shared`, `gl` → `bo` |
 
+The count/scan/scatter, row-gather, shared-expert post-ops and isolated Q2_0
+gate/up tile now have typed GPU encoders and synthetic oracle coverage. The
+expert encoder copies the validated selected address row into caller-owned
+scratch before dispatch. Use a unique range for each pending expert dispatch,
+keep it unchanged through completion, and keep it disjoint from earlier writes
+in the same `Encoder`. The `CommandBuffer` rejects overlapping snapshot ranges
+within its pending work. The GPU test deliberately aliases an earlier grouping
+histogram write with the source address row to verify that the expert consumes
+the snapshot. Other gate/up formats, both down formats, full scheduling and
+`Prefill::run` integration remain planned.
+
 - Upstream runs the shared expert and its gate before the grouping. The Mac runs the grouping first, so the shared
   expert overlaps the `MissResolver` in tiered mode, as in decode (section 8.3). No step reads another's output
   except along the arrows of the table, so the order changes no bit.
@@ -5945,16 +5957,41 @@ boundaries, invalid IDs, `PfPlan` padding, active scratch tails, disjoint
 active slices of an oversized shared allocation, and range/alias/ownership
 validation.
 These synthetic fixtures verify the grouping and row gather in isolation;
-production MoE scheduling, expert execution and model-backed Prefill remain
-pending.
+production MoE scheduling/integration and model-backed Prefill remain pending.
 
 `metal_prefill_moe_post_test` and its concurrent CTest compare the shared
 expert's SwiGLU against an independent scalar oracle and the routed/shared
 combine against an ordered host FMA oracle. They cover row tails, saturated
 F16 outputs, rank-order cancellation, input immutability, output guards,
 Context ownership, active-range aliases and open concurrent groups. These
-post-ops remain isolated; expert tile execution, Prefill scheduling and
-production `Prefill::run` are still pending.
+post-ops remain independently tested.
+
+`metal_prefill_moe_expert_test` and its concurrent CTest compose grouping,
+F16 row gathering, Q2_0 gate/up tiles and the fused SwiGLU epilogue. T=1 and
+T=7 route to two experts with different weight addresses and signed inputs;
+at T=7, the first expert has 65 entries and its tile splits at row 64. An
+independent GPU decode probe checks every F16 weight bit for all four Q2_0
+codes. Hidden outputs are checked against an FP64-dot oracle within four F16 ULPs. The
+expert fixtures also verify missing addresses and malformed plan/tile data
+set distinct GPU status bits and zero affected output, and that both preflight
+failure and a later caller-owned failure discard queued work without changing
+status. They check immutable input and weight bytes, output guards and tails,
+bounded backing resources, Context ownership, active aliases and ordered
+dispatch. A grouping histogram deliberately overwrites the source address row
+earlier in the same Encoder; a dedicated caller-owned snapshot keeps expert
+addresses valid and the result matches the oracle. Snapshot scratch cannot be
+reused by another dispatch in that command buffer; callers use separate
+scratch across concurrently pending command buffers and keep each range
+unchanged through completion. The fixture also corrupts a tile while leaving
+the plan header valid and checks zeroed output. The separate
+`metal_window_storage_test` checks live same-layer
+slot coverage and that an unpinned tiered address sets its status bit and
+zeros output without dereferencing the address. The T=7 expert fixture also
+fails the first expert's address and confirms its 65-entry group is zeroed
+without erasing the following expert's five outputs.
+Only the Q2_0 gate/up format is implemented in this slice; the other seven
+gate/up formats, both down formats, production Prefill scheduling and
+model-backed parity remain pending.
 
 The `metal_ple_test` fixture executes the documented weighted-norm, gate,
 broadcast, convolution-residual and history chain at T=1, 2 and 8. The
