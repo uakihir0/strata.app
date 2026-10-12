@@ -3,6 +3,7 @@
 #include "oracles/qsa.hpp"
 #include "strata/metal/context.hpp"
 #include "strata/metal/encoder.hpp"
+#include "strata/metal/prefill_qsa_prepare_dispatch.hpp"
 #include "strata/metal/qsa_dispatch.hpp"
 #include "twin.hpp"
 
@@ -5371,6 +5372,712 @@ bool run_indexer_append_case(Context& context, std::uint32_t token_rows,
            outer_guards;
 }
 
+bool run_prefill_qsa_prepare_case(
+    Context& context, QsaAttentionMode mode, bool rotate_uncompressed_kv,
+    bool shared_encoder, const twin::Options& options,
+    bool test_late_rollback, bool test_cross_stage_alias,
+    bool test_preflight_contracts) {
+    struct ExpectedRotation {
+        QsaAttentionMode mode;
+        bool optional_rotation;
+        bool keys;
+        bool values;
+        bool query;
+        PrefillQsaAttentionTransform attention;
+    };
+    constexpr std::array expected_rotations{
+        ExpectedRotation{QsaAttentionMode::f16, false, false, false, false,
+                         PrefillQsaAttentionTransform::none},
+        ExpectedRotation{QsaAttentionMode::f16, true, true, true, true,
+                         PrefillQsaAttentionTransform::fwht256},
+        ExpectedRotation{QsaAttentionMode::i8, false, false, false, false,
+                         PrefillQsaAttentionTransform::none},
+        ExpectedRotation{QsaAttentionMode::i8, true, true, true, true,
+                         PrefillQsaAttentionTransform::fwht256},
+        ExpectedRotation{QsaAttentionMode::q4, false, true, true, true,
+                         PrefillQsaAttentionTransform::fwht256},
+        ExpectedRotation{QsaAttentionMode::q4, true, true, true, true,
+                         PrefillQsaAttentionTransform::fwht256},
+        ExpectedRotation{QsaAttentionMode::k8v4, false, false, true, false,
+                         PrefillQsaAttentionTransform::fwht256},
+        ExpectedRotation{QsaAttentionMode::k8v4, true, false, true, false,
+                         PrefillQsaAttentionTransform::fwht256},
+    };
+    const auto expected_rotation = std::find_if(
+        expected_rotations.begin(), expected_rotations.end(),
+        [=](const ExpectedRotation& item) {
+            return item.mode == mode &&
+                   item.optional_rotation == rotate_uncompressed_kv;
+        });
+    if (expected_rotation == expected_rotations.end()) {
+        check(false, "Prefill QSA test has a fixed rotation expectation");
+        return false;
+    }
+    constexpr std::uint32_t kRows = 5u;
+    constexpr std::uint32_t kPosition0 = 3u;
+    constexpr std::uint32_t kCellCapacity = 32u;
+    constexpr float kRopeZeroCos = 1.125f;
+    constexpr float kRopeZeroSin = -0.0f;
+    constexpr std::size_t kRopeCells = kCellCapacity;
+    constexpr std::size_t kPoolRows =
+        kCellCapacity / INDEXER_BLOCK_CELLS + 2u;
+    constexpr std::size_t kKvInputBytes =
+        static_cast<std::size_t>(kRows) * 2u * HEAD_DIM * sizeof(float);
+    constexpr std::size_t kQFullBytes =
+        static_cast<std::size_t>(kRows) * N_HEAD_Q * 2u * HEAD_DIM *
+        sizeof(float);
+    constexpr std::size_t kQueryOutputBytes =
+        static_cast<std::size_t>(kRows) * N_HEAD_Q * HEAD_DIM * sizeof(float);
+    constexpr std::size_t kIndexerQueryBytes =
+        static_cast<std::size_t>(kRows) * INDEXER_HEADS * INDEXER_HEAD_DIM *
+        sizeof(float);
+    constexpr std::size_t kRawIndexerBytes =
+        static_cast<std::size_t>(kRows) * INDEXER_HEAD_DIM * sizeof(float);
+    constexpr std::size_t kGammaBytes = HEAD_DIM * sizeof(float);
+    constexpr std::size_t kIndexerGammaBytes =
+        INDEXER_HEAD_DIM * sizeof(float);
+    constexpr std::size_t kStepBytes = kRows * sizeof(StepRow);
+    constexpr std::size_t kRopeBytes =
+        kRopeCells * 32u * 2u * sizeof(float);
+    constexpr std::size_t kF16PoolBytes =
+        kCellCapacity * 2u * HEAD_DIM * sizeof(std::uint16_t);
+    constexpr std::size_t kI8CodeBytes =
+        kCellCapacity * 2u * HEAD_DIM * sizeof(std::int8_t);
+    constexpr std::size_t kI8ScaleBytes =
+        kCellCapacity * 2u * 4u * sizeof(std::uint16_t);
+    constexpr std::size_t kQ4PoolBytes =
+        kCellCapacity * 2u * (HEAD_DIM / 32u) * 18u;
+    constexpr std::size_t kTailBytes =
+        3u * INDEXER_HEAD_DIM * sizeof(float);
+    constexpr std::size_t kDeadBytes = INDEXER_HEAD_DIM * sizeof(float);
+    constexpr std::size_t kIndexerPoolBytes =
+        kPoolRows * INDEXER_HEAD_DIM * sizeof(float);
+    constexpr std::size_t kArenaBytes = 1'000'000u;
+
+    const std::string label =
+        "Prefill QSA preparation mode=" +
+        std::to_string(static_cast<std::uint32_t>(mode)) +
+        (rotate_uncompressed_kv ? " rotated" : " native") +
+        (shared_encoder ? " shared Encoder" : " standalone");
+    bool passed = true;
+    std::string error;
+    twin::GuardedBuffer arena;
+    check(arena.allocate(context, label + " arena", kArenaBytes, error),
+          label + " arena allocation", error);
+    if (!arena.view()) return false;
+
+    const BufferRef arena_view = arena.view();
+    std::size_t cursor = 0u;
+    const auto allocate = [&](std::size_t bytes) {
+        cursor = (cursor + 63u) & ~std::size_t{63u};
+        if (bytes == 0u || cursor > arena_view.length ||
+            bytes > arena_view.length - cursor) {
+            return BufferRef{};
+        }
+        const BufferRef view = arena_view.slice(cursor, bytes);
+        cursor += bytes;
+        return view;
+    };
+    std::memset(arena.payload().data(), 0xa5, arena.payload().size());
+
+    const BufferRef key = allocate(kKvInputBytes);
+    const BufferRef key_gamma = allocate(kGammaBytes);
+    const BufferRef steps = allocate(kStepBytes);
+    const BufferRef rope = allocate(kRopeBytes);
+    const BufferRef values = allocate(kKvInputBytes);
+    const BufferRef q_full = allocate(kQFullBytes);
+    const BufferRef query_gamma = allocate(kGammaBytes);
+    const BufferRef qcur = allocate(kQueryOutputBytes);
+    const BufferRef indexer_query = allocate(kIndexerQueryBytes);
+    const BufferRef indexer_query_gamma = allocate(kIndexerGammaBytes);
+    const BufferRef raw_indexer = allocate(kRawIndexerBytes);
+    const BufferRef indexer_gamma = allocate(kIndexerGammaBytes);
+    const BufferRef indexer_tail = allocate(kTailBytes);
+    const BufferRef indexer_dead = allocate(kDeadBytes);
+    const BufferRef indexer_pool = allocate(kIndexerPoolBytes);
+    const BufferRef block_position = allocate(sizeof(std::int32_t));
+    const BufferRef f16_key_pool = allocate(kF16PoolBytes);
+    const BufferRef f16_value_pool = allocate(kF16PoolBytes);
+    const BufferRef i8_key_codes = allocate(kI8CodeBytes);
+    const BufferRef i8_key_scales = allocate(kI8ScaleBytes);
+    const BufferRef i8_value_codes = allocate(kI8CodeBytes);
+    const BufferRef i8_value_scales = allocate(kI8ScaleBytes);
+    const BufferRef q4_key_pool = allocate(kQ4PoolBytes);
+    const BufferRef q4_value_pool = allocate(kQ4PoolBytes);
+    const BufferRef k8v4_key_codes = allocate(kI8CodeBytes);
+    const BufferRef k8v4_key_scales = allocate(kI8ScaleBytes);
+    const BufferRef k8v4_value_pool = allocate(kQ4PoolBytes);
+    const std::array all_views{
+        key, key_gamma, steps, rope, values, q_full, query_gamma, qcur,
+        indexer_query, indexer_query_gamma, raw_indexer, indexer_gamma,
+        indexer_tail, indexer_dead, indexer_pool, block_position,
+        f16_key_pool, f16_value_pool, i8_key_codes, i8_key_scales,
+        i8_value_codes, i8_value_scales, q4_key_pool, q4_value_pool,
+        k8v4_key_codes, k8v4_key_scales, k8v4_value_pool};
+    if (std::any_of(all_views.begin(), all_views.end(),
+                    [](BufferRef view) { return !view; })) {
+        check(false, label + " active views fit the guarded arena");
+        return false;
+    }
+    const BufferRef detached_indexer_query =
+        arena_view.slice(cursor + 64u, kIndexerQueryBytes);
+    if (!detached_indexer_query) {
+        check(false, label + " detached indexer-query view fits the arena");
+        return false;
+    }
+
+    std::vector<std::uint32_t> tokens(kRows);
+    for (std::uint32_t row = 0u; row < kRows; ++row) {
+        tokens[row] = row * 17u + 3u;
+    }
+    PrefillChunkMetadata metadata;
+    if (!build_prefill_chunk_metadata(kPosition0, tokens, metadata, error)) {
+        check(false, label + " Prefill metadata", error);
+        return false;
+    }
+    std::vector<StepRow> host_steps(kRows);
+    std::vector<std::int32_t> positions(kRows);
+    for (std::uint32_t row = 0u; row < kRows; ++row) {
+        const std::int32_t pos =
+            static_cast<std::int32_t>(kPosition0 + row);
+        positions[row] = pos;
+        const std::int32_t n_kv = pos + 1;
+        host_steps[row] =
+            StepRow{pos, n_kv,
+                    n_kv / static_cast<std::int32_t>(
+                               INDEXER_BLOCK_CELLS),
+                    std::min<std::int32_t>(n_kv, 2051)};
+    }
+    std::memcpy(steps.contents, host_steps.data(), kStepBytes);
+
+    std::vector<float> source_keys(kKvInputBytes / sizeof(float));
+    std::vector<float> source_values(source_keys.size());
+    std::vector<float> source_q_full(kQFullBytes / sizeof(float));
+    std::vector<float> source_indexer_query(kIndexerQueryBytes /
+                                            sizeof(float));
+    std::vector<float> source_raw_indexer(kRawIndexerBytes / sizeof(float));
+    std::vector<float> host_key_gamma(HEAD_DIM);
+    std::vector<float> host_query_gamma(HEAD_DIM);
+    std::vector<float> host_indexer_query_gamma(INDEXER_HEAD_DIM);
+    std::vector<float> host_indexer_gamma(INDEXER_HEAD_DIM);
+    std::vector<float> host_rope(kRopeBytes / sizeof(float));
+    const auto generate = [&](std::span<float> output, float scale,
+                              std::uint32_t seed) {
+        std::mt19937_64 rng(options.seed ^ seed);
+        for (std::size_t i = 0u; i < output.size(); ++i) {
+            output[i] = sample(twin::InputSet::fixture, rng,
+                               static_cast<std::uint32_t>(i) + seed, scale);
+        }
+    };
+    generate(source_keys, 6.0f, 0x1771u);
+    generate(source_values, 3.0f, 0x2883u);
+    generate(source_q_full, 8.0f, 0x3995u);
+    generate(source_indexer_query, 6.0f, 0x4aa7u);
+    generate(source_raw_indexer, 2.75f, 0x5bb9u);
+    generate(host_key_gamma, 1.0f, 0x6ccbU);
+    generate(host_query_gamma, 1.0f, 0x7dddu);
+    generate(host_indexer_query_gamma, 1.0f, 0x8eefU);
+    generate(host_indexer_gamma, 1.0f, 0x9ff1u);
+    for (auto& value : host_key_gamma) value = 1.0f + value * 0.375f;
+    for (auto& value : host_query_gamma) value = 1.0f + value * 0.375f;
+    for (auto& value : host_indexer_query_gamma) {
+        value = 1.0f + value * 0.375f;
+    }
+    for (auto& value : host_indexer_gamma) value = 1.0f + value * 0.375f;
+    for (std::uint32_t cell = 0u; cell < kRopeCells; ++cell) {
+        for (std::uint32_t pair = 0u; pair < 32u; ++pair) {
+            const float angle =
+                static_cast<float>((cell * 13u + pair * 7u) % 257u) *
+                0.013f;
+            const std::size_t index =
+                (static_cast<std::size_t>(cell) * 32u + pair) * 2u;
+            host_rope[index] = std::cos(angle) * 1.0625f;
+            host_rope[index + 1u] = std::sin(angle) * 1.0625f;
+        }
+    }
+    std::memcpy(key.contents, source_keys.data(), kKvInputBytes);
+    std::memcpy(values.contents, source_values.data(), kKvInputBytes);
+    std::memcpy(q_full.contents, source_q_full.data(), kQFullBytes);
+    std::memcpy(indexer_query.contents, source_indexer_query.data(),
+                kIndexerQueryBytes);
+    std::memcpy(raw_indexer.contents, source_raw_indexer.data(),
+                kRawIndexerBytes);
+    std::memcpy(key_gamma.contents, host_key_gamma.data(), kGammaBytes);
+    std::memcpy(query_gamma.contents, host_query_gamma.data(), kGammaBytes);
+    std::memcpy(indexer_query_gamma.contents,
+                host_indexer_query_gamma.data(), kIndexerGammaBytes);
+    std::memcpy(indexer_gamma.contents, host_indexer_gamma.data(),
+                kIndexerGammaBytes);
+    std::memcpy(rope.contents, host_rope.data(), kRopeBytes);
+
+    constexpr std::uint16_t kHalfSentinel = 0x7bffu;
+    constexpr std::int8_t kCodeSentinel = 0x55;
+    constexpr std::uint16_t kScaleSentinel = 0x5aa5u;
+    constexpr std::uint8_t kQ4Sentinel = 0xa5u;
+    const auto initialize = [](BufferRef view, auto value) {
+        using T = decltype(value);
+        auto output = std::span<T>(static_cast<T*>(view.contents),
+                                   view.length / sizeof(T));
+        std::fill(output.begin(), output.end(), value);
+    };
+    initialize(f16_key_pool, kHalfSentinel);
+    initialize(f16_value_pool, kHalfSentinel);
+    initialize(i8_key_codes, kCodeSentinel);
+    initialize(i8_key_scales, kScaleSentinel);
+    initialize(i8_value_codes, kCodeSentinel);
+    initialize(i8_value_scales, kScaleSentinel);
+    initialize(q4_key_pool, kQ4Sentinel);
+    initialize(q4_value_pool, kQ4Sentinel);
+    initialize(k8v4_key_codes, kCodeSentinel);
+    initialize(k8v4_key_scales, kScaleSentinel);
+    initialize(k8v4_value_pool, kQ4Sentinel);
+
+    oracle::QsaIndexerState initial_indexer;
+    initial_indexer.tail.assign(3u * INDEXER_HEAD_DIM, -13.25f);
+    initial_indexer.dead.assign(INDEXER_HEAD_DIM, -17.5f);
+    initial_indexer.pooled.assign(kPoolRows * INDEXER_HEAD_DIM, -19.75f);
+    initial_indexer.block_position = -23;
+    std::vector<std::int32_t> prefix_positions(kPosition0);
+    std::vector<float> prefix_keys(
+        static_cast<std::size_t>(kPosition0) * INDEXER_HEAD_DIM);
+    std::mt19937_64 prefix_rng(options.seed ^ 0xa119u);
+    for (std::uint32_t row = 0u; row < kPosition0; ++row) {
+        prefix_positions[row] = static_cast<std::int32_t>(row);
+        for (std::uint32_t dimension = 0u; dimension < INDEXER_HEAD_DIM;
+             ++dimension) {
+            const std::size_t index =
+                static_cast<std::size_t>(row) * INDEXER_HEAD_DIM + dimension;
+            prefix_keys[index] =
+                sample(twin::InputSet::fixture, prefix_rng,
+                       static_cast<std::uint32_t>(index) + 0xa119u, 2.75f);
+        }
+    }
+    oracle::qsa_indexer_append(
+        prefix_keys, prefix_positions, host_indexer_gamma, host_rope,
+        kRopeZeroCos, kRopeZeroSin, initial_indexer);
+    std::memcpy(indexer_tail.contents, initial_indexer.tail.data(),
+                kTailBytes);
+    std::memcpy(indexer_dead.contents, initial_indexer.dead.data(),
+                kDeadBytes);
+    std::memcpy(indexer_pool.contents, initial_indexer.pooled.data(),
+                kIndexerPoolBytes);
+    std::memcpy(block_position.contents, &initial_indexer.block_position,
+                sizeof(initial_indexer.block_position));
+
+    const QsaNormRopeBuffers key_norm{
+        key, key_gamma, steps, rope, key};
+    const QsaNormRopeBuffers query_norm{
+        q_full, query_gamma, steps, rope, qcur};
+    const QsaNormRopeBuffers indexer_query_norm{
+        indexer_query, indexer_query_gamma, steps, rope, indexer_query};
+    PrefillQsaKvAppendBuffers kv_append;
+    switch (mode) {
+        case QsaAttentionMode::f16:
+            kv_append = QsaKvAppendF16Buffers{
+                key, values, steps, f16_key_pool, f16_value_pool};
+            break;
+        case QsaAttentionMode::i8:
+            kv_append = QsaKvAppendI8Buffers{
+                key, values, steps, i8_key_codes, i8_key_scales,
+                i8_value_codes, i8_value_scales};
+            break;
+        case QsaAttentionMode::q4:
+            kv_append = QsaKvAppendQ4Buffers{
+                key, values, steps, q4_key_pool, q4_value_pool};
+            break;
+        case QsaAttentionMode::k8v4:
+            kv_append = QsaKvAppendK8V4Buffers{
+                key, values, steps, k8v4_key_codes, k8v4_key_scales,
+                k8v4_value_pool};
+            break;
+    }
+    const QsaPrefillIndexerAppendBuffers indexer_append{
+        raw_indexer, indexer_gamma, rope, indexer_tail, indexer_dead,
+        indexer_pool, block_position};
+    const PrefillQsaPrepareBuffers prepare_buffers{
+        key_norm, query_norm, indexer_query_norm, kv_append, indexer_append};
+
+    std::vector<twin::tf> expected_keys_tf;
+    oracle::qsa_norm_rope(source_keys, host_key_gamma, positions, host_rope,
+                          kRows, QsaNormRopeMode::key, expected_keys_tf);
+    std::vector<float> expected_keys;
+    expected_keys.reserve(expected_keys_tf.size());
+    for (const twin::tf value : expected_keys_tf) {
+        expected_keys.push_back(value.value);
+    }
+    const bool rotate_keys = expected_rotation->keys;
+    const bool rotate_values = expected_rotation->values;
+    const bool rotate_query = expected_rotation->query;
+    if (rotate_keys) {
+        std::vector<twin::tf> transformed;
+        oracle::qsa_fwht256(expected_keys, kRows * 2u, transformed);
+        std::transform(transformed.begin(), transformed.end(),
+                       expected_keys.begin(),
+                       [](const twin::tf value) { return value.value; });
+    }
+    std::vector<float> expected_values = source_values;
+    if (rotate_values) {
+        std::vector<twin::tf> transformed;
+        oracle::qsa_fwht256(expected_values, kRows * 2u, transformed);
+        std::transform(transformed.begin(), transformed.end(),
+                       expected_values.begin(),
+                       [](const twin::tf value) { return value.value; });
+    }
+    std::vector<twin::tf> expected_qcur;
+    oracle::qsa_norm_rope(source_q_full, host_query_gamma, positions,
+                          host_rope, kRows, QsaNormRopeMode::query,
+                          expected_qcur);
+    if (rotate_query) {
+        std::vector<float> query_values;
+        query_values.reserve(expected_qcur.size());
+        for (const twin::tf value : expected_qcur) {
+            query_values.push_back(value.value);
+        }
+        std::vector<twin::tf> transformed;
+        oracle::qsa_fwht256(query_values, kRows * N_HEAD_Q, transformed);
+        expected_qcur = std::move(transformed);
+    }
+    std::vector<twin::tf> expected_indexer_query;
+    oracle::qsa_norm_rope(
+        source_indexer_query, host_indexer_query_gamma, positions, host_rope,
+        kRows, QsaNormRopeMode::indexer_query, expected_indexer_query);
+    oracle::QsaIndexerState expected_indexer = initial_indexer;
+    oracle::qsa_indexer_append(
+        source_raw_indexer, positions, host_indexer_gamma, host_rope,
+        kRopeZeroCos, kRopeZeroSin, expected_indexer);
+
+    std::vector<std::uint16_t> expected_f16_keys(
+        kF16PoolBytes / sizeof(std::uint16_t), kHalfSentinel);
+    std::vector<std::uint16_t> expected_f16_values(
+        kF16PoolBytes / sizeof(std::uint16_t), kHalfSentinel);
+    std::vector<std::int8_t> expected_i8_key_codes(
+        kI8CodeBytes, kCodeSentinel);
+    std::vector<std::int8_t> expected_i8_value_codes(
+        kI8CodeBytes, kCodeSentinel);
+    std::vector<std::uint16_t> expected_i8_key_scales(
+        kI8ScaleBytes / sizeof(std::uint16_t), kScaleSentinel);
+    std::vector<std::uint16_t> expected_i8_value_scales(
+        kI8ScaleBytes / sizeof(std::uint16_t), kScaleSentinel);
+    std::vector<std::uint8_t> expected_q4_keys(kQ4PoolBytes, kQ4Sentinel);
+    std::vector<std::uint8_t> expected_q4_values(kQ4PoolBytes, kQ4Sentinel);
+    if (mode == QsaAttentionMode::f16) {
+        oracle::qsa_kv_append_f16(expected_keys, expected_values, positions,
+                                  expected_f16_keys, expected_f16_values);
+    } else if (mode == QsaAttentionMode::i8) {
+        oracle::qsa_kv_append_i8(
+            expected_keys, expected_values, positions, expected_i8_key_codes,
+            expected_i8_key_scales, expected_i8_value_codes,
+            expected_i8_value_scales);
+    } else if (mode == QsaAttentionMode::q4) {
+        oracle::qsa_kv_append_q4(expected_keys, expected_values, positions,
+                                 expected_q4_keys, expected_q4_values);
+    } else {
+        std::vector<std::int8_t> ignored_value_codes(kI8CodeBytes);
+        std::vector<std::uint16_t> ignored_value_scales(
+            kI8ScaleBytes / sizeof(std::uint16_t));
+        oracle::qsa_kv_append_i8(
+            expected_keys, expected_values, positions,
+            expected_i8_key_codes, expected_i8_key_scales,
+            ignored_value_codes, ignored_value_scales);
+        std::vector<std::uint8_t> ignored_key_pool(kQ4PoolBytes);
+        oracle::qsa_kv_append_q4(
+            expected_keys, expected_values, positions, ignored_key_pool,
+            expected_q4_values);
+    }
+
+    const auto byte_equal = [](BufferRef view, const auto& expected) {
+        return view.length == expected.size() * sizeof(expected[0]) &&
+               std::memcmp(view.contents, expected.data(), view.length) == 0;
+    };
+    const auto floats_as_tf = [](std::span<const float> values) {
+        std::vector<twin::tf> output;
+        output.reserve(values.size());
+        for (const float value : values) output.emplace_back(value);
+        return output;
+    };
+    const auto expect_floats = [&](BufferRef actual,
+                                   std::span<const twin::tf> expected,
+                                   std::string_view name) {
+        const auto actual_values =
+            std::span<const float>(static_cast<const float*>(actual.contents),
+                                   actual.length / sizeof(float));
+        const auto mismatch = twin::compare_floats(
+            actual_values, expected,
+            {twin::Comparison::units, 64.0, 0.0, 0u});
+        check(!mismatch, label + " " + std::string(name) + " U(64)");
+        passed &= !mismatch;
+    };
+
+    std::vector<twin::ByteRange> written;
+    const auto mark_written = [&](BufferRef view) {
+        written.push_back(
+            {view.offset - arena_view.offset, view.length});
+    };
+    mark_written(key);
+    if (rotate_values) mark_written(values);
+    mark_written(qcur);
+    mark_written(indexer_query);
+    mark_written(indexer_tail);
+    mark_written(indexer_dead);
+    mark_written(indexer_pool);
+    mark_written(block_position);
+    switch (mode) {
+        case QsaAttentionMode::f16:
+            mark_written(f16_key_pool);
+            mark_written(f16_value_pool);
+            break;
+        case QsaAttentionMode::i8:
+            mark_written(i8_key_codes);
+            mark_written(i8_key_scales);
+            mark_written(i8_value_codes);
+            mark_written(i8_value_scales);
+            break;
+        case QsaAttentionMode::q4:
+            mark_written(q4_key_pool);
+            mark_written(q4_value_pool);
+            break;
+        case QsaAttentionMode::k8v4:
+            mark_written(k8v4_key_codes);
+            mark_written(k8v4_key_scales);
+            mark_written(k8v4_value_pool);
+            break;
+    }
+    arena.capture_before_dispatch();
+
+    const auto encode_case = [&](CommandBuffer& command,
+                                 const strata::metal::PrefillParams& params,
+                                 PrefillQsaPrepareBuffers selected_buffers,
+                                 PrefillQsaAttentionTransform& transform,
+                                 std::string& encode_error) {
+        if (shared_encoder) {
+            return Encoder::encode(
+                context, command, label,
+                [&](Encoder& encoder, std::string& inner_error) {
+                    return encode_prefill_qsa_prepare(
+                        context, encoder, params, mode, kCellCapacity,
+                        kRopeZeroCos, kRopeZeroSin,
+                        rotate_uncompressed_kv, selected_buffers,
+                        inner_error, &transform);
+                },
+                encode_error);
+        }
+        return encode_prefill_qsa_prepare(
+            context, command, params, mode, kCellCapacity, kRopeZeroCos,
+            kRopeZeroSin, rotate_uncompressed_kv, selected_buffers,
+            encode_error, &transform);
+    };
+    const auto expect_rejection = [&](std::string_view suffix,
+                                     strata::metal::PrefillParams params,
+                                     PrefillQsaPrepareBuffers selected_buffers,
+                                     std::string_view expected_error) {
+        const std::string rejection_label =
+            label + " rejects " + std::string(suffix);
+        auto command = context.make_command_buffer(rejection_label, error);
+        if (!command) {
+            check(false, rejection_label + " command buffer", error);
+            return false;
+        }
+        PrefillQsaAttentionTransform transform =
+            PrefillQsaAttentionTransform::none;
+        const bool rejected =
+            !encode_case(*command, params, selected_buffers, transform,
+                         error) &&
+            command->unsafe_native_handle() == nullptr &&
+            error.find(expected_error) != std::string::npos &&
+            !arena.first_unwritten_change({});
+        check(rejected, rejection_label, error);
+        if (!rejected && command->unsafe_native_handle() != nullptr) {
+            command->discard();
+        }
+        return rejected;
+    };
+
+    if (test_cross_stage_alias) {
+        PrefillQsaPrepareBuffers alias_buffers = prepare_buffers;
+        alias_buffers.indexer_append.pooled = key.slice(
+            sizeof(float), kIndexerPoolBytes);
+        passed &= expect_rejection(
+            "partial cross-stage output alias", metadata.params,
+            alias_buffers, "overlaps active");
+    }
+    if (test_preflight_contracts) {
+        strata::metal::PrefillParams bad_indexer_params = metadata.params;
+        bad_indexer_params.idx_e += INDEXER_BLOCK_CELLS;
+        passed &= expect_rejection(
+            "indexer parameters outside the Prefill chunk",
+            bad_indexer_params, prepare_buffers,
+            "indexer parameters do not match the chunk");
+
+        auto bad_steps = host_steps;
+        ++bad_steps.front().pos;
+        std::memcpy(steps.contents, bad_steps.data(), kStepBytes);
+        arena.capture_before_dispatch();
+        passed &= expect_rejection(
+            "StepRows outside the Prefill chunk", metadata.params,
+            prepare_buffers, "StepRows do not match the chunk");
+        std::memcpy(steps.contents, host_steps.data(), kStepBytes);
+        arena.capture_before_dispatch();
+
+        PrefillQsaPrepareBuffers detached_query_buffers = prepare_buffers;
+        detached_query_buffers.indexer_query_norm_rope.output =
+            detached_indexer_query;
+        passed &= expect_rejection(
+            "out-of-place indexer-query norm/RoPE", metadata.params,
+            detached_query_buffers, "must be in place");
+
+        PrefillQsaPrepareBuffers short_query_buffers = prepare_buffers;
+        short_query_buffers.indexer_query_norm_rope.input =
+            indexer_query.slice(0u, kIndexerQueryBytes - sizeof(float));
+        passed &= expect_rejection(
+            "undersized indexer-query handoff", metadata.params,
+            short_query_buffers, "handoff view is undersized");
+
+        PrefillQsaPrepareBuffers short_key_input_buffers = prepare_buffers;
+        short_key_input_buffers.key_norm_rope.input =
+            key.slice(0u, kKvInputBytes - sizeof(float));
+        passed &= expect_rejection(
+            "undersized K input handoff", metadata.params,
+            short_key_input_buffers, "handoff view is undersized");
+
+        PrefillQsaPrepareBuffers short_append_key_buffers = prepare_buffers;
+        std::visit(
+            [&](auto& append) {
+                append.keys = key.slice(0u, kKvInputBytes - sizeof(float));
+            },
+            short_append_key_buffers.kv_append);
+        passed &= expect_rejection(
+            "undersized KV append-key handoff", metadata.params,
+            short_append_key_buffers, "handoff view is undersized");
+
+        PrefillQsaPrepareBuffers short_query_steps_buffers = prepare_buffers;
+        short_query_steps_buffers.query_norm_rope.steps =
+            steps.slice(0u, kStepBytes - 1u);
+        passed &= expect_rejection(
+            "undersized query StepRows handoff", metadata.params,
+            short_query_steps_buffers, "handoff view is undersized");
+
+        PrefillQsaPrepareBuffers short_indexer_steps_buffers =
+            prepare_buffers;
+        short_indexer_steps_buffers.indexer_query_norm_rope.steps =
+            steps.slice(0u, kStepBytes - 1u);
+        passed &= expect_rejection(
+            "undersized indexer-query StepRows handoff", metadata.params,
+            short_indexer_steps_buffers, "handoff view is undersized");
+
+        PrefillQsaPrepareBuffers short_append_steps_buffers = prepare_buffers;
+        std::visit(
+            [&](auto& append) {
+                append.steps = steps.slice(0u, kStepBytes - 1u);
+            },
+            short_append_steps_buffers.kv_append);
+        passed &= expect_rejection(
+            "undersized KV StepRows handoff", metadata.params,
+            short_append_steps_buffers, "handoff view is undersized");
+    }
+    if (test_late_rollback) {
+        PrefillQsaPrepareBuffers bad_buffers = prepare_buffers;
+        bad_buffers.indexer_query_norm_rope.gamma =
+            arena_view.slice(cursor + 1u, kIndexerGammaBytes);
+        passed &= expect_rejection(
+            "late indexer-query alignment after earlier stages",
+            metadata.params, bad_buffers, "misaligned");
+    }
+
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    PrefillQsaAttentionTransform actual_transform =
+        PrefillQsaAttentionTransform::none;
+    const bool encoded = encode_case(*command, metadata.params,
+                                     prepare_buffers, actual_transform,
+                                     error);
+    check(encoded, label + " encodes preparation chain", error);
+    if (!encoded || !command->commit(error)) {
+        check(false, label + " submit", error);
+        if (command->unsafe_native_handle() != nullptr) command->discard();
+        return false;
+    }
+    id<MTLCommandBuffer> native =
+        (__bridge id<MTLCommandBuffer>)command->unsafe_native_handle();
+    if (native == nil) {
+        check(false, label + " native command buffer",
+              "command buffer became unavailable");
+        return false;
+    }
+    [native waitUntilCompleted];
+    if (native.status != MTLCommandBufferStatusCompleted) {
+        error = native.error.localizedDescription.UTF8String != nullptr
+            ? native.error.localizedDescription.UTF8String
+            : "Metal command buffer failed";
+        check(false, label + " GPU completion", error);
+        return false;
+    }
+
+    const PrefillQsaAttentionTransform expected_transform =
+        expected_rotation->attention;
+    const bool transform_matches = actual_transform == expected_transform;
+    check(transform_matches, label + " reports matching attention FWHT");
+    passed &= transform_matches;
+    const auto expected_keys_tf_final = floats_as_tf(expected_keys);
+    const auto expected_values_tf_final = floats_as_tf(expected_values);
+    expect_floats(key, expected_keys_tf_final, "K norm/RoPE and FWHT");
+    expect_floats(values, expected_values_tf_final, "V input transform");
+    expect_floats(qcur, expected_qcur, "query norm/RoPE and FWHT");
+    expect_floats(indexer_query, expected_indexer_query,
+                  "indexer query norm/RoPE");
+
+    if (mode == QsaAttentionMode::f16) {
+        const bool cache_matches =
+            byte_equal(f16_key_pool, expected_f16_keys) &&
+            byte_equal(f16_value_pool, expected_f16_values);
+        check(cache_matches, label + " fp16 KV cache matches scalar oracle");
+        passed &= cache_matches;
+    } else if (mode == QsaAttentionMode::i8) {
+        const bool cache_matches =
+            byte_equal(i8_key_codes, expected_i8_key_codes) &&
+            byte_equal(i8_key_scales, expected_i8_key_scales) &&
+            byte_equal(i8_value_codes, expected_i8_value_codes) &&
+            byte_equal(i8_value_scales, expected_i8_value_scales);
+        check(cache_matches, label + " int8 KV cache matches scalar oracle");
+        passed &= cache_matches;
+    } else if (mode == QsaAttentionMode::q4) {
+        const bool cache_matches =
+            byte_equal(q4_key_pool, expected_q4_keys) &&
+            byte_equal(q4_value_pool, expected_q4_values);
+        check(cache_matches, label + " q4 KV cache matches scalar oracle");
+        passed &= cache_matches;
+    } else {
+        const bool cache_matches =
+            byte_equal(k8v4_key_codes, expected_i8_key_codes) &&
+            byte_equal(k8v4_key_scales, expected_i8_key_scales) &&
+            byte_equal(k8v4_value_pool, expected_q4_values);
+        check(cache_matches, label + " k8v4 KV cache matches scalar oracle");
+        passed &= cache_matches;
+    }
+
+    const auto expected_tail = floats_as_tf(expected_indexer.tail);
+    const auto expected_dead = floats_as_tf(expected_indexer.dead);
+    const auto expected_pool = floats_as_tf(expected_indexer.pooled);
+    expect_floats(indexer_tail, expected_tail, "indexer tail");
+    expect_floats(indexer_dead, expected_dead, "indexer dead key");
+    expect_floats(indexer_pool, expected_pool, "indexer pooled keys");
+    const auto actual_block =
+        *static_cast<const std::int32_t*>(block_position.contents);
+    const bool block_matches =
+        actual_block == expected_indexer.block_position;
+    check(block_matches, label + " indexer block position");
+    passed &= block_matches;
+
+    const auto untouched =
+        arena.first_unwritten_change(written);
+    check(!untouched, label + " inputs and guards remain intact",
+          untouched ? untouched->reason : "");
+    passed &= !untouched;
+    return passed;
+}
+
 bool run_prefill_indexer_batch_case(
     Context& context, std::uint32_t token_rows, std::uint32_t pos0,
     twin::InputSet set, const twin::Options& options, bool shared_encoder) {
@@ -6392,7 +7099,7 @@ bool test_indexer_commit_batch(Context& context) {
 }
 
 bool test_indexer_append_validation(Context& context,
-                                   Context& foreign_context) {
+                                    Context& foreign_context) {
     constexpr std::uint32_t kRows = 2u;
     constexpr std::uint32_t kCellCapacity = 16u;
     constexpr std::size_t kRawBytes =
@@ -7392,6 +8099,27 @@ int main(int argc, char** argv) {
     passed &= test_kv_q4_encoder_validation(*context, *foreign_context);
     passed &= test_kv_k8v4_encoder_validation(*context, *foreign_context);
     passed &= test_prefill_kv_append_row_bounds(*context);
+    constexpr std::array prefill_qsa_modes{
+        QsaAttentionMode::f16, QsaAttentionMode::i8,
+        QsaAttentionMode::q4, QsaAttentionMode::k8v4};
+    for (const QsaAttentionMode mode : prefill_qsa_modes) {
+        for (const bool rotate_uncompressed : {false, true}) {
+            for (const bool shared_encoder : {false, true}) {
+                const bool test_rollback =
+                    mode == QsaAttentionMode::q4 && !rotate_uncompressed;
+                const bool test_alias =
+                    mode == QsaAttentionMode::f16 &&
+                    !rotate_uncompressed && !shared_encoder;
+                const bool test_preflight_contracts =
+                    mode == QsaAttentionMode::f16 &&
+                    !rotate_uncompressed && !shared_encoder;
+                passed &= run_prefill_qsa_prepare_case(
+                    *context, mode, rotate_uncompressed, shared_encoder,
+                    options, test_rollback, test_alias,
+                    test_preflight_contracts);
+            }
+        }
+    }
     passed &= test_indexer_snapshot_validation(*context, *foreign_context);
     passed &= test_indexer_append_validation(*context, *foreign_context);
     passed &= test_prefill_indexer_batch_validation(*context);
