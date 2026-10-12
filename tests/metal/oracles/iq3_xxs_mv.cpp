@@ -74,6 +74,37 @@ int iq3_xxs_integer_dot(const block_iq3_xxs& weight, std::uint32_t part,
 
 }  // namespace
 
+void iq3_xxs_dequantize_reference(const block_iq3_xxs& weight,
+                                  std::span<float, 256> output) {
+    const float d = strata::kernels::f32_from_f16(weight.d);
+    for (std::uint32_t part = 0u; part < 8u; ++part) {
+        const std::uint32_t aux = part_aux(weight, part);
+        const std::uint32_t scale_code = aux >> 28u;
+        const float scale =
+            d * (0.5f + static_cast<float>(scale_code)) * 0.5f;
+        for (std::uint32_t code_slot = 0u; code_slot < 4u; ++code_slot) {
+            const std::uint32_t sign_index =
+                (aux >> (7u * code_slot)) & 0x7fu;
+            const std::uint32_t signs = unpack_ksigns(sign_index);
+            for (std::uint32_t component = 0u; component < 8u;
+                 ++component) {
+                const std::uint32_t grid_index =
+                    weight.qs[8u * part + 2u * code_slot + component / 4u];
+                const std::uint32_t packed =
+                    iq3xxs_grid[grid_index];
+                const std::uint32_t magnitude =
+                    (packed >> (8u * (component % 4u))) & 0xffu;
+                const float sign =
+                    (signs & (1u << component)) != 0u ? -1.0f : 1.0f;
+                const std::uint32_t index =
+                    part * 32u + code_slot * 8u + component;
+                output[index] =
+                    scale * static_cast<float>(magnitude) * sign;
+            }
+        }
+    }
+}
+
 bool iq3_xxs_matvec_reference(std::span<const block_iq3_xxs> weights,
                               std::span<const Q81> activations,
                               std::uint32_t n_in, std::uint32_t n_out,

@@ -10,6 +10,10 @@
 
 namespace twin {
 
+/// Canonical IQ3_XXS block dequantization, decoded in packed byte order.
+void iq3_xxs_dequantize_reference(const block_iq3_xxs& weight,
+                                  std::span<float, 256> output);
+
 bool iq3_xxs_matvec_reference(std::span<const block_iq3_xxs> weights,
                               std::span<const Q81> activations,
                               std::uint32_t n_in, std::uint32_t n_out,

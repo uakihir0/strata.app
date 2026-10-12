@@ -444,6 +444,37 @@ static inline half pf_moe_iq2_s_value(
     return half(scale * float(magnitude) * sign);
 }
 
+static inline uint pf_moe_iq3_xxs_unpack_signs(uint sign_index) {
+    const uint low_signs = sign_index & 0x7fu;
+    return low_signs ^ ((popcount(low_signs) & 1u) << 7u);
+}
+
+static inline half pf_moe_iq3_xxs_value(
+    device const block_iq3_xxs* row_weights, uint k) {
+    const device block_iq3_xxs* block = row_weights + k / 256u;
+    const uint within_block = k % 256u;
+    const uint part = within_block / 32u;
+    const uint within_part = within_block % 32u;
+    const uint code_slot = within_part / 8u;
+    const uint component = within_part % 8u;
+    const device uchar* indices = block->qs + 8u * part;
+    const device uchar* aux = block->qs + 64u + 4u * part;
+    const uint aux32 = uint(aux[0]) | (uint(aux[1]) << 8u) |
+                       (uint(aux[2]) << 16u) | (uint(aux[3]) << 24u);
+    const uint sign_index = (aux32 >> (7u * code_slot)) & 0x7fu;
+    const uint signs = pf_moe_iq3_xxs_unpack_signs(sign_index);
+    const uint grid_index = indices[2u * code_slot + component / 4u];
+    const uint packed_grid = iq3xxs_grid[grid_index];
+    const uint magnitude =
+        (packed_grid >> (8u * (component % 4u))) & 0xffu;
+    const uint scale_code = aux32 >> 28u;
+    const float scale =
+        float(block->d) * (0.5f + float(scale_code)) * 0.5f;
+    const float sign =
+        (signs & (1u << component)) != 0u ? -1.0f : 1.0f;
+    return half(scale * float(magnitude) * sign);
+}
+
 static inline void pf_moe_zero_output_tile(
     device half* output, uint total_entries, uint first_entry,
     uint end_entry, uint column_group, uint tid) {
@@ -672,7 +703,7 @@ kernel void strata_pf_moe_gu_f16(
             params.rows * kPfMoeRoutesPerRow, group.x, tid);
         return;
     }
-    if (weight_format > 4u) {
+    if (weight_format > 5u) {
         if (tid == 0u) {
             atomic_fetch_or_explicit(status, 2u, memory_order_relaxed);
         }
@@ -793,12 +824,18 @@ kernel void strata_pf_moe_gu_f16(
                         address.role[role]) +
                     output_column * 10u;
                 sw[i] = pf_moe_iq2_xs_value(row_weights, k0 + tile_k);
-            } else {
+            } else if (weight_format == 4u) {
                 const device block_iq2_s* row_weights =
                     reinterpret_cast<device const block_iq2_s*>(
                         address.role[role]) +
                     output_column * 10u;
                 sw[i] = pf_moe_iq2_s_value(row_weights, k0 + tile_k);
+            } else {
+                const device block_iq3_xxs* row_weights =
+                    reinterpret_cast<device const block_iq3_xxs*>(
+                        address.role[role]) +
+                    output_column * 10u;
+                sw[i] = pf_moe_iq3_xxs_value(row_weights, k0 + tile_k);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
