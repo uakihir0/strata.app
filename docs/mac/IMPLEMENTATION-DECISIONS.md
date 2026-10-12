@@ -12175,11 +12175,14 @@ measuring L-15 remain open.
   transactional rollback and the test claims.
 - **Findings:** No P1/P2 correctness or safety issue. The reviewer identified
   stale planned-status/kernel-name text and noted that the original IQ4_NL
-  fixture's exact F16 products did not test dequantization rounding.
+  fixture's exact F16 products did not test dequantization rounding. The
+  follow-up confirmed the rounding-sensitive fixture and found one remaining
+  generic kernel name in the pipeline table.
 - **Disposition:** Update the kernel inventory, test banner and test status.
   Alternate F16 scales `0x3a66` and `0x2800`, and add a rounded-versus-
   unrounded scalar sensitivity check whose difference exceeds the GPU result
-  tolerance. The follow-up review is pending.
+  tolerance. Update the pipeline table to the manifest's shared kernel name,
+  `strata_pf_moe_down_f16`.
 - **Validation:** After the fixes, `mac-dev` builds, all 10 focused serial and
   concurrent Metal CTests pass, `test_map.py`, `check_drift.py` and
   `git diff --check` pass.

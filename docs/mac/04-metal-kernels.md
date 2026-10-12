@@ -4981,7 +4981,7 @@ The prefill MoE computes the decode MoE's function over T rows (section 5.10). I
 | 10 | `strata_pf_gemm_bf16` `ffn_gate_inp_shexp` (n = 1, so `simd`), with its lo GEMM in modes 1 and 2 | `mixed_bf` → `gl[T]` |
 | | tiered mode: `encodeWaitForEvent(ev, base + 2l + 2)` | |
 | 11 | `strata_pf_moe_gu_<fmt>` | `Xs`, `plan[l]`, `tiles`, `addr[l]` → `eh[10T][640]` |
-| 12 | `strata_pf_moe_down_<fmt>` | `eh`, `plan[l]`, `tiles`, `dst`, `addr[l]` → `parts[T][10][2560]` |
+| 12 | `strata_pf_moe_down_f16` (Q2_0 or IQ4_NL) | `eh`, `plan[l]`, `tiles`, `dst`, `addr[l]` → `parts[T][10][2560]` |
 | 13 | `strata_pf_combine` | `parts`, `wts`, `shared`, `gl` → `bo` |
 
 The count/scan/scatter, row-gather, shared-expert post-ops, and isolated Q2_0
@@ -5183,7 +5183,7 @@ simdgroup_store(acc[i][c], &so[16*sg + 8*i][8*c], 64);  barrier;
 epilogue (below), for the rows r with a0 + r < a1
 ```
 
-| | `strata_pf_moe_gu_<fmt>` | `strata_pf_moe_down_<fmt>` |
+| | `strata_pf_moe_gu_<fmt>` | `strata_pf_moe_down_f16` |
 | --- | --- | --- |
 | X, K | `Xs`, K = 2560 | `eh`, K = 640 |
 | Tile column c < 32 | gate row `32x + c`: `ex.role[0] + (32x + c)·gu_row` | down row `64x + c`: `ex.role[2] + (64x + c)·d_row` |
@@ -5923,7 +5923,7 @@ tile's order and take F16 or BF16 activations.
 | `strata_pf_dequant_<fmt>`, `strata_util_to_f16`, `strata_util_to_bf16` | B | Upstream's `group32` expression per value, whose products are exact in F32, rounded once to F16 (RNE); the BF16 helper of section 3.6 |
 | `strata_pf_gemm_f16`, `strata_pf_gemm_bf16` (`mpp` and `simd`) | U(2K) and R(2^-16) | FP64 sum of the exact products of the F16 or BF16 images. A half or bfloat product is exact in F32, so K additions in F32 in any order stay within 2K·2^-24·Σ\|a·b\| (U(2K)); R(2^-16) catches an accumulator narrower than F32. |
 | BF16X2 modes 1 and 2 | As above, with K doubled | FP64 of `W · (hi + lo)` |
-| `strata_pf_moe_gu_<fmt>`, `strata_pf_moe_down_<fmt>` | As the GEMMs; the gate/up epilogue adds U(16) for `silu_k` | The tile's in-place decode must give the bits of upstream's `dq_<fmt>` (`iq_kernels.cu:1002-1140`) rounded to F16, checked B through a debug output of the `simd` form; then FP64 of the exact products |
+| `strata_pf_moe_gu_<fmt>`, `strata_pf_moe_down_f16` | As the GEMMs; the gate/up epilogue adds U(16) for `silu_k` | The tile's in-place decode must give the bits of upstream's `dq_<fmt>` (`iq_kernels.cu:1002-1140`) rounded to F16, checked B through a debug output of the `simd` form; then FP64 of the exact products |
 | `strata_pf_sort_*`, `strata_pf_gather_f16` | B | The stable counting sort of section 6.6: entry order within an expert, experts in id order, and the `PfPlan` fields |
 | `strata_pf_gr_*`, `strata_pf_gdn_*`, `strata_pf_gate_attn`, `strata_idx_append_*`, `strata_pf_swiglu_pair`, `strata_pf_combine`, `strata_embed_image` | B or U(n), as decode kernels | Their order is fixed by section 6, so they are twins like the window kernels |
 | Prefill attention and block scores (Phase 1: the decode kernels in query batches) | The decode kernels' classes | Each query of a batch must equal the same query run alone (B) |
