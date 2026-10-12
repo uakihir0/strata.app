@@ -12580,8 +12580,7 @@ measuring L-15 remain open.
   passed 104/104. Final route/gather rollback assertions also passed in the
   focused serial/concurrent CTests (4/4 across both composed pipelines);
   the strengthened six-coordinate high/low BF16X2 fixture also passed those
-  route tests.
-  Follow-up hostile review is pending.
+  route tests. See REV-204 for hostile findings and their disposition.
 
 ### D-IMPL-409: Compose Prefill MoE shared-expert steps 7–10
 
@@ -12614,5 +12613,65 @@ measuring L-15 remain open.
   45/45 with one real-model-input test skipped, all Python modules passed
   35/35 under `.venv`, and `test_map.py` passed with its existing
   planned/missing-requirement diagnostics. Follow-up hostile review is
-  pending. The per-channel/per-K-block Q2_0 oracle changes passed the
-  focused serial/concurrent route/shared CTests (4/4).
+  recorded in REV-205. The per-channel/per-K-block Q2_0 oracle changes passed
+  the focused serial/concurrent route/shared CTests (4/4).
+
+### REV-204: Adversarial review of Prefill MoE route/gather composition
+
+- **Scope:** Audit the router→route→grouping/gather dispatch order, T/expert/
+  layer bounds, BF16X2 mode restriction, divide-mode route, active cross-stage
+  alias matrix, full-mode residency sentinel, standalone rollback, caller
+  failure propagation, BF16X2 and grouping oracles, and documentation scope.
+- **Findings:** Reviews found active aliases across separate route/grouping
+  stages, unspecified BF16X2 modes, an undocumented caller-owned rollback
+  contract, and missing implementation inventory coverage. Follow-up review
+  also found that the original rollback assertion did not prove the rejected
+  command buffer was discarded, and the route fixture did not exercise the
+  low product or enough of K. The final review identified a cross-coordinator
+  live-range hazard when this API is ordered with the shared FFN, and a sparse
+  route fixture could not catch a truncated K reduction.
+- **Disposition:** Added pre-dispatch active-range checks across router,
+  routing and grouping outputs; restrict the API to BF16X2 modes 1 and 2; and
+  documented caller failure propagation. The rollback test now verifies that
+  late failure nulls the command buffer's native handle. Route fixtures have
+  nonzero high and low contributions at six K coordinates through K=2559 and
+  use separate FP64 product sums. Public headers and docs require writable
+  active views in either coordinator to be disjoint from every active view
+  in the other while allowing read-only inputs to alias. The implementation
+  inventory and review-required decisions were recorded. Final hostile review
+  found no remaining actionable issue.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a),
+  `mac-dev` built; the full `mac-host` suite passed 45/45 with one
+  real-model-input test skipped; the full `mac-metal` suite passed 104/104;
+  and all 35 Python test modules passed under `.venv`. After the final fixture
+  strengthening, the route/shared serial and concurrent CTests passed 4/4.
+  `test_map.py` and `git diff --check` passed.
+
+### REV-205: Adversarial review of Prefill MoE shared-expert composition
+
+- **Scope:** Audit shared native gate/up/down shapes and format selection,
+  F16 SwiGLU, BF16X2 shared-gate modes, active cross-stage aliases, dedicated
+  dequant scratch, standalone and caller-owned rollback, per-output-row and
+  per-K-block scalar references, cross-coordinator live ranges, and claims
+  about production Prefill integration.
+- **Findings:** Reviews found that the caller-owned path lacked a late-failure
+  rollback test and that the D-IMPL-409 decision entry was missing. Follow-up
+  review identified a cross-coordinator alias hazard and insufficient
+  output-channel coverage because the fixture repeated every Q2_0 block and
+  the oracle reused output row 0. No issue was found with the later explicit
+  BF16X2 mode 1/2 guard.
+- **Disposition:** The late-failure tests inject an invalid
+  `STRATA_METAL_GEMM` selector after native dequantization and verify command
+  buffer discard and unchanged scratch/output bytes for both APIs. Added
+  D-IMPL-409 with the decision and reason. The two public APIs now document a
+  strict cross-component writable-range contract. Q2_0 codes and scales vary
+  by output row and K block; every projection channel and every dequant
+  scratch element is checked by an independent scalar traversal. Final hostile
+  review found no remaining actionable issue.
+- **Validation:** On Mac17,9 (64 GB, macOS 27.0.1, Xcode 27.0 build 27A266a),
+  the full `mac-dev` build passed and the full `mac-metal` suite passed
+  104/104. The final route/shared serial and concurrent CTests passed 4/4,
+  including late-failure discard checks and the expanded Q2_0 channel
+  fixtures. The full `mac-host` suite passed 45/45 with one real-model-input
+  test skipped, all 35 Python modules passed under `.venv`, and `test_map.py`
+  plus `git diff --check` passed.
