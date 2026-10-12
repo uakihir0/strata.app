@@ -393,6 +393,31 @@ static inline half pf_moe_iq2_xxs_value(
     return half(scale * float(magnitude) * sign);
 }
 
+static inline half pf_moe_iq2_xs_value(
+    device const block_iq2_xs* row_weights, uint k) {
+    const device block_iq2_xs* block = row_weights + k / 256u;
+    const uint within_block = k % 256u;
+    const uint part = within_block / 32u;
+    const uint within_part = within_block % 32u;
+    const uint code_slot = within_part / 8u;
+    const uint component = within_part % 8u;
+    const ushort codeword = block->qs[4u * part + code_slot];
+    const uint grid_index = uint(codeword & 0x1ffu);
+    const uint sign_index = uint(codeword >> 9u);
+    const uint signs = uint(ksigns_iq2xs[sign_index]);
+    const ulong grid = iq2xs_grid[grid_index];
+    const uint magnitude =
+        uint((grid >> (8u * component)) & 0xfful);
+    const uint scale_pair = uint(block->scales[part]);
+    const uint scale_code =
+        code_slot < 2u ? (scale_pair & 0x0fu) : (scale_pair >> 4u);
+    const float scale =
+        float(block->d) * (0.5f + float(scale_code)) * 0.25f;
+    const float sign =
+        (signs & uint(kmask_iq2xs[component])) != 0u ? -1.0f : 1.0f;
+    return half(scale * float(magnitude) * sign);
+}
+
 static inline void pf_moe_zero_output_tile(
     device half* output, uint total_entries, uint first_entry,
     uint end_entry, uint column_group, uint tid) {
@@ -621,7 +646,7 @@ kernel void strata_pf_moe_gu_f16(
             params.rows * kPfMoeRoutesPerRow, group.x, tid);
         return;
     }
-    if (weight_format > 2u) {
+    if (weight_format > 3u) {
         if (tid == 0u) {
             atomic_fetch_or_explicit(status, 2u, memory_order_relaxed);
         }
@@ -730,12 +755,18 @@ kernel void strata_pf_moe_gu_f16(
                         address.role[role]) +
                     output_column * 10u;
                 sw[i] = pf_moe_iq4_xs_value(row_weights, k0 + tile_k);
-            } else {
+            } else if (weight_format == 2u) {
                 const device block_iq2_xxs* row_weights =
                     reinterpret_cast<device const block_iq2_xxs*>(
                         address.role[role]) +
                     output_column * 10u;
                 sw[i] = pf_moe_iq2_xxs_value(row_weights, k0 + tile_k);
+            } else {
+                const device block_iq2_xs* row_weights =
+                    reinterpret_cast<device const block_iq2_xs*>(
+                        address.role[role]) +
+                    output_column * 10u;
+                sw[i] = pf_moe_iq2_xs_value(row_weights, k0 + tile_k);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

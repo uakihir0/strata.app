@@ -474,11 +474,11 @@
     },
     "metal_prefill_moe_expert_test": {
       "label": "metal",
-      "origin": "04 §6.6/§10.4-10.5 / 06 Prefill Q2_0/IQ4_XS/IQ2_XXS expert tiles / D-IMPL-397/401/402 / REV-193/197/198"
+      "origin": "04 §6.6/§10.4-10.5 / 06 Prefill Q2_0/IQ4_XS/IQ2_XXS/IQ2_XS expert tiles / D-IMPL-397/401/402/403 / REV-193/197/198/199"
     },
     "metal_prefill_moe_expert_test_concurrent": {
       "label": "metal",
-      "origin": "04 §6.6/§10.4-10.5 / 06 Prefill Q2_0/IQ4_XS/IQ2_XXS expert tiles / D-IMPL-397/401/402 / REV-193/197/198"
+      "origin": "04 §6.6/§10.4-10.5 / 06 Prefill Q2_0/IQ4_XS/IQ2_XXS/IQ2_XS expert tiles / D-IMPL-397/401/402/403 / REV-193/197/198/199"
     },
     "metal_prefill_moe_down_test": {
       "label": "metal",
