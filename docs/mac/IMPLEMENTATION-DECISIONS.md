@@ -11602,3 +11602,69 @@ measuring L-15 remain open.
   `metal_attn_test` CTests passed 2/2. `test_map.py` passed with the existing
   no-check, missing-check and planned diagnostics; `check_drift.py` reported
   no upstream changes and valid golden files; `git diff --check` passed.
+
+### D-IMPL-391: Compose Prefill QSA projected-row preparation
+
+- **Decision:** Add `encode_prefill_qsa_prepare` for Prefill QSA steps 3–9:
+  K norm/RoPE, cache-mode FWHT, KV append, qcur norm/RoPE and optional
+  transform, indexer-query norm/RoPE, then batched indexer append. Keep
+  standalone transactional and caller-owned Encoder APIs. Validate the
+  Prefill indexer parameters and every StepRow against `(p0, T)` before
+  dispatch, require indexer-query norm/RoPE to be in place, and preflight
+  active cross-stage writable aliases. Represent the mode/flag transform
+  policy once in the coordinator.
+- **Reason:** Each stage already validates its own inputs, but separate stage
+  calls can still consume mismatched positions or overwrite a future stage's
+  input. The coordinator needs one ordered cache-preparation path with
+  chunk-consistent metadata and a single alias preflight. Requiring in-place
+  indexer-query processing matches the documented projection flow and makes
+  its read/write range unambiguous.
+- **Test-fixture judgment:** Keep a fixed eight-case rotation expectation
+  table in the test instead of deriving expected behavior with the
+  coordinator's predicates. Exercise malformed `idx_e`, mutated StepRows and
+  detached indexer-query output as preflight rejections. Since same-origin
+  views may have different lengths, also shorten each in-place producer and
+  StepRow handoff to prove the coordinator checks the complete active extent.
+  To prove late rollback after earlier work is encoded, use a float-misaligned
+  indexer gamma view that passes composite range checks but fails the child
+  norm/RoPE validator.
+- **Review required:** Audit mode-specific input/cache extents and rotation
+  choices, indexer metadata derivation and StepRow bounds, all producer/
+  consumer and alias relationships, transactional failure handling in both
+  APIs, and the independent test expectation table. Check serial/concurrent
+  coverage for all four formats and both option values, and ensure docs keep
+  projection scheduling and production `Prefill::run` marked pending.
+- **Validation:** `mac-dev` built successfully; serial and concurrent
+  `metal_qsa_test` CTests passed 2/2, including the fixed transform matrix,
+  scalar norm/indexer references, cache-byte checks, malformed metadata,
+  detached query output, partial alias rejection and late-stage rollback.
+  Adversarial findings and final checks are recorded in REV-187.
+
+### REV-187: Adversarial review of Prefill QSA projected-row preparation
+
+- **Scope:** Review transform-policy correctness, active input/output extents,
+  cross-stage read/write dependencies, PrefillParams and StepRow agreement,
+  indexer-query input/output identity, alias preflight, rollback through both
+  APIs, independent test expectations, serial/concurrent coverage and
+  documentation scope.
+- **Findings:** The first pass found three implementation/test weaknesses:
+  the indexer-query input was not represented in the cross-stage range model
+  (P1), `PrefillParams` and `StepRow` could describe different positions
+  (P1), and the test repeated the implementation's rotation predicates (P2).
+  A follow-up found that same-origin views may have shorter lengths, while
+  the new handoff guards lacked coverage for K and shared StepRows (P3). The
+  final pass found no remaining actionable issue.
+- **Disposition:** Require indexer-query norm/RoPE to be in place, so its
+  writable range also covers the future read. Validate `idx_f`, `idx_e` and
+  every signed StepRow against `(p0, T)` before dispatch; check active lengths
+  on same-origin K, KV and StepRows handoffs. Replace formula-derived test
+  expectations with a fixed eight-case mode/option table. Add short-view
+  rejection cases for every handoff guard and retain a late child-stage
+  alignment failure to prove transactional rollback. Documentation records
+  that projections, production layer scheduling and `Prefill::run` remain
+  pending.
+- **Validation:** `mac-dev` built successfully. Serial/concurrent
+  `metal_qsa_test` passed 2/2 and the full `mac-metal` suite passed 90/90
+  after the final test additions. All shortened-view cases fail during
+  preflight with no command dispatch or arena change. `test_map.py`,
+  `check_drift.py` and `git diff --check` passed.
