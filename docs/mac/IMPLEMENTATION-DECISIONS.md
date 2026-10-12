@@ -12330,3 +12330,52 @@ measuring L-15 remain open.
   the full focused Prefill MoE suite passed 10/10. `test_map.py` passed with
   its documented planned/no-check diagnostics, `check_drift.py` reported no
   upstream changes and valid golden files, and `git diff --check` passed.
+
+### D-IMPL-404: Add Prefill IQ2_S gate/up tiles
+
+- **Decision:** Extend the shared Prefill MoE gate/up tile with IQ2_S through
+  typed caller-owned Encoder and transactional CommandBuffer APIs. Validate
+  each expert's 640×10×82-byte weight extent (524,800 bytes). Decode the
+  8-bit low grid index plus two `qh` high bits, apply the packed 8-bit sign
+  mask and the low/high scale nibbles for the corresponding 16-value halves,
+  then round each weight to F16 before accumulation.
+- **Reason:** IQ2_S is a documented gate/up format and already has a standalone
+  row decoder, canonical 1,024-entry grid table, scalar oracle and fixed
+  packed fixture in the repository. This shares the existing tile's validated
+  snapshot, lease, status and rollback path while filling another required
+  format. Production expert scheduling and `Prefill::run` integration remain
+  unfinished.
+- **Fixture judgment:** Exercise T=1/7, all 1,024 grid indices, both scale
+  nibbles across 16 values and all 256 sign masks. Use canonical `dq_iq2_s`
+  dequantization for the FP64 dot oracle, a raw packed-field anchor covering
+  `qh`, signs and scale halves, and a frozen GPU SwiGLU result (`0x1d33`) from
+  the literal packed block and signed half inputs. Check the F16-rounding
+  negative control exceeds four ULPs.
+- **Review required:** See REV-200. Challenge low/high grid composition,
+  sign-mask interpretation, scale nibble selection, the 82-byte geometry and
+  expert extent, F16 rounding, binding and lease coverage, transaction and
+  scratch invariants, fixture/oracle independence, golden provenance and
+  product-scope claims.
+- **Validation:** See REV-200 for hostile findings and final build,
+  serial/concurrent CTests, test-map, drift and whitespace results.
+
+### REV-200: Adversarial review of Prefill IQ2_S gate/up tiles
+
+- **Scope:** Audit IQ2_S grid-low/high composition, direct sign masks, scale
+  nibble selection, F16 conversion, block/expert extents, tiered leases,
+  shared kernel dispatch, transactional/scratch behavior, oracle and fixture
+  independence, frozen GPU output, and documentation.
+- **Findings:** The reviewer found no actionable IQ2_S implementation issue.
+  A P2 documentation concern was caused by this entry still saying validation
+  was pending while the README already reported the post-IQ2_S 10/10 focused
+  suite. The run record confirms the full suite and static checks below were
+  completed after this format was added.
+- **Disposition:** Updated this validation record to match the completed
+  checks. The README's 10/10 result includes IQ2_S; no implementation change
+  was needed.
+- **Validation:** `mac-dev` built. The serial/concurrent expert CTests passed
+  2/2 and the full focused Prefill MoE, encoder and window-storage selection
+  passed 10/10 after the IQ2_S change. `test_map.py` passed with its existing
+  planned/no-check/missing-check diagnostics, `check_drift.py` reported
+  unchanged upstream sources and valid golden files, and `git diff --check`
+  passed.
