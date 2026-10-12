@@ -30,10 +30,20 @@ up projection, injection and four-stream mixing. Serial and concurrent
 synthetic tests cover all BF16X2 modes; layer scheduling, MoE integration and
 production chunk execution are still unimplemented.
 
-A synthetic Prefill MoE path now composes expert grouping and row gathering
-with Q2_0 gate/up SIMD-group tiles and their SwiGLU output. The other expert
-formats, down projections, MoE scheduling and production `Prefill::run`
-integration are still in progress.
+A synthetic Prefill MoE path now covers stable grouping and row gathering,
+gate/up SIMD-group tiles for all eight supported formats, both down formats,
+and the shared SwiGLU/combine post-ops. These are isolated components with
+independent synthetic references; the production MoE schedule and
+`Prefill::run` integration are still in progress.
+
+The full-mode Prefill MoE router, divide-mode top-10 selection, grouping and
+F16 row gather are now composed as one transactional steps 1–6 segment for
+BF16X2 modes 1 and 2, with synthetic serial/concurrent tests and cross-stage
+alias checks. The shared-expert FFN stages 7–10 also have a
+caller-owned/transactional coordinator, verified with synthetic Q2_0 and
+BF16X2 references. These two coordinators can be ordered by a caller; routed
+expert tile consumers and combine, tiered scheduling and production
+`Prefill::run` integration remain pending.
 
 ## Build and test entry points
 

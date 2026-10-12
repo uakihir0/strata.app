@@ -4984,6 +4984,23 @@ The prefill MoE computes the decode MoE's function over T rows (section 5.10). I
 | 12 | `strata_pf_moe_down_f16` (Q2_0 or IQ4_NL) | `eh`, `plan[l]`, `tiles`, `dst`, `addr[l]` → `parts[T][10][2560]` |
 | 13 | `strata_pf_combine` | `parts`, `wts`, `shared`, `gl` → `bo` |
 
+The full-mode `encode_prefill_moe_full_mode_route_gather` compositor orders
+steps 1–6 in one transactional segment for BF16X2 modes 1 and 2, T=1..8 and
+256/512 experts. It checks active cross-stage aliases before dispatch and
+requires callers of its shared-Encoder form to propagate failures.
+Synthetic T=1/7 tests compare BF16X2 logits, divide-mode route IDs/weights,
+the GPU grouping plan and histogram, stable source/destination maps, and F16
+gathers with scalar oracles; mode-0 rejection, cross-stage aliases and a late
+short-route failure verify preflight and rollback.
+`encode_prefill_moe_shared_ffn` separately composes steps 7–10: native
+gate/up projections, F16 SwiGLU, native down projection, and BF16X2 shared
+gate logits in modes 1 and 2. It preflights active cross-stage ranges and
+gives each projection dedicated dequantization scratch. Synthetic
+Q2_0/BF16X2 tests compare the outputs with independent scalar references at
+T=1/7, reject mode 0 before encoding, and trigger a GEMM-selector failure
+after dequant encoding to verify rollback for both API forms. A caller can
+place the two full-mode compositions in the same ordered Encoder segment;
+the expert tile consumers and combine are not yet joined to that path.
 The count/scan/scatter, row-gather, shared-expert post-ops, and isolated
 Q2_0/IQ4_XS/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ1_M gate/up plus Q2_0 and IQ4_NL down tiles now have typed GPU
 encoders and synthetic oracle coverage. Both expert encoders copy the selected address row
@@ -5003,7 +5020,8 @@ linear work, then the down kernel overwrites the full output. A malformed
 permutation sets the plan-error bit and zeros the complete active output. Its
 status word is dedicated to the down stage because plan validation clears it.
 Serial and concurrent tests compare both weight formats with format-specific
-scalar oracles. Other gate/up formats, full scheduling, model-backed parity
+scalar oracles. All eight documented gate/up formats and both down formats
+now have isolated GPU tile coverage. Full MoE scheduling, model-backed parity
 and `Prefill::run` integration remain planned.
 
 - Upstream runs the shared expert and its gate before the grouping. The Mac runs the grouping first, so the shared

@@ -12549,3 +12549,59 @@ measuring L-15 remain open.
   missing-check diagnostics; `check_drift.py` found no upstream changes and
   confirmed valid goldens, and `git diff --check` passed. Pasteur's final
   read-only review found no remaining actionable issue; it did not rerun tests.
+
+### D-IMPL-408: Compose full-mode Prefill MoE routing and gather
+
+- **Decision:** Add a transactional, caller-owned-Encoder composition for
+  Prefill MoE steps 1–6: BF16X2 router projection, divide-mode top-10 route,
+  GPU count/scan/scatter grouping, and F16 row gather. Restrict it to T=1..8,
+  256/512 experts, and a valid Prefill plan layer. Keep grouping's full-mode
+  residency ABI input as a one-int sentinel because that kernel does not read
+  the residency buffer when tiered mode is disabled. Require BF16X2
+  projection mode 1 or 2, and reject active writable aliases across the
+  router, route and grouping stages before encoding.
+- **Reason:** These validated stages form a useful full-mode scheduling
+  boundary and can be composed without changing their numerical contracts.
+  Tiered mode needs host-visible plan resolution and event ordering before
+  expert consumers; putting it into one uninterrupted segment would conceal
+  that required boundary. Mode 0 does not produce the low BF16 product, and
+  cross-stage writable aliases can overwrite `mixed_h` or route weights that
+  later grouping or combine stages still need.
+- **Review required:** See REV-204. Challenge shape and format assumptions,
+  the divide-mode selection, the cross-stage alias matrix, active extents,
+  rollback after late validation, scalar and grouping oracle independence,
+  plan-slot padding, and the explicit full-mode-only scope.
+- **Validation:** The full `mac-dev` build passed; focused Prefill MoE,
+  Encoder and Window storage CTests passed 14/14; `mac-host` passed 45/45
+  with one real-model-input test skipped; and all 35 Python test modules
+  passed under the existing `.venv`. `test_map.py` passed with its existing
+  planned and missing-requirement diagnostics. The full `mac-metal` suite
+  passed 104/104. Final route/gather rollback assertions also passed in the
+  focused serial/concurrent CTests (4/4 across both composed pipelines).
+  Follow-up hostile review is pending.
+
+### D-IMPL-409: Compose Prefill MoE shared-expert steps 7–10
+
+- **Decision:** Add caller-owned and transactional standalone forms that order
+  native shared gate/up projections, F16 SwiGLU, native down projection and
+  BF16X2 shared-gate logits. Accept projection modes 1 and 2 only, limit T to
+  1..8, and require dedicated dequantization scratch for each native
+  projection.
+- **Reason:** The component encoders already define the tensor and arithmetic
+  contracts; this coordinator provides their useful ordered boundary without
+  claiming a complete per-layer MoE schedule. Mode 0 omits the BF16 low
+  product, and overlapping active writes could corrupt intermediate values
+  or route outputs before their next consumers. Tiered event scheduling and
+  production `Prefill::run` integration remain explicit caller work.
+- **Review required:** See REV-205. Challenge projection formats and extents,
+  BF16X2 mode handling, the cross-stage alias checks, dedicated scratch,
+  independent scalar references, and rollback after failures in both API
+  forms.
+- **Validation:** T=1/7 synthetic serial/concurrent tests compare every stage
+  against scalar references. The full `mac-dev` build passed; the complete
+  `mac-metal` suite passed 104/104; and, after adding late-failure rollback
+  checks, the route/shared coordinator tests passed 4/4. `mac-host` passed
+  45/45 with one real-model-input test skipped, all Python modules passed
+  35/35 under `.venv`, and `test_map.py` passed with its existing
+  planned/missing-requirement diagnostics. Follow-up hostile review is
+  pending.
