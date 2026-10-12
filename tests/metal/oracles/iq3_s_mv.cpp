@@ -64,6 +64,45 @@ int iq3_s_integer_dot(const block_iq3_s& weight, std::uint32_t part,
 
 }  // namespace
 
+void iq3_s_dequantize_reference(const block_iq3_s& weight,
+                                std::span<float, 256u> output) {
+    const float d = strata::kernels::f32_from_f16(weight.d);
+    for (std::uint32_t part = 0u; part < 8u; ++part) {
+        const std::uint32_t packed_scale = weight.scales[part >> 1u];
+        const std::uint32_t scale =
+            1u + 2u * ((packed_scale >> (4u * (part & 1u))) & 0x0fu);
+        for (std::uint32_t code_slot = 0u; code_slot < 4u; ++code_slot) {
+            const std::uint32_t sign_mask =
+                weight.signs[4u * part + code_slot];
+            for (std::uint32_t quartet = 0u; quartet < 2u; ++quartet) {
+                const std::uint32_t packed_index =
+                    2u * code_slot + quartet;
+                const std::uint32_t grid_index =
+                    static_cast<std::uint32_t>(
+                        weight.qs[8u * part + packed_index]) |
+                    (((static_cast<std::uint32_t>(weight.qh[part]) >>
+                       packed_index) &
+                      1u)
+                     << 8u);
+                const std::uint32_t packed_grid = iq3s_grid[grid_index];
+                for (std::uint32_t lane = 0u; lane < 4u; ++lane) {
+                    const std::uint32_t within_code = 4u * quartet + lane;
+                    const std::uint32_t magnitude =
+                        (packed_grid >> (8u * lane)) & 0xffu;
+                    const float sign =
+                        ((sign_mask >> within_code) & 1u) != 0u ? -1.0f
+                                                                  : 1.0f;
+                    const std::uint32_t output_index =
+                        32u * part + 8u * code_slot + within_code;
+                    output[output_index] =
+                        d * static_cast<float>(scale) *
+                        static_cast<float>(magnitude) * sign;
+                }
+            }
+        }
+    }
+}
+
 bool iq3_s_matvec_reference(std::span<const block_iq3_s> weights,
                             std::span<const Q81> activations,
                             std::uint32_t n_in, std::uint32_t n_out,

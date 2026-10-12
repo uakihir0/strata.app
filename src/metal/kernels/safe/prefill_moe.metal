@@ -475,6 +475,36 @@ static inline half pf_moe_iq3_xxs_value(
     return half(scale * float(magnitude) * sign);
 }
 
+static inline half pf_moe_iq3_s_value(
+    device const block_iq3_s* row_weights, uint k) {
+    const device block_iq3_s* block = row_weights + k / 256u;
+    const uint within_block = k % 256u;
+    const uint part = within_block / 32u;
+    const uint within_part = within_block % 32u;
+    const uint code_slot = within_part / 8u;
+    const uint position = within_part % 8u;
+    const uint grid_half = position / 4u;
+    const uint component = position % 4u;
+    const uint qs_index = 8u * part + 2u * code_slot + grid_half;
+    const uint high_bit =
+        (uint(block->qh[part]) >> (2u * code_slot + grid_half)) & 1u;
+    const uint grid_index = uint(block->qs[qs_index]) | (high_bit << 8u);
+    const uint packed_grid = iq3s_grid[grid_index];
+    const uint magnitude =
+        (packed_grid >> (8u * component)) & 0xffu;
+    const bool negative =
+        ((uint(block->signs[4u * part + code_slot]) >> position) & 1u) !=
+        0u;
+    const uint packed_scales = uint(block->scales[part / 2u]);
+    const uint scale_code =
+        (packed_scales >> (4u * (part % 2u))) & 0x0fu;
+    const float sign = negative ? -1.0f : 1.0f;
+    const float weight =
+        float(block->d) * float(1u + 2u * scale_code) *
+        float(magnitude) * sign;
+    return half(weight);
+}
+
 static inline void pf_moe_zero_output_tile(
     device half* output, uint total_entries, uint first_entry,
     uint end_entry, uint column_group, uint tid) {
@@ -666,6 +696,18 @@ kernel void strata_pf_q2_0_decode_probe(
     if (index < values) decoded[index] = pf_moe_q2_0_value(weights, index);
 }
 
+// Exhaustive packed-field twin probe for the IQ3_S in-place decoder.
+[[max_total_threads_per_threadgroup(256)]]
+kernel void strata_pf_iq3_s_decode_probe(
+    device const block_iq3_s* weights [[buffer(0)]],
+    device half* decoded [[buffer(1)]],
+    constant uint& values [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    const uint index = group.x * 256u + tid;
+    if (index < values) decoded[index] = pf_moe_iq3_s_value(weights, index);
+}
+
 // One 64-entry x 64-column simdgroup matrix tile. Each 64-column tile
 // interleaves 32 gate and 32 up columns; the epilogue applies SwiGLU and
 // writes the resulting hidden row directly.
@@ -703,7 +745,7 @@ kernel void strata_pf_moe_gu_f16(
             params.rows * kPfMoeRoutesPerRow, group.x, tid);
         return;
     }
-    if (weight_format > 5u) {
+    if (weight_format > 6u) {
         if (tid == 0u) {
             atomic_fetch_or_explicit(status, 2u, memory_order_relaxed);
         }
@@ -830,12 +872,18 @@ kernel void strata_pf_moe_gu_f16(
                         address.role[role]) +
                     output_column * 10u;
                 sw[i] = pf_moe_iq2_s_value(row_weights, k0 + tile_k);
-            } else {
+            } else if (weight_format == 5u) {
                 const device block_iq3_xxs* row_weights =
                     reinterpret_cast<device const block_iq3_xxs*>(
                         address.role[role]) +
                     output_column * 10u;
                 sw[i] = pf_moe_iq3_xxs_value(row_weights, k0 + tile_k);
+            } else {
+                const device block_iq3_s* row_weights =
+                    reinterpret_cast<device const block_iq3_s*>(
+                        address.role[role]) +
+                    output_column * 10u;
+                sw[i] = pf_moe_iq3_s_value(row_weights, k0 + tile_k);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

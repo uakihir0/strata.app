@@ -201,6 +201,7 @@ strata_pf_moe_down_f16 safe 128 1 1
 strata_pf_swiglu_pair safe 256 1 1
 strata_pf_combine safe 256 1 1
 strata_pf_q2_0_decode_probe safe 256 1 1
+strata_pf_iq3_s_decode_probe safe 256 1 1
 strata_samp_greedy safe 1024 1 1
 strata_samp_split_part safe 128 1 1
 strata_samp_split_merge safe 32 1 1

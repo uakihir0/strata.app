@@ -17,6 +17,10 @@ bool iq3_s_matvec_reference(std::span<const block_iq3_s> weights,
                             std::uint32_t nc, std::uint32_t live_rows,
                             std::vector<float>& output, std::string& err);
 
+/// Decode one canonical 256-value IQ3_S block for the F16 Prefill oracle.
+void iq3_s_dequantize_reference(const block_iq3_s& weight,
+                                std::span<float, 256u> output);
+
 bool iq3_s_matvec_tf_reference(
     std::span<const block_iq3_s> weights,
     std::span<const Q81> activations, std::uint32_t n_in,
