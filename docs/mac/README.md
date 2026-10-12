@@ -111,8 +111,12 @@ three modes against scalar oracles through standalone and caller-owned forms.
 The four KV cache formats also have Prefill-sized append APIs; serial and
 concurrent nine-row tests cover all formats through both API forms. Prefill
 QSA now has a batched indexer append encoder, checked against sequential
-Window replay and scalar oracles in serial and concurrent tests. QSA selection,
-attention and production scheduling remain pending.
+Window replay and scalar oracles in serial and concurrent tests. A Prefill
+selection encoder scores rows in batches of at most eight, reuses scratch
+across groups of 256, and runs top-k per group. Same-segment indexer-append
+→ selection cases cover both the identity path and top-k truncation beyond
+2,051 keys; the standalone selection matrix passes in serial and concurrent
+tests. Prefill attention and production scheduling remain pending.
 
 Implementation choices, constraints, and required reviews are tracked in
 [IMPLEMENTATION-DECISIONS.md](IMPLEMENTATION-DECISIONS.md).

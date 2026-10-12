@@ -11278,3 +11278,57 @@ measuring L-15 remain open.
   adding the rollback regression, `mac-dev` built and focused QSA tests passed
   2/2. `test_map.py` passed and `git diff --check` passed after the final audit
   entry. The full-suite run preceded only this additional test assertion.
+
+### D-IMPL-385: Add Prefill QSA selection batching
+
+- **Decision:** Preserve the Window score and top-k entry points' 1..8-row
+  contract. Add `encode_prefill_qsa_selection` for Prefill chunks, validating
+  chunk metadata, contiguous `StepRow`s, fixed ID stride, buffer extents,
+  ownership, alignment and writable aliases before dispatch. Score at most
+  eight rows per dispatch, reuse a 256-row score scratch area serially, and
+  run top-k once for each group of up to 256 rows. Keep standalone
+  transactional and caller-owned Encoder forms; reject an open concurrent
+  dispatch group.
+- **Reason:** This matches the Prefill batching defined in section 6.5 while
+  retaining the existing decode contract. Scoring and top-k depend on prior
+  writes to scores, and later groups reuse the same scratch, so the coordinator
+  needs ordered dispatches and an explicit group boundary. It accepts the
+  completed indexer views but remains separate from indexer append,
+  attention, and production `Prefill::run` scheduling.
+- **Review required:** Check Prefill extent arithmetic and metadata formulas,
+  score offsets within the reusable scratch, dispatch and barrier ordering,
+  the 8- and 256-row boundaries, ID suffix behavior, register/memory top-k
+  selection, aliases and ownership, both public forms and late shared-segment
+  rollback. Confirm the Window 1..8-row API remains unchanged and that
+  attention and production scheduling are still pending.
+- **Validation:** `mac-dev` built successfully. The focused QSA selection
+  serial and concurrent CTests passed 2/2, including the 256-row boundaries,
+  memory top-k path, scalar oracles, validation and rollback. The full
+  `mac-metal` suite passed 90/90, and `mac-host` passed 45/45 with one
+  unavailable real-model fixture skipped; `test_map.py` passed. Adversarial
+  findings, their fixes and the final diff check are recorded in REV-181.
+
+#### REV-181: Adversarial review of Prefill QSA selection batching
+
+- **Scope:** Check Prefill metadata and extent arithmetic, score batching and
+  scratch reuse, score→top-k ordering, the 8- and 256-row boundaries, ID
+  suffix behavior, register/memory top-k selection, aliases and ownership,
+  both public forms, late shared-segment rollback, and indexer-append→selection
+  composition.
+- **Findings:** The initial enhanced scratch assertion incorrectly expected
+  rows beyond a partial final group to retain the untouched sentinel. They
+  actually retain valid score rows from the previous full batch because the
+  coordinator deliberately reuses scratch without clearing it. The original
+  composition fixture also used only `n_kv <= 12`, so its IDs followed the
+  top-k identity path and did not test truncation.
+- **Disposition:** The scratch oracle now models the previous full group and
+  overlays the final group's active prefix, checking the entire reusable view.
+  A second same-Encoder composition fixture uses `p0=2047`, `T=9` and capacity
+  4096; its last five rows have `n_kv=2052..2056`, exercising truncation beyond
+  the 2051-ID selection width after indexer append. A hostile follow-up
+  confirmed both fixes and found no remaining actionable issue.
+- **Validation:** `mac-dev` built successfully; QSA selection serial and
+  concurrent CTests passed 2/2; the full `mac-metal` suite passed 90/90;
+  `mac-host` passed 45/45 with the unavailable real-model fixture skipped;
+  `test_map.py` passed. Final `git diff --check` results are recorded with
+  the completed slice.
