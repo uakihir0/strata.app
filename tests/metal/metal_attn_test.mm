@@ -4,6 +4,8 @@
 #include "oracles/qsa.hpp"
 #include "strata/metal/context.hpp"
 #include "strata/metal/encoder.hpp"
+#include "strata/metal/prefill_gemm_dispatch.hpp"
+#include "strata/metal/prefill_qsa_gate_dispatch.hpp"
 #include "strata/metal/qsa_dispatch.hpp"
 #include "twin.hpp"
 
@@ -19,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <span>
@@ -100,6 +103,11 @@ const char* mode_name(QsaAttentionMode mode) {
         case QsaAttentionMode::k8v4: return "k8v4";
     }
     return "invalid";
+}
+
+bool concurrent_dispatch_mode() {
+    const char* const value = std::getenv("STRATA_METAL_DISPATCH");
+    return value != nullptr && std::string_view(value) == "concurrent";
 }
 
 struct CacheData {
@@ -1494,6 +1502,599 @@ bool run_prefill_attention_case(
     return passed;
 }
 
+std::uint16_t half_order_key(std::uint16_t bits) {
+    return (bits & 0x8000u) != 0u
+        ? static_cast<std::uint16_t>(~bits)
+        : static_cast<std::uint16_t>(bits | 0x8000u);
+}
+
+bool run_prefill_qsa_gate_attn_case(
+    Context& context, std::uint32_t rows, twin::InputSet set,
+    const twin::Options& options, bool shared_encoder, bool apply_fwht) {
+    constexpr std::size_t attn_row_values =
+        static_cast<std::size_t>(N_HEAD_Q) * HEAD_DIM;
+    constexpr std::size_t q_full_row_values =
+        static_cast<std::size_t>(N_HEAD_Q) * 2u * HEAD_DIM;
+    const std::size_t attn_values_count =
+        static_cast<std::size_t>(rows) * attn_row_values;
+    const std::size_t q_full_values_count =
+        static_cast<std::size_t>(rows) * q_full_row_values;
+    const std::string label =
+        "Prefill QSA attention gate T=" + std::to_string(rows) +
+        " set=" + twin::input_set_name(set) +
+        (apply_fwht ? " FWHT" : "") +
+        (shared_encoder ? " shared Encoder" : "");
+    const std::uint64_t seed =
+        options.seed ^ (static_cast<std::uint64_t>(rows) << 32u) ^
+        (static_cast<std::uint64_t>(set) << 24u) ^
+        (shared_encoder ? 0x534841524544ULL : 0x5354414e44414cULL);
+    std::mt19937_64 rng(seed);
+    std::vector<float> attn_values(attn_values_count);
+    std::vector<float> q_full_values(q_full_values_count);
+    for (std::size_t i = 0u; i < attn_values.size(); ++i) {
+        attn_values[i] = sample(set, rng, i + 0x19731u, 8.0f);
+    }
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        for (std::uint32_t head = 0u; head < N_HEAD_Q; ++head) {
+            const std::size_t base =
+                (static_cast<std::size_t>(row) * N_HEAD_Q + head) *
+                (2u * HEAD_DIM);
+            for (std::uint32_t dim = 0u; dim < HEAD_DIM; ++dim) {
+                q_full_values[base + dim] =
+                    32.0f + static_cast<float>(row * 3u + head) * 0.25f +
+                    static_cast<float>(dim) * 0.001f;
+                q_full_values[base + HEAD_DIM + dim] =
+                    sample(set, rng, base + HEAD_DIM + dim, 12.0f);
+            }
+        }
+    }
+
+    const bool exercise_f16_boundaries =
+        rows == 1u && set == twin::InputSet::edge && !apply_fwht;
+    if (exercise_f16_boundaries) {
+        attn_values[0] = 90000.0f;
+        attn_values[1] = -90000.0f;
+        attn_values[2] = 3.0f * std::ldexp(1.0f, -24);
+        attn_values[3] = -3.0f * std::ldexp(1.0f, -24);
+        attn_values[4] = -0.0f;
+        q_full_values[HEAD_DIM] = 30.0f;
+        q_full_values[HEAD_DIM + 1u] = 30.0f;
+        q_full_values[HEAD_DIM + 2u] = 0.0f;
+        q_full_values[HEAD_DIM + 3u] = 0.0f;
+        q_full_values[HEAD_DIM + 4u] = 0.0f;
+    }
+
+    std::vector<twin::tf> expected_fwht;
+    std::vector<float> expected_attn;
+    if (apply_fwht) {
+        oracle::qsa_fwht256(
+            attn_values, rows * static_cast<std::uint32_t>(N_HEAD_Q),
+            expected_fwht);
+        expected_attn.reserve(expected_fwht.size());
+        for (const twin::tf value : expected_fwht) {
+            expected_attn.push_back(value.value);
+        }
+    } else {
+        expected_attn = attn_values;
+    }
+    std::vector<twin::tf> expected_gate;
+    oracle::qsa_gate(expected_attn, q_full_values, rows, expected_gate);
+    std::vector<std::uint16_t> expected_half(expected_gate.size());
+    for (std::size_t i = 0u; i < expected_gate.size(); ++i) {
+        expected_half[i] = half_bits(expected_gate[i].value);
+    }
+
+    const std::size_t attn_bytes = attn_values_count * sizeof(float);
+    const std::size_t q_full_bytes = q_full_values_count * sizeof(float);
+    const std::size_t output_bytes =
+        attn_values_count * sizeof(std::uint16_t);
+    std::string error;
+    twin::GuardedBuffer attn, q_full, output;
+    if (!attn.allocate(context, label + " attn", attn_bytes, error) ||
+        !q_full.allocate(context, label + " Qf", q_full_bytes, error) ||
+        !output.allocate(context, label + " attn_h", output_bytes, error)) {
+        check(false, label + " allocations", error);
+        return false;
+    }
+    std::memcpy(attn.payload().data(), attn_values.data(), attn_bytes);
+    std::memcpy(q_full.payload().data(), q_full_values.data(), q_full_bytes);
+    std::fill(output.payload().begin(), output.payload().end(), 0xa5u);
+    attn.capture_before_dispatch();
+    q_full.capture_before_dispatch();
+    output.capture_before_dispatch();
+    const PrefillQsaGateAttnBuffers buffers{
+        context.buffers().read_only(attn.view()),
+        context.buffers().read_only(q_full.view()), output.view()};
+
+    auto command = context.make_command_buffer(label, error);
+    if (!command) {
+        check(false, label + " command buffer", error);
+        return false;
+    }
+    bool encoded = false;
+    if (shared_encoder) {
+        encoded = Encoder::encode(
+            context, *command, label,
+            [&](Encoder& encoder, std::string& encode_error) {
+                if (apply_fwht &&
+                    !encode_qsa_fwht256(
+                        context, encoder,
+                        rows * static_cast<std::uint32_t>(N_HEAD_Q),
+                        attn.view(), encode_error)) {
+                    return false;
+                }
+                return encode_prefill_qsa_gate_attn(
+                    context, encoder, rows, buffers, encode_error);
+            },
+            error);
+    } else {
+        encoded = !apply_fwht ||
+            encode_qsa_fwht256(
+                context, *command,
+                rows * static_cast<std::uint32_t>(N_HEAD_Q),
+                attn.view(), error);
+        if (encoded) {
+            encoded = encode_prefill_qsa_gate_attn(
+                context, *command, rows, buffers, error);
+        }
+    }
+    check(encoded, label + " encodes FWHT→gate", error);
+    if (!encoded) {
+        command->discard();
+        return false;
+    }
+    if (!wait_for_command(command, label, error)) {
+        check(false, label + " command completes", error);
+        return false;
+    }
+
+    bool passed = true;
+    if (apply_fwht) {
+        const auto mismatch = twin::compare_floats(
+            typed<float>(attn).first(attn_values_count), expected_fwht,
+            {twin::Comparison::bits, 0.0, 0.0, 0u});
+        check(!mismatch, label + " attention FWHT oracle",
+              mismatch ? mismatch->reason : "");
+        passed &= !mismatch;
+    } else {
+        const bool unchanged = !attn.first_unwritten_change({});
+        check(unchanged, label + " attention input is unchanged");
+        passed &= unchanged;
+    }
+
+    const auto actual_half = typed<std::uint16_t>(output)
+                                 .first(expected_half.size());
+    std::uint16_t max_ulp = 0u;
+    bool output_matches = actual_half.size() == expected_half.size();
+    for (std::size_t i = 0u; output_matches && i < actual_half.size(); ++i) {
+        const std::uint16_t actual_order = half_order_key(actual_half[i]);
+        const std::uint16_t expected_order = half_order_key(expected_half[i]);
+        const std::uint16_t distance =
+            actual_order >= expected_order
+                ? static_cast<std::uint16_t>(actual_order - expected_order)
+                : static_cast<std::uint16_t>(expected_order - actual_order);
+        max_ulp = std::max(max_ulp, distance);
+        output_matches &= distance <= 1u;
+    }
+    check(output_matches, label + " F16 gate matches scalar oracle within 1 ULP",
+          "maximum distance=" + std::to_string(max_ulp));
+    passed &= output_matches;
+    if (exercise_f16_boundaries) {
+        const bool boundaries =
+            actual_half[0] == 0x7c00u && actual_half[1] == 0xfc00u &&
+            actual_half[2] == 0x0002u && actual_half[3] == 0x8002u &&
+            actual_half[4] == 0x8000u;
+        check(boundaries,
+              label + " unsaturated overflow, subnormal ties and signed zero");
+        passed &= boundaries;
+    }
+
+    const bool q_full_unchanged = !q_full.first_unwritten_change({});
+    const std::array<twin::ByteRange, 1> output_written{{
+        {0u, output_bytes},
+    }};
+    const bool output_guards =
+        !output.first_unwritten_change(output_written);
+    check(q_full_unchanged, label + " Qf input is unchanged");
+    check(output_guards, label + " F16 output guards");
+    passed &= q_full_unchanged && output_guards;
+    return passed;
+}
+
+bool test_prefill_qsa_gate_attn_validation(Context& context,
+                                           Context& foreign_context) {
+    constexpr std::uint32_t rows = 1u;
+    constexpr std::size_t attn_bytes =
+        static_cast<std::size_t>(N_HEAD_Q) * HEAD_DIM * sizeof(float);
+    constexpr std::size_t q_full_bytes =
+        static_cast<std::size_t>(N_HEAD_Q) * 2u * HEAD_DIM * sizeof(float);
+    constexpr std::size_t output_bytes =
+        static_cast<std::size_t>(N_HEAD_Q) * HEAD_DIM *
+        sizeof(std::uint16_t);
+    const std::string label = "Prefill QSA gate validation";
+    std::string error;
+    twin::GuardedBuffer attn, q_full, output;
+    if (!attn.allocate(context, label + " attn", attn_bytes, error) ||
+        !q_full.allocate(context, label + " Qf", q_full_bytes, error) ||
+        !output.allocate(context, label + " output", output_bytes, error)) {
+        check(false, label + " allocations", error);
+        return false;
+    }
+    const PrefillQsaGateAttnBuffers valid{
+        context.buffers().read_only(attn.view()),
+        context.buffers().read_only(q_full.view()), output.view()};
+    bool passed = true;
+    auto reject = [&](const std::string& case_label,
+                      const PrefillQsaGateAttnBuffers& candidate,
+                      std::uint32_t candidate_rows,
+                      std::string_view expected_error) {
+        auto command = context.make_command_buffer(case_label, error);
+        if (!command) {
+            check(false, case_label + " command buffer", error);
+            return false;
+        }
+        error.clear();
+        const bool rejected =
+            !encode_prefill_qsa_gate_attn(
+                context, *command, candidate_rows, candidate, error) &&
+            error.find(expected_error) != std::string::npos;
+        check(rejected, case_label, error);
+        command->discard();
+        return rejected;
+    };
+
+    passed &= reject(label + " rejects zero rows", valid, 0u, "row count");
+    passed &= reject(label + " rejects rows above maximum", valid,
+                     kPrefillMaxShaderRows + 1u, "row count");
+    passed &= reject(label + " checks maximum-row extents", valid,
+                     kPrefillMaxShaderRows, "undersized or misaligned");
+
+    PrefillQsaGateAttnBuffers short_attn = valid;
+    short_attn.attn = context.buffers().read_only(buffer_subview(
+        attn.view(), 0u, attn_bytes - sizeof(float)));
+    passed &= reject(label + " rejects short attention", short_attn, rows,
+                     "undersized or misaligned");
+    PrefillQsaGateAttnBuffers short_q_full = valid;
+    short_q_full.q_full = context.buffers().read_only(buffer_subview(
+        q_full.view(), 0u, q_full_bytes - sizeof(float)));
+    passed &= reject(label + " rejects short Qf", short_q_full, rows,
+                     "undersized or misaligned");
+    PrefillQsaGateAttnBuffers short_output = valid;
+    short_output.attn_h =
+        output.view().slice(0u, output_bytes - sizeof(std::uint16_t));
+    passed &= reject(label + " rejects short attn_h", short_output, rows,
+                     "undersized or misaligned");
+
+    twin::GuardedBuffer misaligned_input, misaligned_output;
+    if (!misaligned_input.allocate(context, label + " misaligned input",
+                                   q_full_bytes + 8u, error) ||
+        !misaligned_output.allocate(context, label + " misaligned output",
+                                    output_bytes + 8u, error)) {
+        check(false, label + " misaligned allocations", error);
+        return false;
+    }
+    PrefillQsaGateAttnBuffers misaligned_attn = valid;
+    misaligned_attn.attn = context.buffers().read_only(buffer_subview(
+        misaligned_input.view(), 1u, attn_bytes));
+    passed &= reject(label + " rejects misaligned attention",
+                     misaligned_attn, rows, "undersized or misaligned");
+    PrefillQsaGateAttnBuffers misaligned_q = valid;
+    misaligned_q.q_full = context.buffers().read_only(buffer_subview(
+        misaligned_input.view(), 2u, q_full_bytes));
+    passed &= reject(label + " rejects misaligned Qf", misaligned_q, rows,
+                     "undersized or misaligned");
+    PrefillQsaGateAttnBuffers misaligned_half = valid;
+    misaligned_half.attn_h =
+        misaligned_output.view().slice(1u, output_bytes);
+    passed &= reject(label + " rejects misaligned F16 output",
+                     misaligned_half, rows, "undersized or misaligned");
+
+    PrefillQsaGateAttnBuffers exact_attn_alias = valid;
+    exact_attn_alias.attn_h = attn.view();
+    passed &= reject(label + " rejects output/attention alias",
+                     exact_attn_alias, rows, "overlaps a read-only input");
+    PrefillQsaGateAttnBuffers exact_q_alias = valid;
+    exact_q_alias.attn_h =
+        q_full.view().slice(0u, output_bytes);
+    passed &= reject(label + " rejects output/Qf alias", exact_q_alias,
+                     rows, "overlaps a read-only input");
+
+    twin::GuardedBuffer partial_alias;
+    if (!partial_alias.allocate(context, label + " partial alias",
+                                attn_bytes + output_bytes, error)) {
+        check(false, label + " partial-alias allocation", error);
+        return false;
+    }
+    PrefillQsaGateAttnBuffers partial = valid;
+    partial.attn = context.buffers().read_only(
+        buffer_subview(partial_alias.view(), 0u, attn_bytes));
+    partial.attn_h = partial_alias.view().slice(
+        attn_bytes - sizeof(std::uint16_t), output_bytes);
+    passed &= reject(label + " rejects partial output/attention alias",
+                     partial, rows, "overlaps a read-only input");
+
+    twin::GuardedBuffer partial_q_alias;
+    if (!partial_q_alias.allocate(context, label + " partial Qf alias",
+                                  q_full_bytes + output_bytes, error)) {
+        check(false, label + " partial Qf-alias allocation", error);
+        return false;
+    }
+    PrefillQsaGateAttnBuffers partial_q = valid;
+    partial_q.q_full = context.buffers().read_only(buffer_subview(
+        partial_q_alias.view(), 0u, q_full_bytes));
+    partial_q.attn_h = partial_q_alias.view().slice(
+        q_full_bytes - sizeof(std::uint16_t), output_bytes);
+    passed &= reject(label + " rejects partial output/Qf alias", partial_q,
+                     rows, "overlaps a read-only input");
+
+    twin::GuardedBuffer foreign_buffer;
+    if (!foreign_buffer.allocate(foreign_context, label + " foreign input",
+                                 attn_bytes, error)) {
+        check(false, label + " foreign-buffer allocation", error);
+        return false;
+    }
+    PrefillQsaGateAttnBuffers foreign = valid;
+    foreign.attn = foreign_context.buffers().read_only(
+        foreign_buffer.view());
+    passed &= reject(label + " rejects a foreign Context input", foreign,
+                     rows, "not owned");
+
+    twin::GuardedBuffer foreign_q, foreign_output;
+    if (!foreign_q.allocate(foreign_context, label + " foreign Qf",
+                            q_full_bytes, error) ||
+        !foreign_output.allocate(foreign_context, label + " foreign output",
+                                 output_bytes, error)) {
+        check(false, label + " foreign Qf/output allocations", error);
+        return false;
+    }
+    PrefillQsaGateAttnBuffers foreign_query = valid;
+    foreign_query.q_full =
+        foreign_context.buffers().read_only(foreign_q.view());
+    passed &= reject(label + " rejects foreign Qf", foreign_query, rows,
+                     "not owned");
+    PrefillQsaGateAttnBuffers foreign_write = valid;
+    foreign_write.attn_h = foreign_output.view();
+    passed &= reject(label + " rejects a foreign Context output",
+                     foreign_write, rows, "not owned");
+
+    PrefillQsaGateAttnBuffers forged_output = valid;
+    forged_output.attn_h.gpu_address += sizeof(std::uint16_t);
+    passed &= reject(label + " rejects forged output metadata", forged_output,
+                     rows, "not owned");
+    PrefillQsaGateAttnBuffers out_of_bounds = valid;
+    out_of_bounds.attn_h.length += sizeof(std::uint16_t);
+    passed &= reject(label + " rejects out-of-range output metadata",
+                     out_of_bounds, rows, "not owned");
+
+    PrefillQsaGateAttnBuffers readonly_overlap = valid;
+    readonly_overlap.attn = context.buffers().read_only(
+        buffer_subview(q_full.view(), 0u, attn_bytes));
+    auto readonly_command =
+        context.make_command_buffer(label + " read-only overlap", error);
+    if (!readonly_command) {
+        check(false, label + " read-only-overlap command buffer", error);
+        return false;
+    }
+    error.clear();
+    const bool readonly_accepted = encode_prefill_qsa_gate_attn(
+        context, *readonly_command, rows, readonly_overlap, error);
+    check(readonly_accepted,
+          label + " permits overlapping read-only inputs", error);
+    passed &= readonly_accepted;
+    readonly_command->discard();
+
+    auto foreign_command = foreign_context.make_command_buffer(
+        label + " foreign command", error);
+    if (!foreign_command) {
+        check(false, label + " foreign command buffer", error);
+        return false;
+    }
+    error.clear();
+    const bool foreign_command_rejected =
+        !encode_prefill_qsa_gate_attn(context, *foreign_command, rows, valid,
+                                      error);
+    check(foreign_command_rejected,
+          label + " rejects a foreign command buffer", error);
+    passed &= foreign_command_rejected;
+    foreign_command->discard();
+
+    auto submitted_command =
+        context.make_command_buffer(label + " submitted command", error);
+    if (!submitted_command || !submitted_command->commit(error) ||
+        !submitted_command->wait_until_completed(error)) {
+        check(false, label + " submitted command setup", error);
+        return false;
+    }
+    error.clear();
+    const bool submitted_rejected =
+        !encode_prefill_qsa_gate_attn(context, *submitted_command, rows,
+                                      valid, error);
+    check(submitted_rejected,
+          label + " rejects a submitted command buffer", error);
+    passed &= submitted_rejected;
+
+    auto standalone_rollback =
+        context.make_command_buffer(label + " standalone rollback", error);
+    if (!standalone_rollback) {
+        check(false, label + " standalone rollback command buffer", error);
+        return false;
+    }
+    std::fill(attn.payload().begin(), attn.payload().end(), 0u);
+    std::fill(output.payload().begin(), output.payload().end(), 0xa5u);
+    attn.capture_before_dispatch();
+    output.capture_before_dispatch();
+    const bool fwht_encoded = encode_qsa_fwht256(
+        context, *standalone_rollback, N_HEAD_Q, attn.view(), error);
+    PrefillQsaGateAttnBuffers late_invalid = valid;
+    late_invalid.q_full = short_q_full.q_full;
+    error.clear();
+    const bool gate_rejected =
+        fwht_encoded &&
+        !encode_prefill_qsa_gate_attn(context, *standalone_rollback, rows,
+                                      late_invalid, error) &&
+        error.find("undersized or misaligned") != std::string::npos;
+    const bool standalone_commit_rejected =
+        !standalone_rollback->commit(error) &&
+        error.find("discarded") != std::string::npos;
+    const bool standalone_rollback_clean =
+        !attn.first_unwritten_change({}) &&
+        !output.first_unwritten_change({});
+    check(gate_rejected && standalone_commit_rejected &&
+              standalone_rollback_clean,
+          label + " standalone late failure discards FWHT and preserves data",
+          error);
+    passed &= gate_rejected && standalone_commit_rejected &&
+              standalone_rollback_clean;
+
+    auto caller_rollback =
+        context.make_command_buffer(label + " caller rollback", error);
+    if (!caller_rollback) {
+        check(false, label + " caller rollback command buffer", error);
+        return false;
+    }
+    bool caller_gate_rejected = false;
+    const bool caller_encoded = Encoder::encode(
+        context, *caller_rollback, label + " caller rollback",
+        [&](Encoder& encoder, std::string& body_error) {
+            if (!encode_qsa_fwht256(context, encoder, N_HEAD_Q,
+                                    attn.view(), body_error)) {
+                return false;
+            }
+            caller_gate_rejected =
+                !encode_prefill_qsa_gate_attn(
+                    context, encoder, rows, late_invalid, body_error) &&
+                body_error.find("undersized or misaligned") !=
+                    std::string::npos;
+            return caller_gate_rejected ? false : true;
+        },
+        error);
+    const bool caller_commit_rejected =
+        !caller_rollback->commit(error) &&
+        error.find("discarded") != std::string::npos;
+    const bool caller_rollback_clean =
+        !attn.first_unwritten_change({}) &&
+        !output.first_unwritten_change({});
+    check(!caller_encoded && caller_gate_rejected &&
+              caller_commit_rejected && caller_rollback_clean,
+          label + " caller-owned late failure discards FWHT and preserves data",
+          error);
+    passed &= !caller_encoded && caller_gate_rejected &&
+              caller_commit_rejected && caller_rollback_clean;
+
+    const PrefillGemmMPPParams invalid_projection_params{};
+    const PrefillGemmMPPBuffers invalid_projection_buffers{
+        context.buffers().read_only(output.view()),
+        context.buffers().read_only(q_full.view()), output.view()};
+    auto downstream_standalone =
+        context.make_command_buffer(label + " downstream standalone", error);
+    if (!downstream_standalone) {
+        check(false, label + " downstream standalone command buffer", error);
+        return false;
+    }
+    error.clear();
+    const bool standalone_gate_encoded = encode_prefill_qsa_gate_attn(
+        context, *downstream_standalone, rows, valid, error);
+    const bool standalone_projection_rejected =
+        standalone_gate_encoded &&
+        !encode_prefill_gemm(context, *downstream_standalone,
+                             invalid_projection_params,
+                             invalid_projection_buffers,
+                             PrefillGemmFormat::F16, error);
+    const bool standalone_projection_error_expected =
+        standalone_projection_rejected &&
+        error == "STRATA_METAL_GEMM selection requires n > 0";
+    const bool downstream_standalone_commit_rejected =
+        !downstream_standalone->commit(error) &&
+        error.find("discarded") != std::string::npos;
+    const bool downstream_standalone_untouched =
+        !output.first_unwritten_change({});
+    check(standalone_gate_encoded && standalone_projection_error_expected &&
+              downstream_standalone_commit_rejected &&
+              downstream_standalone_untouched,
+          label + " downstream standalone failure discards encoded gate",
+          error);
+    passed &= standalone_gate_encoded && standalone_projection_error_expected &&
+              downstream_standalone_commit_rejected &&
+              downstream_standalone_untouched;
+
+    auto downstream_caller =
+        context.make_command_buffer(label + " downstream caller", error);
+    if (!downstream_caller) {
+        check(false, label + " downstream caller command buffer", error);
+        return false;
+    }
+    bool caller_projection_rejected = false;
+    bool caller_projection_error_expected = false;
+    const bool downstream_caller_encoded = Encoder::encode(
+        context, *downstream_caller, label + " downstream caller",
+        [&](Encoder& encoder, std::string& body_error) {
+            if (!encode_prefill_qsa_gate_attn(
+                    context, encoder, rows, valid, body_error)) {
+                return false;
+            }
+            caller_projection_rejected = !encode_prefill_gemm(
+                context, encoder, invalid_projection_params,
+                invalid_projection_buffers, PrefillGemmFormat::F16,
+                body_error);
+            caller_projection_error_expected =
+                caller_projection_rejected &&
+                body_error ==
+                    "STRATA_METAL_GEMM selection requires n > 0";
+            return caller_projection_rejected ? false : true;
+        },
+        error);
+    const bool downstream_caller_commit_rejected =
+        !downstream_caller->commit(error) &&
+        error.find("discarded") != std::string::npos;
+    const bool downstream_caller_untouched =
+        !output.first_unwritten_change({});
+    check(!downstream_caller_encoded &&
+              caller_projection_error_expected &&
+              downstream_caller_commit_rejected &&
+              downstream_caller_untouched,
+          label + " downstream caller failure discards encoded gate", error);
+    passed &= !downstream_caller_encoded &&
+              caller_projection_error_expected &&
+              downstream_caller_commit_rejected &&
+              downstream_caller_untouched;
+
+    if (concurrent_dispatch_mode()) {
+        auto group_command =
+            context.make_command_buffer(label + " open group", error);
+        if (!group_command) {
+            check(false, label + " open-group command buffer", error);
+            return false;
+        }
+        bool saw_open_group = false;
+        bool gate_succeeded = false;
+        const bool group_encoded = Encoder::encode(
+            context, *group_command, label + " open group",
+            [&](Encoder& encoder, std::string& body_error) {
+                if (!encoder.group_begin(body_error)) return false;
+                saw_open_group = encoder.concurrent_group_open();
+                if (saw_open_group) {
+                    std::string gate_error;
+                    gate_succeeded = encode_prefill_qsa_gate_attn(
+                        context, encoder, rows, valid, gate_error);
+                    body_error = gate_error;
+                }
+                std::string group_error;
+                const bool group_closed = encoder.group_end(group_error);
+                if (!group_closed) body_error = group_error;
+                return false;
+            },
+            error);
+        const bool group_rejected =
+            !group_encoded && saw_open_group && !gate_succeeded &&
+            error.find("ordered concurrent-group boundary") !=
+                std::string::npos;
+        check(group_rejected,
+              label + " rejects an open concurrent group", error);
+        passed &= group_rejected;
+    }
+    return passed;
+}
+
 struct ValidationBuffers {
     AttentionBuffers storage;
     QsaAttentionScratch scratch;
@@ -2283,6 +2884,8 @@ int main(int argc, char** argv) {
     bool passed = true;
     passed &= test_attention_encoder_validation(*context, *foreign_context);
     passed &= test_prefill_attention_encoder_validation(*context);
+    passed &= test_prefill_qsa_gate_attn_validation(*context,
+                                                    *foreign_context);
     for (const QsaAttentionMode mode : modes) {
         for (const twin::InputSet set : selected_sets) {
             const auto input = make_input(
@@ -2356,6 +2959,14 @@ int main(int argc, char** argv) {
     passed &= run_prefill_attention_case(
         *context, QsaAttentionMode::f16, 33u, 2047u, kLargestCapacity,
         options, true);
+    for (const twin::InputSet set : selected_sets) {
+        passed &= run_prefill_qsa_gate_attn_case(
+            *context, 1u, set, options, false, false);
+        passed &= run_prefill_qsa_gate_attn_case(
+            *context, 9u, set, options, true, true);
+        passed &= run_prefill_qsa_gate_attn_case(
+            *context, 65u, set, options, false, true);
+    }
 
     if (!options.input_set_explicit ||
         options.input_set == twin::InputSet::fixture) {
