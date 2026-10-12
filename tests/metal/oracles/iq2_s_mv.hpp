@@ -10,6 +10,10 @@
 
 namespace twin {
 
+/// Canonical IQ2_S block dequantization following ggml's dq_iq2_s contract.
+void iq2_s_dequantize_reference(
+    const block_iq2_s& weight, std::span<float, 256u> output);
+
 bool iq2_s_matvec_reference(std::span<const block_iq2_s> weights,
                             std::span<const Q81> activations,
                             std::uint32_t n_in, std::uint32_t n_out,

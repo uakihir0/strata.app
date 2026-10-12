@@ -34,12 +34,15 @@ constexpr std::size_t kIQ2XXSBlockBytes = 66u;
 constexpr std::size_t kIQ2XXSBlocksPerRow = kModelWidth / 256u;
 constexpr std::size_t kIQ2XSBlockBytes = 74u;
 constexpr std::size_t kIQ2XSBlocksPerRow = kModelWidth / 256u;
+constexpr std::size_t kIQ2SBlockBytes = 82u;
+constexpr std::size_t kIQ2SBlocksPerRow = kModelWidth / 256u;
 
 enum class WeightFormat : std::uint32_t {
     q2_0 = 0u,
     iq4_xs = 1u,
     iq2_xxs = 2u,
     iq2_xs = 3u,
+    iq2_s = 4u,
 };
 
 struct PrefillMoeExpertAddress {
@@ -222,6 +225,10 @@ bool validate_dispatch(Context& context, std::uint32_t rows,
         case WeightFormat::iq2_xs:
             blocks_per_row = kIQ2XSBlocksPerRow;
             block_bytes = kIQ2XSBlockBytes;
+            break;
+        case WeightFormat::iq2_s:
+            blocks_per_row = kIQ2SBlocksPerRow;
+            block_bytes = kIQ2SBlockBytes;
             break;
         default:
             error = "Prefill MoE gate/up tile format is unsupported";
@@ -571,6 +578,14 @@ bool encode_prefill_moe_gu_iq2_xs(
                        WeightFormat::iq2_xs, buffers, error);
 }
 
+bool encode_prefill_moe_gu_iq2_s(
+    Context& context, Encoder& encoder, std::uint32_t rows,
+    std::uint32_t n_experts, std::uint32_t layer,
+    const PrefillMoeExpertTileBuffers& buffers, std::string& error) {
+    return encode_impl(context, encoder, rows, n_experts, layer,
+                       WeightFormat::iq2_s, buffers, error);
+}
+
 bool encode_prefill_moe_gu_q2_0(
     Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
     std::uint32_t n_experts, std::uint32_t layer,
@@ -619,6 +634,19 @@ bool encode_prefill_moe_gu_iq2_xs(
         [&](Encoder& encoder, std::string& encode_error) {
             return encode_impl(context, encoder, rows, n_experts, layer,
                                WeightFormat::iq2_xs, buffers, encode_error);
+        },
+        error);
+}
+
+bool encode_prefill_moe_gu_iq2_s(
+    Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    std::uint32_t n_experts, std::uint32_t layer,
+    const PrefillMoeExpertTileBuffers& buffers, std::string& error) {
+    return Encoder::encode(
+        context, command_buffer, "Prefill MoE IQ2_S gate/up tiles",
+        [&](Encoder& encoder, std::string& encode_error) {
+            return encode_impl(context, encoder, rows, n_experts, layer,
+                               WeightFormat::iq2_s, buffers, encode_error);
         },
         error);
 }
