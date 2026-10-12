@@ -11731,3 +11731,58 @@ measuring L-15 remain open.
   `check_drift.py` and `git diff --check` passed. The full `mac-metal` run
   completed 86/90 tests; the four named timeouts above did not exercise this
   coordinator.
+
+### D-IMPL-393: Add Prefill QSA input projections
+
+- **Decision:** Implement steps 1–2 as `encode_prefill_qsa_projection`, with
+  independent native formats for K/V/Q, BF16 or BF16X2 Indexer K/Q projection,
+  and one serially reused F16 dequant scratch view. Validate every active
+  extent, Context owner and cross-stage writable alias before encoding. Keep
+  both standalone transactional and caller-owned Encoder forms; callers must
+  propagate a false result from their Encoder callback. The stage can be
+  composed with steps 3–14 by a caller but does not create a production layer
+  schedule.
+- **Reason:** The documented QSA plan begins with five projections and then
+  consumes those rows in the already implemented preparation/layer stages.
+  A single ordered boundary makes scratch reuse explicit, preflights the
+  projections together, and lets downstream work share a transaction without
+  claiming that production Prefill is wired.
+- **Fixture judgment:** Use distinct Q4_0 K and Q8_0 V/Q native weights plus
+  nonzero BF16 indexer weights at T=2. Compute output expectations in FP64
+  from the input bit patterns and independently rounded F16 dequantized
+  weights. Exercise BF16-only and both BF16X2 modes through standalone and
+  caller-owned forms; verify scratch reuse, raw input preservation, output
+  guards, row-limit preflight, cross-stage aliases and rollback after an
+  encoded native dequant stage.
+- **Review required:** Challenge projection orientation, packed weight
+  decoding, active-size/alias checks and BF16X2 accumulation against the
+  independent scalar expectations. Confirm invalid selector failure
+  propagates through both wrappers without submitting any encoded prefix.
+- **Validation:** `mac-dev` built successfully. Focused serial/concurrent
+  `metal_qsa_projection_test` and existing `metal_qsa_test` cases passed 4/4
+  with all three BF16X2 settings, both API forms, exact scratch/output
+  extents, aliases, open-group refusal, inclusive row-limit preflight and
+  rollback checks. `test_map.py` reports all checks passed with its existing
+  planned/no-check diagnostics; `check_drift.py` reports no upstream changes
+  and valid golden files, and `git diff --check` passes.
+
+### REV-189: Adversarial review of Prefill QSA input projections
+
+- **Scope:** Review projection dimensions and orientation, native packed
+  weights, BF16X2 accumulation, active-size and alias preflight, standalone
+  and caller-owned rollback, independent FP64 expectations, serial/concurrent
+  registration, and whether documentation keeps the production schedule
+  pending.
+- **Findings:** The review found no actionable implementation or test
+  correctness issue. It identified two documentation issues (P3): the layer
+  coordinator still described input projections as pending, and the cited
+  decision/review entries were not yet in this log.
+- **Disposition:** Clarify that the projection implementation exists as a
+  separate coordinator while one coordinator for steps 1–14 and production
+  scheduling remain pending. Add this review record and keep the CTest and
+  test-map references aligned.
+- **Validation:** Full `mac-dev` build succeeded. Serial/concurrent
+  `metal_qsa_test` and `metal_qsa_projection_test` passed 4/4. `test_map.py`
+  reports all checks passed with its existing planned/no-check diagnostics.
+  `check_drift.py` reports no upstream changes and valid golden files;
+  `git diff --check` passes.
