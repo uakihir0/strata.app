@@ -78,6 +78,7 @@ need a model loading window of their own, and produce result files rather than a
 | `tools/metal/tf_compare.py` | Compares two logits dumps: same top-1, KL, perplexity, margins | 3.3 |
 | `tools/metal/ladder_compare.py` | Compares two `--dump-layers` files, or one with llama.cpp's ladder | 4.1 |
 | `tools/metal/lc_dump/` | `lc_dump.cpp` and its `CMakeLists.txt`: a small program, built against llama.cpp at the pin, that writes every position's logits and the residual ladder in the engine's dump formats | 2.5 |
+| `tools/metal/lc_dump_format.py` | The Python part of `lc_dump`: the logits and ladder writers, the graph node names and the node check. The C++ program is not written yet | 2.5 |
 | `tools/metal/accept/engine.py` | The one parser of the engine's output lines | 3.1 |
 | `tools/metal/accept/criteria.py` | Every criterion's ID, operator, threshold and gating flag, in one table | 3.2, 10.3 |
 | `tools/metal/accept/fake_engine.py`, `tools/metal/test_accept.py` | The fake engine and the runner's own tests | 3.2 |
@@ -327,6 +328,14 @@ lc_dump -m <shard 1> --tokens-file <set>.ids (--logits <out> | --layers <out>) [
   [03](03-model-reference.md), section 9.1, lays out `--dump-layers`.
 - It fails if a node is missing or has another shape, so that a llama.cpp change of the graph cannot pass silently.
 - Its build is a `CMakeLists.txt` that takes `LLAMA_CPP_DIR`; it is not part of the engine build and is not shipped.
+
+**Status (work item T5).** The C++ program and its `CMakeLists.txt` are not written, and nothing in this checkout builds
+them. `tools/metal/lc_dump_format.py` holds the Python part that section 2.5 states in format terms: the `--logits`
+writer, the `--layers` writer with the node names `hc_init` and `l_last-<l>`, the node size check, and the whole-record
+check of a ladder file. Both writers stream to `<path>.partial` and rename it on success. `test_lc_dump_format.py`
+reads the logits output back with `tf_compare.py`, reads the ladder output back in the section 9.1 layout, and fails on
+a renamed or resized node. The node names have not been checked
+against the pinned llama.cpp commit, because no llama.cpp checkout is available to the tests.
 
 **The manifest.** `tests/metal/golden/MANIFEST.json`, in git, schema 1: `upstream_sync`, `valid_for` (the list of
 later sync commits it still applies to, below), `engine_version`, `gpu` (name, PCI id, VRAM), `driver`, `cuda`,
@@ -1384,7 +1393,9 @@ run. `tools/metal/test_map.py` is a CLI checker exercised through CTest, not a u
 | `tools/metal/test_model_headers.py` | [03](03-model-reference.md), work item R1 | macOS Python suite. Checks shard sizes and tensor totals, fixed metadata and the shared PLE shard, rejects duplicate fixture JSON keys, and invokes `ggufhdr.py` on a generated header. |
 | `tools/metal/test_dense_vs_gguf.py` | [03](03-model-reference.md), work item R5 | Synthetic single- and split-shard packs; deterministic sampling; source-hash and pack-form checks for converted rows; full comparison and rejection of a flipped byte, missing or native-marked float row, stale shard size, duplicate conversion, duplicate catalogue identity and unknown model identity. |
 | `tools/metal/test_accept.py` | Section 3.2 | macOS Python suite; the criteria table (every ID, a planted difference per ID, the message), the engine parser on captured output, the fake engine's planted kinds, the pre-run checks, and end-to-end runs through a test-only registry |
-| `tools/metal/test_tf_compare.py`, `tools/metal/test_ladder_compare.py` | Sections 3.3 and 4.1 | Planned; files absent |
+| `tools/metal/test_tf_compare.py` | Section 3.3 | macOS Python suite; synthetic dumps with hand-checked outcomes: the file-size rule and the short prompt-path dump, ties, margin bands, token-ID errors, non-finite values, row ranges and JSON aliasing |
+| `tools/metal/test_lc_dump_format.py` | Section 2.5 | macOS Python suite; the logits and ladder writers (the logits read by `tf_compare.py`, the ladder read in the section 9.1 layout), a failure on a renamed or resized graph node, and no output left under the final name |
+| `tools/metal/test_ladder_compare.py` | Section 4.1 | Planned; file absent (work item T6) |
 | `tools/metal/test_make_prompts.py` | Section 2.2 | Planned; file absent |
 | `tools/metal/test_map.py` | Section 9.4 | macOS host CTest preset, without check 1; through the `test_map` CTest test with it |
 | `tools/metal/test_test_map.py` | Section 9.4 | macOS Python suite; the extra CMake-test and `--final` failure cases |
