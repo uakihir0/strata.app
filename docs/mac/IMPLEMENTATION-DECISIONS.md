@@ -13321,3 +13321,98 @@ measuring L-15 remain open.
   approve re-pinning `UPSTREAM_SYNC` and the documents to the v0.1.34 tag commit. This is a
   provenance decision; no automatic change was made.
 
+### D-IMPL-640: T5 implements only the Python part of lc_dump; the C++ program is not written
+
+- **Decision:** `tools/metal/lc_dump_format.py` holds the `--logits` writer (the `--dump-logits` layout), the `--layers`
+  writer (the `--dump-layers` layout: 49 slots of 4 x 2560 F32 per position), the node names and the node size check.
+  No `lc_dump.cpp` and no `CMakeLists.txt` are written, and nothing is built against llama.cpp.
+- **Reason:** Section 2.5 defines lc_dump as C++ against `llama.h`, built with CMake at the pinned llama.cpp commit on
+  the CUDA PC. This checkout has no llama.cpp source, so the program cannot be built here. The work item restricts this
+  item to the part the spec states in Python terms.
+- **Review required:** Confirm that T5 may close with the Python part, and that the C++ program becomes a separate
+  tracked item. It must exist before T2 can record the `lc-tf-*` and `lc-ladder-*` files. The "fails on a renamed graph
+  node" clause is verified only for the Python check, not for the C++ callback.
+
+### D-IMPL-641: The graph node names are not verified against the pinned llama.cpp commit
+
+- **Decision:** The node names `hc_init` and `l_last-<l>` are used as section 9.1 and section 2.5 state them. The tests
+  check the Python mirror of the node check, not a llama.cpp graph.
+- **Reason:** The pinned commit `3cf03257` is not in this environment. A search of the home directory found no llama.cpp
+  checkout, so no graph could be inspected.
+- **Review required:** Check the names against llama.cpp at `3cf03257` when the C++ program is written, and make its
+  callback use the same list as `layer_node_names()`.
+
+### D-IMPL-642: Dump writers stream to `<path>.partial` and rename on success
+
+- **Decision:** `write_logits` and `write_layers` write `<path>.partial`, rename it to the final name only after the last
+  row or position, and delete the partial file on any failure. A failed write leaves an earlier file at the final name
+  unchanged.
+- **Reason:** Section 3.3 has `tf_compare.py` accept a file with fewer rows than its header declares as a short
+  prompt-path dump. A truncated dump under the final name would therefore be compared without an error. The spec does
+  not state this rule for lc_dump; the choice is ours.
+- **Review required:** Confirm that the C++ tool must follow the same protocol. A process killed during a write runs no
+  cleanup, so it can leave `<path>.partial` behind; nothing removes such a file automatically.
+
+### D-IMPL-643: The standard error uses the sample standard deviation
+
+- **Decision:** `standard_error` is `std(delta, ddof=1) / sqrt(n)`.
+- **Reason:** Section 3.3 gives `sd / sqrt(n)` without naming the estimator. The sample standard deviation is the usual
+  estimate of a mean's standard error. The population form (ddof=0) understates it by `sqrt((n-1)/n)`.
+- **Review required:** Confirm the estimator. The test `test_nontrivial_metrics_match_hand_calculated_values` fixes
+  ddof=1.
+
+### D-IMPL-644: The reference margin is the gap between the two largest reference logits
+
+- **Decision:** A row's margin is the reference top-1 logit minus the second-largest reference logit. A tie gives 0.
+  The margin uses the reference dump only.
+- **Reason:** Section 3.3 sets the bands but does not define the margin. The gap between two log-probabilities equals the
+  gap between their logits, because both subtract the same normaliser, so the choice does not depend on the units.
+- **Review required:** Confirm that the margin is the top-two gap, not the gap between top-1 and the next-token logit.
+  The bands are `[0,m0)`, `[m0,m1)` and `[m1,infinity)`.
+
+### D-IMPL-645: A comparison with no row left to compare fails instead of reporting empty metrics
+
+- **Decision:** Rows without a next-token ID are dropped, as section 3.3 states. If no selected row keeps its next-token
+  ID, `compare` raises `ValueError`, and the CLI exits with status 2.
+- **Reason:** The spec does not say what an empty comparison reports. Every metric is undefined for zero rows, and a
+  silent zero-row success would hide a wrong ID file or `--rows` range.
+- **Review required:** Confirm the failure, rather than an empty report with `rows_compared: 0`.
+
+### D-IMPL-646: Block sizes for validation and comparison
+
+- **Decision:** `load` checks finiteness over blocks of 64 rows. `compare` converts 16 rows at a time to float64.
+- **Reason:** Section 3.3 requires bounded blocks but gives no sizes. At 248,320 logits per row, a 16-row float64 block is
+  about 32 MB per array, and a 64-row float32 check block is about 64 MB. Neither size has been measured on the
+  reference Mac.
+- **Review required:** Measure the peak memory of `tf_compare.py` on a full-length dump on the reference Mac, and adjust
+  the block sizes if they do not fit its memory budget.
+
+### D-IMPL-647: `load` rejects some inputs that section 3.3 does not list
+
+- **Decision:** `load` also rejects a vocabulary below 2, a declared row count below 1, and a file with more rows than its
+  header declares. Section 3.3 gives the whole-row rule and the short-file rule; these three checks are added.
+- **Reason:** A file with more rows than the header declares has no defined position for its extra rows, so it cannot be
+  aligned with the other dump. A vocabulary below 2 has no top-two margin.
+- **Review required:** Confirm that these are errors, not warnings. If the engine ever writes more rows than its header
+  declares, every comparison of that dump will fail.
+
+### D-IMPL-648: T5 covers the ladder clause at the file-layout level; ladder_compare.py is T6
+
+- **Decision:** `ladder_compare.py` and `test_ladder_compare.py` are not written. The T5 clause "files that ...
+  `ladder_compare.py` read" is covered only by `layers_position_count`, which requires a whole, non-empty number of
+  49-slot records. T6 must read ladder files through that check or an equivalent one.
+- **Reason:** The T6 rows of section 12 of `docs/mac/09` and section 3.3 of `docs/mac/10` name `ladder_compare.py` and its
+  test as T6 work. Its acceptance (`accept.py c1` on Q2_0 and Coder) needs the golden set, which T2 has not produced.
+  None of that is needed for the layout guarantee.
+- **Review required:** Confirm that T5 can be accepted with the layout-level clause, and that T6 keeps the layout check.
+
+### D-IMPL-649: The Python module sits outside `lc_dump/`, and the spec's status tables are updated
+
+- **Decision:** `tools/metal/lc_dump_format.py` is placed beside `tf_compare.py`, not in `tools/metal/lc_dump/`, which
+  section 1.3 reserves for the C++ program. Sections 1.3, 2.5 (a status paragraph) and 9.3 are updated for the new
+  module, the new test module and the status of `test_tf_compare.py`.
+- **Reason:** The C++ program's directory should hold only its own build inputs. The section 9.3 row is needed because
+  `tools/metal/test_map.py` counts the test modules of `tools/metal/` that are not listed by name, so the new module
+  would otherwise change that count and fail `test_map`.
+- **Review required:** Confirm the location. Moving the module into `lc_dump/` later is a rename plus the doc rows.
+
