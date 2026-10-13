@@ -273,6 +273,17 @@ set_tests_properties(metal_prefill_test_concurrent PROPERTIES
   TIMEOUT 120
   ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
 
+add_executable(pf_gdn_eq_step_norm tests/metal/pf_gdn_eq_step_norm.mm)
+target_include_directories(pf_gdn_eq_step_norm PRIVATE ${STRATA_METAL_GENERATED_DIR})
+target_link_libraries(pf_gdn_eq_step_norm PRIVATE
+  strata_metal_engine strata_metal_twins strata_metal_options)
+set_source_files_properties(tests/metal/pf_gdn_eq_step_norm.mm
+                            PROPERTIES OBJECT_DEPENDS ${STRATA_METALLIB_SHA256_INC})
+add_dependencies(pf_gdn_eq_step_norm strata_metallib)
+strata_metal_test(pf_gdn_eq_step_norm metal
+                  pf_gdn_eq_step_norm ${STRATA_METALLIB})
+set_tests_properties(pf_gdn_eq_step_norm PROPERTIES TIMEOUT 300)
+
 add_executable(metal_prefill_dequant_test
                tests/metal/metal_prefill_dequant_test.mm)
 target_include_directories(metal_prefill_dequant_test PRIVATE
@@ -310,6 +321,25 @@ set_tests_properties(metal_prefill_moe_grouping_test PROPERTIES
 strata_metal_test(metal_prefill_moe_grouping_test_concurrent metal
                   metal_prefill_moe_grouping_test ${STRATA_METALLIB})
 set_tests_properties(metal_prefill_moe_grouping_test_concurrent PROPERTIES
+  TIMEOUT 180
+  ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
+
+add_executable(pf_sort_eq_host_grouping tests/metal/pf_sort_eq_host_grouping.mm)
+target_include_directories(pf_sort_eq_host_grouping PRIVATE
+  ${STRATA_METAL_GENERATED_DIR})
+target_link_libraries(pf_sort_eq_host_grouping PRIVATE
+  strata_metal_engine strata_metal_twins strata_metal_options)
+set_source_files_properties(tests/metal/pf_sort_eq_host_grouping.mm
+                            PROPERTIES OBJECT_DEPENDS ${STRATA_METALLIB_SHA256_INC})
+add_dependencies(pf_sort_eq_host_grouping strata_metallib)
+strata_metal_test(pf_sort_eq_host_grouping metal
+                  pf_sort_eq_host_grouping ${STRATA_METALLIB})
+set_tests_properties(pf_sort_eq_host_grouping PROPERTIES
+  TIMEOUT 180
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial")
+strata_metal_test(pf_sort_eq_host_grouping_concurrent metal
+                  pf_sort_eq_host_grouping ${STRATA_METALLIB})
+set_tests_properties(pf_sort_eq_host_grouping_concurrent PROPERTIES
   TIMEOUT 180
   ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
 
