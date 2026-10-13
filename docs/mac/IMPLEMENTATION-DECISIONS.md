@@ -13738,3 +13738,97 @@ measuring L-15 remain open.
   would otherwise change that count and fail `test_map`.
 - **Review required:** Confirm the location. Moving the module into `lc_dump/` later is a rename plus the doc rows.
 
+
+### D-IMPL-720: The PLE batch dispatches the four row-ordered kernels directly for up to 64 rows
+
+- **Decision:** `ple_batch_eq_sequential` runs its batch by dispatching `strata_ple_gate`, `strata_ple_broadcast`,
+  `strata_ple_conv_residual` and `strata_ple_history` itself, with the grids of `src/metal/engine/ple_dispatch.mm` and
+  n rows, for n = 1..64. It does not call the `encode_ple_*` wrappers for the batch, because they accept 1..8 rows
+  (`VERIFY_MAX_T`). The sequential reference is the engine's single-row path: the same wrappers with rows = 1, run n
+  times, with the history advanced after each row.
+- **Reason:** Section 10.4 requires n = 1..64. Prefill steps 3-8 are not wired, so no engine entry point above the
+  decode window exists yet, and the batch cannot go through the production API for n > 8.
+- **Review required:** Confirm that direct dispatch with the engine's grids is an acceptable stand-in for a future
+  batched entry point. If `ple_dispatch.mm` changes its grids, the test's copies must change with it.
+
+### D-IMPL-721: Each batch kernel is its own encoder segment
+
+- **Decision:** The batch encodes gate, broadcast, convolution-residual and history as four separate
+  `Encoder::encode` segments in one command buffer. `encode_ple_post_projection` puts the same kernels in one segment.
+- **Reason:** Segments of one command buffer run in order, so the batch's kernel order does not depend on how the
+  Encoder orders dispatches within a shared segment. The test is then about the kernels, not about segment
+  composition. The one-segment composition is exercised by the shared-Encoder cases of `metal_ple_test`.
+- **Review required:** Confirm that the shared-segment ordering of the engine has its own test, as this one does not
+  cover it.
+
+### D-IMPL-722: The weighted RMS norms are outside the PLE chain under test
+
+- **Decision:** `ple_batch_eq_sequential` takes the normalised key, query and `ple_norm` rows as inputs and runs the
+  four row-ordered kernels. It does not dispatch `strata_rms_norm_w` (section 5.4).
+- **Reason:** A norm row depends only on its own input row, so the batch and the sequential run agree on the norms by
+  construction. The norms are checked at T = 1..8 by `metal_ple_test`. The only row-order dependencies in the chain are
+  the convolution taps and the history, and this test covers those.
+- **Review required:** Confirm that norms need no batch check at n > 8. If the spec asks for the full chain at
+  n = 1..64, add the three norm dispatches to the batch and the sequential run.
+
+### D-IMPL-723: Batch versus sequential is bitwise; the CPU references use the existing tolerances
+
+- **Decision:** Every output and the history must equal the sequential run bitwise (class B, section 10.4). The CPU
+  references are: the gate oracle at U(64); an exact float product for the broadcast; the convolution-residual oracle
+  at U(16), with its four taps written out from the row formula and the history read before the batch; and the history
+  as the last nine rows of [old history, `ple_norm`]. The convolution is checked against the CPU oracle only for the
+  batch, because the sequential run must equal it bitwise.
+- **Reason:** A batch compared only with the sequential run could agree with it while both are wrong. The CPU
+  references make the comparison one between two checked results. The tolerances are the ones `metal_ple_test` already
+  uses for the same kernels.
+- **Review required:** Confirm U(64) for the gate and U(16) for the convolution against section 10.2, where n is 16 per
+  transcendental helper on the element's path.
+
+### D-IMPL-724: Two controls must be detected in every case
+
+- **Decision:** Each case runs two controls and requires both to be detected. In the first, one bit of a copy of the
+  batch residual is flipped and the copy must differ from the sequential residual. In the second, a batch that advances
+  the history before its convolution must differ from the sequential residual. The test fails unless every control is
+  detected.
+- **Reason:** The bitwise comparison has to see the faults it exists to catch: a changed element, and the ordering fault
+  that the property is about. The controls show that the comparison is not vacuous for those faults.
+- **Review required:** Confirm the two controls. A batch that skips the history update is not a control here; the
+  history check covers it.
+
+### D-IMPL-725: Both tests run all three input sets; the new modes ignore `--seed` and `--input-set`
+
+- **Decision:** Neither property names an input set. `ple_batch_eq_sequential` runs `random`, `edge` and `fixture` for
+  every n = 1..64. `idx_batch_eq_sequential` runs the spec's p0 and T matrix for each of the three sets, standalone and
+  shared-Encoder. Both new modes are selected by an exact `argv[2]` match before `parse_options`, as the existing
+  `--window-gdn-commit-batch` and `--indexer-commit-batch` modes are, so they run with seed 1.
+- **Reason:** Covering every set means the default `--input-set` does not hide a fault that depends on the set. Parsing
+  options in the new modes would need the flag removed from `argv` before `parse_options`, which the existing modes do
+  not do.
+- **Review required:** Decide whether the new modes should accept `--seed` and `--input-set` before the flag.
+
+### D-IMPL-726: One serial CTest per planned name
+
+- **Decision:** Each planned test is registered once, with `STRATA_METAL_DISPATCH=serial` and `TIMEOUT 600`, under
+  the name in `tests/metal/test_map.json`. No `_concurrent` twin is registered. Measured run times were 7.7 s for
+  `ple_batch_eq_sequential` and 0.8 s for `idx_batch_eq_sequential`.
+- **Reason:** `tools/metal/test_map.py` requires one test-map entry per CTest name, and the counts in section 9.1 of
+  `docs/mac/09-testing-and-validation.md` would change with a twin. The brief asked for the planned names only.
+- **Review required:** Decide whether to add concurrent twins. That needs two test-map entries and the section 9.1
+  count update, and the concurrent run of each must use the same CPU references.
+
+### D-IMPL-727: `idx_batch_eq_sequential` reuses the existing indexer-batch case
+
+- **Decision:** The L6 test is a mode of `metal_qsa_test` that calls the existing `run_prefill_indexer_batch_case` over
+  the spec's matrix for all three input sets. No new comparison was written. The default `metal_qsa_test` run keeps its
+  fixture-only pass of the same matrix.
+- **Reason:** The case already compares the Prefill batch's tails, block positions, dead and pooled keys with chunked
+  Window replay (windows of `VERIFY_MAX_T` = 8 rows), bytewise, and with the scalar oracle at U(64). A second copy would
+  drift from it.
+- **Review required:** Confirm that 8-row Window replay is the sequential reference section 6.5 intends.
+
+### D-IMPL-728: No kernel was changed
+
+- **Decision:** No `.metal` file and no engine source changed. The PLE and indexer kernels met the spec in every case of
+  both tests, and the injected faults used to check the tests were caught and then reverted.
+- **Reason:** The brief allows a kernel change only where the kernel is demonstrably wrong.
+- **Review required:** None beyond the test results.
