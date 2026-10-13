@@ -1,0 +1,314 @@
+{
+  "schema": 1,
+  "mtp_source": {
+    "repo": "Qwen/Qwen3.8-Flash-Next",
+    "revision": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+    "fetched_bytes": 5214301696
+  },
+  "notes": [
+    "Every sha256, head_64mib_sha256 and tail_64mib_sha256 is null: the repository records none of the GGUF hashes. Fill them from the Hugging Face LFS object ids at the pinned revisions and the reference Mac's files, under a reviewed change (IMPLEMENTATION-DECISIONS D-IMPL-662).",
+    "The shard 2 of every ISTA file and of Coder is one Git LFS object, with id prefix 316b46f3a2dbd68c (03 section 2.4); the full SHA-256 is not in the repository.",
+    "cc_pressure_mib is measured by T-9 (09 section 11); null until recorded.",
+    "The derived entries are written by setup and are not pinned; check does not read them."
+  ],
+  "models": {
+    "Q2_0": {
+      "label": "ISTA Q2_0",
+      "family": "qwen",
+      "quant": "Q2_0",
+      "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+      "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+      "cc_pressure_mib": null,
+      "files": [
+        {
+          "role": "shard1",
+          "path": "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+          "source": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/ed59f92082b1e93c0e96d60a8b11aab089b52f09/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+          "bytes": 37623740192,
+          "sha256": null,
+          "head_64mib_sha256": null,
+          "tail_64mib_sha256": null
+        },
+        {
+          "role": "shard2",
+          "path": "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf",
+          "source": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/ed59f92082b1e93c0e96d60a8b11aab089b52f09/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf",
+          "bytes": 28800138432,
+          "sha256": null,
+          "head_64mib_sha256": null,
+          "tail_64mib_sha256": null
+        },
+        {
+          "role": "mmproj",
+          "path": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+          "source": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/ed59f92082b1e93c0e96d60a8b11aab089b52f09/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+          "bytes": 907543008,
+          "sha256": null,
+          "head_64mib_sha256": null,
+          "tail_64mib_sha256": null
+        }
+      ],
+      "derived": [
+        {
+          "path": "pack/dense.bin",
+          "bytes": 1485606400,
+          "made_by": "tools/iq_pack.py (03 section 4.5); not checked"
+        },
+        {
+          "path": "mtp/rt/",
+          "bytes": 823887872,
+          "made_by": "tools/mtp_pack.py and tools/mtp_rt.py (03 section 2.3); not checked"
+        }
+      ]
+    },
+    "IQ2_XS": {
+      "label": "ISTA IQ2_XS",
+      "family": "qwen",
+      "quant": "IQ2_XS",
+      "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+      "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+      "cc_pressure_mib": null,
+      "files": [
+        {
+          "role": "shard1",
+          "path": "Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+          "source": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/ed59f92082b1e93c0e96d60a8b11aab089b52f09/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+          "bytes": 39225954592,
+          "sha256": null,
+          "head_64mib_sha256": null,
+          "tail_64mib_sha256": null
+        },
+        {
+          "role": "shard2",
+          "path": "Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
+          "source": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/ed59f92082b1e93c0e96d60a8b11aab089b52f09/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
+          "bytes": 28800138432,
+          "sha256": null,
+          "head_64mib_sha256": null,
+          "tail_64mib_sha256": null
+        }
+      ],
+      "derived": [
+        {
+          "path": "pack/dense.bin",
+          "bytes": 1538035200,
+          "made_by": "tools/iq_pack.py (03 section 4.5); not checked"
+        },
+        {
+          "path": "mtp/rt/",
+          "bytes": 823887872,
+          "made_by": "tools/mtp_pack.py and tools/mtp_rt.py (03 section 2.3); not checked"
+        }
+      ]
+    },
+    "IQ3_XXS": {
+      "label": "ISTA IQ3_XXS",
+      "family": "qwen",
+      "quant": "IQ3_XXS",
+      "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+      "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+      "cc_pressure_mib": null,
+      "files": [
+        {
+          "role": "shard1",
+          "path": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+          "source": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/ed59f92082b1e93c0e96d60a8b11aab089b52f09/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+          "bytes": 47039860096,
+          "sha256": null,
+          "head_64mib_sha256": null,
+          "tail_64mib_sha256": null
+        },
+        {
+          "role": "shard2",
+          "path": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
+          "source": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/ed59f92082b1e93c0e96d60a8b11aab089b52f09/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
+          "bytes": 28800138432,
+          "sha256": null,
+          "head_64mib_sha256": null,
+          "tail_64mib_sha256": null
+        }
+      ],
+      "derived": [
+        {
+          "path": "pack/dense.bin",
+          "bytes": 1538035200,
+          "made_by": "tools/iq_pack.py (03 section 4.5); not checked"
+        },
+        {
+          "path": "mtp/rt/",
+          "bytes": 823887872,
+          "made_by": "tools/mtp_pack.py and tools/mtp_rt.py (03 section 2.3); not checked"
+        }
+      ]
+    },
+    "IQ3_S": {
+      "label": "ISTA IQ3_S",
+      "family": "qwen",
+      "quant": "IQ3_S",
+      "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+      "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+      "cc_pressure_mib": null,
+      "files": [
+        {
+          "role": "shard1",
+          "path": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+          "source": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/ed59f92082b1e93c0e96d60a8b11aab089b52f09/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+          "bytes": 54817524224,
+          "sha256": null,
+          "head_64mib_sha256": null,
+          "tail_64mib_sha256": null
+        },
+        {
+          "role": "shard2",
+          "path": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+          "source": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/ed59f92082b1e93c0e96d60a8b11aab089b52f09/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+          "bytes": 28800138432,
+          "sha256": null,
+          "head_64mib_sha256": null,
+          "tail_64mib_sha256": null
+        }
+      ],
+      "derived": [
+        {
+          "path": "pack/dense.bin",
+          "bytes": 1538035200,
+          "made_by": "tools/iq_pack.py (03 section 4.5); not checked"
+        },
+        {
+          "path": "mtp/rt/",
+          "bytes": 823887872,
+          "made_by": "tools/mtp_pack.py and tools/mtp_rt.py (03 section 2.3); not checked"
+        }
+      ]
+    },
+    "coder-IQ1_M": {
+      "label": "ISTA Coder IQ1_M",
+      "family": "coder",
+      "quant": "IQ1_M",
+      "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF",
+      "revision": "5348543e0147355ac9cbcb031184a3546350988e",
+      "cc_pressure_mib": null,
+      "files": [
+        {
+          "role": "shard1",
+          "path": "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+          "source": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/resolve/5348543e0147355ac9cbcb031184a3546350988e/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+          "bytes": 29608446496,
+          "sha256": null,
+          "head_64mib_sha256": null,
+          "tail_64mib_sha256": null
+        },
+        {
+          "role": "shard2",
+          "path": "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
+          "source": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/resolve/5348543e0147355ac9cbcb031184a3546350988e/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
+          "bytes": 28800138432,
+          "sha256": null,
+          "head_64mib_sha256": null,
+          "tail_64mib_sha256": null
+        },
+        {
+          "role": "mmproj",
+          "path": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+          "source": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/resolve/5348543e0147355ac9cbcb031184a3546350988e/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+          "bytes": 907543008,
+          "sha256": null,
+          "head_64mib_sha256": null,
+          "tail_64mib_sha256": null
+        }
+      ],
+      "derived": [
+        {
+          "path": "pack/dense.bin",
+          "bytes": 1475120640,
+          "made_by": "tools/iq_pack.py (03 section 4.5); not checked"
+        },
+        {
+          "path": "mtp/rt/",
+          "bytes": 823887872,
+          "made_by": "tools/mtp_pack.py and tools/mtp_rt.py (03 section 2.3); not checked"
+        }
+      ]
+    },
+    "swift-IQ2_XS": {
+      "label": "UkisAI Swift 1.5 IQ2_XS",
+      "family": "swift",
+      "quant": "IQ2_XS",
+      "repo": "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+      "revision": "b22d729eae29b5796f76fb70f91aef549b9fc52c",
+      "cc_pressure_mib": null,
+      "files": [
+        {
+          "role": "shard1",
+          "path": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+          "source": "https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/b22d729eae29b5796f76fb70f91aef549b9fc52c/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+          "bytes": 39788473344,
+          "sha256": null,
+          "head_64mib_sha256": null,
+          "tail_64mib_sha256": null
+        },
+        {
+          "role": "shard2",
+          "path": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
+          "source": "https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/b22d729eae29b5796f76fb70f91aef549b9fc52c/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
+          "bytes": 28363693824,
+          "sha256": null,
+          "head_64mib_sha256": null,
+          "tail_64mib_sha256": null
+        }
+      ],
+      "derived": [
+        {
+          "path": "pack/dense.bin",
+          "bytes": 1538035200,
+          "made_by": "tools/iq_pack.py (03 section 4.5); not checked"
+        },
+        {
+          "path": "mtp/rt/",
+          "bytes": 823887872,
+          "made_by": "tools/mtp_pack.py and tools/mtp_rt.py (03 section 2.3); not checked"
+        }
+      ]
+    },
+    "swift-IQ3_XXS": {
+      "label": "UkisAI Swift 1.5 IQ3_XXS",
+      "family": "swift",
+      "quant": "IQ3_XXS",
+      "repo": "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+      "revision": "b22d729eae29b5796f76fb70f91aef549b9fc52c",
+      "cc_pressure_mib": null,
+      "files": [
+        {
+          "role": "shard1",
+          "path": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+          "source": "https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/b22d729eae29b5796f76fb70f91aef549b9fc52c/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+          "bytes": 39785790560,
+          "sha256": null,
+          "head_64mib_sha256": null,
+          "tail_64mib_sha256": null
+        },
+        {
+          "role": "shard2",
+          "path": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
+          "source": "https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/b22d729eae29b5796f76fb70f91aef549b9fc52c/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
+          "bytes": 36180282560,
+          "sha256": null,
+          "head_64mib_sha256": null,
+          "tail_64mib_sha256": null
+        }
+      ],
+      "derived": [
+        {
+          "path": "pack/dense.bin",
+          "bytes": 1538035200,
+          "made_by": "tools/iq_pack.py (03 section 4.5); not checked"
+        },
+        {
+          "path": "mtp/rt/",
+          "bytes": 823887872,
+          "made_by": "tools/mtp_pack.py and tools/mtp_rt.py (03 section 2.3); not checked"
+        }
+      ]
+    }
+  }
+}
