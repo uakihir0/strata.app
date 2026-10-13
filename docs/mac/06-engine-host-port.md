@@ -1510,6 +1510,13 @@ The Monitor's hardware cards are fed by the server's own `_Apple` telemetry read
 
 `STRATA_WATCHDOG_S` defaults to 60; 0 turns the watchdog off. It checks once per second.
 
+**Status (H11).** Implemented on the host: the watchdog thread, the issue #29 line, the header, the two passes with the
+memory line, the crash-report hint, and the abort. The abort is `std::abort()` unless `ServeLoopOptions::watchdog_abort`
+replaces it. The engine's parts are **planned**, consistent with D-IMPL-826: `Window::diag()`, the `MissResolver` state,
+the Mac `gpu:` line from the last command buffer, and the GPU-wait release through `Context`. Until they are wired, the
+reporter prints no engine lines, prints `gpu: unavailable (no engine is attached to this serve loop)`, and releases
+nothing.
+
 If the engine is `busy` and `beats` has not changed for the limit, the watchdog does three things.
 
 1. It prints this line **verbatim**, because the server's `death_note` looks for "issue #29":
@@ -1519,18 +1526,20 @@ If the engine is `busy` and `beats` has not changed for the limit, the watchdog 
 2. It calls `stall_report`. The header is
    `strata serve: stall report (engine V): stage "..." for N s; L layers served since the last finished step (0 = stopped, more = slow)`.
    It makes two passes, 2 s apart. Each pass prints:
-   - `Window::diag()`;
-   - the `MissResolver` state (tiered mode), which replaces the pool diag;
+   - `Window::diag()` (planned);
+   - the `MissResolver` state (tiered mode, planned), which replaces the pool diag;
    - the memory line `memory: R MiB resident, S MiB in swap, A MiB RAM available; F major page faults so far`, filled
      from `process_memory()` and `available_memory()`. Upstream prints zeros here on macOS.
-   - Mac addition: `gpu: last command buffer "<label>" status <status>, W MiB budget, A MiB allocated`.
+   - Mac addition: `gpu: last command buffer "<label>" status <status>, W MiB budget, A MiB allocated` (planned; until
+     then `gpu: unavailable ...`).
 3. It calls `release_gpu_waits` only for events whose waiting command buffers have no unguarded GPU consumer after the
    wait. Each event advances to `UINT64_MAX`, which satisfies its encoded `encodeWaitForEvent` operations but does not
    cancel later commands, then waits up to the supplied timeout for committed command buffers containing those waits to
    complete. If a window command buffer contains an unguarded expert consumer after the wait, the watchdog must abort
    without releasing that event until the scheduler provides a safe boundary or GPU-visible failure guard. Released
    events are permanently unusable, and `wait()` does not provide completion evidence. In full mode nothing is waiting
-   on the host. Then the watchdog calls `std::abort()`.
+   on the host. The GPU-wait release through `Context` is planned; until it is wired, nothing is released. Then the
+   watchdog calls `std::abort()`.
 
 ### 14.3 Crash report instead of a minidump
 
@@ -1542,6 +1551,10 @@ strata serve: a crash report with every thread will be in ~/Library/Logs/Diagnos
 ```
 
 No in-process stack walking is required.
+
+The host test ends its stalled child serve loops through `ServeLoopOptions::watchdog_abort`: the seam writes one line to
+stderr and exits 86, so no crash report is written. The real `abort()` and its crash report are checked by
+`metal_watchdog_test`, which needs the engine and a model (planned, T13 in [09](09-testing-and-validation.md)).
 
 ### 14.4 Other timeouts
 
@@ -1586,6 +1599,6 @@ Each item becomes one task in [10-implementation-plan.md](10-implementation-plan
 | H8 | `Window` + spec round + MTP host side (section 10) | Gate C2 (spec equals greedy) passes |
 | H9 | Prompt cache, resume, snapshots, parking, memory pressure (section 11) | Gate C3 (conversation cache) passes |
 | H10 | `ExpertStore` tiered mode: `MissResolver`, slot pool, adapt, lookahead (section 9) | Gate C4 (full equals tiered) passes; gate G2 throughput |
-| H11 | Watchdog, stall report, crash-report hint, window timeout (section 14) | `metal_watchdog_test` ([09](09-testing-and-validation.md), section 5.5): with `STRATA_TEST_VERIFY_STALL=3` alone, the engine prints `ERR gpu error: window timeout` and exits 1 within 20 s + 5 s; with `STRATA_WATCHDOG_S=5` as well, it prints the issue #29 line, the stall report and the crash-report hint, and ends by SIGABRT within 5 s + 5 s, leaving a crash report |
+| H11 | Watchdog, stall report, crash-report hint, window timeout (section 14) | `metal_watchdog_test` ([09](09-testing-and-validation.md), section 5.5): with `STRATA_TEST_VERIFY_STALL=3` alone, the engine prints `ERR gpu error: window timeout` and exits 1 within 20 s + 5 s; with `STRATA_WATCHDOG_S=5` as well, it prints the issue #29 line, the stall report and the crash-report hint, and ends by SIGABRT within 5 s + 5 s, leaving a crash report. The host side is `watchdog_host_test`; the engine's `Window::diag()`, `gpu:` and GPU-wait lines are planned (section 14) |
 | H12 | `check_drift.py` | `tools/metal/test_check_drift.py` ([09](09-testing-and-validation.md), section 9.3): `check_drift.py` fails on each kind of change of [10](10-implementation-plan.md), section 4.2, planted one at a time |
 | H13 | `strata-vision` thread-count fix | Uses all performance cores on a Mac |

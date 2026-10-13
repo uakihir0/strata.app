@@ -14132,6 +14132,13 @@ measuring L-15 remain open.
   The callbacks are the only progress points the serve loop can see.
 - **Review required:** Section 2.3 step 12 also puts the startup memory line before INFO. It is not printed, because
   the startup protocol belongs to H6.
+- **Amended (H11 review):** The statement above is wrong. Step 12's "memory line" is the stderr line of section 5.2,
+  item 2 (`strata serve: N MiB of the GPU working set free ...`, with the `LOW` variant below 256 MiB). `serve.cpp`
+  prints it before `INFO` (about lines 1064-1076), so step 12 is met. The stall report's `memory:` line (section 14.2)
+  is a different line, and the watchdog prints it. The decision text above that says `run_one_request` holds the
+  `BusyScope` is also superseded: the scope now starts in `run_serve_loop` before the image load, so the image load is
+  inside the request's busy state (D-IMPL-838). The prompt, resume and token callbacks now set their beat and stage in
+  one call (D-IMPL-837).
 
 ### D-IMPL-825: Stall-report lines go to stderr, one per flushed line, in the order the spec gives
 
@@ -14175,6 +14182,11 @@ measuring L-15 remain open.
 - **Review required:** Each stall run leaves a `watchdog_host_test-<date>.ips` file in
   `~/Library/Logs/DiagnosticReports/` (the child is a fork of the test binary). The engine's own reports are
   `strata-*.ips`. Decide whether CI should keep or suppress these.
+- **Resolved by seam (H11 review):** The child stall cases now end through `ServeLoopOptions::watchdog_abort`, which
+  writes one line on stderr and exits 86, so `watchdog_host_test` no longer calls `abort()` in a child and writes no
+  crash report. One run of `watchdog_host_test` left the `~/Library/Logs/DiagnosticReports/` count at 82 before and 82
+  after, with no `watchdog_host_test-*.ips`. The real `abort()` and its SIGABRT are checked only by
+  `metal_watchdog_test`, which is model-labelled and planned.
 
 ### D-IMPL-830: The new host tests take the names `watchdog_host_test` and `dump_format_host_test`
 
@@ -14207,6 +14219,13 @@ measuring L-15 remain open.
   its last value is exactly `1`. The default of 16 is not accepted. The flag is not checked against `--dump-logits`.
 - **Reason:** Section 9.1 states the `--max-new 1` requirement. The other rules are ours.
 - **Review required:** Decide whether `--logits-stride` without `--dump-logits` should warn or fail.
+- **Amended (H11 review):** It now fails: `--logits-stride` without `--dump-logits` exits 2 with `--logits-stride needs
+  --dump-logits`, checked after the `--max-new 1` rule so the earlier messages stay the same. With `--dump-logits`, the
+  flag is accepted as before. Section 03 9.1 gives no byte layout for the strided rows. It says only "every Nth row plus
+  the final input" for the `--dump-logits` file, so no layout is invented here. `tools/metal/tf_compare.py` reads
+  contiguous rows and takes `first_position` as the header's declared count minus the rows present (D-IMPL-839), so a
+  strided file read by it would place its rows wrongly. Until 03 section 9.1 gives a strided layout, a strided dump is
+  not comparable with `tf_compare.py`, and the stride is not wired to any reader.
 
 ### D-IMPL-834: Byte layouts follow the 09.1 and 09.2 tables, with optional and zero slots as stated
 
@@ -14237,4 +14256,54 @@ measuring L-15 remain open.
 - **Reason:** The Python reader is the consumer that `dump_formats_test` names, and this shows the two sides agree.
 - **Review required:** Register this as the Python half of `dump_formats_test` if the Python test layer can take a
   fixture written by the C++ writer.
+
+### D-IMPL-837: The watchdog compares whole seconds as unsigned, a beat and its stage are one update, and `poll` is private
+
+- **Decision:** `Watchdog::poll` compares the stall's whole seconds, as `uint64_t`, with the limit. It no longer converts
+  the limit into a duration of nanoseconds, which overflows at about 9.2e9 s and fired a huge limit about one second into
+  a request. A stall that the clock reports as negative never fires. `Progress::beat(where, detail)` records the beat and
+  its stage under one lock, and the resume, prompt, reused and token callbacks use it, so a snapshot never pairs a new
+  beat with an older stage. `poll` is private, and the test reaches it through the friend `WatchdogTestAccess`. The
+  header's layer count is the ticks since the last beat, and the test takes it after one tick before the beat and three
+  after, so the subtraction is visible.
+- **Reason:** A limit of UINT64_MAX means "never", so it must not fire after a 20 s stall. Keeping the comparison in
+  seconds changes nothing for limits that fit. A stage must never be reported with a beat that did not set it.
+- **Review required:** A clock that goes backwards is treated as no stall, so confirm that reading. The beat-and-stage
+  check is a concurrency test. Its two-lock mutant was caught in one run (48,653 torn snapshots), but a single run
+  does not prove the window is always hit.
+
+### D-IMPL-838: Stall-report lines share one locked write, the image load is watched, and a watchdog that cannot start is a startup error
+
+- **Decision:** `write_report_line` writes each line with one `fwrite` and a flush, under a process-wide mutex. The
+  watchdog's report and the request thread's diagnostics both go through it (`diagnostic_line` in `serve.cpp`), so their
+  lines do not interleave. `ServeLoopOptions::watchdog_abort` replaces the abort, and a test child writes one line and
+  exits 86. The request's `BusyScope` starts in `run_serve_loop` before the image load, with the stage `image`, so a
+  stuck read is reported like any other stall. `Watchdog::start()` returns false when the thread cannot be created, and
+  serve prints `strata: could not start the watchdog` and exits 2, as `InputReader::start` does.
+- **Reason:** Two writers on one stderr must not split a line. The seam lets the child stall cases end without a crash
+  report. Image loading reads up to 256 MiB from a path the client names, so a stuck read is part of the request.
+- **Review required:** Remaining risks, not fixed. (1) A stderr pipe that nobody drains blocks `write_report_line`
+  inside the watchdog thread, so the report and the abort never finish and the process hangs rather than aborts; the
+  watchdog has no timeout on its own writes. (2) Writers outside the mutex can still interleave with the report: the
+  startup lines, which run before the watchdog starts, and any `fprintf` in the engine. (3) An image read longer than
+  the limit (60 s by default) now ends the engine; confirm that is wanted. (4) The start-failure path has no test: a
+  probe on this Mac showed `std::thread` creation still succeeds under `RLIMIT_NPROC` 0 and `RLIMIT_AS` 1, so a test
+  would need a new seam.
+
+### D-IMPL-839: The dump writers take the declared row count and enforce the bounds the readers enforce
+
+- **Decision:** `write_logits_dump` takes `declared_rows`, the caller's `n_prompt - 1 + max_new`, and writes it as the
+  header's second integer. The file holds `0 < rows <= declared_rows` rows, so a prompt-path run keeps the full declared
+  count, and `tools/metal/tf_compare.py` takes `first_position = declared - rows`. A test covers declared 100 with 36
+  rows present: header 100, 36 rows, first position 64. The logits writers reject `n_vocab < 2` and non-finite values.
+  The routing writer rejects layers outside 0 to 47 and k above 64, the bounds `tools/make_profile.py` reads. A QSA
+  layer whose only slice is the FP16 V pool is rejected, not dropped. This supersedes D-IMPL-834 for the layer and k
+  bounds, which said the writer did not enforce them. The id bound stays with the reader, since it depends on the
+  expert count (512, or 256 for a pruned model).
+- **Reason:** A header that held the rows present would put a short dump's first row at position 0, mislabelling every
+  prompt-path comparison. A writer that accepts what the reader rejects produces files no reader can use. A one-off
+  check outside CTest, as in D-IMPL-836, wrote a 5-vocabulary, 36-row file with declared 100 through `write_logits_dump`;
+  `tf_compare.load()` read it as declared 100, 36 rows, first position 64.
+- **Review required:** The driver is not wired, so nothing checks that the caller's declared count is `n_prompt - 1 +
+  max_new`. Confirm whether `write_first_logits_dump` should reject non-finite values, since no reader checks that file.
 
