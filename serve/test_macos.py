@@ -2,6 +2,7 @@ import importlib.util
 import os
 import select
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -329,6 +330,166 @@ class MacOSProbes(unittest.TestCase):
         identity = macos.proc_identity(os.getpid())
         self.assertRegex(identity or "", r"^mac:\d+\.\d+$")
         self.assertEqual(identity, macos.proc_identity(os.getpid()))
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class ServerSockets(unittest.TestCase):
+    @unittest.skipUnless(macos.MAC, "macOS only")
+    def test_port_probe(self):
+        """docs/mac/07, section 6.1: the four rows of the table, with real loopback sockets on a free port.  The
+        listeners set SO_REUSEADDR as the server's own socket does."""
+        from serve import server
+        port = free_port()
+        cases = (
+            ("0.0.0.0 listening, probe 127.0.0.1", "0.0.0.0", "127.0.0.1", True),
+            ("127.0.0.1 listening, probe 0.0.0.0", "127.0.0.1", "0.0.0.0", True),
+            ("127.0.0.1 listening, probe 127.0.0.1", "127.0.0.1", "127.0.0.1", True),
+            ("nothing listening, probe 127.0.0.1", None, "127.0.0.1", False),
+            ("nothing listening, probe 0.0.0.0", None, "0.0.0.0", False),
+        )
+        for label, listen_on, probe, expected in cases:
+            with self.subTest(label):
+                listener = None
+                try:
+                    if listen_on:
+                        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        listener.bind((listen_on, port))
+                        listener.listen(1)
+                    self.assertIs(server.port_in_use(probe, port), expected)
+                finally:
+                    if listener is not None:
+                        listener.close()
+
+
+class ServerLifecycle(unittest.TestCase):
+    def setUp(self):
+        # test_no_raise_anywhere caches macos_version() as () while MAC is patched False: read the host's value again
+        macos.macos_version.cache_clear()
+
+    @unittest.skipUnless(macos.MAC, "macOS only")
+    def test_sighup_shutdown(self):
+        """docs/mac/07, section 6.2: closing the Terminal window sends SIGHUP to the session.  The mock-engine server
+        exits 0 within 10 s and its port is free again."""
+        from serve import server
+        reason = server.macos_host_error()
+        if reason:
+            self.skipTest(reason)
+        port = free_port()
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "server.log"
+            with open(log, "w", encoding="utf-8") as out:
+                proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "mock",
+                                         "--port", str(port)], cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=out,
+                                        stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                deadline = time.monotonic() + 60
+                while "ready:" not in log.read_text(encoding="utf-8"):
+                    if proc.poll() is not None:
+                        self.fail(f"the server exited before it was ready ({proc.returncode}): "
+                                  + log.read_text(encoding="utf-8"))
+                    if time.monotonic() > deadline:
+                        self.fail("the server was not ready within 60 s")
+                    time.sleep(0.2)
+                time.sleep(0.5)     # the SIGHUP handler is installed just after the ready text
+                os.killpg(proc.pid, signal.SIGHUP)
+                try:
+                    returned = proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.fail("the server did not exit within 10 s of SIGHUP")
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        self.assertEqual(returned, 0)
+        self.assertFalse(server.port_in_use("127.0.0.1", port))
+
+    @unittest.skipUnless(macos.MAC, "macOS only")
+    def test_keep_awake(self):
+        """docs/mac/07, section 6.9: caffeinate runs while the model is loaded and ends at an unload; it starts again
+        at the next load, and with keep_awake off none runs.  The stub engine has no process of its own."""
+        from serve import server
+        from serve.frontend import ChatTemplate
+
+        class StubEngine:
+            def __init__(self):
+                self.up = False
+
+            def alive(self):
+                return self.up
+
+            def restart(self):
+                self.up = True
+
+            def unload(self):
+                self.up = False
+
+        def caffeinate_children():
+            r = subprocess.run(["/usr/bin/pgrep", "-P", str(os.getpid()), "caffeinate"], capture_output=True,
+                               text=True, timeout=10)
+            return [int(x) for x in r.stdout.split()]
+
+        svc = server.Service(StubEngine(), server.ByteTokenizer(), ChatTemplate(ROOT / "serve" / "chat_template.jinja"))
+        self.addCleanup(lambda: (setattr(svc, "keep_awake", False), svc.keep_awake_sync()))
+        svc.keep_awake = True
+        svc.ensure_loaded()
+        first = caffeinate_children()
+        self.assertEqual(len(first), 1)
+        argv = subprocess.run(["/bin/ps", "-o", "command=", "-p", str(first[0])], capture_output=True, text=True,
+                              timeout=10).stdout.split()
+        self.assertTrue(argv[0].endswith("caffeinate"))
+        self.assertEqual(argv[-3:], ["-i", "-w", str(os.getpid())])
+        self.assertEqual(svc.unload(), "unloaded")
+        self.assertEqual(caffeinate_children(), [])
+        svc.ensure_loaded()
+        second = caffeinate_children()
+        self.assertEqual(len(second), 1)
+        self.assertNotEqual(second, first)
+        svc.keep_awake = False
+        svc.unload()
+        self.assertEqual(caffeinate_children(), [])
+        svc.ensure_loaded()
+        self.assertEqual(caffeinate_children(), [])
+
+
+class SourceRules(unittest.TestCase):
+    def test_module_rules(self):
+        """Runs everywhere: serve/macos.py parses as Python 3.9, imports only the standard library and starts every
+        subprocess with an absolute path (docs/mac/07, sections 3.1 and 10.3)."""
+        import ast
+        if not hasattr(sys, "stdlib_module_names"):
+            self.skipTest("the standard-library list needs Python 3.10+")
+        tree = ast.parse((ROOT / "serve" / "macos.py").read_text(encoding="utf-8"), feature_version=(3, 9))
+        allowed = set(sys.stdlib_module_names) | {"__future__"}
+        launchers = {"run", "Popen", "call", "check_call", "check_output", "_tool"}
+        checked = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                self.assertEqual(node.level, 0, "relative import in serve/macos.py")
+                names = [node.module or ""]
+            else:
+                names = []
+            for name in names:
+                self.assertIn(name.split(".")[0], allowed, f"{name} is not a standard-library module")
+            if isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.List):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                if name in launchers:
+                    checked += 1
+                    first = node.args[0].elts[0] if node.args[0].elts else None
+                    self.assertIsInstance(first, ast.Constant, f"line {node.lineno}: no literal program")
+                    self.assertTrue(str(first.value).startswith("/"), f"line {node.lineno}: {first.value!r}")
+        self.assertGreater(checked, 0, "no subprocess call was checked")
 
 
 if __name__ == "__main__":
