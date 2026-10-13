@@ -224,8 +224,7 @@
     },
     "prompts_manifest_test": {
       "label": "host",
-      "origin": "09 2.2",
-      "planned": "T1"
+      "origin": "09 2.2"
     },
     "serve_transcript_test": {
       "label": "host",

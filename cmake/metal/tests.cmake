@@ -672,6 +672,11 @@ set_tests_properties(metal_encoder_test PROPERTIES TIMEOUT 120)
 find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
 strata_metal_test(test_map host ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/metal/test_map.py)
 set_tests_properties(test_map PROPERTIES ENVIRONMENT "STRATA_BUILD_DIR=${CMAKE_BINARY_DIR}")
+# The prompt builder's self-test: a synthetic tokenizer, the project's own sources, and a changed-byte check. The
+# frozen sets need the pack's tokenizer, so their --check is not a CTest yet (docs/mac/IMPLEMENTATION-DECISIONS.md).
+strata_metal_test(prompts_manifest_test host ${Python3_EXECUTABLE}
+                  ${CMAKE_SOURCE_DIR}/tools/metal/make_prompts.py --self-test)
+set_tests_properties(prompts_manifest_test PROPERTIES TIMEOUT 120)
 
 # the shipped engine: identity and the hash it embeds, on the binary itself (host: --version opens no device)
 strata_metal_test(strata_version host ${CMAKE_COMMAND} -DSTRATA=$<TARGET_FILE:strata> -DMETALLIB=${STRATA_METALLIB}

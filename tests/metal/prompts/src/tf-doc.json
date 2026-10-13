@@ -1,0 +1,5 @@
+{
+  "schema": 1,
+  "system": "You are a careful assistant. Answer from the document in the conversation, and say so when the document does not contain the answer.",
+  "request": "List the build steps for a CPU-only build, and explain how a function-calling prompt is formatted."
+}

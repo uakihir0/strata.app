@@ -13187,3 +13187,118 @@ measuring L-15 remain open.
   tools/metal/test_map.py` passed with its existing planned and missing
   requirement diagnostics; `git diff --check` passed. All inputs were
   synthetic; this does not establish model parity or production inference.
+
+### D-IMPL-620: Stop T1 at the builder and self-test until the pack and upstream sources exist
+
+- **Decision:** Commit the project's prompt sources (`tests/metal/prompts/src/*.json`), the builder
+  `tools/metal/make_prompts.py`, its unit tests, and the CTest `prompts_manifest_test`. Do not generate
+  `tests/metal/prompts/*.ids`, `*.txt` or `MANIFEST.json`, and do not write any token id or hash by hand.
+- **Reason:** Three inputs that the frozen sets need are not available to this work:
+  1. No model pack's `tokenizer/` folder. The repository has no `vocab.json`, `merges.txt`, `token_type.json` or
+     `tokenizer.json`, and `~/.cache/huggingface` holds no Qwen/Strata pack. Only `serve/chat_template.jinja`
+     exists, and it cannot tokenise.
+  2. The `ca-*` repository files at upstream commit `1678de33d0e0711bc414ad992b640e1a37dd814` cannot be read.
+     The GitHub API returns 422 for `repos/Niko1221/Strata/commits/1678de33...` and 404 for the git-objects
+     endpoint, while the repository is public and its `v0.1.34` tag resolves to
+     `eb8bb8bcd90d5cf3930dc83782ce6001df71df67`.
+  3. `third_party/llama.cpp` is absent from the worktree. Commit `3cf03257f219afbe7334045ff7c6a06ac68c627d`
+     exists in `ggml-org/llama.cpp`. Its `docs/build.md` and `docs/function-calling.md` were fetched to scratch
+     space and contain no control-token spellings.
+- **Review required:** Frozen generation is blocked until a pack's `tokenizer/` folder (all five files) is
+  provided, the upstream commit is made readable (or the pin is corrected, since `PROJECT_ORIGIN.md` also names
+  it), and `third_party/llama.cpp` is checked out at `3cf03257`. Then run
+  `make_prompts.py --pack <pack> --upstream <checkout>` and `--check`. T1 is not complete until then.
+
+### D-IMPL-621: Encode file text as text, so every set round-trips
+
+- **Decision:** The `ca-*` and `tf-doc` file text is encoded with `parse_special=True`, not `False`.
+- **Reason:** The spec requires both that file text is encoded with `parse_special=False` and that
+  `encode(decode(ids), parse_special=True) == ids`. The upstream lineage's `serve/` and `tools/` code spells
+  `<|im_end|>` and `<|im_start|>` (for example `serve/server.py` and `tools/strata_tokenizer.py`), so with
+  `parse_special=False` every cut of a `ca-*` set would fail the round trip. The round trip is the spec's stated
+  invariant (a server request with the `.txt` gives the same ids), so the builder keeps it. The injection concern
+  of section 2.2 is about user input, and these benchmark sets are fixed text. The ids of a set are the tokenisation
+  of its own text, which the round trip verifies.
+- **Review required:** This departs from the wording of section 2.2, step 3. The frozen `ca-*` sets will contain
+  control tokens where the source spells them. Confirm this is acceptable, or amend section 2.2.
+
+### D-IMPL-622: Load the pack's tokenizer from its files, and hash the token-type and pre-tokenizer files too
+
+- **Decision:** `load_pack` reads `vocab.json`, `merges.txt`, `token_type.json`, `tokenizer.json` and
+  `chat_template.jinja` from `<pack>/tokenizer/` and builds `Tokenizer(tokens, merges, token_types, pre,
+  special_ids)`, since the class takes lists rather than a folder. `tokenizer_sha256` is over `vocab.json`,
+  `merges.txt` and `chat_template.jinja`, as the spec says. Each manifest entry also carries
+  `tokenizer_aux_sha256`, over `token_type.json` and `tokenizer.json`. Any `pre` other than `qwen35` is refused.
+- **Reason:** Token types decide which literals match with `parse_special` (type 3 for control tokens, type 4 for
+  user-defined ones), and `pre` selects the pre-tokenizer pattern. A pack whose three hashed files match but whose
+  token types differ would produce different ids under the same `tokenizer_sha256`. The `qwen35` pattern is the only
+  one transcribed in `strata_tokenizer.py`.
+- **Review required:** Confirm that the spec should name these two files too. If it should not, drop the aux hash
+  from the manifest and note the gap.
+
+### D-IMPL-623: `prompts_manifest_test` runs the builder's self-test, not the frozen check
+
+- **Decision:** Register `prompts_manifest_test` as `make_prompts.py --self-test` (host label, 120 s timeout),
+  and remove `"planned": "T1"` from `tests/metal/test_map.json`. The self-test writes a synthetic byte-level pack
+  into a temporary folder, builds the sets from the project's own JSON sources (`ca-4k`, `tf-code`, `tf-doc`,
+  `tf-chat`, `g1-*`), and checks three things: a fresh rebuild matches itself, a changed byte in
+  `code-agent.json` is detected, and a changed byte in an `.ids` file is detected.
+- **Reason:** The plan says the commit that registers a test removes its `planned` key, and `test_map.py` requires
+  that. A CTest that compared frozen files would fail until D-IMPL-620 is resolved, which would turn the host
+  suite red. The self-test exercises the same code path (rebuild, manifest, hash, compare) on a tokenizer that
+  exists in the repository.
+- **Review required:** The name `prompts_manifest_test` promises a check of the frozen sets. Once they exist,
+  add a second CTest that runs `--check` against `tests/metal/prompts` with the pack path from an environment
+  variable, and state in the test map what each test checks.
+
+### D-IMPL-624: Render options and context of each set
+
+- **Decision:** The `ca-*` and `tf-*` sets render with `enable_thinking=False` (explicit, not the template
+  default). The `g1-*` sets take their `thinking` flag from `g1.json` (only `g1-03` is on). `ca-*` use the tool
+  definitions in `code-agent.json`, and `g1-06` has its one tool. The `ca-*` user message is the file placeholder
+  followed by the request. Contexts are 8,192 for `ca-1k` to `ca-4k`, `tf-*` and `g1-*`, and 32,768 to 262,144 for
+  the long sets, as section 2.1 states. The builder fails when a set is longer than its context.
+- **Reason:** The spec names no template option for these sets. Setting it explicitly makes the ids independent of
+  the template's default, and the chosen value is recorded here.
+- **Review required:** Confirm that `enable_thinking=False` matches the decode benchmark's server path. Also
+  check `ca-1k`: the system prompt and tool definitions alone may exceed 1,024 tokens with the real tokenizer, in
+  which case the builder fails with a clear message and the prompt needs trimming.
+
+### D-IMPL-625: Check compares the identities and bytes the spec names, and output goes to one folder per tokenizer
+
+- **Decision:** `--check` compares `MANIFEST.json` byte for byte, with CRLF read as LF. It recomputes the ids hash
+  from each `.ids` file, with CRLF read as LF, and compares it with the manifest. It compares each `.txt` with LF
+  line ends. It reports any set file that the manifest does not name. If `out/MANIFEST.json` holds another
+  tokenizer's hash, the sets go to `out/<tokenizer_sha256[:12]>/`.
+- **Reason:** Section 2.2 defines the check by ids hash, and a line-end conversion by the version-control tool must
+  not change a set's identity. The manifest is written deterministically, so a byte compare catches any edit to it,
+  including whitespace. The subfolder rule is the one section 2.2 describes for a second tokenizer.
+- **Review required:** Confirm that a CRLF-converted `.ids` file should pass. Under the same rule, a change to any
+  other byte fails.
+
+### D-IMPL-626: Round-trip and cut details
+
+- **Decision:** `decode` is strict: a cut that splits a UTF-8 character fails the round trip. The cut tries
+  `k`, `k-1`, ..., `k-16`, which is 17 attempts. `g1-*` are whole prompts and must round-trip without a cut. The
+  `tf-code`, `tf-doc` and `tf-chat` sets are prefixes and are not round-tripped. Their `.txt` uses
+  `errors="replace"`, since their last token may split a character. The `tokens` count in the manifest is the exact
+  length.
+- **Reason:** A cut that splits a character would decode to U+FFFD, and the round trip must detect that rather than
+  accept it. The bound of 16 is the spec's.
+- **Review required:** None beyond the spec's own bounds. The 16-step bound and the 17-attempt count are covered by
+  `tools/metal/test_make_prompts.py`.
+
+### D-IMPL-627: Read upstream sources from pinned checkouts, and write the project's prompts from scratch
+
+- **Decision:** `read_sources` lists the `ca-*` files from the upstream checkout at the pinned commit, limited to
+  `src`, `include`, `serve` and `tools` with the six extensions of section 2.2. It refuses any entry that is not a
+  regular blob, and reads each one's content. The `tf-doc` documents are read the same way from a llama.cpp checkout
+  at the pinned commit. Neither source is copied into the repository. The project's prompt sources
+  (`code-agent.json`, `tf-doc.json`, `tf-chat.json`, `g1.json`) are written for this project, including the Chinese
+  news text and the C++ file in `g1-09`. The request string in `code-agent.json` is the one section 2.2 gives.
+- **Reason:** Vendoring upstream text would conflict with the licence record. The builder must fail clearly when a
+  checkout is missing or lacks the pinned commit, and both paths were run by hand against a missing directory and
+  a checkout without the commit.
+- **Review required:** Confirm that `g1-09` (a project-written 255-line C++ file) and the Chinese text satisfy the
+  spec's "project's licence" source rule. Also confirm that the 46-rule `g1-07` prompt (about 4,600 characters) is
+  near its 3,000-token target once the real tokenizer measures it.
