@@ -954,8 +954,8 @@ void test_sve1_loader() {
 
     ServeRequest extra_prompt;
     extra_prompt.embeddings_path = valid_path;
-    extra_prompt.token_ids = {kServeImagePadToken, kServeImagePadToken,
-                              kServeImagePadToken, kServeImagePadToken, 7};
+    extra_prompt.token_ids = {kServeImagePadToken, kServeImagePadToken, 7,
+                              kServeImagePadToken, kServeImagePadToken, 8};
     check(!load_serve_image_embeddings(extra_prompt, 32, error) &&
               error == "the prompt has more images than the embeddings file",
           "each image-pad run requires a matching record");
@@ -988,6 +988,70 @@ void test_sve1_loader() {
     if (!over_budget_path.empty()) (void) ::unlink(over_budget_path.c_str());
 }
 
+void test_strict_request_grammar() {
+    struct Malformed {
+        std::string_view line;
+        std::string_view error;
+    };
+    constexpr std::string_view id_error = "invalid token id: expected an integer in [0, 2147483647]";
+    const std::array malformed_requests {
+        Malformed {"GEN 2 1,,2", id_error},
+        Malformed {"GEN 2 1 2", id_error},
+        Malformed {"GEN 2 1,2,", id_error},
+        Malformed {"GEN 2 ,1", id_error},
+        Malformed {"GEN 2 1,2 ", id_error},
+        Malformed {"GEN 2 1 , 2", id_error},
+        Malformed {"GEN 2 +1", id_error},
+        Malformed {"GEN 2 temperature=-0.5 1", "temperature"},
+        Malformed {"GEN 2 min_p=1.5 1", "min_p"},
+        Malformed {"GEN 2 min_p=-0.1 1", "min_p"},
+    };
+    for (const auto& test_case : malformed_requests) {
+        const ServeParseResult result = parse_serve_request(test_case.line);
+        check(result.kind == ServeParseKind::BadRequest && result.error == test_case.error,
+              "malformed request is rejected: " + std::string(test_case.line));
+    }
+    const ServeParseResult strict = parse_serve_request("GEN 2 min_p=0.5 temperature=0 1,2");
+    check(strict.kind == ServeParseKind::Request && strict.request.token_ids == std::vector<std::int32_t>({1, 2}) &&
+              strict.request.sampling.min_p == 0.5f && strict.request.sampling.temperature == 0.0f,
+          "a comma-separated id list after in-range sampling keys still parses");
+}
+
+void test_image_runs_match_records() {
+    const std::string two_records = make_sve_records_file({
+        {0x31455653, 2, 2, 1, kServeImageEmbeddingWidth},
+        {0x31455653, 2, 2, 1, kServeImageEmbeddingWidth},
+    });
+    const std::string one_record = make_sve_records_file({
+        {0x31455653, 2, 2, 1, kServeImageEmbeddingWidth},
+    });
+    check(!two_records.empty() && !one_record.empty(), "create SVE1 records for run matching");
+    std::string error;
+
+    ServeRequest split;
+    split.embeddings_path = two_records;
+    split.token_ids = {kServeImagePadToken, kServeImagePadToken, kServeImagePadToken, kServeImagePadToken, 7};
+    check(!load_serve_image_embeddings(split, 32, error) && error == "image 1 has 2 rows but more <|image_pad|> tokens",
+          "one run of pad tokens cannot be shared by two records");
+
+    ServeRequest longer;
+    longer.embeddings_path = one_record;
+    longer.token_ids = {kServeImagePadToken, kServeImagePadToken, kServeImagePadToken, kServeImagePadToken, 7};
+    check(!load_serve_image_embeddings(longer, 32, error) &&
+              error == "image 1 has 2 rows but more <|image_pad|> tokens",
+          "a run longer than its record is rejected rather than handed to a later record");
+
+    ServeRequest exact;
+    exact.embeddings_path = one_record;
+    exact.token_ids = {kServeImagePadToken, kServeImagePadToken, 7};
+    check(load_serve_image_embeddings(exact, 32, error) && exact.images.size() == 1 &&
+              exact.mrope_positions == std::vector<std::array<std::int32_t, 3>>{{0, 0, 0}, {0, 0, 1}, {2, 2, 2}},
+          "a run equal to its record's rows loads with the two-dimensional M-RoPE positions");
+
+    if (!two_records.empty()) (void) ::unlink(two_records.c_str());
+    if (!one_record.empty()) (void) ::unlink(one_record.c_str());
+}
+
 int child_main(std::string_view mode) {
     const bool slow = mode == "slow" || mode == "slow-length";
     const bool report_length_after_stop = mode == "slow-length";
@@ -1003,6 +1067,8 @@ int main(int argc, char** argv) {
     if (argc == 3 && std::string_view(argv[1]) == "--serve-child") return child_main(argv[2]);
 
     test_request_parser();
+    test_strict_request_grammar();
+    test_image_runs_match_records();
     run_fixture("basic", false);
     run_fixture("image", true);
     run_fixture("gpu_error", false, true);

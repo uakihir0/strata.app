@@ -52,15 +52,22 @@ bool parse_i64(std::string_view text, std::int64_t& value) {
     return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
 }
 
+// The id list is `<id>(,<id>)*`: base-10 integers in [0, 2147483647] with single commas and no spaces, as the
+// server writes it. Empty fields, spaces and a trailing comma are malformed, not skipped.
 bool parse_token_list(std::string_view text, std::vector<std::int32_t>& tokens, std::string& error) {
     tokens.clear();
-    std::string normalized(text);
-    std::replace(normalized.begin(), normalized.end(), ',', ' ');
-    std::istringstream input(normalized);
-    for (std::string item; input >> item;) {
+    if (text.empty()) {
+        error = "token list was empty";
+        return false;
+    }
+    std::size_t begin = 0;
+    for (;;) {
+        const std::size_t comma = text.find(',', begin);
+        const std::string_view item =
+            text.substr(begin, comma == std::string_view::npos ? std::string_view::npos : comma - begin);
         std::int32_t token = 0;
         const auto parsed = std::from_chars(item.data(), item.data() + item.size(), token);
-        if (parsed.ec != std::errc{} || parsed.ptr != item.data() + item.size() || token < 0) {
+        if (item.empty() || parsed.ec != std::errc{} || parsed.ptr != item.data() + item.size() || token < 0) {
             error = "invalid token id: expected an integer in [0, 2147483647]";
             tokens.clear();
             return false;
@@ -71,12 +78,9 @@ bool parse_token_list(std::string_view text, std::vector<std::int32_t>& tokens, 
             return false;
         }
         tokens.push_back(token);
+        if (comma == std::string_view::npos) return true;
+        begin = comma + 1;
     }
-    if (tokens.empty()) {
-        error = "token list was empty";
-        return false;
-    }
-    return true;
 }
 
 std::string_view trim_spaces(std::string_view text) {
@@ -736,7 +740,8 @@ ServeParseResult parse_serve_request(std::string_view line) {
                    key == "penalty_repeat" || key == "penalty_freq" || key == "penalty_present" ||
                    key == "pcie_frac" || key == "spec_min_p") {
             float parsed = 0.0f;
-            if (!parse_float_value(value, parsed)) {
+            if (!parse_float_value(value, parsed) || (key == "temperature" && parsed < 0.0f) ||
+                (key == "min_p" && (parsed < 0.0f || parsed > 1.0f))) {
                 result.kind = ServeParseKind::BadRequest;
                 result.error = std::string(key);
                 return result;
@@ -878,6 +883,12 @@ bool load_serve_image_embeddings(ServeRequest& request, std::int64_t max_context
             (void) std::fclose(file);
             return fail("image " + std::to_string(image_number) + " has " +
                         std::to_string(header[1]) + " rows but fewer <|image_pad|> tokens");
+        }
+        // One run of pad tokens is one image: a longer run would leave pad rows for a later record to claim.
+        if (static_cast<std::uint64_t>(header[1]) < image_pad_run) {
+            (void) std::fclose(file);
+            return fail("image " + std::to_string(image_number) + " has " +
+                        std::to_string(header[1]) + " rows but more <|image_pad|> tokens");
         }
 
         const std::uint64_t element_count =
