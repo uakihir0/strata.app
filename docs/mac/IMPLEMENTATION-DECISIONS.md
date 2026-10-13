@@ -13738,3 +13738,94 @@ measuring L-15 remain open.
   would otherwise change that count and fail `test_map`.
 - **Review required:** Confirm the location. Moving the module into `lc_dump/` later is a rename plus the doc rows.
 
+
+### D-IMPL-700: The `strata_util_*` kernels are added to `safe/util.metal` for `metal_util_test`
+
+- **Decision:** `src/metal/kernels/safe/util.metal` is created with `strata_util_copy_strided`, `strata_util_to_f16` and
+  `strata_util_to_bf16`, with the bodies that section 5.13 of `docs/mac/04-metal-kernels.md` gives. The three kernels
+  are listed in `src/metal/kernels/manifest.txt` (safe, 256 × 1 × 1). `metal_util_test` dispatches them through the
+  manifest-checked twin harness. No host encoder API is added.
+- **Reason:** `safe/util.metal` is in the documented file inventory, but the tree did not contain it, so the test had
+  no kernels to check. The kernels are kernel-level twins only; the encoders that the engine will need belong to
+  work item H3.
+- **Review required:** Confirm that the three kernels belong to this change and not to H3. Confirm the parameter
+  shape: the row count is read from a one-word buffer (bound at index 2 or 3), and the width and strides are setBytes
+  constants.
+
+### D-IMPL-701: A float32 denormal converts to a signed zero, which differs from the +0 recorded in A.10
+
+- **Decision:** `strata_util_to_f16` maps a negative float32 denormal to `0x8000` and a positive one to `0x0000`. The
+  `metal_util_test` reference does the same. Appendix A.10 records "float32 denormal input: +0". Its measured inputs
+  were positive, and the rule the spec gives for `as_type<ushort>(half(x))` keeps the sign.
+- **Reason:** The edge set, which contains both signs, shows `0x8000` on this Mac (Apple metal, macOS 27,
+  arm64), and the test passes with the signed-zero reference. Class B compares the sign of zero, so the choice matters.
+- **Review required:** Correct the A.10 row and the sentence in section 5.13 ("a float32 denormal becomes zero") to
+  say signed zero, or measure the negative-input result separately and record it. This change does not edit the spec.
+
+### D-IMPL-702: The BF16 low-part oracle models the GPU's flush of float32 denormal operands
+
+- **Decision:** The `metal_util_test` reference for `strata_util_to_bf16`'s low part computes the residual
+  `x - hi` after flushing float32 denormal operands to signed zeros (`x` and the float value of `hi`). A residual that
+  is a nonzero float32 denormal is marked "unmodelled" and fails the test rather than being predicted. No input in the
+  three sets produces one.
+- **Reason:** In the edge set, `x = 0x80000001` gives `hi = 0x8000`, and the GPU returns a low part of `0x0000`. Exact
+  residual arithmetic would give `0x8000`. Denormal operands therefore flush in the subtraction, as they do in the
+  conversion. The high part is bit arithmetic and keeps denormals.
+- **Review required:** Confirm the operand flush as the intended Metal behaviour. A denormal residual needs its own
+  measurement before a test can cover it.
+
+### D-IMPL-703: The util input sets are synthetic, and the util test has no real set
+
+- **Decision:** For `metal_util_test`, `random` is normal values at log-uniform magnitudes from 2^-30 to 2^20. `edge`
+  is an explicit list of bit patterns: signed zeros, both ends of the float32 denormal range, the half subnormal and
+  overflow boundaries, infinities, NaN payloads of both signs, and the float16 and BF16 ties. `fixture` is the A.10
+  anchors only, since the tree has no upstream utility fixtures. `--input-set real` exits with the skip code 77. Every
+  set runs at T = 1..8, with the row width of section 5.13 (10,240). Each of the three kernels is checked for each T,
+  and row t must equal its T = 1 dispatch.
+- **Reason:** The utilities read no model tensors (section 9.1 of `docs/mac/09-testing-and-validation.md` says so), so
+  a real set is not defined for them. The tolerance is B throughout, since every output is a copy or a conversion.
+- **Review required:** Confirm that A.10 anchors are an acceptable "fixture" for these kernels.
+
+### D-IMPL-704: `mv_multi_eq_single` is a flagged run of the existing mat-vec property code
+
+- **Decision:** `mv_multi_eq_single` is registered as `metal_mv_test --multi-eq-single`, in the same way as
+  `samp_coupled_eq_host` and `metal_mtp_shared_ffn_write_test`. The flag runs the seventeen existing
+  `run_*_multi_eq_single` functions: sixteen dense formats (Q8_0, Q4_0, Q5_0, Q2_0, IQ4_NL, IQ4_XS, IQ3_S, IQ2_XXS,
+  IQ2_XS, IQ2_S, IQ3_XXS, IQ1_M, Q4_K, Q5_K, Q3_K, Q6_K) and BF16. Each compares NC = 2, 4 and 8 column by column with
+  the single-column dispatch, bitwise. Every run is also checked against the scalar oracle of its format, through the
+  shape helpers.
+- **Reason:** These functions already implement the property and its negative controls for the dense formats (the
+  property of section 10.4 is a comparison of two Mac runs). A separate binary would duplicate their shape helpers
+  and oracles.
+- **Review required:** Confirm that the flag mode is an acceptable way to register a property, as for
+  `samp_coupled_eq_host`.
+
+### D-IMPL-705: The MoE expert kernels are outside this change's `mv_multi_eq_single`
+
+- **Decision:** `mv_multi_eq_single` as built does not cover `strata_moe_gu_<fmt>` and `strata_moe_down_<fmt>`, which
+  section 10.4 of `docs/mac/04-metal-kernels.md` lists. Their manifest names have no NC suffix. Their column unit is the
+  routed expert entry, and each dispatch needs a plan table, an address table and Q8_1 rows for 80 or 20 blocks. Only
+  `metal_moe_test` checks a grouped-versus-single-entry parity, and only for IQ4_NL down.
+- **Reason:** The L3 work item (section 12.1 of `docs/mac/04`) covers the Q8_1 quantiser and the dense and BF16
+  mat-vecs (sections 5.8 and 5.9). The expert kernels are L7 work.
+- **Review required:** Decide whether the MoE property belongs to L7 or to an extension of this test. Until then the
+  test map entry covers the dense and BF16 kernels only.
+
+### D-IMPL-706: The Q4_K and Q5_K negative controls now compare against the original-weight result
+
+- **Decision:** In `run_q4_k_multi_eq_single` and `run_q5_k_multi_eq_single` of `tests/metal/metal_mv_test.mm`, the
+  one-bit weight flip must change the NC = 4 result relative to the original weights. The check is
+  "negative control detects code-bit flip", as in the other formats. Their previous controls flipped one bit of an
+  output value and checked the comparator, which does not test the kernel's sensitivity to weight bits. Those checks
+  remain.
+- **Reason:** Section 10.4 requires a negative control that flips one weight bit in a copy and must fail. Without this
+  check, a kernel that ignored its weights could still pass those two controls.
+- **Review required:** Confirm the change to an existing test, which fixes a gap in its negative control.
+
+### D-IMPL-707: The low part of a NaN residual is checked for class only
+
+- **Decision:** In `metal_util_test`, when the BF16 residual `x - hi` is NaN (a NaN input, or infinity minus
+  infinity), the low output must be some BF16 NaN. Its bits are not compared. A finite residual is compared exactly.
+- **Reason:** Section 5.13 gives the low-part formula but no NaN payload for it, and the NaN payload that the subtraction
+  propagates is not defined by the spec. Class B would otherwise require a payload the spec does not fix.
+- **Review required:** Confirm that the class-only rule is acceptable, or specify the NaN payload of the low part.
