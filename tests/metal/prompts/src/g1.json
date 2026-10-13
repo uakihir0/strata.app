@@ -1,0 +1,164 @@
+{
+  "schema": 1,
+  "prompts": [
+    {
+      "id": "g1-01",
+      "thinking": false,
+      "expect": "def ",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write a Python function that merges overlapping intervals, with three unit tests."
+        }
+      ]
+    },
+    {
+      "id": "g1-02",
+      "thinking": false,
+      "expect": "360",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A shop sells pencils at 3 for 40 yen. How much do 27 pencils cost? Answer with the number only."
+        }
+      ]
+    },
+    {
+      "id": "g1-03",
+      "thinking": true,
+      "expect": "11:38",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A train leaves station A at 09:00 and travels towards station B at 80 km/h. A second train leaves station B at 09:30 and travels towards station A at 60 km/h. The stations are 340 km apart. At what time do the trains meet? Show the steps."
+        }
+      ]
+    },
+    {
+      "id": "g1-04",
+      "thinking": false,
+      "expect": "スレッド",
+      "messages": [
+        {
+          "role": "user",
+          "content": "プロセスとスレッドの違いを、日本語で簡潔に説明してください。"
+        }
+      ]
+    },
+    {
+      "id": "g1-05",
+      "thinking": false,
+      "expect": "。",
+      "messages": [
+        {
+          "role": "user",
+          "content": "请用三句话概括下面这段新闻。\n\n本报讯 记者从市交通运输局获悉，经过三年建设，连接城东与城西的快速公交线路将于本月正式通车。该线路全长二十四公里，设车站十七座，首末班车时间分别为早晨六点和晚上十点半。根据规划，线路在早晚高峰期的发车间隔为四分钟，平峰期为八分钟。市民可以使用移动支付扫码乘车，票价与普通公交相同，换乘地铁时还可享受优惠。交通部门表示，通车后预计每天约有十二万人次乘坐该线路，有效缓解沿线居民的通勤压力。为方便市民接驳，沿线还新增了四个非机动车停放点，并对十二处人行横道进行了改造。据介绍，项目建设期间共有两百余户居民的出行受到影响，相关部门通过设置临时便道和增加摆渡车等方式尽量减少不便。一位在城西工作的市民说，以前乘坐私家车上班需要近一个小时，如今乘坐快速公交只需三十多分钟，而且车厢宽敞，座位舒适。工作人员提醒，乘客上下车时请按顺序排队，照看好随身物品，并注意保持车厢内的安静与整洁。下一阶段，相关部门还将根据客流变化情况，适时增加夜间班次，并进一步完善与周边社区的步行连接，使公共交通服务覆盖更多居民。此外，市里计划在今年年底前完成该线路沿线十座车站的无障碍设施改造，为老年人和残疾人提供更加便利的出行条件。专家认为，这条线路的开通将进一步优化城市空间布局，推动沿线商业和文化设施的发展，也有助于减少道路拥堵和尾气排放。会后，记者还了解到，车站的电子站牌和语音播报系统已经调试完毕，将为乘客提供实时到站信息。"
+        }
+      ]
+    },
+    {
+      "id": "g1-06",
+      "thinking": false,
+      "expect": "get_weather",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "City name"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the weather in Osaka?"
+        }
+      ]
+    },
+    {
+      "id": "g1-07",
+      "thinking": false,
+      "expect": "clean checkout",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Coding rules for this repository. Follow them in every answer.\n\n1. Every change starts from an issue or a written plan that states the goal and the way to check it.\n2. Keep each commit focused on one logical change, and write its message in the imperative mood.\n3. Do not mix formatting changes with behaviour changes in the same commit.\n4. Read the existing code around a change before you write new code, and follow its naming and layout.\n5. Prefer small functions with one clear purpose; a function longer than eighty lines needs a reason.\n6. Name variables after what they hold, not after their type, and avoid abbreviations except common ones.\n7. Handle every error path explicitly; never discard an error value without a comment that says why.\n8. Do not catch an exception only to log it and continue, unless the caller cannot do anything useful with it.\n9. Validate inputs at the boundary of a module, and trust the validated values inside it.\n10. Use constants with names for every magic number, and put them next to the code that depends on them.\n11. Write a test for every bug before you fix it, and keep the test after the fix.\n12. Tests must be deterministic; seed random generators and never depend on the wall clock.\n13. Do not skip or disable a failing test to make a build pass; report it and fix the cause.\n14. Keep public interfaces stable; when one must change, document the change in the changelog.\n15. Comments explain why code is written a certain way, not what the next line does.\n16. Remove dead code instead of commenting it out; version control keeps the history.\n17. Before you merge a pull request, run the full test suite on a clean checkout and attach its output to the pull request.\n18. Never store secrets, tokens or passwords in the repository, in test fixtures or in log output.\n19. Dependencies must be pinned to exact versions, and each new dependency needs a written reason.\n20. Do not add a dependency for a function that is a few lines of standard library code.\n21. Generated files are not edited by hand; change the generator and regenerate them in the same commit.\n22. Build artefacts, caches and local configuration never enter the repository.\n23. Log messages state the operation, the object and the outcome, in that order, without personal data.\n24. Logs at the debug level may be verbose, but they must never print the contents of a user's message.\n25. Concurrency code documents which lock protects which data, and locks are always taken in the same order.\n26. A shared mutable value needs a single owner or a lock; never rely on timing to keep two threads apart.\n27. Resource handles such as files, sockets and buffers are released on every path, including the error path.\n28. Input from the network is untrusted; check its length before allocating memory for it.\n29. Numeric code states its units in the name or the type, and converts between units in one place only.\n30. Public functions document their preconditions, their result and the errors they can return.\n31. Performance claims need a measurement on a stated machine, with the command used to produce it.\n32. Do not optimise a path before a profile shows that it dominates the run time.\n33. Keep configuration in one file per component, and read it once at start-up.\n34. Migrations that change stored data come with a rollback plan and a test on a copy of real data.\n35. Documentation changes ship in the same commit as the behaviour they describe.\n36. Code reviews check correctness first, then clarity, then style; style comments are marked as optional.\n37. A reviewer may ask for a test; the author adds the test or explains in writing why it is not needed.\n38. Do not force push to a shared branch; create a new commit that fixes the problem instead.\n39. Release tags are signed, and the changelog lists every user-visible change since the previous tag.\n40. When you are unsure about a requirement, ask the owner of the component before you guess.\n41. Keep the build green on the main branch; a failing build is fixed before any new change is merged.\n42. Respect the licence of every imported file, and keep its notice in the file it came from.\n43. Accessibility requirements apply to every user interface change, including labels and keyboard use.\n44. Write user-facing text in plain language, and translate it only from an approved source.\n45. Retire a feature with a deprecation notice that names its replacement and the release that removes it.\n46. The final answer lists the files changed, the commands run and their results, and any open risk."
+        },
+        {
+          "role": "user",
+          "content": "Under rule 17, what must I attach before I merge a pull request? Quote the rule."
+        }
+      ]
+    },
+    {
+      "id": "g1-08",
+      "thinking": false,
+      "expect": "Halcyon",
+      "messages": [
+        {
+          "role": "user",
+          "content": "My project is called Halcyon and it uses version 3.4 of the protocol library."
+        },
+        {
+          "role": "assistant",
+          "content": "Understood. Halcyon uses protocol library version 3.4."
+        },
+        {
+          "role": "user",
+          "content": "What is a good name for a logging module?"
+        },
+        {
+          "role": "assistant",
+          "content": "Logger, or journal if you want something distinctive, works well."
+        },
+        {
+          "role": "user",
+          "content": "Thanks. Now write a one-line README heading."
+        },
+        {
+          "role": "assistant",
+          "content": "# Halcyon: a protocol-driven service"
+        },
+        {
+          "role": "user",
+          "content": "What was the name of my project, and which protocol version does it use?"
+        }
+      ]
+    },
+    {
+      "id": "g1-09",
+      "thinking": false,
+      "expect": "@@",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Here is a C++ file:\n\n```cpp\n// block_store.cpp - a small block store with checksummed records.\n#include <algorithm>\n#include <cstddef>\n#include <cstdint>\n#include <cstring>\n#include <map>\n#include <memory>\n#include <stdexcept>\n#include <string>\n#include <utility>\n#include <vector>\n\nnamespace store {\n\nconstexpr std::size_t kBlockSize = 4096;\nconstexpr std::size_t kHeaderSize = 16;\nconstexpr std::uint32_t kMagic = 0x5354524Au;\n\nstruct Header {\n    std::uint32_t magic;\n    std::uint32_t length;\n    std::uint64_t id;\n};\n\nstatic_assert(sizeof(Header) == kHeaderSize, \"header layout\");\n\nstd::uint32_t compute_checksum(const std::uint8_t* data, std::size_t size) {\n    std::uint32_t a = 1;\n    std::uint32_t b = 0;\n    for (std::size_t i = 0; i < size; ++i) {\n        a = (a + data[i]) % 65521u;\n        b = (b + a) % 65521u;\n    }\n    return (b << 16) | a;\n}\n\nclass Block {\npublic:\n    Block(std::uint64_t id, std::size_t capacity)\n        : id_(id), bytes_(capacity, 0), used_(0) {}\n\n    std::uint64_t id() const { return id_; }\n    std::size_t used() const { return used_; }\n    std::size_t capacity() const { return bytes_.size(); }\n    bool empty() const { return used_ == 0; }\n\n    bool fits(std::size_t size) const {\n        return used_ + kHeaderSize + size <= bytes_.size();\n    }\n\n    void append(const std::uint8_t* data, std::size_t size) {\n        if (!fits(size)) {\n            throw std::length_error(\"block is full\");\n        }\n        Header h{kMagic, static_cast<std::uint32_t>(size), id_};\n        std::memcpy(bytes_.data() + used_, &h, kHeaderSize);\n        std::memcpy(bytes_.data() + used_ + kHeaderSize, data, size);\n        used_ += kHeaderSize + size;\n    }\n\n    std::uint32_t seal() {\n        std::uint32_t sum = compute_checksum(bytes_.data(), used_);\n        sealed_ = sum;\n        return sum;\n    }\n\n    bool verify() const {\n        if (!sealed_) {\n            return false;\n        }\n        return compute_checksum(bytes_.data(), used_) == *sealed_;\n    }\n\n    const std::uint8_t* data() const { return bytes_.data(); }\n\nprivate:\n    std::uint64_t id_;\n    std::vector<std::uint8_t> bytes_;\n    std::size_t used_;\n    std::unique_ptr<std::uint32_t> sealed_;\n};\n\nclass BlockStore {\npublic:\n    explicit BlockStore(std::size_t block_size = kBlockSize)\n        : block_size_(block_size), next_id_(1) {\n        if (block_size_ <= kHeaderSize) {\n            throw std::invalid_argument(\"block size too small\");\n        }\n    }\n\n    std::uint64_t put(const std::string& payload) {\n        return put(reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size());\n    }\n\n    std::uint64_t put(const std::uint8_t* data, std::size_t size) {\n        if (size + kHeaderSize > block_size_) {\n            throw std::length_error(\"record larger than a block\");\n        }\n        Block& block = writable_block(size);\n        block.append(data, size);\n        index_[block.id()] = last_index();\n        ++records_;\n        return block.id();\n    }\n\n    bool get(std::uint64_t record, std::string& out) const {\n        auto it = index_.find(record);\n        if (it == index_.end()) {\n            return false;\n        }\n        const Block& block = blocks_[it->second];\n        std::size_t offset = 0;\n        while (offset + kHeaderSize <= block.used()) {\n            Header h{};\n            std::memcpy(&h, block.data() + offset, kHeaderSize);\n            if (h.magic != kMagic) {\n                throw std::runtime_error(\"bad record magic\");\n            }\n            if (h.id == record) {\n                out.assign(reinterpret_cast<const char*>(block.data() + offset + kHeaderSize), h.length);\n                return true;\n            }\n            offset += kHeaderSize + h.length;\n        }\n        return false;\n    }\n\n    void seal_all() {\n        for (auto& block : blocks_) {\n            if (!block.empty()) {\n                block.seal();\n            }\n        }\n    }\n\n    std::size_t verify_all() const {\n        std::size_t bad = 0;\n        for (const auto& block : blocks_) {\n            if (!block.empty() && !block.verify()) {\n                ++bad;\n            }\n        }\n        return bad;\n    }\n\n    std::size_t block_count() const { return blocks_.size(); }\n    std::size_t record_count() const { return records_; }\n\n    std::uint32_t digest() const {\n        std::uint32_t acc = 0;\n        for (const auto& block : blocks_) {\n            acc ^= compute_checksum(block.data(), block.used());\n        }\n        return acc;\n    }\n\nprivate:\n    Block& writable_block(std::size_t size) {\n        if (blocks_.empty() || !blocks_.back().fits(size)) {\n            blocks_.emplace_back(next_id_++, block_size_);\n        }\n        return blocks_.back();\n    }\n\n    std::size_t last_index() const { return blocks_.size() - 1; }\n\n    std::size_t block_size_;\n    std::uint64_t next_id_;\n    std::size_t records_ = 0;\n    std::vector<Block> blocks_;\n    std::map<std::uint64_t, std::size_t> index_;\n};\n\nstd::string describe(const BlockStore& store) {\n    std::string text = \"blocks=\" + std::to_string(store.block_count());\n    text += \" records=\" + std::to_string(store.record_count());\n    text += \" digest=\" + std::to_string(store.digest());\n    return text;\n}\n\nstd::vector<std::uint32_t> checksums(const std::vector<std::string>& payloads) {\n    std::vector<std::uint32_t> out;\n    out.reserve(payloads.size());\n    for (const auto& p : payloads) {\n        out.push_back(compute_checksum(reinterpret_cast<const std::uint8_t*>(p.data()), p.size()));\n    }\n    return out;\n}\n\nbool same_checksums(const std::vector<std::string>& a, const std::vector<std::string>& b) {\n    if (a.size() != b.size()) {\n        return false;\n    }\n    return checksums(a) == checksums(b);\n}\n\nstd::vector<std::string> split_records(const std::string& text, std::size_t max_size) {\n    std::vector<std::string> parts;\n    std::size_t start = 0;\n    while (start < text.size()) {\n        std::size_t len = std::min(max_size, text.size() - start);\n        parts.push_back(text.substr(start, len));\n        start += len;\n    }\n    return parts;\n}\n\nstd::string join_records(const std::vector<std::string>& parts) {\n    std::string out;\n    for (const auto& p : parts) {\n        out += p;\n    }\n    return out;\n}\n\nstruct Stats {\n    std::size_t puts = 0;\n    std::size_t gets = 0;\n    std::size_t misses = 0;\n    std::size_t bytes = 0;\n};\n\nclass Instrumented {\npublic:\n    explicit Instrumented(BlockStore& inner) : inner_(inner) {}\n\n    std::uint64_t put(const std::string& payload) {\n        ++stats_.puts;\n        stats_.bytes += payload.size();\n        return inner_.put(payload);\n    }\n\n    bool get(std::uint64_t id, std::string& out) {\n        ++stats_.gets;\n        bool found = inner_.get(id, out);\n        if (!found) {\n            ++stats_.misses;\n        }\n        return found;\n    }\n\n    const Stats& stats() const { return stats_; }\n\nprivate:\n    BlockStore& inner_;\n    Stats stats_;\n};\n\nstd::size_t count_empty(const std::vector<Block>& blocks) {\n    return static_cast<std::size_t>(std::count_if(blocks.begin(), blocks.end(),\n                                                  [](const Block& b) { return b.empty(); }));\n}\n\n}  // namespace store\n```\n\nGive a unified diff that renames the function compute_checksum to checksum_block in this file, including every call. Output only the diff in one code block."
+        }
+      ]
+    },
+    {
+      "id": "g1-10",
+      "thinking": false,
+      "expect": "\"tags\"",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Return only a JSON object with the keys name, year and tags for the paragraph below. The tags value is a list of strings.\n\nParagraph: The Ferrocarril Lenticular was founded in 1887 by Ana Villareal in Puebla. It ran passenger trains for ninety years and is now a museum with a restored steam locomotive and a small archive of timetables."
+        }
+      ]
+    }
+  ]
+}
