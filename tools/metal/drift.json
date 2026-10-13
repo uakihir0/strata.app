@@ -6,7 +6,7 @@
     ".gitattributes": 1,
     ".gitignore": 1,
     "setup.py": 0,
-    "serve/server.py": 0,
+    "serve/server.py": 3,
     "src/platform/direct_file.cpp": 0
   },
   "copies": {},
