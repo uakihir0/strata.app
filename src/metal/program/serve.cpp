@@ -53,13 +53,10 @@ bool parse_i64(std::string_view text, std::int64_t& value) {
 }
 
 // The id list is `<id>(,<id>)*`: base-10 integers in [0, 2147483647] with single commas and no spaces, as the
-// server writes it. Empty fields, spaces and a trailing comma are malformed, not skipped.
+// server writes it. Empty fields, spaces and a trailing comma are malformed, not skipped. An empty list is one
+// empty field, so it gets the same error.
 bool parse_token_list(std::string_view text, std::vector<std::int32_t>& tokens, std::string& error) {
     tokens.clear();
-    if (text.empty()) {
-        error = "token list was empty";
-        return false;
-    }
     std::size_t begin = 0;
     for (;;) {
         const std::size_t comma = text.find(',', begin);
@@ -87,6 +84,15 @@ std::string_view trim_spaces(std::string_view text) {
     while (!text.empty() && text.front() == ' ') text.remove_prefix(1);
     while (!text.empty() && text.back() == ' ') text.remove_suffix(1);
     return text;
+}
+
+// An option key is `[a-z_]+` (06 section 5.3). A `key=value` token with any other key is not an option.
+bool valid_option_key(std::string_view key) {
+    if (key.empty()) return false;
+    for (const char ch : key) {
+        if (!((ch >= 'a' && ch <= 'z') || ch == '_')) return false;
+    }
+    return true;
 }
 
 bool parse_float_value(std::string_view text, float& parsed_value) {
@@ -727,6 +733,9 @@ ServeParseResult parse_serve_request(std::string_view line) {
         if (key_value.find('=') == std::string_view::npos) break;
         const std::size_t equals = key_value.find('=');
         const std::string_view key = key_value.substr(0, equals);
+        // A token with a malformed key is not skipped: it starts the id list (GEN, where it fails the id parse)
+        // or the path (GENI, where a path may not contain '=').
+        if (!valid_option_key(key)) break;
         const std::string_view value = key_value.substr(equals + 1);
         if (key == "cvec") {
             std::int32_t parsed = 0;
@@ -792,26 +801,33 @@ ServeParseResult parse_serve_request(std::string_view line) {
 
     std::string_view token_text;
     if (image) {
+        // A GENI request needs both a path and an id list, and a path may not contain '='. Without them the request
+        // does not match the grammar, so it gets the usage line.
         const std::string_view rest = line.substr(payload_start);
         const std::size_t last_space = rest.find_last_of(' ');
-        if (last_space == std::string_view::npos) {
-            result.kind = ServeParseKind::BadRequest;
-            result.error = "max_new";
+        const std::string_view path =
+            last_space == std::string_view::npos ? std::string_view {} : trim_spaces(rest.substr(0, last_space));
+        token_text =
+            last_space == std::string_view::npos ? std::string_view {} : trim_spaces(rest.substr(last_space + 1));
+        if (path.empty() || token_text.empty() || path.find('=') != std::string_view::npos) {
+            result.kind = ServeParseKind::InvalidCommand;
+            result.error = std::string(kExpectedRequest);
             return result;
         }
-        result.request.embeddings_path = std::string(trim_spaces(rest.substr(0, last_space)));
-        token_text = trim_spaces(rest.substr(last_space + 1));
-        if (result.request.embeddings_path.empty()) {
-            result.kind = ServeParseKind::BadRequest;
-            result.error = "max_new";
-            return result;
-        }
+        result.request.embeddings_path = std::string(path);
     } else {
         token_text = line.substr(payload_start);
     }
 
     if (!parse_token_list(token_text, result.request.token_ids, result.error)) {
         result.kind = ServeParseKind::BadRequest;
+        return result;
+    }
+    // Image-pad ids are only valid in a GENI request, where each run is matched to its embeddings record.
+    if (!image && std::find(result.request.token_ids.begin(), result.request.token_ids.end(),
+                            kServeImagePadToken) != result.request.token_ids.end()) {
+        result.kind = ServeParseKind::BadRequest;
+        result.error = "image pad token needs GENI";
         return result;
     }
     result.kind = ServeParseKind::Request;

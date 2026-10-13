@@ -197,6 +197,7 @@ enum class BackendFault {
     CancelWithoutStop,
     StopWithoutEos,
     TokenAfterEos,
+    NegativeToken,
     EosStop
 };
 
@@ -242,6 +243,8 @@ public:
             } else if (fault_ == BackendFault::TokenAfterEos) {
                 (void) callbacks.token(248044);
                 (void) callbacks.token(9);
+            } else if (fault_ == BackendFault::NegativeToken) {
+                (void) callbacks.token(-1);
             } else if (fault_ == BackendFault::EosStop) {
                 if (!callbacks.token(248044)) return false;
                 saw_stop_after_eos_ = callbacks.should_stop();
@@ -282,6 +285,7 @@ void test_backend_protocol_limits() {
                   true},
         TestCase {BackendFault::StopWithoutEos, "finish=stop requires an emitted configured EOS token", 1, 1, true},
         TestCase {BackendFault::TokenAfterEos, "backend cannot emit tokens after EOS", 1, 1, true},
+        TestCase {BackendFault::NegativeToken, "backend cannot emit a negative token id", 0, 1, true},
         TestCase {BackendFault::EosStop, "EOS requests backend stop and overrides length", 1, 0, false},
     };
     for (const auto& test_case : cases) {
@@ -842,7 +846,8 @@ void test_request_parser() {
               malformed.error == "invalid token id: expected an integer in [0, 2147483647]",
           "malformed token lists return the upstream diagnostic");
     const ServeParseResult empty = parse_serve_request("GEN 2 temperature=0.4");
-    check(empty.kind == ServeParseKind::BadRequest && empty.error == "token list was empty",
+    check(empty.kind == ServeParseKind::BadRequest &&
+              empty.error == "invalid token id: expected an integer in [0, 2147483647]",
           "empty token lists are rejected");
     const ServeParseResult bad_float = parse_serve_request("GEN 2 temperature=nan 1");
     check(bad_float.kind == ServeParseKind::BadRequest && bad_float.error == "temperature",
@@ -1005,16 +1010,50 @@ void test_strict_request_grammar() {
         Malformed {"GEN 2 temperature=-0.5 1", "temperature"},
         Malformed {"GEN 2 min_p=1.5 1", "min_p"},
         Malformed {"GEN 2 min_p=-0.1 1", "min_p"},
+        // An empty id list is one empty field, so it gets the id error too.
+        Malformed {"GEN 2", id_error},
+        Malformed {"GEN 2 temperature=0.4", id_error},
+        Malformed {"GEN 2 1,2=3", id_error},
+        // A key that is not [a-z_]+ is not an option, so the token is parsed as part of the id list.
+        Malformed {"GEN 2 1,,2=3 5", id_error},
+        Malformed {"GEN 2 1,2=3 5", id_error},
+        Malformed {"GEN 2 Temperature=0.4 1", id_error},
+        Malformed {"GEN 2 temperature0=0.4 1", id_error},
+        // Ids are non-negative, in GEN and in GENI.
+        Malformed {"GEN 2 -1", id_error},
+        Malformed {"GEN 2 1,-1", id_error},
+        Malformed {"GENI 4 /tmp/x.sve -1", id_error},
+        // Image-pad ids need GENI, where each run is matched to a record.
+        Malformed {"GEN 2 248056,7", "image pad token needs GENI"},
+        Malformed {"GEN 1 248056", "image pad token needs GENI"},
     };
     for (const auto& test_case : malformed_requests) {
         const ServeParseResult result = parse_serve_request(test_case.line);
         check(result.kind == ServeParseKind::BadRequest && result.error == test_case.error,
               "malformed request is rejected: " + std::string(test_case.line));
     }
+    // A GENI request without its path or its id list gets the usage line, not a max_new error.
+    constexpr std::string_view usage = "expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>";
+    const std::array usage_requests {
+        "GENI 4 /tmp/x.sve",
+        "GENI 4 /tmp/x.sve ",
+        "GENI 4 1,2",
+        "GENI 4 /tmp/a=b.sve 1,2",
+        "GENI 4 /tmp/x.sve a=b 1,2",
+    };
+    for (const std::string_view line : usage_requests) {
+        const ServeParseResult result = parse_serve_request(line);
+        check(result.kind == ServeParseKind::InvalidCommand && result.error == usage,
+              "GENI without a path or ids gets the usage line: " + std::string(line));
+    }
     const ServeParseResult strict = parse_serve_request("GEN 2 min_p=0.5 temperature=0 1,2");
     check(strict.kind == ServeParseKind::Request && strict.request.token_ids == std::vector<std::int32_t>({1, 2}) &&
               strict.request.sampling.min_p == 0.5f && strict.request.sampling.temperature == 0.0f,
           "a comma-separated id list after in-range sampling keys still parses");
+    const ServeParseResult pad_in_geni = parse_serve_request("GENI 2 /tmp/x.sve 248056,7");
+    check(pad_in_geni.kind == ServeParseKind::Request && pad_in_geni.request.token_ids ==
+              std::vector<std::int32_t>({248056, 7}),
+          "image-pad ids are accepted in GENI");
 }
 
 void test_image_runs_match_records() {
