@@ -671,6 +671,7 @@ also registers later work-item tests; the current `mac-host` and `mac-metal` pre
 | `test_map` | host | Mac: the documented test, requirement and review maps agree with CTest |
 | `strata_version` | host | Mac (section 6.3) |
 | `options_dispositions_test` | host | Mac: the full upstream and Metal CLI inventory, dispositions, warning policy, arity and validation |
+| `kernel_env_dispositions_test` | host | Mac: every kernel flag of section 9.2 through the parser, with its warning and rejected value; `STRATA_METAL_DISPATCH`, `STRATA_METAL_GEMM` and `STRATA_PREFILL_BF16X2` through their readers; the section 9.3 variables by a scan of the Mac sources for a quoted name |
 | `metal_cli_modes_test` | host | Mac: empty invocation fails closed; device listing rejects unimplemented model modes and an explicit capture request |
 | `metal_context_test` | metal | Mac: `Context::open` on the GPU. A first open compiles every pipeline; a second uses the archive; a damaged archive is ignored and then rewritten; a self-test dispatch runs; a wrong hash is refused. It uses `build-dev/metal/test-cache` as its archive folder (section 10.1). |
 | `metal_fault_test` | metal | Mac: a deliberately faulting GPU command buffer is reported with its label; a following command buffer completes and writes the expected result. |

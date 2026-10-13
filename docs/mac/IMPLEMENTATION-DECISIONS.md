@@ -13738,3 +13738,93 @@ measuring L-15 remain open.
   would otherwise change that count and fail `test_map`.
 - **Review required:** Confirm the location. Moving the module into `lc_dump/` later is a rename plus the doc rows.
 
+### D-IMPL-760: `kernel_env_dispositions_test` covers the kernel flags, the section 9.3 variables and the Mac switches on the host
+
+- **Decision:** The host test covers every flag of section 9.2, every variable of section 9.3, and the four Mac switches that section 9.3 names: `STRATA_METAL_GEMM`, `STRATA_METAL_DISPATCH`, `STRATA_METAL_ICB` and `STRATA_METAL_SMALL_TILES`. It does not check the group rules of concurrent dispatch (balanced, non-nested groups, and no-ops in serial mode). Those need a Metal Context and stay with `metal_encoder_test` (label `metal`), and the production parity stays with `metal_dispatch_modes_test` (label `model`, still planned). The test is registered as a host test beside `options_dispositions_test`, and its `planned` key is removed from `tests/metal/test_map.json`.
+- **Reason:** L14 names the concurrent groups, but a group check needs a GPU, and `mac-host` runs without one.
+- **Review required:** Confirm that the group rules are covered by `metal_encoder_test`, and that L14 may be closed while `metal_dispatch_modes_test` is still planned.
+
+### D-IMPL-761: The policy readers move into `include/strata/metal/kernel_env.hpp`, and the behaviour does not change
+
+- **Decision:** `parse_dispatch_mode` replaces the anonymous-namespace reader of `STRATA_METAL_DISPATCH` in `src/metal/host/encoder.mm`, and `prefill_bf16x2_enabled` replaces the inline reader of `STRATA_PREFILL_BF16X2` in `src/metal/program/main.cpp`. The production code still calls `getenv` itself, and the test calls the same two functions after `setenv`. `STRATA_METAL_GEMM` already has a pure reader, `resolve_prefill_gemm_backend`, which the test calls.
+- **Reason:** A host test cannot reach either old reader: one is in an anonymous namespace of an Objective-C++ file that needs Metal, and the other is in the executable's `main.cpp`.
+- **Review required:** Check that the two replacements keep the old results. In `main.cpp` the old code assigned only when the setting parsed, and the plan options start at `false`, so the unconditional assignment gives the same value.
+
+### D-IMPL-762: A variable with no callable reader is checked by a scan of the Mac sources
+
+- **Decision:** For a variable of section 9.3 that has no reader a test can call, the test scans `src/metal`, `include/strata/metal`, `src/platform` and `src/ngram` for the name as a quoted string literal. An ignored name must not appear, because section 9.3 defines "ignored" as "read by nothing". An honoured name must appear. The scan first checks that it finds the known reader of `STRATA_METAL_DISPATCH`, so an empty scan cannot pass. `src/kernels` is not scanned: it holds the upstream CUDA sources, and the one file of it that the Mac build compiles, `ngram.cpp`, reads none of these names.
+- **Reason:** These variables have no function a host test can call, and the spec's own definition of "ignored" is what a scan checks.
+- **Review required:** The scan misses a read built at run time (for example by concatenating the name) and a read outside the four directories. Confirm that these limits are acceptable, or extend the scan.
+
+### D-IMPL-763: The test restates the names of sections 9.2 and 9.3 as data, and checks them against the document
+
+- **Decision:** The tables `kFlags` and `kVariables` copy the dispositions of `docs/mac/04-metal-kernels.md`, sections 9.2 and 9.3. The test also checks that each name appears in backticks inside those two sections, so a renamed or removed row fails. The free-text Mac column is not parsed.
+- **Reason:** Parsing that column (for example "Honoured, same modes" or "Phase 1 always runs this arm") would be fragile. The names are what a test can check mechanically.
+- **Review required:** When section 9.3 changes a disposition, change `kVariables` in the same commit. The document check catches renamed or removed names only.
+
+### D-IMPL-764: Flag warnings follow section 9.1, and a value after a flag is rejected
+
+- **Decision:** A flag that selects another upstream arm warns, and a flag whose arm is always on does not (section 9.1). The test therefore expects a warning for `--cpu-oracle-q8-0`, `--shared-late`, `--keep-canonical`, `--no-token-graph`, `--no-fused-gr`, `--no-fast-attn`, `--no-publish-kernel`, `--no-fused-gdn` and `--no-fast-select`, and no warning for `--gr-native-mmvf`, `--gr-fp32-activations` and `--stream-token`. A value after any of these flags exits 2 as an unknown argument. `--check-logits` is KEEP, so it parses only with a model.
+- **Reason:** Section 9.2 gives "with a warning" for some rows only. The rule of section 9.1 gives it for the rest, and `options.cpp` implements that rule.
+- **Review required:** Confirm that `--cpu-oracle-q8-0` selects another arm. Its row says only "IGNORE", and the warning follows from that reading.
+
+### D-IMPL-765: `STRATA_KV_ROT` is honoured in the spec and has no reader, so the test fails
+
+- **Decision:** Section 9.3 says the Mac honours `STRATA_KV_ROT` (Hadamard rotation of int8 KV, sections 5.6 and 5.11). No Mac source reads it, so the test fails on it. The code is not changed.
+- **Reason:** The disposition is explicit, and the rule for explicit mismatches is that the test fails.
+- **Review required:** Either write the reader with the int8 KV path, or change section 9.3 to planned and name the work item. The test stays red until one of these is done.
+
+### D-IMPL-766: `STRATA_PREFILL_TIMING`, `STRATA_PREFILL_DUMP_R` and `STRATA_DBG_NAN` are honoured in the spec and have no reader, so the test fails
+
+- **Decision:** Section 9.3 and section 4.2 of `docs/mac/06-engine-host-port.md` say the Mac honours these three variables: the prompt path's GPU timing, its R dump, and the non-finite diagnostics of the window and the prompt path. No Mac source reads any of them, so the test fails on each. The code is not changed.
+- **Reason:** The prompt path (L13) and the window's diagnostics are not wired, so the honoured behaviour does not exist yet. The rule for explicit mismatches applies.
+- **Review required:** Decide whether these become planned rows with L13 and the window work named as their dependency, or whether L14 waits for them. The test passes once each has a reader.
+
+### D-IMPL-767: `STRATA_METAL_ICB` does not print the notice that section 8.3 requires, so the test fails
+
+- **Decision:** Section 8.3 says that setting `STRATA_METAL_ICB` prints `strata: STRATA_METAL_ICB is not implemented; encoding each window` once and is then ignored. No Mac source prints that text, so the test fails on it. The code is not changed.
+- **Reason:** The text is stated exactly, and L14 names the notice as one of the things it checks. Section 4.4 of `docs/mac/06-engine-host-port.md` says only "1 uses indirect command buffers per T, once implemented", which does not contradict the notice.
+- **Review required:** The notice belongs in the window's encode path, which is not written. Either add the notice with that path, or amend section 8.3. No Mac code reads the variable yet, so the notice cannot print before then.
+
+### D-IMPL-768: `--check-logits` is KEEP in the spec and no engine code reads it, so the test fails
+
+- **Decision:** Section 9.2 gives `--check-logits` the KEEP disposition: after the window's wait, the host scans row 0 of the logits and fails with the upstream message and exit 1. The parser accepts the flag, but no code outside the parser reads it, so the test fails. The code is not changed.
+- **Reason:** KEEP means the same flag with the same meaning, and the meaning is the window's logits check, which is not wired.
+- **Review required:** As for D-IMPL-765: wire the check with the window, or record it as planned.
+
+### D-IMPL-769: `STRATA_PREFILL_BF16X2` is read with `strtol`, and the spec says `atoi`, so the test fails on `1x`
+
+- **Decision:** Section 4.2 of `docs/mac/06-engine-host-port.md` says the variable is read with `atoi`, so a leading whole number counts and `1x` turns the feature on. `main.cpp` reads it with `strtol` and requires the whole value to be a number, so `1x` leaves it off. The test fails on `1x`, and the code is not changed. The test checks only on or off: the memory plan takes the same bytes for 1 and 2 (`docs/mac/05-memory-and-residency.md`, section 2.4). The mode split of section 9.3 (1 for every projection, 2 for all but the hyper-connection's) has no reader until the prompt path (L13) exists, so the test does not check it.
+- **Reason:** The spec states the reading, so the mismatch is explicit. Changing `main.cpp` to `atoi` would change the behaviour of an input that no test had pinned, so that is a decision for review.
+- **Review required:** Choose one: change `prefill_bf16x2_enabled` to the `atoi` reading (one line, and the test then passes), or change section 4.2 to say "a whole number". Also confirm that on or off is enough for the planner until L13.
+
+### D-IMPL-770: Two `STRATA_METAL_GEMM` cases that the spec does not settle are not asserted
+
+- **Decision:** Two cases are not in the test, and the code is not changed. (a) `n = 0` is rejected for every setting, including unset. Section 4.4 of `docs/mac/06-engine-host-port.md` does not say what `n = 0` does. (b) `mpp` with `n < 64` on an earlier GPU family selects SIMD with no error. The same row says both that `n < 64` always uses `simd` and that `mpp` "is rejected on other families", so the spec conflicts with itself for this case.
+- **Reason:** Neither statement is explicit enough to fail on, so the rule is to document the case.
+- **Review required:** State in section 4.4 of `docs/mac/06` which result is wanted for both cases.
+
+### D-IMPL-771: Two names in the inventory disagree with the spec, and they are not tested
+
+- **Decision:** Section 9.3 of `docs/mac/04` names `HIPBLASLT_TUNING`, `HIPBLASLT_VERBOSE` and `HIPBLASLT_TUNING_V1` without the `STRATA_` prefix. `tools/metal/drift.json` lists `STRATA_HIPBLASLT_TUNING` and `STRATA_HIPBLASLT_VERBOSE`, and neither form appears in `src/`. The test uses the names of section 9.3, and both ignored results hold under either name. `STRATA_PLE_GGUF` is listed in `tools/metal/drift.json` and read by `src/kernels/ple_parity.cpp`, but it is in neither section 9 of `docs/mac/04` nor section 4 of `docs/mac/06`. It is not built for the Mac, so the test does not cover it.
+- **Reason:** The HIP variables are HIP-only, and the Mac code reads neither form.
+- **Review required:** Correct the HIP names in one of the two files. Decide the disposition of `STRATA_PLE_GGUF`, since REQ-FUN-02 in `docs/mac/01-requirements.md` requires every upstream variable to have one.
+
+### D-IMPL-772: The test is left failing on seven explicit mismatches
+
+- **Decision:** `kernel_env_dispositions_test` builds, is registered, and runs: 186 of 193 checks pass. The seven that fail are D-IMPL-765 (1), D-IMPL-766 (3), D-IMPL-767 (1), D-IMPL-768 (1) and D-IMPL-769 (1). Nothing in `src/` was changed to make the test pass. The failures are not downgraded, because each of these rows of the spec is explicit.
+- **Reason:** The rule for mismatches is that the test fails when the spec is explicit.
+- **Review required:** Before commit, decide whether the test lands red on `mac-host`, or whether these rows become planned in section 9.3 and the test skips them. The second option changes the spec, so it needs its own review.
+
+### D-IMPL-773: The `test_map` error about Python module counts predates this change
+
+- **Decision:** `tools/metal/test_map.py` fails with `Mac Python module counts in section 9.3 do not match the files: documented [14, 0, 6], found [14, 2, 6]`. The two extra modules are `tools/metal/lc_dump_format.py` and `tools/metal/test_lc_dump_format.py`. This change touches neither file nor section 9.3, so the error is not fixed here.
+- **Reason:** It is outside L14.
+- **Review required:** The owner of the T5 rows (D-IMPL-649) should update the count in `docs/mac/09-testing-and-validation.md`, section 9.3.
+
+### D-IMPL-774: The test appears in the host test table of `docs/mac/08`
+
+- **Decision:** The table of host tests in `docs/mac/08-build-and-distribution.md`, section 6.4, has a row for `kernel_env_dispositions_test` beside `options_dispositions_test`.
+- **Reason:** AGENTS.md asks that the engineering documents match the implementation.
+- **Review required:** None, unless the table is meant to list only tests that pass.
+
