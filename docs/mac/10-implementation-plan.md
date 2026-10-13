@@ -179,14 +179,14 @@ The engine starts, reads every catalogue file, plans it, and every kernel passes
 | L1, L2 | `common/` headers; the twin harness and oracles | H3 |
 | L3-L8 | Mat-vecs, embedding, PLE, GR, GDN, QSA, attention, MoE, head and sampler: each against its twin | L1, L2 |
 | T1 | The prompt sets | |
-| R12 + T2 | The CUDA golden set and `record_golden.py`, with T-7 | T1, T3 |
+| R12 + T2 | **Out of project scope (D-IMPL-629, D-IMPL-671):** the CUDA golden set and `record_golden.py`, with T-7. The replacement is the per-kernel check C1.K, in T6 ([09](09-testing-and-validation.md), section 4.1) | T1, T3 |
 | T4 | The `accept.py` framework | |
 | T5 | `tf_compare.py`, `lc_dump` | T4 |
 | S1 | `serve/macos.py` | |
 | S4 | `metal_plan`, `plan_class` | U1 |
 
-Measurements: R-4; L-6 (checks 1-3 and 5), L-8, L-9 and L-10 on the reference Mac; M-1; X-3; T-1, T-2 and T-3
-once the golden set exists; T-7 with the golden set.
+Measurements: R-4; L-6 (checks 1-3 and 5), L-8, L-9 and L-10 on the reference Mac; M-1; X-3. T-1, T-2, T-3 and T-7
+belong to the golden set, which is out of project scope (D-IMPL-629): they are not measured.
 
 Exit criteria:
 - `ctest --preset mac-metal` passes, with the twins of L1-L8 registered ([04](04-metal-kernels.md), section 10).
@@ -194,7 +194,9 @@ Exit criteria:
 - `strata --plan-only` prints a PLAN line for each of the seven catalogue files, within the time limits of
   [06](06-engine-host-port.md), section 2.3, and the plan of [05](05-memory-and-residency.md), section 8.1, on the
   reference Mac.
-- The golden set of Q2_0 and Coder is on the reference Mac, with its manifest in git.
+- The golden set of Q2_0 and Coder is out of project scope (D-IMPL-629), so it is no longer an exit criterion. Its
+  replacement is the per-kernel FP64 oracle check C1.K ([09](09-testing-and-validation.md), section 4.1, D-IMPL-671), which
+  runs in `ctest --preset mac-metal` with the twins above.
 - `tools/metal/test_accept.py` passes on the reference Mac with its documented fixture inputs.
 
 ### 3.3 Phase 2: first token, speculation and the prompt path
@@ -215,7 +217,7 @@ suffix drafter, sampling and the prompt path.
 | L13 | The prompt path | L9 |
 | L14 | The kernel dispositions, and `metal_dispatch_modes_test` | L10 |
 | H11 | The watchdog and the stall report | H6, L10 |
-| T6 | C1: `ladder_compare.py`, `metal_router_replay`, `metal_layer_replay` | T5, L9 |
+| T6 | C1 (section 4.1): C1.K (`ctest --preset mac-metal`), `metal_router_replay`, `metal_layer_replay`; `ladder_compare.py` as a diagnostic | T5, L9 |
 | T8 | C2, every arm | L11, H8 |
 | T11 | The benchmark, PF-1, PF-2 and the regression check. **Status: partly done.** The host logic is in `tools/metal/accept/bench.py` and tested by `test_bench.py`, and `accept.py pf` is wired to PF-1 and PF-2. Open: the reference Mac's runs of `bench` and `pf`, `engines.py` (the REG.* baseline), the re-run of 5.1 step 3 that `bench` needs, and `upstream_speed.json` ([09](09-testing-and-validation.md), section 12) | T4, L13 |
 | T13 (part) | `metal_gpu_time_test` and `metal_watchdog_test`, with their full-mode cases; the tiered cases come in phase 4 | L13, H11 |
@@ -228,10 +230,12 @@ The model tests registered at G1: `dense_vs_gguf_test`, `ple_oracle_model_test`,
 `metal_watchdog_test` with their full-mode cases: 25 of the 28. `tiered_eq_full`, `metal_full_vs_tiered` and
 `metal_alloc_fail_test` stay planned until phase 4.
 
-Measurements: R-1 and R-5 (G1 step 7); R-2; L-2, L-4, L-12, L-13, L-14 and L-15; L-6 check 4; H-4; H-7; M-5;
+Measurements: R-1 (G1 step 7, its FP64 form in C1.4); R-5 (out of project scope, D-IMPL-629); R-2; L-2, L-4, L-12, L-13, L-14 and L-15; L-6 check 4; H-4; H-7; M-5;
 M-6; T-4 and T-5; B-1 and B-10.
 
-**G1**, `accept.py g1` ([09](09-testing-and-validation.md), section 6.1). If it fails on correctness, the bisection
+**G1**, `accept.py g1` ([09](09-testing-and-validation.md), section 6.1). Its kernel-level check, C1.K, can pass on the
+Mac now. C1.4 on the model's own rows needs the models. C1.1, C1.5, G1.tf and G1.free need a model-level reference that
+the owner has not named (D-IMPL-671). Until that reference is named, G1 is NOT RUN, not PASS, and phase 3 does not start. If it fails on correctness, the bisection
 of [09](09-testing-and-validation.md), section 10.1, comes first, and phase 3 waits. Between 15 and 20 tok/s, the
 profile (H-4, L-13, L-14) and its fixes come first, which may start conditional items (section 3.8), and G1 runs
 again. Below 15 tok/s with no clear cause, the stop rule of [00](00-feasibility-study.md), section 7, applies.
@@ -388,7 +392,8 @@ Keep the invariants in [02](02-architecture.md), section 9; run the checks in
 3. **Run `tools/metal/check_drift.py`.** Classify each changed marker, copied range, kernel, model or pinned revision
    using section 4.2. Update its implementation, test and specification together. Advance `UPSTREAM_SYNC` only when
    intentionally changing the project's comparison baseline, then run `check_drift.py --update` (section 4.3).
-4. **Review golden sets.** Apply [09](09-testing-and-validation.md), section 2.5. Follow `check_drift.py`'s
+4. **Review golden sets.** Apply [09](09-testing-and-validation.md), section 2.5. The golden set is out of project scope
+   (D-IMPL-629): the verdict is recorded, and the owner decides what it requires (D-IMPL-978). Follow `check_drift.py`'s
    path-based verdict: every changed `src/` or `include/` path requires a new CUDA golden set unless it is explicitly
    listed in `no_arithmetic` (currently only `src/platform/**`). Retain the existing validity record only when the
    verdict is `still valid`.
@@ -539,11 +544,11 @@ default stands, and the specification is written for that default.
 
 | ID | Measures | Phase | Default until recorded | Defined in |
 | --- | --- | ---: | --- | --- |
-| R-1 | Coder's router ids and weights against CUDA's FP64 router | 2 | Ids identical except at exact ties; weights within 1e-5 relative | [03](03-model-reference.md), section 10 |
+| R-1 | Coder's router ids and weights against the FP64 host router, on the model's own rows (D-IMPL-965) | 2 | Ids identical except at exact ties; weights within 1e-5 relative | [03](03-model-reference.md), section 10 |
 | R-2 | The expert union of a verify window, T = 2..4 | 2 | The upper bound of [03](03-model-reference.md), section 4.3 | [03](03-model-reference.md), section 10 |
 | R-3 | MTP acceptance per draft position, with and without the draft vocabulary | 3 | Upstream's rates, because the arithmetic matches | [03](03-model-reference.md), section 10 |
 | R-4 | Unlisted float tensors byte-identical between `dense.bin` and the GGUF | 1 | Yes | [03](03-model-reference.md), section 10 |
-| R-5 | Per-layer residual drift between the Metal and CUDA builds | 2 | Smooth growth, below the CUDA-to-llama.cpp drift | [03](03-model-reference.md), section 10 |
+| R-5 | Per-layer residual drift between the Metal and CUDA builds (out of project scope, D-IMPL-629) | 2 | Not measured: C1.3 is retired | [03](03-model-reference.md), section 10 |
 | L-2 | Tile width of `strata_gr_down`; rows per mat-vec threadgroup | 2, 5 | TILEV 512; R = 4 | [04](04-metal-kernels.md), section 11 |
 | L-3 | `simd_sum` order on M1-M4 | 5 | Ascending, as on M5 | [04](04-metal-kernels.md), section 11 |
 | L-4 | Codebook placement in the real kernels | 2, 5 | Program-scope `constant` | [04](04-metal-kernels.md), section 11 |
@@ -593,14 +598,14 @@ default stands, and the specification is written for that default.
 | B-9 | Local build time | 3, 5 | "5-10 minutes" | [08](08-build-and-distribution.md), section 14 |
 | B-10 | GPU trace size with a real model | 2 | Warn above 8 GiB | [08](08-build-and-distribution.md), section 14 |
 | B-11 | Symbolication with the dSYM and `.metallibsym` | 5 | Ship both | [08](08-build-and-distribution.md), section 14 |
-| T-1 | The spread of upstream's own CUDA paths | 1 | Upstream's Q2_0 floor; Y_pp 89.8% and 0.33 | [09](09-testing-and-validation.md), section 11 |
-| T-2 | The margin above which the floor never flips | 1 | m₁ = 1.0 logit | [09](09-testing-and-validation.md), section 11 |
-| T-3 | CUDA against llama.cpp | 1 | C1.2 and C1.3 not gating | [09](09-testing-and-validation.md), section 11 |
+| T-1 | The spread of upstream's own CUDA paths (out of project scope, D-IMPL-629) | 1 | None: not measured | [09](09-testing-and-validation.md), section 11 |
+| T-2 | The margin above which the reference's floor never flips | 1 | None until T-1 is measured for the reference named | [09](09-testing-and-validation.md), section 11 |
+| T-3 | CUDA against llama.cpp (out of project scope, D-IMPL-629) | 1 | None: C1.2 and C1.3 are retired | [09](09-testing-and-validation.md), section 11 |
 | T-4 | Run-to-run variation of a benchmark | 2 | CV ≤ 2%; bar 0.95 | [09](09-testing-and-validation.md), section 11 |
 | T-5 | Slowdown over back-to-back runs | 2 | No pause | [09](09-testing-and-validation.md), section 11 |
 | T-6 | The time of each run | 3 | The split of [09](09-testing-and-validation.md), section 7.2 | [09](09-testing-and-validation.md), section 11 |
-| T-7 | Size and recording time of the golden set | 1 | About 40 GB, about 2 h per model | [09](09-testing-and-validation.md), section 11 |
-| T-8 | A replacement reference GPU | When a card is replaced | Run only then | [09](09-testing-and-validation.md), section 11 |
+| T-7 | Size and recording time of the golden set (out of project scope, D-IMPL-629) | 1 | None: no golden set is recorded | [09](09-testing-and-validation.md), section 11 |
+| T-8 | A replacement reference GPU (out of project scope, D-IMPL-629) | When a card is replaced | None: not run | [09](09-testing-and-validation.md), section 11 |
 | T-9 | The cache budget that gives the pressure scenario its pressure | 3 | None: C3.pressure and C3.exchange wait for it | [09](09-testing-and-validation.md), section 11 |
 
 A recorded value changes the default where it is specified, in the same pull request as the appendix row. A
@@ -613,7 +618,7 @@ threshold of [09](09-testing-and-validation.md) changes by its section 10.3.
 | Resource | Needed from | Use | If missing |
 | --- | --- | --- | --- |
 | The reference Mac: M5 Pro, 64 GB, 20-core GPU, 2 TB SSD for models and results | Phase 0 | `strata-ref`: every hardware run, every gate, every release verification | The plan cannot run; it is the one machine nothing replaces |
-| The CUDA reference PC: an sm_120 card with 12 GB or more, 64 GB of RAM ([09](09-testing-and-validation.md), section 2.4) | Phase 1 | The golden set, at the start and for every compatibility change whose verdict is `golden: record again` (all changed `src/` or `include/` paths except reviewed `no_arithmetic` paths; currently only `src/platform/**`) | C1 has no reference, and G1 cannot pass ([11](11-risks-and-open-questions.md), section 2) |
+| Out of project scope (D-IMPL-629): the CUDA reference PC, an sm_120 card with 12 GB or more and 64 GB of RAM ([09](09-testing-and-validation.md), section 2.4) | Not needed | The golden set, which is not recorded. C1.K runs on the reference Mac | C1.1, C1.5, G1.tf and G1.free are NOT RUN until a model-level reference is named (D-IMPL-671, D-IMPL-960) ([11](11-risks-and-open-questions.md), section 2) |
 | A 48 GB Apple10 Mac | Phase 4 | The authoritative form of G2; M-8 | G2 runs on the reference Mac with the balloon |
 | Macs of the M1, M2, M3 and M4 generations, for a few hours each; 32 GB or more for `accept.py family` | Phase 5, and again for each release candidate | The family runs; the family parts of L-2 to L-8 and L-10 to L-15; M-8 on 32 and 36 GB | REQ-PLT-03 cannot hold, and the release notes say "tested on M5 only" |
 | A GitHub repository for the project, and a test repository for the release pipeline | Phase 0, phase 5 | CI, releases; B12 and B18 | — |

@@ -257,6 +257,11 @@ def blocked_reason(step: runs.Step) -> str | None:
 def first_reason(spec: runs.RunSpec, plan: list[runs.Step], found: list[checks.Check]) -> str | None:
     if spec.plan is None:
         return f"{spec.name} has no command plan yet: composed by {spec.task}"
+    # A criterion whose reference is not named can never pass (criteria.py, basis reference): the run is NOT RUN
+    # before any step starts, so no engine time is spent on it (09 sections 4.1 and 6.1).
+    unnamed = [cid for cid in spec.criteria if criteria.get(cid).basis == criteria.REFERENCE]
+    if unnamed:
+        return f"{', '.join(unnamed)} {criteria.REFERENCE_NOTE}"
     for check in found:
         if not check.ok:
             return f"{check.name}: {check.detail}"

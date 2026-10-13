@@ -366,7 +366,7 @@ kernels meet them.
 | **Bitwise within the Mac build** | Quantisers (Q8_1, Q8_0-scaled, KV int8 and q4), router ids, selection ids, the embedding gather, the PLE history, sampler candidates, every integer dot; decode ≡ verify for every T; NC-column mat-vecs ≡ one column; tiered ≡ full experts | Twins with tolerance class B, and the property tests of section 10.4 |
 | **Bounded against an oracle** | Every kernel whose order this document fixes but which calls `exp`, `log`, `sqrt` or `rsqrt`. The oracle uses the same order, with each library call in double rounded to float. | Twins with tolerance class U(n) or R(ε) (section 10.2) |
 | **Tolerance against an FP32 or FP64 reference** | The prompt path's GEMMs, where the order is the tile's: the dense projections (section 6.2) and the expert tiles (section 6.6); the Phase-2 prompt attention (section 2.6) | Twins with classes U(2K) and R(2^-16) (section 10.3) |
-| **KL against CUDA** | The whole model | Gate C1 ([09](09-testing-and-validation.md)) |
+| **KL against a model-level reference** | The whole model | C1.1 and C1.5 ([09](09-testing-and-validation.md), section 4.1): NOT RUN until a reference is named (D-IMPL-671) |
 
 No kernel's output is required to equal a CUDA output bit for bit (section 3.9).
 
@@ -400,7 +400,7 @@ Rules:
   1. an A/B on M5 and on one of M1-M4 shows at least a 5% gain in the kernel's GPU time in a release-build window;
   2. the kernel has no bitwise contract (section 3.1) and tests no NaN or infinity (fast mode assumes neither);
   3. every division in the kernel that must be correctly rounded uses `precise::divide`;
-  4. its twin passes with the tolerance it had in `safe/`, and gate C1 still passes.
+  4. its twin passes with the tolerance it had in `safe/`, and C1.K still passes ([09](09-testing-and-validation.md), section 4.1).
 
 ### 3.3 The contraction rule
 
@@ -533,7 +533,7 @@ gate `2·sigmoid(inject/4)` has three upstream flavours; section 5.4 says which 
 ### 3.9 Deviations from CUDA
 
 These are the places where the Mac computes something different from CUDA on purpose. Each changes only the last
-bits, which is why gate C1 compares the Mac with CUDA by KL and the ladder, not by equality.
+bits, which is why the kernel checks compare with tolerance classes (section 10.2), not by equality.
 
 | Upstream | Mac | Effect |
 | --- | --- | --- |
@@ -5875,7 +5875,7 @@ without, which [03](03-model-reference.md), section 9, requires. R11 checks it.
 `fast/` holds `strata_selftest_exp` only. A kernel moves there only by the rule of section 3.2, and each move adds a
 row here:
 
-| Kernel | Date | A/B (M5; M1-M4 GPU) | Tolerance in `safe/` and `fast/` | Gate C1 |
+| Kernel | Date | A/B (M5; M1-M4 GPU) | Tolerance in `safe/` and `fast/` | Gate C1 (C1.K) |
 | --- | --- | --- | --- | --- |
 | (none) | | | | |
 
@@ -5921,10 +5921,10 @@ non-finite references.
 
 | Set | Content | Label |
 | --- | --- | --- |
-| `random` | The real shapes ([03](03-model-reference.md), section 2). Activations N(0, 1) scaled to the RMS the model has at that point (from R12's dumps; 1 where unknown). Quantised weights are random valid blocks: F16 scales drawn log-uniformly from [2^-12, 2^-4], codes uniform over the format's range, IQ grid indices uniform. BF16 weights N(0, 0.02²). | `metal` |
+| `random` | The real shapes ([03](03-model-reference.md), section 2). Activations N(0, 1) scaled to the RMS the model has at that point (from the Mac's own dumps of a model run; 1 where unknown). Quantised weights are random valid blocks: F16 scales drawn log-uniformly from [2^-12, 2^-4], codes uniform over the format's range, IQ grid indices uniform. BF16 weights N(0, 0.02²). | `metal` |
 | `edge` | All zeros; one row whose amax is 2^10 times the rest; quantiser inputs placed exactly on a rounding tie (x / d = k + 0.5); −0; ±65,504 on F16 paths; the largest and smallest positions, cells and expert ids the kernel accepts; NaN and ±∞ where the kernel's section specifies their handling | `metal` |
 | `fixture` | Upstream's vectors and fixtures, unchanged: `ple_oracle_vectors.inc` and the IQ fixtures of `tools/iq_fixture.py` | `metal` |
-| `real` | The first and last 64 rows of every tensor of each format in the Q2_0 and Coder packs, with activations from a CUDA `--dump-halves` run (R12) | `model` |
+| `real` | The first and last 64 rows of every tensor of each format in the Q2_0 and Coder packs, with activations from the Mac's own `--dump-halves` run of the same rows (no CUDA dump, D-IMPL-629) | `model` |
 
 The sampler twin's `fixture` input combines deterministic synthetic coverage with semantic ports of upstream
 `sampler_parity` cases 16 and 17. Their background logits come from a portable integer-only generator with
@@ -5980,6 +5980,12 @@ outside the documented test range.
 
 For R(ε), the comparison uses the oracle's FP64 mathematical reference directly; it must not first round that
 reference to F32.
+
+**The oracle and the FP64 yardstick (D-IMPL-671).** The per-kernel checks of C1.K ([09](09-testing-and-validation.md),
+section 4.1) are these twins. Their references are FP64 for class R(ε) and for the GEMM bounds of section 10.3. For
+classes B and U(n), the oracle runs the kernel's own operation order in float, with the magnitude m carried in double.
+That is a host reference of the same operation on the same quantized inputs, but it is not an FP64 evaluation of the
+operation. Whether the owner accepts it as the FP64 yardstick is open (D-IMPL-978).
 
 ### 10.3 The prefill tolerance
 
@@ -6277,7 +6283,7 @@ The order follows the bring-up of audit E.8: twins first, then T = 1, then windo
 | L6 | QSA, KV, indexer, selection and attention (sections 5.6-5.7) | `metal_qsa_test` and `metal_attn_test` pass for every `--kv` mode; `reg` and `mem` give the same ids. Sparse-attention chunk and merge now have a tested selection→top-k→attention→merge shared-Encoder coordinator, including O-class FWHT and gate for q4_0/k8v4; production Window/Prefill integration and external parity remain open under REV-002/025/032 |
 | L7 | MoE: router, plan, experts, shared expert, combine (section 5.10) | `metal_moe_test` passes with both plan tables (full and tiered), both router sizes, and the validated grouped gate/up encoder for all eight formats; Window scheduling, shared-expert production dispatch and model-backed inference remain open |
 | L8 | Head and sampler (section 5.12) | The sampler twins pass synthetic coverage, upstream host fixture 15, and semantic ports of upstream cases 16-17; `samp_coupled_eq_host` passes; `coupled_draft_test` passes unchanged. L8 remains open until literal upstream cases 1-14 and 18, external generated-vector parity, and production window/head/MTP integration are completed under REV-028 |
-| L9 | The T = 1 window of section 5.1 and its encode in full mode (sections 8.1-8.3), with the dump hooks of section 9.4 | The benchmark prompts decode at T = 1 and pass gate C1 against the R12 golden set ([03](03-model-reference.md), section 11); `dump_eq_nodump` passes |
+| L9 | The T = 1 window of section 5.1 and its encode in full mode (sections 8.1-8.3), with the dump hooks of section 9.4 | The benchmark prompts decode at T = 1 and pass C1.K ([09](09-testing-and-validation.md), section 4.1), and the model-level rows of C1 once a reference is named ([03](03-model-reference.md), section 11, R12 being out of project scope, D-IMPL-629); `dump_eq_nodump` passes |
 | L10 | Windows of T = 2..8, commit and write-through windows (sections 5.1, 8.4 and 8.5), with [06](06-engine-host-port.md) H8 | `window_eq_decode`, `state_after_commit_eq_decode` and `write_through_eq_commit` pass; gate C2 passes |
 | L11 | The MTP drafter (section 5.11) | `metal_mtp_test` and `mtp_kv_t_independent` pass; a recorded window replayed on the CPU oracle and on Metal gives the same draft ids, `row_top_prob` and drafter K/V |
 | L12 | Tiered encoding: the per-layer signal and wait, the shared expert between them, and the plan's miss table (section 8.3), with [06](06-engine-host-port.md) H10 | `tiered_eq_full` passes for Q2_0 and Coder; gate C4 passes |

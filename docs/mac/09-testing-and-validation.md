@@ -1,6 +1,6 @@
 # 09. Testing and validation: how the Mac engine is shown to be right and fast
 
-Status: design specification, updated 2026-10-10. The host and Metal CTest targets and the macOS Python test runner exist. Model-backed acceptance, the release gate, and end-to-end inference tests are not implemented.
+Status: design specification, updated 2026-10-13 (the C1 and G1 yardstick, D-IMPL-960 to D-IMPL-979). The host and Metal CTest targets and the macOS Python test runner exist. Model-backed acceptance, the release gate, and end-to-end inference tests are not implemented.
 Upstream baseline: [Niko1221/Strata](https://github.com/Niko1221/Strata) v0.1.34, commit `1678de33`.
 Source audits: [audit/A-model-and-kernels.md](audit/A-model-and-kernels.md), sections E.0-E.8 (tests and oracles), and
 [audit/K5-orchestration-vram-tests.md](audit/K5-orchestration-vram-tests.md), section 6 (determinism and the test
@@ -9,8 +9,8 @@ plan). Upstream's own evidence: `bench/results/2026-09-27-cache-parity/`, `2026-
 Every `file:line` reference is relative to the upstream repository root.
 
 This document covers how the port is shown to work:
-- the frozen inputs: the benchmark prompt sets, the test models, and the reference data from upstream's CUDA build and
-  from llama.cpp;
+- the frozen inputs: the benchmark prompt sets, the test models, and the reference data from llama.cpp. Upstream's
+  CUDA build is out of project scope (D-IMPL-629), and the per-kernel FP64 oracles replace it (D-IMPL-671);
 - the correctness criteria C1-C4, the prompt-path criterion, long-context needles and the server end-to-end run;
 - the performance criteria: the decode benchmark, PF-1 and PF-2, and the regression check;
 - the gates G1-G3 of [00-feasibility-study.md](00-feasibility-study.md), section 7, as commands with exit codes;
@@ -41,10 +41,10 @@ measurement or review may overturn.
 | # | Principle | What it means here |
 | --- | --- | --- |
 | P1 | Bitwise only where the arithmetic is the same | Mac against Mac is compared bit for bit: speculation against greedy, tiered against full, a resumed state against a re-read one, one run against the next. Mac against CUDA or llama.cpp is a tolerance comparison, because the order of floating-point additions differs ([04](04-metal-kernels.md), section 3.9). |
-| P2 | Frozen reference results | Previously measured results from the upstream CUDA build and llama.cpp at `3cf03257f219afbe7334045ff7c6a06ac68c627d` inform the target comparisons. This project builds and supports the Metal product only; it does not build or run a CUDA product backend. |
-| P3 | The tolerance comes from the references | A cross-backend threshold is set from how far upstream's own valid CUDA paths differ from each other, and how far CUDA differs from llama.cpp (measurements T-1 to T-3). The Mac must be no further from CUDA than that. No threshold is chosen to make a result pass. |
+| P2 | Frozen reference results | Previously measured results from llama.cpp at `3cf03257f219afbe7334045ff7c6a06ac68c627d` and from the upstream CUDA build inform the target comparisons. The CUDA build is out of project scope (D-IMPL-629): no criterion reads its results. This project builds and supports the Metal product only; it does not build or run a CUDA product backend. |
+| P3 | The tolerance comes from the references | A threshold is set from how far a reference's own valid paths differ from each other, and from the arithmetic bound of the kernel's tolerance class (04, section 10.2). Where no reference is named, the criterion is NOT RUN (section 4.1). No threshold is chosen to make a result pass. |
 | P4 | Kernels against oracles, the model against references | A kernel is tested against its CPU oracle in [04](04-metal-kernels.md), section 10. This document tests the whole model. A model-level failure is bisected down to a kernel with the dumps of section 3.1. |
-| P5 | Frozen inputs | Prompts, golden data and test models are named by SHA-256 in manifests in git. A run whose inputs do not match their manifest fails before it starts. |
+| P5 | Frozen inputs | Prompts and test models are named by SHA-256 in manifests in git. Golden data is named the same way if a reference is ever recorded; none is recorded now (D-IMPL-629). A run whose inputs do not match their manifest fails before it starts. |
 | P6 | A criterion is a command | Every criterion is checked by a script that exits 0 on a pass and non-zero otherwise (section 3.2), and writes its numbers to a result file. Only the reviews named in section 7.6 need a person. |
 | P7 | Keep reference formats stable | The upstream needle and conversation-cache tools remain the numerical reference. `tools/metal/tf_compare.py` reads the retained logits dump format directly and runs on macOS without the old workstation-specific launcher. |
 | P8 | No retries | A test that fails once has failed. A test that passes and fails on the same inputs is a bug in the engine or the test, filed as one (section 10.2). |
@@ -72,8 +72,8 @@ need a model loading window of their own, and produce result files rather than a
 | `tools/metal/make_prompts.py` | Builds the prompt sets from their sources | 2.2 |
 | `tests/metal/models.json` | The test models: tag, files, sizes and SHA-256 values | 2.3 |
 | `tools/metal/test_models.py` | `fetch` and `check` for the models under `STRATA_TEST_MODELS` | 2.3 |
-| `tests/metal/golden/MANIFEST.json` | The golden set: files, SHA-256 values, command lines, GPU, driver, upstream commit | 2.5 |
-| `tools/metal/record_golden.py` | Records the golden set on the CUDA reference PC | 2.5 |
+| `tests/metal/golden/MANIFEST.json` | Out of project scope (D-IMPL-629): the golden set's files, SHA-256 values, command lines, GPU, driver, upstream commit | 2.5 |
+| `tools/metal/record_golden.py` | Out of project scope (D-IMPL-629): would record the golden set on the CUDA reference PC | 2.5 |
 | `tools/metal/accept.py`, `tools/metal/accept/` | The acceptance runner and its runs (one module per run) | 3.2 |
 | `tools/metal/tf_compare.py` | Compares two logits dumps: same top-1, KL, perplexity, margins | 3.3 |
 | `tools/metal/ladder_compare.py` | Compares two `--dump-layers` files, or one with llama.cpp's ladder | 4.1 |
@@ -248,9 +248,10 @@ for `STRATA_TEST_MODELS` and `STRATA_RESULTS`, excluded from Spotlight (`mdutil 
 
 ### 2.4 The CUDA reference PC
 
-> **Scope note (owner decision, 2026-10-13, D-IMPL-629):** The CUDA reference PC is outside the project
-> scope. No work is blocked on it, and the criteria that use the CUDA golden set have no reference until the
-> owner chooses a replacement. This section is kept as the specification of the original reference.
+> **Scope note (owner decision, 2026-10-13, D-IMPL-629):** The CUDA reference PC is outside the project scope. No work
+> is blocked on it. The owner chose a per-kernel FP64 oracle to replace the golden set for C1 and G1.tf (D-IMPL-671,
+> section 4.1), and no criterion reads the golden set any more. This section is kept as the specification of the
+> original reference.
 
 The golden data is recorded on a PC with upstream's own build, not on a Mac:
 
@@ -276,6 +277,11 @@ The golden data is recorded on a PC with upstream's own build, not on a Mac:
 
 ### 2.5 The golden set (work item R12 of [03](03-model-reference.md))
 
+> **Scope note (D-IMPL-629, D-IMPL-960):** Out of project scope. No golden set is recorded, and no criterion reads one.
+> C1 and G1 use the per-kernel FP64 oracle (section 4.1), and their model-level rows wait for a reference that the owner
+> names. Work items R12 and T2 are out of scope. The text below is the specification of the original set, kept so that
+> a reference recorded later can be specified against it.
+
 `tools/metal/record_golden.py` runs on the CUDA PC, in a checkout of the project at the local project commit, and writes one
 folder per sync: `golden/<UPSTREAM_SYNC[:12]>/<tag>/`. It is portable Python (paths through `pathlib`, the engine
 named `strata` or `strata.exe`), because upstream's benchmark PC runs Windows.
@@ -295,7 +301,7 @@ For each of Q2_0 and Coder:
 | --- | --- | --- | --- |
 | `tf-code.logits`, `tf-doc.logits`, `tf-chat.logits` | The three `tf-*` sets | `--tokens-file <set>.ids --max-new 1 --dump-logits <file>` | C1.1, T-1, T-2 |
 | `tf-*.nocache.logits` | The same | As above, without `--expert-cache` (every routed expert on the CPU pool) | T-1 (the noise floor) |
-| `ladder-code.layers`, `ladder-doc.layers`, `ladder-chat.layers` | The first 65 ids of each `tf-*` set (64 positions) | `--tokens <ids> --max-new 1 --dump-layers <file>` | C1.3, R-5 |
+| `ladder-code.layers`, `ladder-doc.layers`, `ladder-chat.layers` | The first 65 ids of each `tf-*` set (64 positions) | `--tokens <ids> --max-new 1 --dump-layers <file>` | C1.3 (retired, a diagnostic), R-5 |
 | `router.layers`, `router.halves`, `router.routing` | The first 1,001 ids of `tf-doc` (1,000 positions) | `--tokens-file <ids> --max-new 1 --dump-layers <file> --dump-halves <file> --dump-routing <file>` | C1.4, R-1 |
 | `pp-32k.logits` | `ca-32k` | `--prefill auto --prefill-until 32000 --tokens-file ca-32k.ids --max-new 1 --dump-logits <file>` | The prompt-path criterion (section 4.5) |
 | `pp-32k.c6144.logits` | `ca-32k` | As above with `--prefill 6144` in place of `--prefill auto` | T-1: the prompt path's own yardstick, a chunk-size change of the unchanged CUDA engine |
@@ -313,7 +319,7 @@ do not depend on a GPU), `record_golden.py --llama-cpp <build>` also writes:
 | Files | Input | Tool | Read by |
 | --- | --- | --- | --- |
 | `lc-tf-code.logits`, `lc-tf-doc.logits`, `lc-tf-chat.logits` | The three `tf-*` sets | `lc_dump --logits`, in the engine's `--dump-logits` format (`int32 n_vocab, int32 rows`, then F32) | C1.2, T-3 |
-| `lc-ladder-*.layers` | As `ladder-*` | `lc_dump --layers`, in the `--dump-layers` layout | C1.3, T-3 |
+| `lc-ladder-*.layers` | As `ladder-*` | `lc_dump --layers`, in the `--dump-layers` layout | C1.3 (retired), T-3 |
 
 **`tools/metal/lc_dump`.** llama.cpp's own `llama-debug` (`examples/debug/debug.cpp`) is not enough: it saves only
 the last position's logits (`llama_get_logits_ith(ctx, tokens.size() - 1)`) and logs tensors as text. `lc_dump`
@@ -395,7 +401,7 @@ these outputs with upstream's formats, and [03](03-model-reference.md), section 
 | `strata generate: prompt chunk auto: N tokens` (stderr) | The chunk size `--prefill auto` chose | The prompt-path criterion, PF-1, PF-2 |
 | `--dump-logits` file | `int32 n_vocab, int32 rows`, then F32 rows | C1, G1, the prompt-path criterion |
 | `STRATA_DUMP_FIRST_LOGITS` file | `n_vocab` F32, no header | C1.5 |
-| `--dump-layers`, `--dump-halves`, `--dump-routing` files | [03](03-model-reference.md), sections 9.1-9.2 | C1.3, C1.4, R-1, R-5 |
+| `--dump-layers`, `--dump-halves`, `--dump-routing` files | [03](03-model-reference.md), sections 9.1-9.2 | C1.3 (retired), C1.4, R-1, R-5 |
 | `strata serve: STATE_HASH L=<n> gdn=<16 hex> ple=… tail=… pooled=… kv=… mtp=… stale=… dead=… pooled_full=… ple_prev=<a>,<b>` (stderr, with `STRATA_STATE_HASH=1`) | One line after each serve request (`:5558-5564`) | C3, through upstream's tools |
 | `strata serve: STATE_HASH_GDN <hashes>` (stderr, with `STRATA_STATE_HASH_GDN=1`) | One hash per GDN layer | Bisection (section 10.1) |
 | The server's `/v1/status`, `/metrics` and `DONE` counters | [07](07-server-setup-port.md), section 6 | The server run (section 4.7) |
@@ -409,7 +415,8 @@ number, and the first row's position as the header's count minus the rows presen
 
 **Parsing.** `tools/metal/accept/engine.py` holds the one parser of these lines. It fails with
 `accept: <file>: no <label> line` when a line it needs is missing, rather than reading a default. Its unit test
-parses captured output of upstream's CUDA engine and of the fake engine (section 3.2).
+parses captured output of the one-shot formatter's sample and of the fake engine (section 3.2); no CUDA capture is
+needed (D-IMPL-629).
 
 ### 3.2 The runner: `tools/metal/accept.py`
 
@@ -423,7 +430,7 @@ python3 tools/metal/accept.py <run> [--engine PATH] [--vision PATH] [--models DI
 | `--engine` | `build-dev/strata` | The engine under test. The release run passes the installed engine (section 8). |
 | `--vision` | `strata-vision` next to `--engine`, else `build-vision/bin/strata-vision` | The image encoder for S.image (section 4.7). A run that includes S.image and finds neither exits 2. |
 | `--models` | `$STRATA_TEST_MODELS` | The test models (section 2.3) |
-| `--golden` | `<models>/golden/<UPSTREAM_SYNC[:12]>/` | The golden set (section 2.5) |
+| `--golden` | `<models>/golden/<UPSTREAM_SYNC[:12]>/` | The golden set (section 2.5). Out of project scope (D-IMPL-629): no run reads one now |
 | `--out` | `$STRATA_RESULTS/<run>/` | Where the result folder goes |
 | `--model` | The run's own list | Restricts a run to some models |
 | `--prompt` | The run's own list | Restricts a run to some prompt sets, for a bisection (section 10.1). A run restricted this way never counts for a gate or a release. |
@@ -436,7 +443,7 @@ The runs:
 
 | Run | What it checks | Section |
 | --- | --- | --- |
-| `c1` | C1.1-C1.5, or the short form with `--short` | 4.1 |
+| `c1` | C1.K, C1.1, C1.4 and C1.5, or the short form with `--short` (C1.1 and C1.5 are NOT RUN until a reference is named) | 4.1 |
 | `c2` | Speculation and every Mac path against plain decode | 4.2 |
 | `c3` | The conversation-cache tools, the re-read check and the repeats | 4.3 |
 | `c4` | Tiered against full mode at the acceptance level | 4.4 |
@@ -457,7 +464,7 @@ line of output is `accept <run>: PASS (<n> criteria, <minutes> min)`, or
 
 **Before any model loads**, a run checks:
 - the prompt sets' `ids_sha256` against `tests/metal/prompts/MANIFEST.json`;
-- every golden file it reads against the golden manifest (section 2.5);
+- every golden file it reads against the golden manifest (section 2.5; a run reads none while no reference is named);
 - `test_models.py check --quick` for each model it uses;
 - that the engine starts: `strata --version` and `strata --list-devices`.
 
@@ -495,31 +502,33 @@ The run's folder is uploaded as a workflow artifact (`actions/upload-artifact`, 
 release run writes its folder under `$STRATA_RESULTS/release/<tag>/` as well, and that folder is kept on the
 reference Mac for good.
 
-**Criterion IDs.** `tools/metal/accept/criteria.py` holds one row per ID below: the operator, the threshold and the
-gating flag. These are the IDs that `result.json`'s `criteria`, the `FAIL` line and the `accept:` checks of
+**Criterion IDs.** `tools/metal/accept/criteria.py` holds one row per ID below: the operator, the threshold, the
+gating flag and the basis. The basis is `kernel` (passable on the Mac from fixtures and oracles), `model` (needs the test
+models), `reference` (compares with a model-level reference that the specification does not name: never a pass, NOT RUN),
+or `retired` (no verdict). A gating NOT RUN makes its run NOT RUN, never PASS (D-IMPL-960). These are the IDs that `result.json`'s `criteria`, the `FAIL` line and the `accept:` checks of
 `tests/metal/requirements.json` (section 9.4) use.
 
 | Group | IDs | Section |
 | --- | --- | --- |
-| C1 | `C1.1.top1`, `C1.1.kl`, `C1.1.safe`, `C1.1.band`, `C1.1.ppl`, `C1.1.p99`, `C1.2`, `C1.3`, `C1.4.ids`, `C1.4.weights`, `C1.5` | 4.1 |
+| C1 | `C1.K` (the per-kernel checks and the synthetic compositions); `C1.1.top1`, `C1.1.kl`, `C1.1.safe`, `C1.1.band`, `C1.1.ppl`, `C1.1.p99` and `C1.5` (NOT RUN until a model-level reference is named); `C1.4.ids` and `C1.4.weights`. `C1.2` and `C1.3` are retired | 4.1 |
 | C2 | `C2.b` to `C2.j`: each arm's output against arm (a)'s. `C2.d.accept`: arm (d)'s share of accepted drafts. | 4.2 |
 | C3 | `C3.reuse`, `C3.pressure`, `C3.oversized`, `C3.exchange`, `C3.admission`, `C3.growth`, `C3.isolation`, `C3.soak`, `C3.http`, `C3.disabled`, `C3.reread`, `C3.repeat` | 4.3 |
 | C4 | `C4.tiered`: the `--adapt-swaps 0` arm against full mode. `C4.swaps`: the arm with adaptive swaps against full mode, or against `C4.tiered`'s arm on a Mac without full mode. | 4.4 |
-| Prompt path | `PP.top1`, `PP.kl`, `PP.ppl`, `PP.chunk` | 4.5 |
+| Prompt path | `PP.top1`, `PP.kl`, `PP.ppl` (NOT RUN until a reference is named), `PP.chunk` | 4.5 |
 | Needles | `NEEDLE.32k`, `NEEDLE.128k`, `NEEDLE.262k`: every needle of that length found | 4.6 |
 | Server | `S.models`, `S.status`, `S.openai`, `S.stream`, `S.tool`, `S.anthropic`, `S.image`, `S.cancel`, `S.unload` | 4.7 |
 | Decode | `BENCH.mtp`, `BENCH.mtp.target`, `BENCH.plain`, `BENCH.other` | 5.1 |
 | Prefill | `PF-1`, `PF-2` | 5.2 |
 | Regression | `REG.decode`, `REG.prefill`, `REG.trend` | 5.4 |
 | Robustness | `PRESSURE.smoke`: the `metal_memory_pressure_smoke` step of the Sunday slice | 5.5 |
-| Gates | `G1.tf`, `G1.free`, `G2.speed` | 6 |
+| Gates | `G1.tf`, `G1.free` (NOT RUN until a reference is named), `G2.speed` | 6 |
 | Release | `PLAN.models`: step 1 of the release run | 8 |
 
 **The runner's tests.** `tools/metal/test_accept.py` runs in the macOS Python test layer. It uses
 `tools/metal/accept/fake_engine.py`, a script that takes the engine's arguments, prints the one-shot lines and writes
 dump files, with differences planted on request (`FAKE_ENGINE_PLANT=<kind>:<where>`). Every criterion ID of
-`tools/metal/accept/criteria.py` has a test that it passes on equal inputs and fails on its planted difference, with
-its message. The parser is tested on captured output (the formatter's sample in `tests/metal/oneshot_output_test.cpp`,
+`tools/metal/accept/criteria.py` has a test: a `kernel` or `model` criterion passes on equal inputs and fails on its
+planted difference, with its message; a `reference` criterion is NOT RUN on every input; a `retired` one has no verdict. The parser is tested on captured output (the formatter's sample in `tests/metal/oneshot_output_test.cpp`,
 not a CUDA capture). No run has a measurement yet, so the runs' criteria are judged only in their tests; a live run of
 any run stops with NOT RUN before a step starts.
 
@@ -558,99 +567,105 @@ outputs aliasing inputs through either the same path or a hard link.
 
 ## 4. Correctness criteria
 
-### 4.1 C1: the Mac computes the same model as CUDA
+### 4.1 C1: the Mac's kernels and layers against their FP64 oracles
 
-> **Owner decision (2026-10-13, D-IMPL-671):** The reference for C1 and G1.tf is a per-kernel FP64 oracle
-> (sections 2.4-2.5 are no longer the yardstick). The criteria below are NOT RUN until this section is rewritten
-> to match that decision.
+> **Owner decision (2026-10-13, D-IMPL-671), specification rewritten in D-IMPL-960 to D-IMPL-979.** The CUDA golden set
+> is out of project scope (D-IMPL-629), so C1 no longer compares the Mac with CUDA. Its reference is a per-kernel FP64
+> oracle in the twin harness (L2, [04](04-metal-kernels.md), section 10). A criterion that names a whole-model
+> comparison has no reference in this specification: it is NOT RUN until the owner names a model-level reference, and
+> no kernel oracle result may stand in for it.
 
-C1 compares the Mac with the references of section 2. It gates on Q2_0 and Coder. The other formats run C1.1 on
-`tf-code` in the weekly rotation (section 7.2).
+**What C1 checks.** C1 has two parts.
+- **C1.K, the per-kernel checks.** Each kernel of [04](04-metal-kernels.md) is checked by its twin (section 10.1)
+  against a host oracle of the same operation on the same quantized inputs, on the `random`, `edge` and `fixture` sets.
+  The oracle is an FP64 evaluation for the class R(ε) and for the GEMM bounds of section 10.3. For the classes B and
+  U(n), the oracle runs the kernel's own operation order in float, with the error magnitude carried in double (section
+  10.2). Those are the twins' references, but they are not FP64 evaluations of the operation. The owner confirms or
+  changes this (D-IMPL-978).
+- **The synthetic full-layer compositions**: the layer coordinators and the synthetic model of
+  [04](04-metal-kernels.md), sections 10.4 and 10.5. Each composition equals its component chain bit for bit (class B),
+  and its FP64 oracle where section 10.5 names one.
 
-**The Mac's settings.** The model's `config.json` args, with `--prompt-cache 0` and `--spec 0`, `--prefill` removed
-except where a step names it, and `--adapt-swaps 0`. The reference Mac runs Q2_0 and Coder in full mode
-([05](05-memory-and-residency.md), section 8). C4 (section 4.4) shows that tiered mode gives the same bits, so C1 is not
-repeated there.
+C1.K passes when `ctest --preset mac-metal` has no failing test. Its value is the number of failing `metal`-label
+tests. It does not show that the model computes the same function as upstream. That is the gap D-IMPL-671 states, and
+only the model-level rows below could show it.
 
-**The yardstick.** For each model and text t, from the golden set (measurements T-1 and T-3):
-- the floor F(t): CUDA with `--expert-cache 4000` against CUDA with no expert cache (`tf-t.logits` against
-  `tf-t.nocache.logits`). This is how much upstream's own valid paths differ;
-- the cross reference L(t): CUDA against llama.cpp (`tf-t.logits` against `lc-tf-t.logits`);
-- Y(t), the worse of the two: the lower same top-1, the higher median KL.
+**The model-level rows.** C1.1 and C1.5 compare the Mac's whole-model logits, teacher-forced and at the first token
+after the prompt path, with a model-level reference R. The only reference so far was the CUDA golden set, which is out
+of scope, and the specification names no replacement. These rows are therefore NOT RUN. In `criteria.py` they have the
+basis `reference`: `judge()` never passes them, and a gating one makes its run NOT RUN (exit 2). C1.4 is also a
+model-level row, but it needs only the models: it checks the router's arithmetic on the model's own rows.
 
-**The safe margin m₁.** The smallest margin above which the floor shows no flip in any text of either model, times
-1.5, and at least 1.0 logit (measurement T-2). Upstream reports that most flips between its own paths have a margin
-under 0.5 logits (`bench/results/2026-09-27-cache-parity/README.md`).
+**The fate of each C1 ID.** Every ID of section 3.2 is listed, with its fate. A kept ID keeps its metric. A retired ID
+has no criterion, no threshold and no verdict.
 
-**C1.1, teacher-forced against CUDA.** For each `tf-*` set, the Mac runs
-`--tokens-file <set>.ids --max-new 1 --dump-logits <file>`, and `tf_compare.py` compares it with `tf-<set>.logits`.
+| ID | Fate | Measured meaning | Basis | Gating |
+| --- | --- | --- | --- | --- |
+| C1.K | New. The kernel-level gate of C1 | Failing `metal` tests of `ctest --preset mac-metal`; pass when 0 | kernel | yes |
+| C1.1.top1 | Kept. NOT RUN until R is named | Teacher-forced same top-1 (percent) against R, ≥ R's floor − 1.0 point | reference | yes |
+| C1.1.kl | Kept. NOT RUN until R is named | Median KL against R ≤ 1.5 × R's floor | reference | yes |
+| C1.1.safe | Kept. NOT RUN until R is named | Same top-1 is 100% (percent) where R's margin is in [m₁, ∞) | reference | yes |
+| C1.1.band | Kept. NOT RUN until R is named | Same top-1 in [0.5, m₁) at least R's floor in that band − 3 points | reference | yes |
+| C1.1.ppl | Kept. NOT RUN until R is named | \|Δ\| of perplexity against R ≤ max(3 standard errors, 0.005 nats per token) | reference | yes |
+| C1.1.p99 | Kept. NOT RUN until R is named | p99 KL against R ≤ 2 × R's floor; reported | reference | no |
+| C1.2 | Retired | Was: Mac against llama.cpp, with the CUDA-to-llama.cpp spread as its threshold | retired | none |
+| C1.3 | Retired | Was: per-slot residual against CUDA and llama.cpp | retired | none |
+| C1.4.ids | Redefined: the model's own rows, against the FP64 host router | Router ids equal the FP64 host router's, except boundary swaps within 2^-16 (counted) | model | yes |
+| C1.4.weights | Redefined: the same rows | \|w_mac − w_fp64\| / w_fp64 ≤ 1e-5 over the matched ids | model | yes |
+| C1.5 | Kept. NOT RUN until R is named | First token after the prompt path: same top-1 (percent) against R where R's margin ≥ m₁ | reference | yes |
 
-| Criterion | Pass when | Gating |
-| --- | --- | --- |
-| C1.1.top1 | Same top-1 ≥ Y(t) − 1.0 percentage point | yes |
-| C1.1.kl | Median KL ≤ 1.5 × Y(t) | yes |
-| C1.1.safe | Same top-1 is 100% in the band [m₁, ∞) | yes |
-| C1.1.band | Same top-1 in the band [0.5, m₁) is at least the floor's in the same band minus 3 points | yes |
-| C1.1.ppl | \|Δ\| ≤ max(3 standard errors, 0.005 nats per token) | yes |
-| C1.1.p99 | p99 KL, against 2 × the floor's | no |
+**C1.1, teacher-forced against R.** For each `tf-*` set, the Mac runs `--tokens-file <set>.ids --max-new 1
+--dump-logits <file>`, and `tf_compare.py` compares it with R's logits for the same ids. The metrics are those of the
+table. C1.1.p99 does not gate: the p99 of a text rests on its worst 1% of rows, so a few hard positions move it. It is
+reported so that a change in the tail shows in review. The thresholds are derived from R's own floor: the spread
+between two valid paths of R on each text, measured the way T-1 measured CUDA's, and R's cross reference L(t) where R
+has one. No threshold is given until R is named and its floor is measured, and `judge()` refuses an underived one. The
+provisional thresholds of the earlier text were upstream's published CUDA floor, and they are withdrawn with the golden
+set.
 
-C1.1.p99 does not gate: the p99 of a text rests on its worst 1% of rows, so a few hard positions move it. It is
-reported so that a change in the tail shows in review.
+**The safe margin m₁** is the smallest margin above which R's floor shows no flip in any text, times 1.5, and at least
+1.0 logit (T-2, measured against R). It has no provisional value.
 
-Until T-1 and T-3 are recorded, the thresholds are derived from upstream's published floor for Q2_0, and the same
-numbers are used for Coder:
+**C1.2 and C1.3 are retired.** C1.2's threshold is the spread between CUDA and llama.cpp (T-3), and C1.3's per-slot
+bound is the same spread. Both need the CUDA reference, which is out of scope. Neither has a kernel-level meaning,
+because the residual stream of a real text is a whole-model quantity. The ladder dump (`--dump-layers`, step
+`c1.layers`) stays as a diagnostic for a bisection (section 10.1), with no criterion. Whether llama.cpp becomes a
+model-level reference is an owner decision (D-IMPL-978).
 
-| Text | Upstream floor: same top-1, median KL | Provisional: same top-1 ≥, median KL ≤ |
-| --- | --- | --- |
-| `tf-code` | 97.7%, 3.0e-4 | 96.7%, 4.5e-4 |
-| `tf-doc` | 96.2%, 4.5e-3 | 95.2%, 6.8e-3 |
-| `tf-chat` | 95.0%, 4.4e-3 | 94.0%, 6.6e-3 |
-
-The provisional m₁ is 1.0 logit. Upstream's numbers come from `--expert-cache auto` with a profile, not from
-`--expert-cache 4000`, which is why T-1 measures the floor again with the golden set's own settings.
-
-**C1.2, against llama.cpp.** The Mac's `tf-*` dumps against `lc-tf-*.logits`: same top-1 ≥ L(t)'s same top-1 − 1
-point, and median KL ≤ 1.5 × L(t)'s median KL. The Mac must be no further from the independent implementation than
-CUDA is. Gating once T-3 is recorded; reported until then.
-
-**C1.3, the residual ladder.** The Mac runs `--tokens <the first 65 ids of the set> --max-new 1 --dump-layers <file>`
-for each `tf-*` set. `tools/metal/ladder_compare.py <reference.layers> <test.layers> [--third <lc-ladder>]` computes,
-for each slot s = 0..48, the median over the 64 positions of the relative L2 distance ‖test − ref‖₂ / ‖ref‖₂ over the
-slot's 4 × 2,560 floats.
-- The criterion: for every slot, the Mac-to-CUDA distance is at most the CUDA-to-llama.cpp distance at that slot, and
-  at most 1e-6 at slot 0 (the embedding, which has no arithmetic but the dequantisation).
-- Reported, not gating, until T-3 is recorded. This is the drift that R-5 ([03](03-model-reference.md), section 10)
-  expects to grow smoothly with depth. A step of more than 4 times from one slot to the next is printed as a note;
-  it is where a bisection starts (section 10.1).
-
-**C1.4, the router replay.** The model-label test `metal_router_replay` runs for Q2_0 and Coder and is R-1's
-measurement. The halves dump does not hold the router's input, so the test rebuilds it from CUDA's data, for each of
-the 1,000 positions p and 48 layers l of the `router.*` files:
-1. R = slot l of `router.layers` (R after layer l − 1, complete, because upstream dumps with the fused read off);
-   `bo` = the attention half's block output (offset 0 of the halves record of layer l); `inject` = the attention
-   `inject` (offset 5,120).
+**C1.4, the router on the model's own rows.** The model-label test `metal_router_replay` runs for Q2_0 and Coder. For
+each of the 1,000 positions p and the 48 layers l of one run over the first 1,001 ids of `tf-doc`, it builds the
+router's input from the Mac's own dumps of that run:
+1. `h` = the residual that layer l reads (slot l of the `--dump-layers` record); `bo` = the attention half's block
+   output and `inject` = the attention inject, from the `--dump-halves` record of layer l (offsets 0 and 5,120).
 2. The Mac's FFN read on that input: `strata_gr_norm`, `strata_gr_down`, `strata_gr_up` with `apply = 1`
    ([04](04-metal-kernels.md), section 5.1, step 5), which gives `mixed`.
-3. The router mat-vec and `strata_moe_route` on `mixed` give the ids and weights.
-4. They are compared with the record of `router.routing` for (p, l). The records come in the order the token loop
-   wrote them, one per layer and position.
+3. The FP64 host router on `mixed`: the router mat-vec in double, then the top-k with the tie rule of
+   [04](04-metal-kernels.md), section 3.4.
+4. The Mac's `strata_moe_route` on `mixed` gives the ids and weights, which are compared with step 3 at every (p, l).
 
 | Criterion | Pass when |
 | --- | --- |
 | C1.4.ids | The id sets are equal at every (p, l), except that two experts may swap across the top-k boundary where the Mac's own k-th and (k+1)-th scores differ by at most 2^-16 relative. Such swaps are counted and reported. |
-| C1.4.weights | For each id in both sets, \|w_mac − w_cuda\| ≤ 1e-5 · w_cuda |
+| C1.4.weights | For each id in both sets, \|w_mac − w_fp64\| ≤ 1e-5 · w_fp64 |
 
-The weight tolerance is R-1's provisional expectation. If R-1 measures a larger deviation for Coder's 256-expert
-router, the tolerance becomes twice the measured maximum, recorded in appendix A, and
-[03](03-model-reference.md), section 10, decides whether Coder needs the CPU FP64 normalisation.
+The weight tolerance is R-1's provisional expectation, now measured against the FP64 host router (03, section 10). If
+R-1 measures a larger deviation for Coder's 256-expert router, the tolerance becomes twice the measured maximum,
+recorded in appendix A, and [03](03-model-reference.md), section 10, decides whether Coder needs the CPU FP64
+normalisation. The synthetic route cases of `metal_moe_test` are in C1.K ([04](04-metal-kernels.md), section 10.5), so
+the router's arithmetic is checked without the models; C1.4 adds the model's own rows.
 
-**C1.5, the first token after the prompt path.** For each `g1-*` set the Mac runs
-`--prefill auto --tokens-file <set>.ids --max-new 1` with `STRATA_DUMP_FIRST_LOGITS=<file>`, and compares the row with
-`g1-XX.first`. It gates on the same top-1 where CUDA's margin is at least m₁; the KL is reported. This is the only check
-of the prompt path that reaches every short prompt. The prompt-path criterion (section 4.5) checks a long one.
+**C1.5, the first token after the prompt path.** For each `g1-*` set the Mac runs `--prefill auto --tokens-file
+<set>.ids --max-new 1` with `STRATA_DUMP_FIRST_LOGITS=<file>`, and the first-token row is compared with R's. It gates on
+the same top-1 where R's margin is at least m₁; the KL is reported. The prompt path has its own kernel checks
+([04](04-metal-kernels.md), section 10.3) and a Mac-against-Mac check across chunk sizes (`prefill_chunk_independent`,
+[04](04-metal-kernels.md), section 10.4). The prompt-path criterion (section 4.5) checks a long prompt against R.
 
-**The short form** (`accept.py c1 --short`): C1.1 on `tf-code` and C1.4, for Q2_0 and Coder. The nightly and the
-release runs use it. The full form runs in the weekly rotation and whenever the compatibility baseline advances.
+**The short form and the full form.** `accept.py c1 --short` runs C1.K, C1.1 on `tf-code` and C1.4, for Q2_0 and Coder.
+The full form adds the other `tf-*` sets, the ladder diagnostic and C1.5. The nightly and release runs use the short
+form, and its model-level rows are NOT RUN until R is named.
+
+**Status.** Nothing in C1 has a result yet. C1.K is defined here and has not been run on the reference Mac. C1.4 needs
+the models. C1.1 and C1.5 need a reference that the specification does not name.
 
 ### 4.2 C2: speculation and every Mac path give the plain-decode tokens
 
@@ -749,25 +764,29 @@ On a Mac that cannot run the model in full mode, part 2 compares the two tiered 
 
 ### 4.5 The prompt-path criterion
 
+> **Scope (D-IMPL-629, D-IMPL-960):** the yardstick of this criterion is CUDA's `pp-32k.logits`, which is out of project
+> scope. PP.top1, PP.kl and PP.ppl are NOT RUN until a model-level reference is named, as C1.1 is (section 4.1). PP.chunk
+> is reported.
+
 The prompt path computes the same function as the token path with a different order of additions (chunked GEMMs,
-[04](04-metal-kernels.md), section 6), so it is a tolerance comparison against CUDA, measured the way upstream measured
-its own prompt-path changes (`bench/results/2026-09-28-prefill-speed/README.md`): the 32K prompt goes through the
-prompt path up to its last 256 tokens, and those go through the token path with their logits dumped.
+[04](04-metal-kernels.md), section 6), so it is a tolerance comparison against a model-level reference, measured the way
+upstream measured its own prompt-path changes (`bench/results/2026-09-28-prefill-speed/README.md`): the 32K prompt goes
+through the prompt path up to its last 256 tokens, and those go through the token path with their logits dumped.
 
 - The Mac runs `--prefill auto --prefill-until 32000 --tokens-file ca-32k.ids --max-new 1 --dump-logits <file>` at
   `--max-context 32768`. The dump holds the rows from position 32,000 on (section 3.1).
-- `tf_compare.py golden/pp-32k.logits <file> --ids ca-32k.ids` compares the 255 rows whose next token is in the
-  prompt.
-- **The yardstick** Y_pp is CUDA against CUDA with another chunk size: `pp-32k.logits` against `pp-32k.c6144.logits`
-  (T-1). Upstream measured 89.8% same top-1 and a mean KL of 0.33 for the same change (chunk 8,192 against 6,144),
-  which are the provisional values. The CUDA run's chunk size is in its manifest command entry; if `auto` chose
-  6,144 there, the yardstick file is recorded at 4,096 instead.
+- `tf_compare.py <reference logits> <file> --ids ca-32k.ids` compares the 255 rows whose next token is in the prompt.
+  The reference's logits are not named (section 4.1), so no comparison runs yet.
+- **The yardstick** Y_pp is the reference's own two chunk sizes: its `pp-32k.logits` against `pp-32k.c6144.logits` (T-1,
+  out of project scope with the CUDA reference, D-IMPL-629). Upstream measured 89.8% same top-1 and a mean KL of 0.33 for
+  the same change on CUDA (chunk 8,192 against 6,144). Those numbers are no longer a provisional threshold: Y_pp is
+  measured for the reference that is named.
 
 | Criterion | Pass when | Gating |
 | --- | --- | --- |
 | PP.top1 | Same top-1 ≥ Y_pp − 3 points (256 rows: one row is 0.4 points) | yes |
 | PP.kl | Mean KL ≤ 1.5 × Y_pp's mean KL | yes |
-| PP.ppl | The Mac's perplexity on the 255 rows within 3% of CUDA's | yes |
+| PP.ppl | The Mac's perplexity on the 255 rows within 3% of the model-level reference's (NOT RUN until one is named) | yes |
 | PP.chunk | The chunk size the Mac chose, from its stderr line | no |
 
 Mac against Mac across chunk sizes is bitwise, not a tolerance: that is the model-label test
@@ -944,21 +963,32 @@ decision: the result folder's name, pass or fail, and what was decided when it f
 ### 6.1 G1: end of phase 2
 
 The question: does the Mac compute the model correctly, at a speed that makes the rest worth doing?
-`accept.py g1`, on the reference Mac with Q2_0 in full mode:
+`accept.py g1`, on the reference Mac with Q2_0 in full mode. Under the owner's decision D-IMPL-671, as rewritten by
+D-IMPL-960 to D-IMPL-979, G1 has two kinds of check. Kernel-level checks are passable on the Mac from fixtures and
+oracles. Checks that need a model are NOT RUN where the model is absent, and the ones that compare with a reference are
+NOT RUN until the owner names that reference.
 
-| Step | Criterion | Pass when |
-| --- | --- | --- |
-| 1 | `ctest --preset mac-model` | Every test passes |
-| 2 | C1 in full (section 4.1) | C1.1, C1.4 and C1.5 pass. C1.2 and C1.3 are reported, and gate once T-3 is recorded. |
-| 3 | G1.tf | For each `g1-*` set, the Mac runs `--tokens-file <set + g1-XX.out> --max-new 1 --dump-logits` and compares with `g1-XX.tf.logits` over the 256 generated positions. Same top-1 is 100% where CUDA's margin is at least m₁, and at least 95% over all 2,560 positions. |
-| 4 | G1.free | For each `g1-*` set, the Mac's `--greedy --spec 0 --max-new 256` output equals `g1-XX.out`, or first differs at a position where CUDA's margin is below m₁. After the first difference the two texts are not compared, because they legitimately diverge from there. |
-| 5 | C2 (section 4.2), Q2_0, the nightly arms | Every arm equals arm (a) |
-| 6 | BENCH.plain (section 5.1) | ≥ 20 tok/s |
-| 7 | R-1 and R-5 ([03](03-model-reference.md), section 10) | Recorded in appendix A |
+| Step | Criterion | Basis | Pass when | Status in this specification |
+| --- | --- | --- | --- | --- |
+| 1 | `ctest --preset mac-model` | model | Every test passes | NOT RUN without the models. The `real` inputs of the model-label twins are the Mac's own dumps (04, section 10.1) |
+| 2 | C1.K (section 4.1) | kernel | No failing `metal` test | **Kernel-level.** Passable on the Mac from fixtures and oracles |
+| 2 | C1.4.ids and C1.4.weights (section 4.1) | model | The router ids and weights equal the FP64 host router's, on the model's own rows | NOT RUN without the models |
+| 2 | C1.1.top1 to C1.1.p99, C1.5 (section 4.1) | reference | As section 4.1 | NOT RUN: no model-level reference is named |
+| 3 | G1.tf | reference | For each `g1-*` set, the Mac runs `--tokens-file <set + g1-XX.out> --max-new 1 --dump-logits` and its logits over the 256 generated positions agree with the reference's: same top-1 is 100% where the reference's margin is at least m₁, and at least 95% over all 2,560 positions | NOT RUN: no model-level reference is named |
+| 4 | G1.free | reference | For each `g1-*` set, the Mac's `--greedy --spec 0 --max-new 256` output equals the reference's output, or first differs at a position where the reference's margin is below m₁. After the first difference the two texts are not compared, because they legitimately diverge from there | NOT RUN: no model-level reference is named |
+| 5 | C2 (section 4.2), Q2_0, the nightly arms | model | Every arm equals arm (a) | NOT RUN without the models. Mac against Mac, so it names no reference |
+| 6 | BENCH.plain (section 5.1) | model | ≥ 20 tok/s | NOT RUN without the models |
+| 7 | R-1 and R-5 ([03](03-model-reference.md), section 10) | model | Recorded in appendix A | NOT RUN. R-5 and the CUDA form of R-1 are out of project scope (D-IMPL-629). R-1's measure is the FP64 form of C1.4 |
 
-This is how doc 00's "greedy output matches the reference for 256 tokens on 10 prompts" is made exact. CUDA is not
-bitwise repeatable against itself (section 2.6). So "matches" means: equal wherever the reference's own choice is
-safe, and teacher-forced agreement as close as the reference's own noise.
+**G1 cannot pass in this specification.** Steps 3 and 4, and the model-level rows of step 2, need a model-level reference
+that is not named. A G1 run is therefore NOT RUN, never PASS, and `docs/mac/gates/G1.md` records it so. Step 2's C1.K can
+pass on the Mac now. By itself it shows that the kernels agree with their oracles, not that the model computes the same
+function (D-IMPL-671).
+
+Doc 00's "greedy output matches the reference for 256 tokens on 10 prompts" is what G1.free checks, once a reference is
+named. "Matches" then means: equal wherever the reference's own choice is safe, and teacher-forced agreement as close as
+the reference's own noise. That noise is measured by the reference's own valid paths (section 2.6, for the reference
+named).
 
 If G1 fails:
 - **On correctness:** bisect (section 10.1). Phase 3 does not start until G1 passes.
@@ -1010,7 +1040,8 @@ The question: is the port a release? `accept.py g3` passes when all of these hol
   (for example, the current `mac-host` job) has the conclusion `success` in `gh run view <id> --json jobs`. The
   planned `mac-release.yml/verify` job does not exist yet; release reproducibility cannot pass until that workflow and
   its release tools are implemented ([08](08-build-and-distribution.md), section 12.3).
-- **The release run passes.** The release run of section 8 passes on a release-candidate tag.
+- **The release run passes.** The release run of section 8 passes on a release-candidate tag. Its steps 2 and 3 are
+  NOT RUN until a model-level reference is named (sections 4.1 and 6.1), so G3 cannot pass before then either.
 - **The family runs pass.** Section 7.4 has a passing family run for each of M1-M4 on the candidate commit.
 
 `accept.py g3` starts with `test_map.py --final` (section 9.4). It fails G3 when a test is still planned, when a
@@ -1048,7 +1079,7 @@ labels ([08](08-build-and-distribution.md), section 12.2). Then:
 
 | Run | Content |
 | --- | --- |
-| `c1 --short` | C1.1 on `tf-code` and C1.4, Q2_0 and Coder (section 4.1) |
+| `c1 --short` | C1.K, C1.1 on `tf-code` and C1.4, Q2_0 and Coder (section 4.1); the C1.1 part is NOT RUN until a reference is named |
 | `c2` | Q2_0, the arms marked nightly (section 4.2) |
 | `c3` | C3.reuse (`--spec 1` and `--spec 4`) and C3.reread, Q2_0 (section 4.3) |
 | `c4` | Q2_0, `g1-01..03` and `ca-4k` (section 4.4); the model tests of C4 run in step 1 |
@@ -1076,7 +1107,7 @@ The job runs after the nightly job has finished, so the two never load models at
 | 2 Tuesday | C2, every arm, Q2_0 and Coder; C4 in full, Q2_0 and Coder |
 | 3 Wednesday | C2, every arm, IQ2_XS, IQ3_XXS and IQ3_S; C1.1 on `tf-code` for the same three |
 | 4 Thursday | `bench` on `ca-64k` and `ca-128k` for Q2_0 and Coder; PF-1 |
-| 5 Friday | C1 in full (C1.1-C1.5) for Q2_0 and Coder; `pp` for Coder |
+| 5 Friday | C1 in full (C1.K and C1.1-C1.5, section 4.1) for Q2_0 and Coder; `pp` for Coder |
 | 6 Saturday | `needle` at 128K (two depths) and 262K; `bench` on `ca-262k`. A Mac whose plan does not hold 262,144 records `not-run` for the 262K parts. |
 | 7 Sunday | `metal_memory_pressure_smoke`; `test_models.py check` (full SHA-256 of every model); the `metal_<area>_model_test` set under the validation layer |
 
@@ -1087,8 +1118,10 @@ The slice's result folder goes under `$STRATA_RESULTS/weekly/`.
 The review process is [10-implementation-plan.md](10-implementation-plan.md), section 4. Run these checks on the
 project branch before merging the local change:
 1. Every push-level test (section 7.1).
-2. If section 2.5's rule says so, record the golden set again on the CUDA PC for the local project commit.
-3. C1 in full against the new golden set (or against the old one, if the rule keeps it), for Q2_0 and Coder.
+2. The golden-set record of section 2.5 is out of project scope (D-IMPL-629), so no golden set is recorded. The
+   `check_drift.py` verdict is still written to the sync log, and the owner decides what it requires (D-IMPL-978).
+3. C1.K on the reference Mac (`ctest --preset mac-metal`), and C1.4 for Q2_0 and Coder. C1.1 and C1.5 stay NOT RUN
+   until a model-level reference is named (section 4.1).
 4. `accept.py nightly` and the Tuesday and Friday slices, run on demand.
 5. T-9 again, if the compatibility change altered a snapshot's size (section 4.3).
 
@@ -1155,13 +1188,14 @@ which the reviewer adds an entry with the commit and the link (section 9.4).
 Step 6 of `verify_release.py` ([08](08-build-and-distribution.md), section 11.8) runs
 `accept.py release --engine <installed engine> --out $STRATA_RESULTS/release/<tag>/` on the reference Mac. The
 engine under test is the one setup installed from the draft release, not a build of the checkout. It should take
-about 2 hours.
+about 2 hours. Steps 2 and 3 are NOT RUN until a model-level reference is named (sections 4.1 and 6.1), so the release
+run cannot pass before then.
 
 | Step | Check | Section |
 | --- | --- | --- |
 | 1 | `strata --plan-only` for every model of `models.json` that the Mac has, and `strata --plan-only --geometry` for every file of `data/geometry/`: a PLAN line, exit 0, within the time limits of [06](06-engine-host-port.md), section 2.3 (1 s from the files, 200 ms from a geometry file) | 3.1 |
-| 2 | C1 in its short form, Q2_0 and Coder | 4.1 |
-| 3 | G1.tf (section 6.1, step 3), Q2_0 | 6.1 |
+| 2 | C1 in its short form, Q2_0 and Coder: C1.K and C1.4 can run; C1.1 is NOT RUN until a model-level reference is named | 4.1 |
+| 3 | G1.tf (section 6.1, step 3), Q2_0: NOT RUN until a model-level reference is named | 6.1 |
 | 4 | C2, Q2_0, the nightly arms | 4.2 |
 | 5 | C4 at `--gpu-budget-mib 37888`, Q2_0 | 4.4 |
 | 6 | C3.reuse, C3.disabled against the previous release, and C3.http with the server of step 11 | 4.3 |
@@ -1211,7 +1245,7 @@ The test map (`tests/metal/test_map.json`) registers 193 tests: 52 `host`, 113 `
 | `ple_oracle_layout_test` | [03](03-model-reference.md), work item R9 | A compact synthetic GGUF checks standalone Direct reads and a split-shard mapped PLE tensor at a nonzero parsed offset, with known IQ4_NL values |
 | `dequant_oracle_test`, `metal_manifest_test` | [08](08-build-and-distribution.md), section 6.4 | The pattern of the parity tests; the manifest against the built library |
 | `sampler_tail_test` | [04](04-metal-kernels.md), section 5.12 | Philox known answers, strict inverse-CDF boundary, top-p/min-p order, temperature ordering, CPU FP64 tail cases, and upstream fixture 15's host penalty-history rows |
-| `metal_moe_real_inputs_unavailable` | [04](04-metal-kernels.md), section 10.5 | Confirms that an explicit `metal_moe_test --input-set real` invocation returns 77 and CTest reports it as skipped until REV-002's model pack and CUDA dump fixture are available |
+| `metal_moe_real_inputs_unavailable` | [04](04-metal-kernels.md), section 10.5 | Confirms that an explicit `metal_moe_test --input-set real` invocation returns 77 and CTest reports it as skipped until REV-002's model pack and a dump of a model run are available (no CUDA dump, D-IMPL-629) |
 | `strata_version` | [08](08-build-and-distribution.md), section 6.3 | The engine's identity |
 | `model_metadata_test`, `model_types_test`, `ple_constants_test`, `native_experts_reader_test`, `pack_index_test`, `expert_address_test` | [03](03-model-reference.md), work items R2-R4 and R6-R8 | The seven header fixtures' metadata and tensor tables are parsed by the production C++ reader from compact GGUF headers; Python checks every tensor role/type, block geometry and FF = 640. `ple_constants_test` matches each fixture's PLE metadata and table shape to the n-gram kernel constants, compares the C++ parameter block and compile-time-asserts the Metal parameter block, checks the head prefix sums and 90 trailing table rows, and rejects value or JSON-type mutations, including a mistyped tokenizer EOS, with the key named. Sparse WeightStore negatives cover changed metadata keys, Q5_0 expert downs and partial quantization blocks. R6 builds a compact 1,224-tensor model in a temporary directory and exercises the production expert-table reader, so it needs no downloaded model. R7 has a dedicated compact-pack test for valid 19-field rows, canonical `code_bits`, `compat_bf16: true`, and truncated 18-field rows; the seven real catalogue indexes remain dependent on T3's pinned packs. R8 exercises every expert in all 48 layers and three roles for five sparse layouts (512-expert single shard, Swift IQ2_XS-like and IQ3_XXS-like two-shard splits, a synthetic v4 per-role split, and 256-expert Coder) through WeightStore and the window planner, including absolute source offsets, slab sizes, shard selection and window-relative bounds. The generated layouts validate the reader and planner contract; T3's pinned packs are still required to verify catalogue offsets. |
 | `codebooks` | [04](04-metal-kernels.md), section 10.5, work item L1 | The codebook header against upstream's and ggml's |
@@ -1364,7 +1398,7 @@ CTest cases pass.
 | `metal_embed_model_test`, `metal_ple_model_test`, `metal_gr_model_test`, `metal_gdn_model_test`, `metal_qsa_model_test`, `metal_attn_model_test`, `metal_mv_model_test`, `metal_moe_model_test`, `metal_mtp_model_test`, `metal_prefill_model_test` | [04](04-metal-kernels.md), section 10.1 | The `real` set of each twin whose kernels read tensors. `metal_math_test`, `metal_sampler_parity_test` and `metal_util_test` read no tensors and have no `real` set. |
 | `window_eq_decode`, `state_after_commit_eq_decode`, `write_through_eq_commit`, `cvec_off_eq_stock`, `mtp_kv_t_independent`, `tiered_eq_full`, `dump_eq_nodump`, `metal_dispatch_modes_test`, `prefill_chunk_independent` | [04](04-metal-kernels.md), section 10.4 | The nine `model` properties |
 | `metal_full_vs_tiered` | [05](05-memory-and-residency.md), section 13 | C4's model-level part (section 4.4) |
-| `metal_router_replay` | Section 4.1 | C1.4, and measurement R-1 |
+| `metal_router_replay` | Section 4.1 | C1.4 (the model's own rows, against the FP64 host router), and measurement R-1 |
 | `metal_gpu_time_test`, `metal_watchdog_test` | Section 5.5; [06](06-engine-host-port.md), work item H11 | Command-buffer times; the watchdog |
 | `metal_alloc_fail_test` | [06](06-engine-host-port.md), section 2.3, step 9 | Q2_0 with `STRATA_TEST_CACHE_FAIL=1`, in full mode and with `--gpu-budget-mib 37888`: the engine exits 1, prints the PLAN line, and names the buffer it could not create. The hook makes the first long-lived buffer of step 9 fail as an allocation does. |
 
@@ -1392,7 +1426,7 @@ adds it to `tests/metal/twin.{hpp,cpp}`.
 | `tests/metal/metal_shared_event_handoff` | Built with the tests, not registered: measurement M-1 ([06](06-engine-host-port.md), section 15) | Its output is a number for appendix A |
 | The H-5 stall probe, the programs of `spikes/metal-tuning/` (the L measurements of [04](04-metal-kernels.md), section 11), `tools/metal/balloon.py` | By hand, or by the step that names them | Measurements and helpers |
 | Upstream's `tools/needle_bench.py` and `tools/conversation_cache_*.py` | Through `accept.py` (sections 4.3 and 4.6) | P7: unchanged, and they need a running engine |
-| `tools/metal/lc_dump` | The CUDA PC (section 2.5) | It links llama.cpp, not the engine |
+| `tools/metal/lc_dump` | Out of project scope with the golden set (section 2.5) | It links llama.cpp, not the engine |
 
 A work item whose "Done when" is a one-off check, such as [06](06-engine-host-port.md) H13 (the thread count of
 `strata-vision`) or [08](08-build-and-distribution.md) B9 (two identical `strata-vision` builds), is checked once by
@@ -1433,7 +1467,7 @@ run. `tools/metal/test_map.py` is a CLI checker exercised through CTest, not a u
 | `tools/metal/test_test_map.py` | Section 9.4 | macOS Python suite; the extra CMake-test and `--final` failure cases |
 `tools/metal/check_drift.py` itself runs in CI as a check, not as a test module ([08](08-build-and-distribution.md),
 section 12.1). The format of the one-shot lines (work item H7 of [06](06-engine-host-port.md)) is checked by
-`test_accept.py`'s parser cases on captured output (today the formatter's sample; a CUDA capture is added with T-1), and again by every acceptance run, which fails on a missing
+`test_accept.py`'s parser cases on captured output (today the formatter's sample; a capture of upstream's output is added when one exists, and T-1 is out of project scope, D-IMPL-629), and again by every acceptance run, which fails on a missing
 line (section 3.1).
 
 ### 9.4 `tools/metal/test_map.py`
@@ -1496,21 +1530,20 @@ The map has a machine form, `tests/metal/test_map.json`, schema 1:
 ### 10.1 Bisection
 
 **Mac against a reference** (C1, G1, the prompt-path criterion). The question is where the Mac's arithmetic leaves
-the reference's.
+the reference's. Steps 1 to 4 need a model-level reference R, which section 4.1 does not name yet, so they do not run.
+Where R is named, its dumps take the place of CUDA's in them. Step 5 needs no reference and runs now.
 1. `tf_compare.py --json` lists the disagreements with their margins. Take the position with the largest KL among
-   those where CUDA's margin is at least m₁.
-2. `ladder_compare.py` on the ladder of that text, with `--third` the llama.cpp ladder. Slot 0 is the embedding;
-   slot s ≥ 1 is the residual after layer s − 1. The first slot whose Mac-to-CUDA distance is above the
-   CUDA-to-llama.cpp distance, or that grows by more than 4 times from the slot before, names the layer. If the
-   position is not among the ladder's 64, record a ladder of the first `position + 1` ids on both sides first
-   (`record_golden.py --only ladder --ids <file>` on the CUDA PC).
-3. The Mac's `--dump-halves` at the same ids, against CUDA's (`router.halves` when the position is among its 1,000,
-   else a new recording), names the half: attention or FFN.
-4. `metal_layer_replay --model <tag> --layer l --half attn|ffn|router --halves <CUDA file> --layers <CUDA file>`
-   runs the one half of layer l on CUDA's input to that layer, and compares its output with CUDA's. Attention needs
-   its state, so the replay first runs every earlier position through the layer's attention in order, from CUDA's
-   slot inputs. A replay that agrees means that the error came in from an earlier layer; a replay that differs names
-   the half. `metal_router_replay` is the same program's router mode.
+   those where R's margin is at least m₁.
+2. `ladder_compare.py` on the ladder of that text, against R's ladder. This is a diagnostic: C1.3 is retired. Slot 0
+   is the embedding; slot s ≥ 1 is the residual after layer s − 1. The first slot whose distance from R's grows by more
+   than 4 times from the slot before names the layer. If the position is not among the ladder's 64, record a ladder of
+   the first `position + 1` ids on both sides first, with the same recording tool.
+3. The Mac's `--dump-halves` at the same ids, against R's, names the half: attention or FFN.
+4. `metal_layer_replay --model <tag> --layer l --half attn|ffn|router --halves <R file> --layers <R file>` runs the one
+   half of layer l on R's input to that layer, and compares its output with R's. Attention needs its state, so the
+   replay first runs every earlier position through the layer's attention in order, from R's slot inputs. A replay
+   that agrees means that the error came in from an earlier layer; a replay that differs names the half.
+   `metal_router_replay` is the same program's router mode.
 5. Down to the kernel: a GPU capture of the window ([08](08-build-and-distribution.md), section 10.2) at that
    position, or the twin's `real` set with `--layer l` (section 9.1). The fix adds the failing input to the twin as a
    regression case in its `fixture` set.
@@ -1557,22 +1590,22 @@ new threshold.
 
 | ID | Question | How to measure | Provisional default | Decision it drives |
 | --- | --- | --- | --- | --- |
-| T-1 | How far apart are upstream's own valid CUDA paths? | `tf_compare.py` of `tf-*.logits` against `tf-*.nocache.logits` per text and model; `pp-32k.logits` against `pp-32k.c6144.logits` | Upstream's Q2_0 floor for both models (section 4.1); Y_pp 89.8% and 0.33 (section 4.5) | The C1.1 and PP thresholds |
-| T-2 | Above which margin does the floor never flip? | From T-1's disagreements: the largest margin of a flip, over the three texts and both models | m₁ = 1.0 logit | m₁ = max(1.0, 1.5 × that margin), used by C1.1.safe, C1.1.band, C1.5, G1.tf and G1.free |
-| T-3 | How far is CUDA from llama.cpp? | `tf_compare.py` of `tf-*.logits` against `lc-tf-*.logits`; `ladder_compare.py` per slot | C1.2 and C1.3 not gating | L(t) in Y(t); C1.2 and C1.3 become gating |
+| T-1 | **Out of project scope (D-IMPL-629).** How far apart are the valid paths of the model-level reference? | `tf_compare.py` of the reference's logits against its own second path, per text and model; the same for `pp-32k` | None until the reference is named. The CUDA floor (section 4.1) and Y_pp 89.8% and 0.33 (section 4.5) are no longer used | The C1.1 and PP.* thresholds, for the reference named |
+| T-2 | Above which margin does the reference's floor never flip? | From T-1's disagreements: the largest margin of a flip, over the three texts and both models | None until T-1 is measured for the reference named | m₁ = max(1.0, 1.5 × that margin), used by C1.1.safe, C1.1.band, C1.5, G1.tf and G1.free (all NOT RUN until then) |
+| T-3 | **Out of project scope (D-IMPL-629).** How far is CUDA from llama.cpp? | `tf_compare.py` of `tf-*.logits` against `lc-tf-*.logits`; `ladder_compare.py` per slot | None: C1.2 and C1.3 are retired (section 4.1) | Nothing, unless the named reference needs a second one |
 | T-4 | How much does a benchmark result vary from run to run? | 20 runs of each arm on `ca-4k` and `ca-32k`, each a fresh process | Coefficient of variation ≤ 2% | Three measured runs, the 5% spread rule, and the regression bar: 0.95, or 1 − 2.5 × CV |
 | T-5 | Does the Mac slow down over back-to-back runs? | 10 back-to-back `mtp` runs on `ca-32k` | The 10th run within 3% of the first: no pause | Otherwise, the shortest pause that keeps the 10th run within 3% (section 5.1, step 4) |
 | T-6 | How long does each run take? | `seconds` of each step in `result.json`, over 2 weeks of nightly and weekly runs | The split of section 7.2 | The nightly and weekly split; the step time limits of section 3.2 |
-| T-7 | How big is the golden set, and how long does recording take? | The first recording's manifest | About 40 GB, about 2 h per model | The disk of the reference Mac; the CUDA PC's time for each compatibility review whose verdict is `golden: record again` |
-| T-8 | Does a replacement reference GPU give the same golden set? | Record again on the new card; compare old with new with `tf_compare.py`; L-9 on its SASS | Run only when a card is replaced | Whether the old set stays valid; otherwise T-1 to T-3 again |
+| T-7 | **Out of project scope (D-IMPL-629).** How big is the golden set, and how long does recording take? | The first recording's manifest | None: no golden set is recorded (about 40 GB was the estimate for the CUDA set) | Nothing while the golden set is out of scope |
+| T-8 | **Out of project scope (D-IMPL-629).** Does a replacement reference GPU give the same golden set? | Record again on the new card; compare old with new with `tf_compare.py`; L-9 on its SASS | None: not run | Nothing while the golden set is out of scope |
 | T-9 | Which cache budget gives the pressure scenario its pressure? | `conversation_cache_parity.py --scenario pressure --cache-mib 65536`, which fails and prints the range (`pressure_budget_hint`, `tools/conversation_cache_parity.py:53-70`) | None: C3.pressure and C3.exchange do not run until it is recorded | `cc_pressure_mib` in `models.json`: the middle of the range |
 
 **Items in other documents that change values here.**
 
 | Item | Document | What it changes here |
 | --- | --- | --- |
-| R-1 | [03](03-model-reference.md), section 10 | C1.4's weight tolerance |
-| R-5 | [03](03-model-reference.md), section 10 | C1.3's expectation of smooth drift |
+| R-1 | [03](03-model-reference.md), section 10 | C1.4's weight tolerance, measured against the FP64 host router (its CUDA form is out of project scope, D-IMPL-629) |
+| R-5 | [03](03-model-reference.md), section 10 | None: C1.3 is retired (section 4.1). R-5's CUDA form is out of project scope (D-IMPL-629) |
 | L-9 | [04](04-metal-kernels.md), section 11 | Rerun by T-8 for a new card |
 | L-12 | [04](04-metal-kernels.md), section 11 | The half-limit of `metal_gpu_time_test` |
 | L-13 | [04](04-metal-kernels.md), section 11 | The profile of a slow G1; PF-1 and L19 |
@@ -1584,8 +1617,8 @@ new threshold.
 | H-5 | [06](06-engine-host-port.md), section 15 | The robustness checks of section 5.5 |
 | X-8 | [07](07-server-setup-port.md), section 14 | Whether hosted Macs run the `metal` label (section 7.5) |
 
-**Open items** ([11-risks-and-open-questions.md](11-risks-and-open-questions.md)): who owns and runs the CUDA
-reference PC; where the M1-M4 family Macs come from; when a 48 GB Mac replaces the balloon of G2; whether a hosted
+**Open items** ([11-risks-and-open-questions.md](11-risks-and-open-questions.md)): which model-level reference
+replaces the golden set (D-IMPL-978); where the M1-M4 family Macs come from; when a 48 GB Mac replaces the balloon of G2; whether a hosted
 macOS runner is used.
 
 ---
@@ -1593,16 +1626,16 @@ macOS runner is used.
 ## 12. Work items for this area
 
 Each item becomes one task in [10-implementation-plan.md](10-implementation-plan.md). An item is done when its
-"Done when" holds on the reference Mac (or, for T2, on the CUDA PC), with its result in the item's pull request.
+"Done when" holds on the reference Mac, with its result in the item's pull request. T2 is out of project scope (D-IMPL-629).
 
 | # | Item | Done when |
 | --- | --- | --- |
 | T1 | The prompt sets (sections 2.1-2.2): `tests/metal/prompts/src/`, `make_prompts.py`, the sets, `test_make_prompts.py` and `prompts_manifest_test` | Every set builds and round-trips; `--check` passes; a changed source byte fails `prompts_manifest_test` |
-| T2 | `record_golden.py`, the golden manifest and the first golden set (section 2.5), with [03](03-model-reference.md) R12, and the IQ formats' `tf-code` files | The set is on the reference Mac, its manifest is in git, and T-7 is in appendix A |
+| T2 | **Out of project scope (D-IMPL-629, D-IMPL-671).** `record_golden.py`, the golden manifest and the first golden set (section 2.5), with [03](03-model-reference.md) R12, and the IQ formats' `tf-code` files. The replacement is C1.K (section 4.1) | Not done, and no task waits for it. Former condition: the set is on the reference Mac, its manifest is in git, and T-7 is in appendix A |
 | T3 | `models.json` with `cc_pressure_mib` and the `mmproj` entries, `test_models.py`, the pack fixtures of section 9.1, the disk of section 2.3 | `fetch` gives every model of section 2.3 on the reference Mac; `check` passes; a changed byte fails `check --quick` when it is in the first or last 64 MiB, and the full check otherwise |
 | T4 | The `accept.py` framework (section 3.2): runs, options, exit codes, `result.json`, step limits, crash-report copies; `engine.py`, `criteria.py`, `fake_engine.py`, `test_accept.py` | Done in its framework form: the macOS Python suite covers planted differences (`test_accept.py`); the runner dry-run lists the commands of each run with a plan. The nightly, weekly and family runs have no plan yet (T14, T16), and no run is measured yet (T5-T12) |
 | T5 | `tf_compare.py` and its synthetic comparison tests (section 3.3); `lc_dump` (section 2.5) | The tests pass; `lc_dump` writes files that `tf_compare.py` and `ladder_compare.py` read, and fails on a renamed graph node |
-| T6 | C1 (section 4.1): `ladder_compare.py` and its test, `metal_router_replay`, `metal_layer_replay`, the twins' `--layer` option | `accept.py c1` passes on Q2_0 and Coder; a planted ulp error in one layer's `strata_gr_down` is found at that layer by the steps of section 10.1 |
+| T6 | C1 (section 4.1): C1.K (`ctest --preset mac-metal`), `metal_router_replay`, `metal_layer_replay`, the twins' `--layer` option; `ladder_compare.py` as a diagnostic | C1.K passes on the reference Mac; C1.4 passes on Q2_0 and Coder; C1.1 and C1.5 stay NOT RUN until a model-level reference is named. A planted ulp error in one layer's `strata_gr_down` is found by its twin, as section 10.1 step 5 says |
 | T7 | The gates (section 6): `accept.py g1`, `g2`, `g3`; `balloon.py`; `docs/mac/gates/` | Each gate's run gives its result folder; `balloon.py --gib 16` holds 16 GiB without swap-outs growing by more than 1 GiB |
 | T8 | C2 (section 4.2), every arm | `accept.py c2` passes on Q2_0; arm (d) shows at least 95% accepted drafts |
 | T9 | C3 (section 4.3): the tool wrappers, C3.reread, C3.repeat; T-9 | `accept.py c3` passes on Q2_0 with every check; `cc_pressure_mib` is in `models.json` for Q2_0 and Coder |
@@ -1615,7 +1648,7 @@ Each item becomes one task in [10-implementation-plan.md](10-implementation-plan
 | T16 | `family_run.sh` and the first family runs (section 7.4) | One family file for each of M1-M4 |
 | T17 | `test_map.py`, `test_map.json`, `requirements.json`, `reviews.json` (section 9.4) | `test_map` passes; a test added only in CMake fails it with its message; with `--final`, a planned test and a requirement without a check each fail it with theirs |
 | T18 | The Python layer on the reference Mac's nightly run (section 7.2, step 3): the parity run of [07](07-server-setup-port.md), section 4.4.3 | `test_geometry_plans` and `test_geometry_equals_files` run, and pass, in the nightly log |
-| T19 | Measurements T-1 to T-9 (section 11) | Each result is in appendix A, and the value it drives is updated here and in `criteria.py` (section 10.3) |
+| T19 | Measurements T-1 to T-9 (section 11), except T-1, T-2, T-3, T-7 and T-8, which are out of project scope (D-IMPL-629) | Each result is in appendix A, and the value it drives is updated here and in `criteria.py` (section 10.3) |
 
 ---
 

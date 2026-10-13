@@ -3,8 +3,8 @@
 A plan is a list of steps. A step's argv is the engine's argument list (kind "engine"), a full tool command (kind
 "tool"), a server command ("server"), an HTTP request description ("http") or a CTest command ("ctest"). Placeholders:
 `{python}`, `{engine}`, `{config}` (the step's model), `{result}` (the result folder) and `{step}` (the step's own
-stem under steps/). Any other `<...>` text marks an input that a live run must resolve from the models, the golden
-set or the host; the runner refuses to start such a step, so a placeholder cannot reach the engine.
+stem under steps/). Any other `<...>` text marks an input that a live run must resolve from the models or the host; the
+runner refuses to start such a step, so a placeholder cannot reach the engine.
 
 `measure` turns the step outputs into verdicts. Only `pf` has one (bench.py, T11). Each other run gets one from the work
 item that owns it (`task`); until then a live run stops with NOT RUN before any step starts, and it never reports PASS.
@@ -158,8 +158,13 @@ def _bench_criteria(arm: str, prompt: str) -> tuple[str, ...]:
     return ("BENCH.other",)
 
 
+# A step reads only the reference files its criteria compare against. C1.1 and C1.5 name no model-level reference
+# (09 section 4.1, D-IMPL-960), so their steps read nothing; their judgement is NOT RUN (criteria.py, basis reference).
 def plan_c1(ctx: Context) -> list[Step]:
-    steps: list[Step] = []
+    # C1.K: the per-kernel oracle twins and the synthetic compositions, one `metal` CTest run (09 section 4.1).
+    steps: list[Step] = [Step(
+        name="c1.kernels", kind="ctest", argv=("ctest", "--preset", "mac-metal"), criteria=("C1.K",),
+    )]
     sets = ("tf-code",) if ctx.short else ("tf-code", "tf-doc", "tf-chat")
     for tag in ctx.models:
         base = with_flags(ctx.args[tag], ["--prompt-cache", "0", "--spec", "0", "--adapt-swaps", "0"])
@@ -170,16 +175,16 @@ def plan_c1(ctx: Context) -> list[Step]:
                 argv=tuple(base + ["--tokens-file", f"{PROMPTS}/{name}.ids", "--max-new", "1",
                                    "--dump-logits", "{step}.logits"]),
                 dumps=(".logits",),
-                reads=(f"{name}.logits", f"{name}.nocache.logits"),
                 criteria=("C1.1.top1", "C1.1.kl", "C1.1.safe", "C1.1.band", "C1.1.ppl", "C1.1.p99"),
             ))
         if not ctx.short:
+            # A diagnostic for a bisection (09 section 10.1). C1.3 is retired, so the step has no criterion.
             for name in sets:
                 steps.append(Step(
                     name=f"c1.layers.{name}", model=tag, prompt=name,
                     argv=tuple(base + ["--tokens", f"<first 65 ids of {name}>", "--max-new", "1",
                                        "--dump-layers", "{step}.layers"]),
-                    dumps=(".layers",), reads=(f"{name}.layers",), criteria=("C1.3",),
+                    dumps=(".layers",),
                 ))
         steps.append(Step(
             name="c1.router", model=tag, kind="ctest",
@@ -193,7 +198,7 @@ def plan_c1(ctx: Context) -> list[Step]:
                     argv=tuple(with_flags(base, ["--prefill", "auto"]) + ["--tokens-file",
                                f"{PROMPTS}/{name}.ids", "--max-new", "1"]),
                     env=(("STRATA_DUMP_FIRST_LOGITS", "{step}.first"),),
-                    dumps=(".first",), reads=(f"{name}.first",), criteria=("C1.5",),
+                    dumps=(".first",), criteria=("C1.5",),
                 ))
     return steps
 
@@ -418,6 +423,7 @@ def plan_server(ctx: Context) -> list[Step]:
 
 
 def plan_g1(ctx: Context) -> list[Step]:
+    # Step 2 of G1 is C1 in full: C1.K (kernel level) and the model-level rows, which are NOT RUN (09 section 6.1).
     steps = plan_c1(replace(ctx, short=False))
     steps += plan_c2(replace(ctx, arms=C2_NIGHTLY_ARMS, prompts=C2_NIGHTLY_PROMPTS))
     steps += _timed(replace(ctx, arms=("plain",), prompts=("ca-4k",)),
@@ -425,14 +431,14 @@ def plan_g1(ctx: Context) -> list[Step]:
     for tag in ctx.models:
         base = ctx.args[tag]
         for name in G1_SETS:
+            # G1.tf and G1.free name no reference file (09 section 6.1, D-IMPL-960): they read nothing.
             steps.append(Step(
                 name=f"g1.tf.{name}", model=tag, prompt=name, criteria=("G1.tf",), dumps=(".logits",),
-                reads=(f"{name}.tf.logits",),
                 argv=tuple(with_flags(base, ["--tokens-file", f"<{name}.ids + {name}.out>", "--max-new", "1",
                                              "--dump-logits", "{step}.logits"])),
             ))
             steps.append(Step(
-                name=f"g1.free.{name}", model=tag, prompt=name, criteria=("G1.free",), reads=(f"{name}.out",),
+                name=f"g1.free.{name}", model=tag, prompt=name, criteria=("G1.free",),
                 argv=tuple(with_flags(base, prompt_args(name) + ["--greedy", "--spec", "0", "--max-new", "256"])),
             ))
     return steps
@@ -465,7 +471,7 @@ def measure_pf(results: RunResults) -> list[Verdict]:
 
 
 RUN_LIST: tuple[RunSpec, ...] = (
-    RunSpec("c1", ("C1.1.top1", "C1.1.kl", "C1.1.safe", "C1.1.band", "C1.1.ppl", "C1.1.p99", "C1.2", "C1.3",
+    RunSpec("c1", ("C1.K", "C1.1.top1", "C1.1.kl", "C1.1.safe", "C1.1.band", "C1.1.ppl", "C1.1.p99",
                    "C1.4.ids", "C1.4.weights", "C1.5"), models=("Q2_0", "Coder"), plan=plan_c1,
             accepts_short=True, task="T6"),
     RunSpec("c2", ("C2.b", "C2.c", "C2.d", "C2.e", "C2.f", "C2.g", "C2.h", "C2.i", "C2.j", "C2.d.accept"),

@@ -89,7 +89,7 @@ Some requirements gate earlier, at G1 or G2. Each gate is its own run of `accept
 
 | Gate | End of | Requirements it checks first |
 | --- | --- | --- |
-| G1 | Phase 2 | Every `model`-label CTest (`ctest --preset mac-model`, step 1 of [09](09-testing-and-validation.md), section 6.1), REQ-COR-01 (C1.1, C1.4 and C1.5), REQ-COR-03, REQ-COR-04 (the nightly arms), REQ-PRF-02 |
+| G1 | Phase 2 | Every `model`-label CTest (`ctest --preset mac-model`, step 1 of [09](09-testing-and-validation.md), section 6.1), REQ-COR-01 (C1.K; C1.4 on the models; C1.1 and C1.5 NOT RUN until a model-level reference is named), REQ-COR-03 (NOT RUN, same reason), REQ-COR-04 (the nightly arms), REQ-PRF-02 |
 | G2 | Phase 4 | REQ-PRF-05, REQ-COR-08 |
 
 A gate that fails follows its own rule in [09](09-testing-and-validation.md), section 6: the gate decides whether the
@@ -230,9 +230,9 @@ the value last set by the rule of [09](09-testing-and-validation.md), section 10
 
 | ID | Requirement | Verified by | Specified in |
 | --- | --- | --- | --- |
-| REQ-COR-01 | The Mac must compute the same model as upstream's CUDA build, within the references' own spread (C1): teacher-forced logits, the router replay, and the first token after the prompt path. C1.2 and C1.3 gate once T-3 is recorded and are reported until then. | `accept:C1.1.top1`, `accept:C1.1.kl`, `accept:C1.1.safe`, `accept:C1.1.band`, `accept:C1.1.ppl`, `accept:C1.2`, `accept:C1.3`, `accept:C1.4.ids`, `accept:C1.4.weights`, `accept:C1.5`, `ctest:metal_router_replay` | [09](09-testing-and-validation.md), section 4.1 |
+| REQ-COR-01 | The Mac must compute the same model as upstream's CUDA build, within the references' own spread (C1): teacher-forced logits, the router replay, and the first token after the prompt path. The CUDA build is out of project scope (D-IMPL-629), and per-kernel FP64 oracles replace it (D-IMPL-671): the kernels are verified by C1.K, the router on the model's own rows by C1.4, and the whole-model rows (C1.1, C1.5) are NOT RUN until a model-level reference is named. C1.2 and C1.3 are retired (D-IMPL-960). | `accept:C1.K`, `accept:C1.1.top1`, `accept:C1.1.kl`, `accept:C1.1.safe`, `accept:C1.1.band`, `accept:C1.1.ppl`, `accept:C1.4.ids`, `accept:C1.4.weights`, `accept:C1.5`, `ctest:metal_router_replay` | [09](09-testing-and-validation.md), section 4.1 |
 | REQ-COR-02 | Every kernel must pass its twin against its CPU oracle, in its tolerance class, on synthetic inputs and on real model rows | `ctest:dequant_oracle_test`, `ctest:bf16_bits_test`, `ctest:metal_math_test`, `ctest:metal_embed_test`, `ctest:metal_ple_test`, `ctest:metal_gdn_test`, `ctest:metal_util_test`, `ctest:metal_twin_selftest`, `ctest:metal_embed_model_test`, `ctest:metal_ple_model_test`, `ctest:metal_gr_model_test`, `ctest:metal_gdn_model_test`, `ctest:metal_qsa_model_test`, `ctest:metal_attn_model_test`, `ctest:metal_mv_model_test`, `ctest:metal_moe_model_test`, `ctest:metal_mtp_model_test`, `ctest:metal_prefill_model_test` | [04](04-metal-kernels.md), section 10 |
-| REQ-COR-03 | Greedy output on the ten `g1-*` prompts must match upstream's CUDA output over 256 tokens, as G1.tf and G1.free define "match" | `accept:G1.tf`, `accept:G1.free` | [09](09-testing-and-validation.md), section 6.1 |
+| REQ-COR-03 | Greedy output on the ten `g1-*` prompts must match upstream's CUDA output over 256 tokens, as G1.tf and G1.free define "match". The CUDA output is out of project scope (D-IMPL-629): until a model-level reference is named, G1.tf and G1.free are NOT RUN (D-IMPL-671) | `accept:G1.tf`, `accept:G1.free` | [09](09-testing-and-validation.md), section 6.1 |
 | REQ-COR-04 | Speculation and every Mac path must give the plain-decode tokens bit for bit (C2): every greedy arm equals arm (a), and each sampled arm equals the sampled `--spec 0` arm with the same seed | `accept:C2.b`, `accept:C2.c`, `accept:C2.d`, `accept:C2.e`, `accept:C2.f`, `accept:C2.g`, `accept:C2.h`, `accept:C2.i`, `accept:C2.j`, `ctest:window_eq_decode`, `ctest:state_after_commit_eq_decode`, `ctest:write_through_eq_commit` | [09](09-testing-and-validation.md), section 4.2; [06](06-engine-host-port.md), section 10.5 |
 | REQ-COR-05 | The conversation cache must change nothing but the time (C3): upstream's six tools pass unchanged, a re-read equals a restore, and a repeated request gives one answer | `accept:C3.reuse`, `accept:C3.pressure`, `accept:C3.oversized`, `accept:C3.exchange`, `accept:C3.admission`, `accept:C3.growth`, `accept:C3.isolation`, `accept:C3.http`, `accept:C3.disabled`, `accept:C3.reread`, `accept:C3.repeat`, `python:tools/test_conversation_cache_parity.py` | [09](09-testing-and-validation.md), section 4.3 |
 | REQ-COR-06 | The prompt path must stay within the prompt-path tolerance of upstream's CUDA build on a 32K prompt | `accept:PP.kl`, `accept:PP.ppl` | [09](09-testing-and-validation.md), section 4.5 |
@@ -340,7 +340,7 @@ These are measured and published with every release, but a miss does not fail G3
 | `BENCH.other` | Every other model, prompt and arm | No upstream number is a reference ([09](09-testing-and-validation.md), section 2.6); the regression check compares them |
 | `REG.trend` | No change of more than 3% night to night | A trend, not a gate ([09](09-testing-and-validation.md), section 5.4) |
 | Time to first token | Reported with PF-2 | Prefill speed covers it |
-| `C1.1.p99` | p99 KL within 2 × the floor's | A tail statistic, reported beside the gating median ([09](09-testing-and-validation.md), section 4.1) |
+| `C1.1.p99` | p99 KL within 2 × the floor's of the model-level reference (NOT RUN until one is named) | A tail statistic, reported beside the gating median ([09](09-testing-and-validation.md), section 4.1) |
 
 ---
 
