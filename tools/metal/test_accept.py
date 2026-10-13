@@ -36,7 +36,7 @@ ACCEPT_CLI = HERE / "accept.py"
 UPSTREAM = "1678de33d0e0711bc414ad992b640e1a37dd814"
 
 SPEC_IDS = (
-    "C1.1.top1 C1.1.kl C1.1.safe C1.1.band C1.1.ppl C1.1.p99 C1.2 C1.3 C1.4.ids C1.4.weights C1.5 "
+    "C1.K C1.1.top1 C1.1.kl C1.1.safe C1.1.band C1.1.ppl C1.1.p99 C1.2 C1.3 C1.4.ids C1.4.weights C1.5 "
     "C2.b C2.c C2.d C2.e C2.f C2.g C2.h C2.i C2.j C2.d.accept "
     "C3.reuse C3.pressure C3.oversized C3.exchange C3.admission C3.growth C3.isolation C3.soak C3.http "
     "C3.disabled C3.reread C3.repeat C4.tiered C4.swaps PP.top1 PP.kl PP.ppl PP.chunk "
@@ -44,9 +44,13 @@ SPEC_IDS = (
     "S.cancel S.unload BENCH.mtp BENCH.mtp.target BENCH.plain BENCH.other PF-1 PF-2 REG.decode REG.prefill "
     "REG.trend PRESSURE.smoke G1.tf G1.free G2.speed PLAN.models"
 ).split()
+# Retired rows stay in the table and in criteria.py, but no run lists them and judge() gives them no verdict (D-IMPL-960).
+RETIRED_IDS = ("C1.2", "C1.3")
 
-# id: (threshold used for the case, equal value that passes, planted difference that fails)
+# id: (threshold used for the case, equal value that passes, planted difference that fails). For a row of basis
+# `reference` the two values are not a pass: the row is NOT RUN on every input (D-IMPL-960), and the case checks that.
 CASES: dict[str, tuple[object, object, object]] = {
+    "C1.K": (0, 0, 1),
     "C1.1.top1": (95.0, 95.0, 94.9),
     "C1.1.kl": (0.5, 0.5, 0.51),
     "C1.1.safe": (100.0, 100.0, 99.5),
@@ -148,7 +152,18 @@ class CriteriaTable(unittest.TestCase):
 
     def test_every_spec_id_belongs_to_some_run(self):
         covered = {cid for spec in runs.RUN_LIST for cid in spec.criteria}
-        self.assertEqual(set(SPEC_IDS) - covered, set())
+        self.assertEqual(set(SPEC_IDS) - set(RETIRED_IDS) - covered, set())
+
+    def test_retired_ids_are_retired_and_in_no_run(self):
+        covered = {cid for spec in runs.RUN_LIST for cid in spec.criteria}
+        self.assertEqual(set(RETIRED_IDS) & covered, set())
+        for cid in RETIRED_IDS:
+            self.assertEqual(criteria.get(cid).basis, criteria.RETIRED, cid)
+
+    def test_reference_rows_are_the_model_level_c1_and_g1_rows(self):
+        reference = {cid for cid, row in criteria.CRITERIA.items() if row.basis == criteria.REFERENCE}
+        self.assertEqual(reference, {"C1.1.top1", "C1.1.kl", "C1.1.safe", "C1.1.band", "C1.1.ppl", "C1.1.p99",
+                                     "C1.5", "G1.tf", "G1.free", "PP.top1", "PP.kl", "PP.ppl"})
 
     def test_report_rows_are_not_gating(self):
         for row in criteria.CRITERIA.values():
@@ -163,8 +178,27 @@ class CriteriaTable(unittest.TestCase):
         self.assertEqual(declared, matching)
 
     def test_derived_threshold_is_refused_without_a_value(self):
+        # REG.decode's threshold is derived per run (5.4). It used to be C1.1.top1's example, but C1.1.top1 is a
+        # reference row now and is NOT RUN whatever the value (D-IMPL-960), so the example moved here.
         with self.assertRaises(ValueError):
-            criteria.judge("C1.1.top1", 99.0)
+            criteria.judge("REG.decode", 0.99)
+
+    def test_reference_row_is_never_a_pass_even_with_a_threshold(self):
+        verdict = criteria.judge("C1.1.top1", 99.9, 95.0)
+        self.assertIsNone(verdict.passed)
+        self.assertTrue(verdict.skipped)
+        self.assertFalse(verdict.blocks)
+        self.assertTrue(verdict.gating)
+        self.assertIn("model-level reference", verdict.message)
+
+    def test_retired_row_has_no_verdict(self):
+        for cid in RETIRED_IDS:
+            with self.assertRaises(ValueError):
+                criteria.judge(cid, 0, 0)
+
+    def test_basis_is_a_known_value(self):
+        with self.assertRaises(ValueError):
+            criteria.Criterion(id="X.1", op="==", threshold=0, gating=True, section="x", basis="cuda")
 
     def test_missing_value_never_passes(self):
         verdict = criteria.judge("C2.b", None, 0)
@@ -183,8 +217,23 @@ def criteria_source() -> str:
 def _make_criterion_test(cid: str, threshold, ok, bad):
     def test(self):
         row = criteria.get(cid)
+        if row.basis == criteria.RETIRED:
+            # A retired row has no verdict, on any input (D-IMPL-960).
+            with self.assertRaises(ValueError):
+                criteria.judge(cid, ok, threshold)
+            return
         if row.threshold is not None:
             self.assertEqual(row.threshold, threshold, f"{cid}: case threshold differs from the row")
+        if row.basis == criteria.REFERENCE:
+            # The reference is not named, so the row is NOT RUN on equal and on planted inputs alike (09 section 4.1).
+            for value in (ok, bad):
+                verdict = criteria.judge(cid, value, threshold)
+                self.assertIsNone(verdict.passed, f"{cid} must not pass or fail without a reference")
+                self.assertTrue(verdict.skipped, f"{cid} must be NOT RUN")
+                self.assertFalse(verdict.blocks, "a skipped row does not block; its run becomes NOT RUN")
+                self.assertEqual(verdict.gating, row.gating)
+                self.assertTrue(verdict.message.startswith(f"{cid}: NOT RUN ("), verdict.message)
+            return
         if row.op == criteria.REPORT:
             verdict = criteria.judge(cid, ok)
             self.assertIsNone(verdict.passed)
@@ -507,6 +556,23 @@ class PlanRules(unittest.TestCase):
         self.assertFalse(any(name.startswith("c1.tf.tf-doc") for name in names))
         self.assertFalse(any(name.startswith("c1.layers") for name in names))
 
+    def test_c1_plan_starts_with_the_metal_kernel_checks(self):
+        context = runs.Context(models=("Q2_0",), args={"Q2_0": ("--max-context", "8192")}, short=True)
+        first = runs.plan_c1(context)[0]
+        self.assertEqual((first.name, first.kind, first.argv, first.criteria),
+                         ("c1.kernels", "ctest", ("ctest", "--preset", "mac-metal"), ("C1.K",)))
+        self.assertIn("c1.kernels", [step.name for step in runs.plan_c1(context)])
+
+    def test_g1_plan_contains_the_kernel_checks_and_reads_no_reference(self):
+        context = runs.Context(models=("Q2_0",), args={"Q2_0": ("--max-context", "8192")})
+        steps = runs.plan_g1(context)
+        self.assertIn("c1.kernels", [step.name for step in steps])
+        model_level = {"C1.1.top1", "C1.1.kl", "C1.1.safe", "C1.1.band", "C1.1.ppl", "C1.1.p99", "C1.5",
+                       "G1.tf", "G1.free"}
+        for step in steps:
+            if model_level & set(step.criteria):
+                self.assertEqual(step.reads, (), f"{step.name} names a reference file that is not named")
+
     def test_registry_matches_section_3_2_run_names(self):
         self.assertEqual(
             set(runs.RUNS),
@@ -683,7 +749,11 @@ class RunnerEndToEnd(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = ACCEPT.run_cli(argv, runs.RUNS, self.root, {})
         self.assertEqual(code, 2)
-        self.assertIn("NOT RUN", out.getvalue().strip().splitlines()[-1])
+        last = out.getvalue().strip().splitlines()[-1]
+        self.assertIn("NOT RUN", last)
+        # C1 holds reference rows, so the run stops before any step with the reason (D-IMPL-960).
+        self.assertIn("C1.1.top1", last)
+        self.assertIn("model-level reference", last)
         self.assertFalse(self.out.exists(), "a run that cannot start writes no result folder")
 
     def test_production_c2_is_not_ready_because_arm_d_needs_arm_a(self):
