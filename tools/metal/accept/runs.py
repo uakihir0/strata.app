@@ -6,8 +6,9 @@ A plan is a list of steps. A step's argv is the engine's argument list (kind "en
 stem under steps/). Any other `<...>` text marks an input that a live run must resolve from the models, the golden
 set or the host; the runner refuses to start such a step, so a placeholder cannot reach the engine.
 
-`measure` turns the step outputs into verdicts. No run has one yet: each is added by the work item that owns it
-(`task`). Until then a live run stops with NOT RUN before any step starts, and it never reports PASS.
+`measure` turns the step outputs into verdicts. Only `pf` has one (bench.py, T11). Each other run gets one from the work
+item that owns it (`task`); until then a live run stops with NOT RUN before any step starts, and it never reports PASS.
+`bench` waits for the previous release's baseline (section 5.4), which is not in the plan yet.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Callable
 
+from . import bench
 from .criteria import Verdict
 
 PROMPTS = "tests/metal/prompts"
@@ -89,6 +91,8 @@ class RunSpec:
     accepts_day: bool = False
     task: str = ""
     measure: Measure | None = None
+    # A timed benchmark: the host checks of section 5.1 run before its first step.
+    benchmark: bool = False
 
 
 def strip_flags(args: tuple[str, ...] | list[str], names: set[str]) -> list[str]:
@@ -456,6 +460,10 @@ def plan_release(ctx: Context) -> list[Step]:
     return steps
 
 
+def measure_pf(results: RunResults) -> list[Verdict]:
+    return bench.measure_pf(results.outputs)
+
+
 RUN_LIST: tuple[RunSpec, ...] = (
     RunSpec("c1", ("C1.1.top1", "C1.1.kl", "C1.1.safe", "C1.1.band", "C1.1.ppl", "C1.1.p99", "C1.2", "C1.3",
                    "C1.4.ids", "C1.4.weights", "C1.5"), models=("Q2_0", "Coder"), plan=plan_c1,
@@ -472,10 +480,10 @@ RUN_LIST: tuple[RunSpec, ...] = (
     RunSpec("server", ("S.models", "S.status", "S.openai", "S.stream", "S.tool", "S.anthropic", "S.image",
                        "S.cancel", "S.unload", "C3.http"), plan=plan_server, needs_vision=True, task="T12"),
     RunSpec("bench", ("BENCH.mtp", "BENCH.mtp.target", "BENCH.plain", "BENCH.other", "REG.decode", "REG.prefill",
-                      "REG.trend"), plan=plan_bench, accepts_prompts=True, task="T11"),
-    RunSpec("pf", ("PF-1", "PF-2"), plan=plan_pf, task="T11"),
-    RunSpec("g1", ("G1.tf", "G1.free"), plan=plan_g1, task="T7"),
-    RunSpec("g2", ("G2.speed",), plan=plan_g2, task="T7"),
+                      "REG.trend"), plan=plan_bench, accepts_prompts=True, task="T11", benchmark=True),
+    RunSpec("pf", ("PF-1", "PF-2"), plan=plan_pf, task="T11", measure=measure_pf, benchmark=True),
+    RunSpec("g1", ("G1.tf", "G1.free"), plan=plan_g1, task="T7", benchmark=True),
+    RunSpec("g2", ("G2.speed",), plan=plan_g2, task="T7", benchmark=True),
     RunSpec("g3", (), plan=plan_g3, task="T7"),
     RunSpec("nightly", (), task="T14"),
     RunSpec("weekly", ("PRESSURE.smoke",), accepts_day=True, task="T14"),

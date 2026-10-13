@@ -1,8 +1,9 @@
 """Criterion IDs, operators, thresholds and gating flags (docs/mac/09-testing-and-validation.md, sections 3.2 and 4-8).
 
 One row per ID. The runner judges a measured value with `judge()`, and a verdict is blocking only when its row is
-gating and it did not pass. Rows whose threshold is derived from a yardstick (the golden set, T-1 to T-9) have
-`threshold=None`: the caller must supply the derived number, and `judge()` refuses to pass a value without one.
+gating and it neither passed nor was skipped (`skip()`, for the skips section 5.4 allows). Rows whose threshold is
+derived from a yardstick (the golden set, T-1 to T-9) have `threshold=None`: the caller must supply the derived number,
+and `judge()` refuses to pass a value without one.
 A missing value never passes. Rows with the operator "report" are printed and never block a run.
 """
 from __future__ import annotations
@@ -39,15 +40,19 @@ class Verdict:
     gating: bool
     passed: bool | None
     note: str = ""
+    # A criterion the spec lets a run skip (section 5.4): NOT RUN, never a pass, and it does not block.
+    skipped: bool = False
 
     @property
     def message(self) -> str:
+        if self.skipped:
+            return f"{self.id}: NOT RUN ({self.note})"
         return f"{self.id}: {format_value(self.value)}, want {self.op} {format_value(self.threshold)}"
 
     @property
     def blocks(self) -> bool:
-        """True when this verdict fails a run: a gating criterion that did not pass."""
-        return self.gating and self.passed is not True
+        """True when this verdict fails a run: a gating criterion that did not pass and was not skipped."""
+        return self.gating and self.passed is not True and not self.skipped
 
 
 CRITERIA: dict[str, Criterion] = {
@@ -216,6 +221,13 @@ def format_value(value: object) -> str:
     if isinstance(value, float):
         return format(value, ".6g")
     return str(value)
+
+
+def skip(criterion_id: str, note: str) -> Verdict:
+    """A criterion the spec lets a run skip, with the reason (section 5.4). It is NOT RUN: passed is None."""
+    row = get(criterion_id)
+    return Verdict(id=criterion_id, value=None, op=row.op, threshold=None, gating=row.gating, passed=None,
+                   note=note, skipped=True)
 
 
 def judge(criterion_id: str, value: object, threshold: object = None, note: str = "") -> Verdict:
