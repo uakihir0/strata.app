@@ -13364,6 +13364,24 @@ measuring L-15 remain open.
   definitions of section 6.1 and the phase 2 exit criteria of [10](10-implementation-plan.md) must be
   rewritten to name the per-kernel oracles. Until then, the end-to-end yardstick is absent.
 
+### D-IMPL-775: Hold the kernel environment disposition test until the seven mismatches are resolved
+
+- **Decision:** `kernel_env_dispositions_test` (L14) is not merged to main. Its work is on the branch
+  `worktree-agent-a89d10b204f21f04a`, and its `planned: L14` key stays in `tests/metal/test_map.json`.
+  The test compiles and runs, and it fails on seven places where the specification and the code disagree
+  (see D-IMPL-765 to D-IMPL-769 on that branch): `STRATA_KV_ROT`, `STRATA_PREFILL_TIMING`,
+  `STRATA_PREFILL_DUMP_R` and `STRATA_DBG_NAN` are documented as honoured but have no Mac reader;
+  `STRATA_METAL_ICB` must print a notice that no source prints; `--check-logits` is documented but unread;
+  and `STRATA_PREFILL_BF16X2` is documented as `atoi` while the code uses `strtol`.
+- **Reason:** Registering a failing test would make `ctest --preset mac-host` red on main, and the
+  push-run rule of [09](09-testing-and-validation.md) requires green runs. Relaxing the test or
+  marking the seven cases as expected failures would hide the mismatches. The mismatches are real, and
+  each needs a choice between implementing the reader or changing the specification to say it is not
+  implemented on the Mac. That choice is not made here.
+- **Review required:** For each of the seven, the owner chooses: implement it, or amend the
+  specification. After that the branch is rebased onto main, the test is registered, and its planned
+  key is removed in the same commit.
+
 ### D-IMPL-680: Put the planner in `setup.py`, and keep `main()` fail-closed
 
 - **Decision:** `metal_plan`, `plan_class`, the PLAN parser and their constants are module-level code in `setup.py`,
