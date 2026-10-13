@@ -244,8 +244,7 @@
     },
     "idx_batch_eq_sequential": {
       "label": "metal",
-      "origin": "04 10.4",
-      "planned": "L6"
+      "origin": "04 10.4"
     },
     "metal_attn_test": {
       "label": "metal",
@@ -629,8 +628,7 @@
     },
     "ple_batch_eq_sequential": {
       "label": "metal",
-      "origin": "04 10.4",
-      "planned": "L4"
+      "origin": "04 10.4"
     },
     "samp_coupled_eq_host": {
       "label": "metal",

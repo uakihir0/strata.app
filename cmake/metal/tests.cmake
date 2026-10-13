@@ -502,6 +502,11 @@ strata_metal_test(metal_ple_test_concurrent metal
 set_tests_properties(metal_ple_test_concurrent PROPERTIES
   TIMEOUT 120
   ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
+strata_metal_test(ple_batch_eq_sequential metal
+                  metal_ple_test ${STRATA_METALLIB} --ple-batch-eq-sequential)
+set_tests_properties(ple_batch_eq_sequential PROPERTIES
+  TIMEOUT 600
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial")
 
 add_executable(metal_gr_test tests/metal/metal_gr_test.mm)
 target_include_directories(metal_gr_test PRIVATE ${STRATA_METAL_GENERATED_DIR})
@@ -591,6 +596,12 @@ strata_metal_test(metal_qsa_indexer_commit_batch_test_concurrent metal
 set_tests_properties(metal_qsa_indexer_commit_batch_test_concurrent PROPERTIES
   TIMEOUT 300
   ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
+strata_metal_test(idx_batch_eq_sequential metal
+                  metal_qsa_test ${STRATA_METALLIB}
+                  --prefill-indexer-batch-eq-sequential)
+set_tests_properties(idx_batch_eq_sequential PROPERTIES
+  TIMEOUT 600
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial")
 
 add_executable(metal_attn_test tests/metal/metal_attn_test.mm)
 target_include_directories(metal_attn_test PRIVATE ${STRATA_METAL_GENERATED_DIR})
