@@ -1401,7 +1401,7 @@ its reviewer and is not in the map.
 ### 9.3 The Python layer
 
 `tools/metal/run_python_tests.py` discovers current `test_*.py` modules under `tools/`, `tools/metal/` and `serve/`,
-then runs each in a fresh process. It passed 40/40 modules on 2026-10-13. Rows marked planned are absent and are not
+then runs each in a fresh process. It passed 44/44 modules on 2026-10-13, in this worktree with the pinned llama.cpp checkout linked as `third_party/llama.cpp`. Rows marked planned are absent and are not
 run. `tools/metal/test_map.py` is a CLI checker exercised through CTest, not a unittest module.
 
 | Modules | Defined in | Runs on |
@@ -1414,7 +1414,11 @@ run. `tools/metal/test_map.py` is a CLI checker exercised through CTest, not a u
 | `tools/test_make_profile.py` | [05](05-memory-and-residency.md), section 10.1 | macOS Python suite; validates STRP dimensions, ranking bounds, producer route-count/uniqueness limits and finite non-negative weights |
 | `tools/metal/test_check_drift.py` | [06](06-engine-host-port.md), work item H12 | Hosted macOS CI and the reference Mac. In a temporary copy of the tree it plants, one at a time, each kind of change of [10](10-implementation-plan.md), section 4.2: a new flag; a new `STRATA_*` variable; a new INFO key, ERR string and DONE field; a changed line in a copied range; a removed `# MAC:` marker; a changed line next to a marker in a patched Python file, and a new `sys.platform` branch there; a changed and a new CUDA reference kernel; a new model and a new pinned revision. `check_drift.py` must fail naming each. On the unchanged copy it passes, and after `--update` it passes on the changed copy. |
 | `tools/metal/test_check_release_policy.py` | [08](08-build-and-distribution.md), section 11.1, work item B13 | macOS Python suite; mocks every `gh` call |
-| `tools/metal/test_workflows.py` | [08](08-build-and-distribution.md), section 12 | macOS Python suite; checks pinned Actions, read-only permissions, reference-runner triggers and Dependabot cadence |
+| `tools/test_setup_metal.py` | [08](08-build-and-distribution.md), section 8, work item B8 | macOS Python suite; synthetic trees and fake `xcodebuild` and `git`: the engine and vision definitions against `CMakePresets.json` and the vision CMake file, the source identity, the BUILD.json keys and values, the tool lookup, the llama.cpp pin and checkout, and the CMake build call |
+| `tools/metal/test_check_asset.py` | [08](08-build-and-distribution.md), section 11.7, work item B11 | macOS Python suite; synthetic zip assets for each of the twelve checks, with the macOS tools faked, plus `--run` on shell scripts that stand in for the engine |
+| `tools/metal/test_make_release.py` | [08](08-build-and-distribution.md), sections 11.3, 11.4 and 11.9, work items B10 and B20 | macOS Python suite; preconditions, the cache values, the deterministic zip, the licence excerpt and vendor checks, the assembled release checked by `check_asset.py`'s checks, and the notarisation verdict |
+| `tools/metal/test_verify_release.py` | [08](08-build-and-distribution.md), section 11.8, work item B12 | macOS Python suite; a synthetic draft with fake `gh`, `git` and rebuild and the real `shasum`: one changed byte fails, a differing rebuild fails, a different toolchain skips the rebuild, and steps 5 and 6 refuse until their parts exist |
+| `tools/metal/test_workflows.py` | [08](08-build-and-distribution.md), section 12 | macOS Python suite; checks pinned Actions, read-only permissions except the release jobs, reference-runner triggers, the release workflow's tag trigger, environment and signing rules, and Dependabot cadence |
 | `tools/metal/test_macos_paths.py` | [07](07-server-setup-port.md), section 8.1 | macOS Python suite; uses `samefile()` to test filesystem path identity |
 | `tools/metal/test_run_python_tests.py` | [08](08-build-and-distribution.md), section 12.1, work item B14 | macOS Python suite |
 | `tools/metal/test_model_headers.py` | [03](03-model-reference.md), work item R1 | macOS Python suite. Checks shard sizes and tensor totals, fixed metadata and the shared PLE shard, rejects duplicate fixture JSON keys, and invokes `ggufhdr.py` on a generated header. |

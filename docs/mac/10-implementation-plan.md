@@ -273,6 +273,11 @@ Exit criteria:
 - `accept.py server` and `accept.py c3` pass on Q2_0. `accept.py nightly` passes.
 - The Mac golden set passes on the reference Mac.
 
+**Status (2026-10-13).** Host parts of B8, B9, B10 and B11 are done, with the tests in 09 section 9.3 and the
+decisions D-IMPL-940 to D-IMPL-959. Their reference-Mac and publication parts are open, as 08 section 15 lists. The
+rest of phase 3 (the setup flows, the server, the prompt cache and the other tasks above) is not in that change, so
+the exit criteria are not met.
+
 ### 3.5 Phase 4: tiered mode
 
 | Task | What | After |
@@ -315,6 +320,10 @@ Exit criteria:
   leaves only a draft (B18, T15).
 - Each of M1-M4 has a family file ([09](09-testing-and-validation.md), section 7.4).
 
+**Status (2026-10-13).** Host parts of B12 (steps 5 and 6 of verify_release still refuse), B13, B18 (written, not run)
+and B20 (the licence review is open) are done. T15, T16 and S14 are not in that change, so the exit criteria are not
+met, and no measurement of B-2, B-5 to B-8 has been taken.
+
 ### 3.7 Phase 6: parity and the first release
 
 | Task | What | After |
@@ -332,6 +341,9 @@ section 2.
 **G3**, `accept.py g3` ([09](09-testing-and-validation.md), section 6.3), on the first release's candidate
 (section 5.2). If it fails, the first release goes out as a beta, with each failing requirement and its check in the
 notes.
+
+**Status (2026-10-13).** B22 is not started: its measurements need the reference Mac and the model files
+(appendix A).
 
 ### 3.8 Conditional work items
 

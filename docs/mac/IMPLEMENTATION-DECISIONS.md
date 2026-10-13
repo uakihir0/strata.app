@@ -14833,3 +14833,195 @@ measuring L-15 remain open.
   owner wants the skip to pass a non-release run, change the single branch in `accept.py` and its test
   `test_a_skipped_gating_criterion_makes_the_run_not_run_never_pass`.
 
+### D-IMPL-940: The section 8 functions live in setup.py, and nothing calls them yet
+
+- **Decision:** `setup.py` gains `metal_engine_defs`, `metal_vision_defs`, `metal_source_rev`, `source_hash`,
+  `find_tool`, `metal_build_json` and `xcode_and_toolchain` (docs/mac/08 section 8), and, for make_release and
+  verify_release, `llama_pin`, `get_llama_cpp` and `cmake_build`. `main()` is unchanged and still exits 2. The
+  install and build flows (07 S7 and S8) stay open.
+- **Reason:** B8 asks for the section 8 functions. The S-track owns the setup flow, but the definitions must be
+  written once for the local build and the release.
+- **Review required:** Confirm the S7 and S8 owner accepts these signatures. The spec names upstream versions of
+  `cmake_build` and `get_llama_cpp` (setup.py:1746 and :868); this checkout has neither, so these are minimal.
+
+### D-IMPL-941: The vision CMake gets the portable recipe and an embedded Metal library
+
+- **Decision:** `tools/vision/CMakeLists.txt` accepts `-DLLAMA_DIR=<checkout>`, which skips FetchContent, and
+  `STRATA_PORTABLE`, which sets `GGML_NATIVE` OFF (ON otherwise). It forces `GGML_METAL_EMBED_LIBRARY` ON. OpenMP
+  stays forced OFF in both modes.
+- **Reason:** 08 section 9 and 11.3 step 4 require these cache values, and the file had none of them. Apple clang has
+  no OpenMP (08 section 8.2), so OFF in both modes is the safer reading than ggml's default.
+- **Review required:** `test_workflows` used to assert that `STRATA_PORTABLE` is absent from this file; the assertion
+  now requires the portable branch.
+
+### D-IMPL-942: `metal_vision_defs` omits `-DSTRATA_VISION_CUDA=OFF`
+
+- **Decision:** The definitions of 08 section 8.2 are followed except `-DSTRATA_VISION_CUDA=OFF`, which the file does
+  not read. CUDA stays off because the file forces `GGML_CUDA` OFF.
+- **Reason:** CMake warns about an unused manually specified variable on every configure, and `test_workflows` requires
+  that the file never names `STRATA_VISION_CUDA`.
+- **Review required:** None.
+
+### D-IMPL-943: The source identity inputs
+
+- **Decision:** `ENGINE_SOURCES` is the root `CMakeLists.txt`, `CMakePresets.json`, `cmake/metal`, `src`, `include`,
+  `METAL_REV`, and `third_party/ggml/VERSION.txt`, the pinned llama.cpp commit that 08 section 8.3 names.
+  `VISION_SOURCES` is `tools/vision`. An identity is the first 16 hex digits of SHA-256 over each file's relative
+  path, size and bytes, in path order, with `.DS_Store` skipped.
+- **Reason:** 08 8.3 lists the engine inputs without the pin file's name; 07 4.7.2 adds `METAL_REV` and `cmake/metal`.
+  The 16-digit length comes from 08 11.7, check 9.
+- **Review required:** Confirm that `third_party/ggml/VERSION.txt` is the intended "pinned llama.cpp revision" input.
+
+### D-IMPL-944: drift.json records the setup.py marker count
+
+- **Decision:** `tools/metal/drift.json` sets the `setup.py` marker count from 0 to 10, the number of `# MAC:` lines
+  that B8 and B10 added. 10 section 4.3 says the work item that patches a file sets its count.
+- **Reason:** `check_drift.py` fails on any other count. It passes now.
+- **Review required:** The reviewer checks those ten lines in the diff.
+
+### D-IMPL-945: make_release uses a minimal `cmake_build`, and fetches llama.cpp only when it is missing
+
+- **Decision:** `setup.cmake_build(src, build, target, defs)` configures with Ninja, using the venv's cmake and ninja,
+  then builds the target. `setup.get_llama_cpp()` clones the pin when `third_party/llama.cpp` is absent. It refuses a
+  checkout whose `git rev-parse HEAD` is not the pin, including a copy without `.git`.
+- **Reason:** 08 11.3 calls both. The release worktree that verify_release creates copies `third_party/llama.cpp` with
+  `cp -cR`, which keeps `.git`, so the check still works there.
+- **Review required:** The clone is network access inside make_release and in CI. The owner confirms that is allowed.
+
+### D-IMPL-946: The release tools are host-tested with synthetic inputs, and run for real on this Mac
+
+- **Decision:** make_release, check_asset and verify_release have synthetic unit tests (09 section 9.3). The real
+  release was built twice on this Mac (Apple M5 Pro, macOS 27.0, Xcode 27.0 27A266a, Metal toolchain
+  `com.apple.dt.toolchain.Metal.32023.921.5`): once in the worktree and once in a clone at another path. Both used
+  `--allow-dirty` at commit `ec3bd04`, and llama.cpp at the pin through a symlink to the dev checkout's clone. The two
+  asset zips are byte-identical (SHA-256 `866a942b…`). `check_asset.py --symbols --run` passes on it.
+- **Reason:** B10 and B11 Done-when. The reference Mac was not used.
+- **Review required:** Repeat the two-checkout comparison on the reference Mac (08 11.4 records it there).
+
+### D-IMPL-947: The symbols zip differs across checkout paths, as 11.4 predicts
+
+- **Decision:** B10's Done-when says "the same member hashes in both zips". The asset zip meets it. The symbols zip
+  differs in `strata.metallibsym` only: `metal-dsymutil` records the build folder, as in
+  `/private/tmp/b10-checkout-b/build-release/metal/safe/attention.air`. The dSYM members are identical. This is left as
+  is. 08 11.4 keeps the symbols zip out of the reproducibility check, and verify_release compares only asset members
+  (11.8).
+- **Reason:** A path-independent `strata.metallibsym` changes the metallib link in `cmake/metal` (B3), outside this
+  scope.
+- **Review required:** Decide whether B10's "both zips" or 11.4 governs. A path-independent metallib symbol file would
+  be the B3 follow-up.
+
+### D-IMPL-948: The CI release step runs make_release.py without a file guard
+
+- **Decision:** `.github/workflows/ci.yml` runs `make_release.py --out dist` in the step named "Build the release files
+  and check them", with no `hashFiles` guard. It is in `mac-host`, which stays off until `MAC_HOSTED_RUNNER` is set.
+- **Reason:** The guard waited for the builder, which now exists. The step clones llama.cpp when it is missing and runs
+  `check_asset.py`.
+- **Review required:** Confirm the hosted runner can clone llama.cpp and finish within the job's 60 minutes. The local
+  run took about 3.5 minutes.
+
+### D-IMPL-949: The licence excerpts come from the pinned tree, and the vendor counts match 08 11.9
+
+- **Decision:** `tools/metal/licenses/` holds four excerpts (`yarn-rope.txt`, `stb_image.txt`, `miniaudio.txt`,
+  `subprocess.txt`). Each is copied from the pinned llama.cpp (3cf03257…), with its comment markers removed and a
+  `source:` line. On the real build the vendor check counted `stbi_` 153, `ma_decoder` 17, `subprocess_` 18 and
+  `sha256_` 6, and 0 for `httplib`, `nlohmann`, `XXH` and `SHA1`. These are the counts of 08 11.9.
+- **Reason:** B20's host part: the excerpt check and the vendor check run in make_release, and each fails on a fixture
+  in test_make_release.
+- **Review required:** The licence review (review:B20) is still for a person to confirm the table and the texts.
+
+### D-IMPL-950: verify_release fails closed at steps 5 and 6
+
+- **Decision:** Step 5 needs `setup.get_prebuilt_metal` and `setup.smoke_test` (07 S7), which are absent, so it refuses.
+  Step 6 needs `tools/metal/accept.py` (09 T15), also absent, so it refuses. Step 5 serves the download with
+  `python3 -m http.server` on 127.0.0.1, as the spec says. Step 7 compares the asset members, not the symbols zip. A
+  different toolchain prints the spec's note and reports `ok (rebuild skipped)`, and `--no-rebuild` reports the same.
+- **Reason:** A draft must not verify without its install and acceptance. Passing without them would be wrong.
+- **Review required:** Confirm that `ok (rebuild skipped)` for `--no-rebuild` is the intended output, since the spec does
+  not name it.
+
+### D-IMPL-951: mac-release.yml is written and has not run
+
+- **Decision:** `.github/workflows/mac-release.yml` follows 12.3. It triggers on tags `v*-metal.*` with group
+  `mac-release`, `queue: max` and `cancel-in-progress: false`. `build` (runner `vars.MAC_HOSTED_RUNNER` or `strata-ref`,
+  contents write) runs the remote policy check and make_release (signing and notarisation only when their secrets are
+  set), then `gh release create --draft --verify-tag`. `verify` runs verify_release on `strata-ref`. `publish` runs on
+  ubuntu-24.04 in the `release` environment and alone runs `gh release edit --draft=false --latest`. The action SHAs are
+  those pinned in `ci.yml` and `mac-hardware.yml`, so no new action is introduced.
+- **Reason:** The host part of B18. The trial in a test repository is open.
+- **Review required:** Merging this file to main makes every `v*-metal.*` tag push start a build. The owner decides when
+  that happens. The `release` environment's reviewer is repository configuration, which this checkout does not contain.
+
+### D-IMPL-952: Release jobs may request contents write; every other job stays read-only
+
+- **Decision:** `test_workflows` requires `contents: write` for the `build`, `verify` and `publish` jobs of
+  `mac-release.yml`, and `contents: read` for every other job and workflow. New tests cover the release workflow's
+  triggers, needs chain, environment, optional signing and always-run keychain removal.
+- **Reason:** 12.3 gives those jobs contents write. The earlier test required read everywhere, which would fail the
+  workflow by design.
+- **Review required:** None.
+
+### D-IMPL-953: requirements.json has no checks for the release tools yet
+
+- **Decision:** The Verified-by cells of REQ-BLD-01, -03 and -05 (01-requirements.md) name `tools/test_metal_build.py`,
+  the B5 module. test_map accepts only the checks named in those cells, so the check_asset and make_release tests are
+  not listed. `requirements.json` is unchanged.
+- **Reason:** test_map treats an unlisted check as an error, and changing a requirement's verification is a spec
+  change.
+- **Review required:** Decide whether REQ-BLD-01, -03 and -05 name the check_asset tests, or whether B5's module takes
+  them.
+
+### D-IMPL-954: release_metadata holds the release layout
+
+- **Decision:** `tools/metal/release_metadata.py` gains the asset and symbols member lists with their modes, the file
+  names, `BUILD_JSON_KEYS` and `LICENSE_TITLES`. `source_version` takes a checkout root, defaulting to the current
+  one. setup, check_asset, make_release and verify_release read the layout from there.
+- **Reason:** One definition of the layout. check_release_policy still calls `source_version()` with no argument.
+- **Review required:** None.
+
+### D-IMPL-955: Check 8 runs metal-nm and metal-dsymutil on the library itself
+
+- **Decision:** Check 8 lists the defined names with `xcrun metal-nm -j -U` and compares them with the manifest's first
+  words. It copies the library and runs `xcrun metal-dsymutil -flat -remove-source` on the copy. The development library
+  (`STRATA_METAL_EMBED_SOURCES=ON` in build-dev) fails the second part, as designed.
+- **Reason:** The release library has its sources removed (`STRATA_METAL_EMBED_SOURCES=OFF`, 08 5.7).
+- **Review required:** None.
+
+### D-IMPL-956: B13's table was mostly covered; five rows were added
+
+- **Decision:** `test_check_release_policy.py` already covered most rows of 11.1's table. Five tests were added for the
+  rest: the branch name from `GITHUB_REF_NAME` and from `git branch --show-current`, draft releases excluded from the
+  revision history, an unannotated tag on a published release branch, and a release-branch pull request whose latest
+  release differs.
+- **Reason:** B13's Done-when asks for a test per row.
+- **Review required:** None.
+
+### D-IMPL-957: Vision reproducibility, checked on this Mac
+
+- **Decision:** B9 is checked on this Mac (Apple M5 Pro, macOS 27.0, Xcode 27.0 27A266a), not on the reference Mac.
+  Two builds of `vision-repro.sh` in `/tmp/b9-vision/vpa` and `vpb`, against llama.cpp at 3cf03257 (the dev checkout's
+  clone), give identical binaries: 8,191,600 B, SHA-256 `23c08ce9…`. Stripped, both are 7,468,320 B, SHA-256
+  `faebac15…`. Checks 2 to 6 of 11.7 pass on the stripped binary, and its one allowed string is the only
+  `/tmp/` occurrence.
+- **Reason:** The spec's figures (8,180,336 B and 7,453,408 B) come from the reference Mac. They are recorded as measured,
+  not forced.
+- **Review required:** The reference Mac still has to confirm the spec's figures (08 section 9).
+
+### D-IMPL-958: BUILD.json's text and commit rules
+
+- **Decision:** Check 9 requires the file to end with a newline and to hold the documented keys and values. It does not
+  compare the bytes with `json.dumps(meta, indent=1)`. The commit is 40 hex, with `-dirty` accepted only under
+  `--allow-dirty`.
+- **Reason:** This follows the wording of 11.7, check 9. The writer produces the canonical text anyway.
+- **Review required:** None.
+
+### D-IMPL-959: What is not verified
+
+- **Decision:** Not done: B22 (its measurements need the reference Mac and the models); the test-repository trial of
+  `mac-release.yml`, and the draft verification (both need GitHub and a test repository, and this task forbids
+  publication); Developer ID signing and notarisation (no certificate, so those command lines are untested); the
+  reference-Mac repeats of B9 and B10; the licence review (review:B20); and verify_release's steps 5 and 6 (07 S7 and
+  09 T15). The worktree's `third_party/llama.cpp` is an ignored symlink to the dev checkout's pinned clone, which the
+  builds used.
+- **Reason:** The scope of this task, and parts that do not exist yet.
+- **Review required:** The owner reads this list before the coordinator merges.
+

@@ -14,7 +14,7 @@ This document covers how the Mac engine is built and shipped:
 - the toolchain;
 - the macOS-only root CMake build and its Metal test targets;
 - `cmake/metal/`: the Metal backend, the kernel library, the tests and the presets;
-- the proposed `setup.py` build integration (not implemented), and the optional `strata-vision` validation helper;
+- the `setup.py` build definitions and metadata (section 8; no setup flow calls them yet), and the optional `strata-vision` helper;
 - the pipeline cache and GPU capture, which the build sets up for the engine;
 - the release: versioning, the asset, reproducibility, signing, symbols and the release checks;
 - CI and the developer workflow.
@@ -76,9 +76,10 @@ measurement or review may overturn.
 | `tools/metal/check_release_policy.py` | Checks the version rules | 11.1 |
 | `tools/metal/run_python_tests.py` | Runs every Python test module, each in its own process | 12.1 |
 | `tools/metal/check_drift.py`, `tools/metal/drift.json` | The upstream drift check | [06](06-engine-host-port.md) H12; [10](10-implementation-plan.md) |
-| `tools/metal/licenses/` | Licence texts that upstream keeps inside headers | 11.9 |
-| `tools/test_metal_build.py` | Proposed release/build-definition tests; the file does not exist yet | 7.2, 12.1 |
-| `.github/workflows/ci.yml`, `mac-hardware.yml`; `.github/dependabot.yml` | Existing macOS CI and hardware workflows. The release workflow is only specified in section 12.3. | 12 |
+| `tools/metal/licenses/` | Excerpts of licence texts that upstream keeps inside headers (four files) | 11.9 |
+| `tools/metal/make_release.py`, `check_asset.py`, `verify_release.py` | The release tools (sections 11.3, 11.7 and 11.8) | 11 |
+| `tools/test_metal_build.py` | Proposed release/build-definition tests; the file does not exist yet (B5, phase 0) | 7.2, 12.1 |
+| `.github/workflows/ci.yml`, `mac-hardware.yml`, `mac-release.yml`; `.github/dependabot.yml` | macOS CI and hardware workflows, and the release workflow (written, not run) | 12 |
 | `docs/mac/` | This documentation set | 1.4 |
 
 ### 1.3 Upstream files edited for the build
@@ -89,7 +90,7 @@ measurement or review may overturn.
 | `src/platform/direct_file.cpp` | The `F_NOCACHE` branch at `:308` | 3.2 |
 | `.gitattributes` | Three lines: LF for `*.metal`, the manifest and `METAL_REV` | 3.5 |
 | `.gitignore` | `.DS_Store`, `*.gputrace` | 3.5 |
-| `setup.py` | Current fail-closed CLI stub; the proposed build helpers described in section 8 are not implemented | 8 |
+| `setup.py` | Fail-closed CLI stub, plus the build definitions and metadata helpers of section 8 (no setup flow calls them yet) | 8 |
 | `tools/vision/strata_vision.cpp` | The thread-count fix ([06](06-engine-host-port.md), H13) | 9 |
 
 **Markers.** Every edited line is marked, so `tools/metal/check_drift.py` can count the markers per file. It fails when
@@ -746,10 +747,12 @@ checks; it does not run this proposed test.
 
 ---
 
-## 8. Proposed setup build integration (not implemented)
+## 8. Setup build integration: definitions, identity and metadata
 
-`setup.py` currently exits with status 2 before changing files. The examples below specify a possible future
-macOS-only installer/build interface; none of these functions or release helpers exist in the checkout.
+`setup.py` still exits with status 2 before changing files, and no install or build step calls the functions below
+yet: the setup flows of 07 (S7 and S8) are open. The functions exist in `setup.py`, with the release helpers
+`llama_pin`, `get_llama_cpp` and `cmake_build` that make_release.py uses (work item B8; D-IMPL-940 and D-IMPL-945). The
+tests are in `tools/test_setup_metal.py`. Sections 8.3 to 8.5 describe them as implemented.
 
 ### 8.1 `metal_engine_defs(llama)`
 
@@ -784,8 +787,8 @@ def metal_vision_defs(llama, portable) -> list:  # MAC:
 
 The future Mac installer may hash the engine's CMake and source inputs to decide whether a local rebuild is needed.
 The input set would include the root `CMakeLists.txt`, `CMakePresets.json`, `cmake/metal/`, `src/`, `include/`,
-`METAL_REV`, and the pinned llama.cpp revision. A Finder-created `.DS_Store` must not affect that identity. This
-logic is not implemented.
+`METAL_REV`, and the pinned llama.cpp revision. A Finder-created `.DS_Store` must not affect that identity. The logic
+is `source_hash` in `setup.py` (D-IMPL-943); no build calls it yet.
 
 ### 8.4 BUILD.json: informational keys
 
@@ -837,7 +840,8 @@ def metal_build_json(eng: Path, source: str) -> dict:  # MAC:
 
 The proposed Mac `find_tool` helper searches the venv's `bin` directory (`Path(sys.executable).parent`) before
 PATH. Setup is expected to run with the venv's Python without activating it, so PATH-first could pick an older
-Homebrew or MacPorts `cmake` instead of the pinned `cmake==4.4.3`. This helper is not implemented.
+Homebrew or MacPorts `cmake` instead of the pinned `cmake==4.4.3`. The helper is `find_tool` in `setup.py`, and
+`cmake_build` uses it; setup's own flow does not call it yet.
 
 ---
 
@@ -855,8 +859,9 @@ cmake -G Ninja -S tools/vision -B /tmp/strata-vision-build -DCMAKE_BUILD_TYPE=Re
 cmake --build /tmp/strata-vision-build --target strata-vision
 ```
 
-The portable release recipe and measurements later in this section describe the proposed distribution design, not
-the current standalone helper binary.
+The helper accepts the release recipe of the next paragraphs: `-DLLAMA_DIR=<checkout>` skips the fetch, and
+`-DSTRATA_PORTABLE=ON` turns off the native CPU tuning (D-IMPL-941). It is still not part of the root CMake build or
+a setup-installed asset; the release files of section 11 include it.
 
 - `GGML_METAL_EMBED_LIBRARY=ON` embeds ggml's shader source in the binary. Metal compiles it at the first start, so
   `strata-vision` needs no `.metallib` beside it and no Xcode at run time. The cost of that first compile is
@@ -873,6 +878,11 @@ Verified with the release definitions (`spikes/metal-build/vision-repro.sh`):
 - it links only `Accelerate`, `Foundation`, `Metal`, `MetalKit` and `CoreFoundation` from `/System/Library/Frameworks`,
   and `libSystem`, `libc++` and `libobjc` from `/usr/lib`, with no `LC_RPATH`;
 - with no argument, it prints its usage and exits 2.
+
+Host check on a Mac that is not the reference Mac (B9, 2026-10-13, Apple M5 Pro, macOS 27.0, Xcode 27.0 27A266a,
+llama.cpp at the pin; D-IMPL-957): the two builds in separate folders give identical binaries, 8,191,600 B, and
+identical stripped binaries, 7,468,320 B. The spec's figures above are from the reference Mac and are not matched
+exactly. Checks 2 to 6 of section 11.7 pass for the stripped binary.
 
 The binary contains one absolute path, `/tmp/perf-metal-%d.gputrace`. It is ggml's capture file name
 (`ggml/src/ggml-metal/ggml-metal-context.m:526` at the pin), used only when `GGML_METAL_CAPTURE_COMPUTE` is set.
@@ -970,10 +980,13 @@ Verified with the skeleton: an 80 KB trace of the self-test dispatches.
 
 ---
 
-## 11. Proposed release design (not implemented)
+## 11. Release design
 
-The release asset tools and release workflow are absent. The following sections specify a future macOS-only release
-contract; they do not describe a currently available publishing path.
+The release tools are in `tools/metal/`: `make_release.py` (11.3), `check_asset.py` (11.7) and `verify_release.py`
+(11.8), and the workflow `mac-release.yml` (12.3). Their host parts are tested in the macOS Python suite (09 section
+9.3). The asset of 11.3 was built and checked on a Mac (B10, B11; D-IMPL-946). No release has been published from this
+checkout, and the publication path has not been tried in a test repository (B12, B18). verify_release's steps 5 and 6
+refuse until 07 S7 and 09 T15 exist (D-IMPL-950). Signing and notarisation are not yet tested (D-IMPL-959).
 
 ### 11.1 Versions and the release policy
 
@@ -1179,6 +1192,10 @@ instead.
 
 The zip writer gave identical zips across mtimes, umasks, and Python 3.9.6 and 3.13.12, all with zlib 1.2.12.
 
+Measured on a Mac that is not the reference Mac (B10, 2026-10-13; D-IMPL-946 and D-IMPL-947): two checkouts at different
+paths, with the same commit and content, gave byte-identical asset zips (SHA-256 `866a942b…`). Their symbols zips
+differ in `strata.metallibsym` only, which records the build folder, as this section predicts for that file.
+
 **What is compared.** `verify_release.py` compares the members of both zips by SHA-256, not the zip files: another
 zlib could deflate differently (measurement B-7). Whether a hosted runner gives the same bytes as the reference Mac
 is measurement B-2. Until B-2 confirms it, a difference fails the verification (section 11.8).
@@ -1262,8 +1279,9 @@ code is 1 if any check failed.
 | 11 | With `--symbols`: the symbols zip has the members of section 11.2. The dSYM's UUID equals `strata`'s. `strata.metallibsym` is not empty. |
 | 12 | With `--run`: unpack into a temporary folder, setting each mode from `external_attr`. `strata --version` must exit 0 within 30 s and print exactly `strata <v> metal <rev>\n`. `strata-vision` with no argument must exit 2 within 30 s, with stderr starting `usage: strata-vision`. Neither run needs a GPU. |
 
-The release asset validator and its fixture test are planned but absent. The proposed validator would exercise plain
-archive and JSON checks in the macOS Python suite, then use macOS tools for architecture, signing and runtime checks.
+`check_asset.py` implements the twelve checks. `test_check_asset.py` runs the archive, JSON, string and licence checks on
+synthetic assets in the macOS Python suite, with the macOS tools faked. On the asset built on this Mac, every check
+passes with `--symbols --run` (D-IMPL-946). The run of check 12 executes the engine and `strata-vision` with no GPU.
 No Linux test or release-validation job is part of this repository.
 
 ### 11.8 `tools/metal/verify_release.py`
@@ -1349,7 +1367,10 @@ The failure for the last four is
 A library in the first four rows with no match only prints a note: its section stays until the licence review
 removes it. The counts were measured on the release build of section 9 (appendix A.8).
 
-The licence review (work item B20) confirms the table before the first release.
+The licence review (work item B20) confirms the table before the first release. Its host part is done: the four
+excerpts in `tools/metal/licenses/` were copied from the pinned tree, and on the vision build of this Mac the vendor
+check counted 153, 17, 18 and 6 defined symbols for the four vendored libraries of the first rows, and 0 for the four
+refused ones (D-IMPL-949). The review itself, by a person, is open.
 
 ---
 
@@ -1418,11 +1439,13 @@ runs `accept.py weekly`, or `accept.py weekly --day N` for a validated `N` from 
 ([09](09-testing-and-validation.md), section 7.2). It does not depend on both jobs landing on the same self-hosted
 machine. Missing model assets or `accept.py` fail the weekly gate.
 
-### 12.3 Planned `mac-release.yml` (not implemented)
+### 12.3 `mac-release.yml`
 
-No `.github/workflows/mac-release.yml` exists in this checkout. This section records the release design only; it must not be treated as an active workflow. The release asset and verification tools listed above are also not present yet.
+`.github/workflows/mac-release.yml` exists in this checkout and has the jobs of the table below (B18). It has not run:
+it has not been tried in a test repository, and it must not be enabled or dispatched before that trial and the owner's
+decision (D-IMPL-951). `test_workflows.py` checks its triggers, needs chain, environment, permissions and signing rules.
 
-Planned trigger: `push` of a tag matching `v*-metal.*`. `concurrency: { group: mac-release, queue: max,
+Trigger: `push` of a tag matching `v*-metal.*`. `concurrency: { group: mac-release, queue: max,
 cancel-in-progress: false }`.
 
 | Job | Runner | Permissions | Steps |
@@ -1578,3 +1601,23 @@ Each item becomes one task in [10-implementation-plan.md](10-implementation-plan
 | B20 | Licence review (section 11.9) | The table of section 11.9 is confirmed; the excerpt check and the vendor check run in `make_release.py`, and each fails on a fixture |
 | B21 | The `strata-ref` runner (section 12.4) | Every rule of section 12.4 holds, checked by a second person |
 | B22 | Measurements B-1 to B-11 (section 14) | Each result is in appendix A, and the default it drives is updated here |
+
+**Status after the host work of 2026-10-13** (decisions D-IMPL-940 to D-IMPL-959). An item is done only when its
+"Done when" holds on the reference Mac, so each line says what is host-verified and what stays open.
+
+- **B8:** host part done. `setup.py` has the section 8 functions and the release helpers, with `tools/test_setup_metal.py`.
+  Open: the setup flows that call them (07 S7 and S8), and the Mac setup test that B5's module names.
+- **B9:** host part done. `tools/vision/CMakeLists.txt` has the release recipe, and two builds on a Mac that is not the
+  reference Mac are identical. Open: the reference Mac's two builds and the spec's figures.
+- **B10:** host part done. `tools/metal/make_release.py` builds and checks the asset; two checkouts at different paths
+  give identical asset zips. Open: the reference Mac's comparison; the symbols zip differs in `strata.metallibsym`
+  (D-IMPL-947); Developer ID signing and notarisation are untested.
+- **B11:** host part done. `tools/metal/check_asset.py` runs checks 1 to 12, with fixtures in the macOS suite, and a
+  real asset passes. Open: a Developer ID asset, which has not been built.
+- **B12:** host part done. `tools/metal/verify_release.py` runs steps 1 to 4, 7 and 8. Open: a draft verified in a test
+  repository, and steps 5 and 6 (07 S7 and 09 T15).
+- **B13:** done as a host test, with every row of section 11.1 covered by `test_check_release_policy.py`.
+- **B18:** host part done. `.github/workflows/mac-release.yml` is written and checked locally, and has not run. Open: the
+  trial in a test repository and the `release` environment's reviewer.
+- **B20:** host part done. The excerpts and the vendor check run in make_release. Open: the licence review by a person.
+- **B22:** not started. Its measurements need the reference Mac and the models (appendix A).
