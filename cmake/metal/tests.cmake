@@ -174,6 +174,15 @@ add_dependencies(metal_twin_selftest strata_metallib)
 strata_metal_test(metal_twin_selftest metal metal_twin_selftest ${STRATA_METALLIB})
 set_tests_properties(metal_twin_selftest PROPERTIES TIMEOUT 120)
 
+add_executable(metal_util_test tests/metal/metal_util_test.mm)
+target_include_directories(metal_util_test PRIVATE ${STRATA_METAL_GENERATED_DIR})
+target_link_libraries(metal_util_test PRIVATE strata_metal_twins strata_metal_options)
+set_source_files_properties(tests/metal/metal_util_test.mm
+                            PROPERTIES OBJECT_DEPENDS ${STRATA_METALLIB_SHA256_INC})
+add_dependencies(metal_util_test strata_metallib)
+strata_metal_test(metal_util_test metal metal_util_test ${STRATA_METALLIB})
+set_tests_properties(metal_util_test PROPERTIES TIMEOUT 120)
+
 add_executable(metal_mv_test tests/metal/metal_mv_test.mm)
 target_include_directories(metal_mv_test PRIVATE ${STRATA_METAL_GENERATED_DIR})
 target_link_libraries(metal_mv_test PRIVATE
@@ -190,6 +199,11 @@ strata_metal_test(metal_mv_test_concurrent metal
 set_tests_properties(metal_mv_test_concurrent PROPERTIES
   TIMEOUT 120
   ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
+strata_metal_test(mv_multi_eq_single metal
+                  metal_mv_test ${STRATA_METALLIB} --multi-eq-single)
+set_tests_properties(mv_multi_eq_single PROPERTIES
+  TIMEOUT 120
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial")
 
 add_executable(metal_moe_test tests/metal/metal_moe_test.mm)
 target_include_directories(metal_moe_test PRIVATE ${STRATA_METAL_GENERATED_DIR})
@@ -273,6 +287,17 @@ set_tests_properties(metal_prefill_test_concurrent PROPERTIES
   TIMEOUT 120
   ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
 
+add_executable(pf_gdn_eq_step_norm tests/metal/pf_gdn_eq_step_norm.mm)
+target_include_directories(pf_gdn_eq_step_norm PRIVATE ${STRATA_METAL_GENERATED_DIR})
+target_link_libraries(pf_gdn_eq_step_norm PRIVATE
+  strata_metal_engine strata_metal_twins strata_metal_options)
+set_source_files_properties(tests/metal/pf_gdn_eq_step_norm.mm
+                            PROPERTIES OBJECT_DEPENDS ${STRATA_METALLIB_SHA256_INC})
+add_dependencies(pf_gdn_eq_step_norm strata_metallib)
+strata_metal_test(pf_gdn_eq_step_norm metal
+                  pf_gdn_eq_step_norm ${STRATA_METALLIB})
+set_tests_properties(pf_gdn_eq_step_norm PROPERTIES TIMEOUT 300)
+
 add_executable(metal_prefill_dequant_test
                tests/metal/metal_prefill_dequant_test.mm)
 target_include_directories(metal_prefill_dequant_test PRIVATE
@@ -310,6 +335,25 @@ set_tests_properties(metal_prefill_moe_grouping_test PROPERTIES
 strata_metal_test(metal_prefill_moe_grouping_test_concurrent metal
                   metal_prefill_moe_grouping_test ${STRATA_METALLIB})
 set_tests_properties(metal_prefill_moe_grouping_test_concurrent PROPERTIES
+  TIMEOUT 180
+  ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
+
+add_executable(pf_sort_eq_host_grouping tests/metal/pf_sort_eq_host_grouping.mm)
+target_include_directories(pf_sort_eq_host_grouping PRIVATE
+  ${STRATA_METAL_GENERATED_DIR})
+target_link_libraries(pf_sort_eq_host_grouping PRIVATE
+  strata_metal_engine strata_metal_twins strata_metal_options)
+set_source_files_properties(tests/metal/pf_sort_eq_host_grouping.mm
+                            PROPERTIES OBJECT_DEPENDS ${STRATA_METALLIB_SHA256_INC})
+add_dependencies(pf_sort_eq_host_grouping strata_metallib)
+strata_metal_test(pf_sort_eq_host_grouping metal
+                  pf_sort_eq_host_grouping ${STRATA_METALLIB})
+set_tests_properties(pf_sort_eq_host_grouping PROPERTIES
+  TIMEOUT 180
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial")
+strata_metal_test(pf_sort_eq_host_grouping_concurrent metal
+                  pf_sort_eq_host_grouping ${STRATA_METALLIB})
+set_tests_properties(pf_sort_eq_host_grouping_concurrent PROPERTIES
   TIMEOUT 180
   ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
 
@@ -502,6 +546,11 @@ strata_metal_test(metal_ple_test_concurrent metal
 set_tests_properties(metal_ple_test_concurrent PROPERTIES
   TIMEOUT 120
   ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
+strata_metal_test(ple_batch_eq_sequential metal
+                  metal_ple_test ${STRATA_METALLIB} --ple-batch-eq-sequential)
+set_tests_properties(ple_batch_eq_sequential PROPERTIES
+  TIMEOUT 600
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial")
 
 add_executable(metal_gr_test tests/metal/metal_gr_test.mm)
 target_include_directories(metal_gr_test PRIVATE ${STRATA_METAL_GENERATED_DIR})
@@ -591,6 +640,12 @@ strata_metal_test(metal_qsa_indexer_commit_batch_test_concurrent metal
 set_tests_properties(metal_qsa_indexer_commit_batch_test_concurrent PROPERTIES
   TIMEOUT 300
   ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
+strata_metal_test(idx_batch_eq_sequential metal
+                  metal_qsa_test ${STRATA_METALLIB}
+                  --prefill-indexer-batch-eq-sequential)
+set_tests_properties(idx_batch_eq_sequential PROPERTIES
+  TIMEOUT 600
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial")
 
 add_executable(metal_attn_test tests/metal/metal_attn_test.mm)
 target_include_directories(metal_attn_test PRIVATE ${STRATA_METAL_GENERATED_DIR})
@@ -996,6 +1051,16 @@ target_link_libraries(metal_window_test PRIVATE strata_metal_options)
 target_compile_definitions(metal_window_test PRIVATE
                            STRATA_MODEL_HEADER_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/model-headers")
 strata_metal_test(metal_window_test host metal_window_test)
+add_executable(metal_never_wrap_host_test tests/metal/metal_never_wrap_host_test.cpp
+               src/metal/engine/window_plan.cpp)
+target_include_directories(metal_never_wrap_host_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(metal_never_wrap_host_test PRIVATE strata_metal_options)
+strata_metal_test(metal_never_wrap_host_test host metal_never_wrap_host_test)
+add_executable(metal_window_offset_test tests/metal/metal_window_offset_test.cpp
+               src/metal/engine/window_plan.cpp src/metal/engine/window.cpp)
+target_include_directories(metal_window_offset_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(metal_window_offset_test PRIVATE strata_metal_options)
+strata_metal_test(metal_window_offset_test host metal_window_offset_test)
 add_executable(window_params_test tests/metal/window_params_test.cpp
                src/metal/engine/window_params.cpp)
 target_include_directories(window_params_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -1103,18 +1168,37 @@ target_link_libraries(metal_slot_pool_test PRIVATE strata_metal_engine strata_me
 strata_metal_test(metal_slot_pool_test metal metal_slot_pool_test)
 set_tests_properties(metal_slot_pool_test PROPERTIES TIMEOUT 30)
 add_executable(serve_transcript_test tests/metal/serve_transcript_test.cpp tests/metal/fake_window.cpp
-               src/metal/program/serve.cpp)
+               src/metal/program/serve.cpp src/metal/program/watchdog.cpp)
 target_include_directories(serve_transcript_test PRIVATE ${CMAKE_SOURCE_DIR}/include
                            ${CMAKE_SOURCE_DIR}/tests/metal)
 target_compile_definitions(serve_transcript_test PRIVATE
                            STRATA_SERVE_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/metal/fixtures/serve")
-target_link_libraries(serve_transcript_test PRIVATE strata_metal_options Threads::Threads)
+target_link_libraries(serve_transcript_test PRIVATE strata_metal_options strata_metal_platform Threads::Threads)
 strata_metal_test(serve_transcript_test host serve_transcript_test)
 set_tests_properties(serve_transcript_test PROPERTIES TIMEOUT 30)
+
+# The serve watchdog (docs/mac/06, section 14): fake-clock checks, the stall report, and real stalls in a child serve loop.
+add_executable(watchdog_host_test tests/metal/watchdog_host_test.cpp src/metal/program/serve.cpp
+               src/metal/program/watchdog.cpp)
+target_include_directories(watchdog_host_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(watchdog_host_test PRIVATE strata_metal_platform Threads::Threads)
+strata_metal_test(watchdog_host_test host watchdog_host_test)
+set_tests_properties(watchdog_host_test PROPERTIES TIMEOUT 60)
+
+# The byte layouts of the --dump-* files (docs/mac/03, sections 9.1 and 9.2).
+add_executable(dump_format_host_test tests/metal/dump_format_host_test.cpp src/metal/program/dump_format.cpp)
+target_include_directories(dump_format_host_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+strata_metal_test(dump_format_host_test host dump_format_host_test)
 add_executable(oneshot_output_test tests/metal/oneshot_output_test.cpp src/metal/program/oneshot.cpp
                src/metal/program/stats.cpp)
 target_include_directories(oneshot_output_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
 strata_metal_test(oneshot_output_test host oneshot_output_test)
+add_executable(oneshot_loop_test tests/metal/oneshot_loop_test.cpp src/metal/program/oneshot.cpp
+               src/metal/program/stats.cpp)
+target_include_directories(oneshot_loop_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(oneshot_loop_test PRIVATE strata_metal_options)
+strata_metal_test(oneshot_loop_test host oneshot_loop_test)
+set_tests_properties(oneshot_loop_test PROPERTIES TIMEOUT 30)
 set(_metal_weight_store_test_dir ${CMAKE_BINARY_DIR}/metal/weight-store-cli)
 file(MAKE_DIRECTORY ${_metal_weight_store_test_dir})
 strata_metal_test(metal_weight_store_cli_test host ${CMAKE_COMMAND} -DSTRATA=$<TARGET_FILE:strata>

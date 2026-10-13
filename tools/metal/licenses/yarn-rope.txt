@@ -1,0 +1,2 @@
+source: ggml/src/ggml-metal/kernels/rope.metal
+MIT licensed. Copyright (c) 2023 Jeffrey Quesnelle and Bowen Peng.

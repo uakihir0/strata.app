@@ -59,8 +59,7 @@ jobs:
           cmake --build --preset mac-ci
       - name: Run host tests
         run: ctest --test-dir build-ci -L '^host$' --output-on-failure --no-tests=error
-      - name: Build a release asset when B10 is implemented
-        if: hashFiles('tools/metal/make_release.py') != ''
+      - name: Build the release files and check them
         run: .venv/bin/python tools/metal/make_release.py --out dist
       - name: Upload the release asset
         if: always() && hashFiles('dist/**') != ''

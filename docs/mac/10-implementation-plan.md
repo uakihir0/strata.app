@@ -204,10 +204,10 @@ suffix drafter, sampling and the prompt path.
 
 | Task | What | After |
 | --- | --- | --- |
-| U3 | Full mode: file windows, address and resident tables, residency set, warm-up; with M-5 | U2 |
-| U4 | The never-wrap rules | U3 |
-| H6 | The serve loop and protocol, first with a fake `Window` | H4 |
-| H7 | One-shot mode and `--stats` | H6 |
+| U3 | Full mode: file windows, address and resident tables, residency set, warm-up; with M-5. **Status: partly done.** The window offsets and the address and resident tables are checked on the host at full shape (`metal_window_offset_test`). The Q2_0 start on the reference Mac, the warm-up line and M-5 are open ([05](05-memory-and-residency.md), section 14). | U2 |
+| U4 | The never-wrap rules. **Status: partly done.** The section 6 rules are verified on the host (`metal_never_wrap_host_test`) and in the live loader (`metal_never_wrap_test`). The tiered no-GGUF rule waits for the tiered loader (U5). | U3 |
+| H6 | The serve loop and protocol, first with a fake `Window`. **Status: open, test-only.** The loop, parser and protocol are implemented and tested with a fake `Window` (`serve_transcript_test`). `strata --serve` does not call `run_serve_loop`, so the item stays open until REV-011 (the Metal backend connection) closes. | H4 |
+| H7 | One-shot mode and `--stats`. **Status: open, test-only.** The runner, formatter and `--stats` lines are implemented and tested with a synthetic backend (`oneshot_output_test`, `oneshot_loop_test`). `strata` does not call `run_one_shot`, and this checkout has no captured upstream output, so the item stays open until REV-015 (the Metal generation loop) closes. | H6 |
 | L9 | The T = 1 window and its encode, with the dump hooks | L3-L8, U3, D-IMPL-177 (fixed-address WindowParams ring), D-IMPL-178 (generic Metal Encoder), D-IMPL-180 (session-state owner), D-IMPL-181 (named full-mode dense tensor views), D-IMPL-182 (exact T=8 Window scratch layout), D-IMPL-183 (Context-owned Window scratch storage), D-IMPL-184 (ModelStorage and planner composition), D-IMPL-185 (validated Window PLE row indices), D-IMPL-186 (full-mode PLE shared-mapping reader), D-IMPL-187 (ModelStorage PLE reader composition), D-IMPL-188 (Window PLE row staging), D-IMPL-261 (ordered GR read composition), D-IMPL-262 (layer-0 write and PLE entry composition), D-IMPL-263 (ordered Window GDN block composition), D-IMPL-265 (full-mode tensor-view access through ModelStorage), D-IMPL-266 (read-only Encoder input binding), D-IMPL-267 (T=1 Window input stem), D-IMPL-268 (T=1 layer-0 attention/GDN coordinator), D-IMPL-269 (layer-0 attention/GDN/FFN GR chain), D-IMPL-270 (validated MoE route dispatch), D-IMPL-271 (read-only BF16 mat-vec inputs), D-IMPL-272 (T=1 router→route→Q8_1 prefix), D-IMPL-285 (routed expert FFN composition), D-IMPL-289 (routed/shared FFN and GR write composition), D-IMPL-290 (full-mode T=1 Window MoE layer composition), D-IMPL-291 (preserve the layer-0 pending-write policy; tiered scheduling remains open), D-IMPL-294 (same-segment FullMode-to-no-PLE handoff test), D-IMPL-295 (same-segment FullMode-to-PLE handoff test), D-IMPL-296 (T=1 typed pending-consumer selector), D-IMPL-297 (FullMode T=1 token-to-consumer composition; production Window wiring and model parity remain pending), D-IMPL-298 (standalone transactional CommandBuffer wrapper for the FullMode T=1 step), D-IMPL-299 (read-only FullMode PLE model-weight binding in the T=1 branch), D-IMPL-300 (FullMode PLE native key-format handoff coverage), D-IMPL-301 (committed PLE token suffix and accepted-prefix state), D-IMPL-302 (bind PLE token history to the SessionStateStorage reset lifecycle), D-IMPL-303 (prepare T=1 parameters and session-owned PLE input rows), D-IMPL-304 (ordered GR head-mixer composition), D-IMPL-305 (read-only dense mat-vec for output-weight formats), D-IMPL-306 (FullMode output.weight resolution and Q8_1-to-logits projection), D-IMPL-307 (FullMode output_hc tensor resolution and mixer→logits composition), D-IMPL-308 (FullMode output head→GPU top-k→CPU tail composition; production Window wiring, accepted-prefix scheduling and model parity remain open), D-IMPL-411 (synchronous accepted-prefix GPU state commit with success-only session PLE suffix advancement; production Window wiring remains open) |
 | R11 | The dump flags and formats | L9 |
 | L10 + H8 | Windows of T = 2..8, commit and write-through; the spec round | L9, D-IMPL-264 (per-layer accepted-prefix GDN commit), D-IMPL-309 (all-layer GDN batch), D-IMPL-310 (GDN/PLE composition), D-IMPL-311 (12-layer QSA indexer commit batch), D-IMPL-312 (GDN/PLE/QSA full state-commit transaction), D-IMPL-313 (validated per-layer GDN write-through block; model-wide scheduler remains open), D-IMPL-314 (speculative layer-0 attention/GDN/FFN-read coordinators for T=1..8; full Window scheduler remains open), D-IMPL-315 (speculative layer-0 router/route/Q8_1 prefix for T=1..8), D-IMPL-316 (generic speculative router/route/plan prefix for T=1..8; expert scheduling remains open), D-IMPL-317 (generic 1..8 pending-MoE consumer selector), D-IMPL-318 (generic FullMode layer-0 MoE producer for T=1..8), D-IMPL-319 (compose the generic FullMode producer with the typed PLE/no-PLE pending consumer for T=1..8, including speculative history/alias checks; token gathering, GR stream initialization, production Window scheduling and model parity remain open), D-IMPL-320 (compose speculative T=1..8 token gather and GR broadcast with the FullMode producer/consumer; proposal preparation, accepted-prefix scheduling, production Window integration and model parity remain open), D-IMPL-321 (prepare T=1..8 speculative WindowParams and optional committed-history PLE rows; proposal generation and production integration remain open) |
@@ -217,7 +217,7 @@ suffix drafter, sampling and the prompt path.
 | H11 | The watchdog and the stall report | H6, L10 |
 | T6 | C1: `ladder_compare.py`, `metal_router_replay`, `metal_layer_replay` | T5, L9 |
 | T8 | C2, every arm | L11, H8 |
-| T11 | The benchmark, PF-1, PF-2 and the regression check | T4, L13 |
+| T11 | The benchmark, PF-1, PF-2 and the regression check. **Status: partly done.** The host logic is in `tools/metal/accept/bench.py` and tested by `test_bench.py`, and `accept.py pf` is wired to PF-1 and PF-2. Open: the reference Mac's runs of `bench` and `pf`, `engines.py` (the REG.* baseline), the re-run of 5.1 step 3 that `bench` needs, and `upstream_speed.json` ([09](09-testing-and-validation.md), section 12) | T4, L13 |
 | T13 (part) | `metal_gpu_time_test` and `metal_watchdog_test`, with their full-mode cases; the tiered cases come in phase 4 | L13, H11 |
 | T7 (part) | `accept.py g1` and `docs/mac/gates/` | T6, T8, T11 |
 
@@ -255,12 +255,12 @@ A person with a 64 GB Mac can install Strata with `./setup.sh`, run it, and use 
 | S9 | Steps 6 and 7: pack, MTP, disk, args, the final plan, the config | S6, S7 |
 | S10 | Run scripts, `.command` files, quarantine | S9 |
 | S11 | `start()` on a Mac, the data folder, sleep, flags and texts | S9 |
-| S12 | `serve/server.py`: port probe, SIGHUP, the death texts, `keep_awake` | S1 |
-| S13 | `serve/telemetry.py` | S1 |
-| S15 | `tools/strata_mcp.py` | S4 |
-| S16 | The tools | |
+| S12 | `serve/server.py`: port probe, SIGHUP, the death texts, `keep_awake`. **Status: host part done (2026-10-13).** The probe, SIGHUP, `keep_awake`, the texts, the vision folder and the MCP PATH are tested with a mock engine (D-IMPL-920 to 928). Open: the engine's SIGHUP ignore (06, section 2.4) and the reference-Mac checks. | S1 |
+| S13 | `serve/telemetry.py`. **Status: host part done (2026-10-13).** The `_Apple` reader and the Mac sampler keys are tested with stubs, and no Mac key appears off darwin. Open: the reference-Mac readings and S14. | S1 |
+| S15 | `tools/strata_mcp.py`. **Status: host part done (2026-10-13).** The section 8 rules are tested with a fake engine. Open: the reference-Mac run, the MCP golden case (S18) and the Claude Desktop install. | S4 |
+| S16 | Withdrawn, as in 07 section 15: no CUDA calibration utility is shipped on macOS (D-IMPL-236). | |
 | S18 | The Mac golden set and `record_mac_plans.py` | S6, S9 |
-| S19 | `serve/test_macos.py` | S2, S10-S12 |
+| S19 | `serve/test_macos.py`. **Status: server tests done in part (2026-10-13).** Four section 10.3 tests that the host runs pass (`test_port_probe`, `test_sighup_shutdown`, `test_keep_awake`, `test_module_rules`). Open: the setup- and engine-owned tests of that list, `WebHealthAuthContract`, and the reference-Mac pass (07, section 15). | S2, S10-S12 |
 | T12 | The needles and the server run, with S.image | H9, H13 |
 | T14 | The nightly job's five steps and the weekly job | T7-T9, T11, T12 |
 | T18 | The Python layer in the nightly run | T14, S5 |
@@ -272,6 +272,16 @@ Exit criteria:
   the server from `run-<model>.command`.
 - `accept.py server` and `accept.py c3` pass on Q2_0. `accept.py nightly` passes.
 - The Mac golden set passes on the reference Mac.
+
+Status (2026-10-13): the host parts of S2, S7, S10, S11 (the data folder), S12 and S13 are done, with fake-engine tests
+in `serve/test_macos.py`; their reference-Mac parts are open, as [07](07-server-setup-port.md), section 15 says. S5, S6, S8
+and S9 are not started, for the reasons given there.
+
+**Status (2026-10-13), B track.** Host parts of B8, B9, B10 and B11 are done, with the tests in 09 section 9.3 and the
+decisions D-IMPL-940 to D-IMPL-959. Their reference-Mac and publication parts are open, as 08 section 15 lists. S8 (the
+build flow that calls `cmake_build` and `metal_build_json`) is open, so B8 is not complete.
+
+Phase 3 is not complete: the exit criteria above are not met.
 
 ### 3.5 Phase 4: tiered mode
 
@@ -315,6 +325,10 @@ Exit criteria:
   leaves only a draft (B18, T15).
 - Each of M1-M4 has a family file ([09](09-testing-and-validation.md), section 7.4).
 
+**Status (2026-10-13).** Host parts of B12 (step 6 of verify_release still refuses), B13, B18 (written, not run)
+and B20 (the licence review is open) are done. T15, T16 and S14 are not in that change, so the exit criteria are not
+met, and no measurement of B-2, B-5 to B-8 has been taken.
+
 ### 3.7 Phase 6: parity and the first release
 
 | Task | What | After |
@@ -332,6 +346,9 @@ section 2.
 **G3**, `accept.py g3` ([09](09-testing-and-validation.md), section 6.3), on the first release's candidate
 (section 5.2). If it fails, the first release goes out as a beta, with each failing requirement and its check in the
 notes.
+
+**Status (2026-10-13).** B22 is not started: its measurements need the reference Mac and the model files
+(appendix A).
 
 ### 3.8 Conditional work items
 

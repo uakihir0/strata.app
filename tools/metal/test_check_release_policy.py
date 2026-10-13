@@ -37,6 +37,7 @@ class ReleasePolicy(unittest.TestCase):
         tag_object_type="tag",
         tag_commit="c" * 40,
         branch_commit="c" * 40,
+        current_branch="main",
     ):
         response_iter = iter(responses)
         calls = []
@@ -44,7 +45,7 @@ class ReleasePolicy(unittest.TestCase):
         def runner(command, **kwargs):
             calls.append(command)
             if command[:3] == ["git", "branch", "--show-current"]:
-                return subprocess.CompletedProcess(command, 0, "main\n", "")
+                return subprocess.CompletedProcess(command, 0, current_branch + "\n", "")
             if command == ["git", "remote", "get-url", "--all", "origin"]:
                 return subprocess.CompletedProcess(command, 0, origin + "\n", "")
             if command == ["git", "remote", "get-url", "--push", "--all", "origin"]:
@@ -826,6 +827,88 @@ class ReleasePolicy(unittest.TestCase):
         self.assertIn(
             "check_release_policy: gh api --paginate --slurp repos/owner/repo/releases?per_page=100 "
             "failed: not authenticated",
+            errors,
+        )
+
+
+    def test_branch_name_falls_back_to_ref_name_then_git_branch(self):
+        (self.root / "METAL_REV").write_text("1\n", encoding="ascii")
+        wrong = "check_release_policy: branch release/0.1.34-metal.2 does not match the version: " \
+            "want release/0.1.34-metal.1"
+
+        errors, _, _ = self.run_check(env={"GITHUB_HEAD_REF": "", "GITHUB_REF_NAME": "release/0.1.34-metal.2"})
+        self.assertIn(wrong, errors)
+
+        errors, _, _ = self.run_check(
+            env={"GITHUB_HEAD_REF": "", "GITHUB_REF_NAME": ""},
+            current_branch="release/0.1.34-metal.2",
+        )
+        self.assertIn(wrong, errors)
+
+    def test_draft_releases_are_not_in_the_revision_history(self):
+        (self.root / "METAL_REV").write_text("2\n", encoding="ascii")
+        errors, _, _ = self.run_check(
+            remote=True,
+            env={"GITHUB_HEAD_REF": "release/0.1.34-metal.2", "GITHUB_REF_NAME": "123/merge"},
+            responses=[
+                self.result(
+                    ["gh"],
+                    [[
+                        {"tag_name": "v0.1.34-metal.1", "draft": False, "prerelease": False},
+                        {"tag_name": "v0.1.34-metal.5", "draft": True, "prerelease": False},
+                    ]],
+                )
+            ],
+        )
+
+        self.assertEqual([], errors)
+
+    def test_release_branch_with_published_release_needs_an_annotated_tag(self):
+        errors, _, _ = self.run_check(
+            remote=True,
+            env={"GITHUB_HEAD_REF": "release/0.1.34-metal.1", "GITHUB_REF_NAME": "123/merge"},
+            tag_object_type="commit",
+            responses=[
+                self.result(
+                    ["gh"],
+                    [[{"tag_name": "v0.1.34-metal.1", "draft": False, "prerelease": False}]],
+                ),
+                self.result(
+                    ["gh"],
+                    {"tagName": "v0.1.34-metal.1", "assets": [{"name": "strata-macos-arm64.zip"}]},
+                ),
+            ],
+        )
+
+        self.assertIn(
+            "check_release_policy: tag v0.1.34-metal.1 must be annotated; git object type is commit",
+            errors,
+        )
+
+    def test_release_branch_pull_request_must_reference_the_latest_release(self):
+        errors, _, _ = self.run_check(
+            remote=True,
+            env={
+                "GITHUB_EVENT_NAME": "pull_request",
+                "GITHUB_HEAD_REF": "release/0.1.34-metal.1",
+                "GITHUB_REF_NAME": "123/merge",
+                "GITHUB_EVENT_PULL_REQUEST_HEAD_SHA": "c" * 40,
+            },
+            responses=[
+                self.result(
+                    ["gh"],
+                    [[{"tag_name": "v0.1.34-metal.1", "draft": False, "prerelease": False}]],
+                ),
+                self.result(
+                    ["gh"],
+                    {"tagName": "v0.1.34-metal.2", "assets": [{"name": "strata-macos-arm64.zip"}]},
+                ),
+            ],
+        )
+
+        self.assertIn(
+            "check_release_policy: release branch must point at its published release: the latest "
+            "release is v0.1.34-metal.2, this commit needs v0.1.34-metal.1",
             errors,
         )
 

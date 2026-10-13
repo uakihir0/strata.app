@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from accept import checks, criteria, engine, result, runs
+from accept import bench, checks, criteria, engine, result, runs
 from accept import steps as stepper
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -190,6 +190,8 @@ def gather_checks(settings: Settings, spec: runs.RunSpec, plan: list[runs.Step],
     facts.devices = devices
     found += engine_checks
     found.append(checks.no_engine_running())
+    if spec.benchmark:
+        found += bench.host_checks()
 
     if spec.needs_vision:
         found.append(checks.resolve_vision(settings.root, settings.engine, settings.vision))
@@ -339,7 +341,14 @@ def execute(spec: runs.RunSpec, settings: Settings, plan: list[runs.Step], facts
         verdicts = [failing]
 
     blocking = [verdict for verdict in verdicts if verdict.blocks]
-    status = "fail" if blocking else "pass"
+    # A gating criterion that section 5.4 lets us skip was not measured, so the run is NOT RUN, never PASS.
+    skipped_gating = tuple(dict.fromkeys(v.id for v in verdicts if v.skipped and v.gating))
+    if blocking:
+        status = "fail"
+    elif skipped_gating:
+        status = "not-run"
+    else:
+        status = "pass"
     seconds = time.monotonic() - clock
     _write(spec, settings, facts, folder, started, seconds, status, step_rows, verdicts)
     if not blocking and not settings.keep:
@@ -349,7 +358,14 @@ def execute(spec: runs.RunSpec, settings: Settings, plan: list[runs.Step], facts
     if blocking:
         print(f"accept {spec.name}: FAIL {blocking[0].message}")
         return EXIT_FAIL
+    if skipped_gating:
+        print(f"accept {spec.name}: NOT RUN: skipped (section 5.4): {', '.join(skipped_gating)}")
+        return EXIT_NOT_RUN
     suffix = " (restricted run: does not count for a gate or a release)" if settings.restricted else ""
+    skipped = tuple(dict.fromkeys(verdict.id for verdict in verdicts if verdict.skipped))
+    if skipped:
+        # A skipped criterion that does not gate the run is named on the line.
+        suffix += f" (NOT RUN, skipped: {', '.join(skipped)})"
     print(f"accept {spec.name}: PASS ({count} criteria, {seconds / 60:.1f} min){suffix}")
     return EXIT_PASS
 

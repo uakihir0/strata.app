@@ -146,6 +146,9 @@ struct ServeLoopOptions {
     int input_fd = 0;
     std::FILE* output = nullptr;
     std::FILE* diagnostics = nullptr;
+    /// Replaces the watchdog's std::abort (docs/mac/06, section 14.2). Unset, the watchdog aborts. Tests use it to end a
+    /// stalled child process without a crash report.
+    std::function<void()> watchdog_abort;
 };
 
 /// Run the protocol until QUIT or stdin EOF. Returns 0 on a clean shutdown,

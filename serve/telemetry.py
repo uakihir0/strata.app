@@ -71,7 +71,10 @@ def free_unified_memory_mib(index=0, backend=None):
 
 
 def _cpu_name():
-    return macos.cpu_brand() or platform.processor() or None
+    """On a Mac the brand string only: platform.processor() would report "arm" there (07 section 7.2)."""
+    if MAC:
+        return macos.cpu_brand() or None
+    return platform.processor() or None
 
 
 class Telemetry:

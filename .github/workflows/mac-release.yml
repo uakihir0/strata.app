@@ -1,0 +1,148 @@
+name: Mac release
+
+# Builds a draft for a Metal release tag, verifies it on the reference Mac, and publishes it after approval of the
+# `release` environment (docs/mac/08-build-and-distribution.md, section 12.3). Not run yet: it has not been tried in a
+# test repository (work item B18).
+
+on:
+  push:
+    tags:
+      - "v*-metal.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-release
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ${{ vars.MAC_HOSTED_RUNNER || 'strata-ref' }}
+    timeout-minutes: 240
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Select Xcode 27 and install the Metal toolchain
+        run: |
+          echo "DEVELOPER_DIR=/Applications/Xcode_27.0.app/Contents/Developer" >> "$GITHUB_ENV"
+          xcodebuild -version | grep -E '^Xcode 27\.'
+          xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk macosx metal --version
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install pinned Python and build tools
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -r requirements.txt
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Check release policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .venv/bin/python tools/metal/check_release_policy.py --remote
+      - name: Read the tag message for the release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          git for-each-ref "refs/tags/$TAG" --format='%(contents)' > "$RUNNER_TEMP/notes.txt"
+      - name: Detect the signing secrets
+        id: signing
+        env:
+          MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
+        run: |
+          if [ -n "$MAC_CERT_P12_BASE64" ]; then echo "certificate=true" >> "$GITHUB_OUTPUT"; else echo "certificate=false" >> "$GITHUB_OUTPUT"; fi
+          if [ -n "$NOTARY_KEY_P8_BASE64" ]; then echo "notary=true" >> "$GITHUB_OUTPUT"; else echo "notary=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Import the Developer ID certificate into a temporary keychain
+        if: steps.signing.outputs.certificate == 'true'
+        env:
+          MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: |
+          printf '%s' "$MAC_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          KC_PW="$(openssl rand -hex 24)"
+          KEYCHAIN="$RUNNER_TEMP/sign.keychain-db"
+          security create-keychain -p "$KC_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MAC_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PW" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -n 1)"
+          if [ -z "$IDENTITY" ]; then echo "::error::The certificate holds no Developer ID Application identity."; exit 1; fi
+          echo "MAC_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "MAC_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          echo "MAC_KEYCHAIN_PASSWORD=$KC_PW" >> "$GITHUB_ENV"
+      - name: Write the notarisation key
+        if: steps.signing.outputs.notary == 'true'
+        env:
+          NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
+        run: printf '%s' "$NOTARY_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+      - name: Build the release files
+        env:
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+          SIGNED: ${{ steps.signing.outputs.certificate }}
+          NOTARIZED: ${{ steps.signing.outputs.notary }}
+        run: |
+          args=(--out dist --notes "$RUNNER_TEMP/notes.txt")
+          if [ "$SIGNED" = "true" ]; then args+=(--sign "$MAC_SIGN_IDENTITY"); fi
+          if [ "$SIGNED" = "true" ] && [ "$NOTARIZED" = "true" ]; then
+            args+=(--notarize --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER")
+          fi
+          .venv/bin/python tools/metal/make_release.py "${args[@]}"
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$TAG" \
+            --notes-file dist/NOTES.md \
+            dist/strata-macos-arm64.zip dist/strata-macos-arm64-symbols.zip dist/SHA256SUMS
+      - name: Remove the signing keychain and key
+        if: always()
+        run: |
+          if [ -n "${MAC_KEYCHAIN:-}" ]; then security delete-keychain "$MAC_KEYCHAIN" || true; fi
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/AuthKey.p8"
+
+  verify:
+    needs: build
+    runs-on: [self-hosted, macOS, ARM64, strata-ref]
+    timeout-minutes: 240
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install pinned Python and build tools
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -r requirements.txt
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Verify the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: .venv/bin/python tools/metal/verify_release.py "$TAG" --repo "$GITHUB_REPOSITORY"
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the verified draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

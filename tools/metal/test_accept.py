@@ -3,7 +3,8 @@
 Each criterion is judged on equal inputs (it passes) and on its planted difference (it fails, with the message of
 section 3.2). The engine parser is tested on captured output. The runner is tested end to end with
 tools/metal/accept/fake_engine.py, through a test-only run registry, because no production run has a measurement
-yet. Production runs are tested to stop with NOT RUN before any step starts.
+yet. Production runs without a measure are tested to stop with NOT RUN before any step starts (the `pf` measure and the
+benchmark rules are tested in test_bench.py).
 """
 from __future__ import annotations
 

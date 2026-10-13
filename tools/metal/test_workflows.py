@@ -35,14 +35,17 @@ class WorkflowConfiguration(unittest.TestCase):
                             )
 
     def test_workflows_request_only_read_access(self):
+        # docs/mac/08 section 12.3: the release jobs that read a draft or publish it ask for contents: write.
+        write_jobs = {("mac-release.yml", "build"), ("mac-release.yml", "verify"), ("mac-release.yml", "publish")}
         for path in sorted(WORKFLOWS.glob("*.yml")):
             with self.subTest(path=path.name):
                 workflow = load_yaml(path)
                 self.assertEqual({"contents": "read"}, workflow.get("permissions"))
                 for job_name, job in workflow.get("jobs", {}).items():
                     with self.subTest(path=path.name, job=job_name):
+                        expected = {"contents": "write"} if (path.name, job_name) in write_jobs else {"contents": "read"}
                         self.assertEqual(
-                            {"contents": "read"},
+                            expected,
                             job.get("permissions", workflow["permissions"]),
                         )
 
@@ -168,7 +171,74 @@ class WorkflowConfiguration(unittest.TestCase):
         self.assertIn("GGML_CUDA", source)
         self.assertIn("GGML_HIP", source)
         self.assertNotIn("STRATA_VISION_CUDA", source)
-        self.assertNotIn("STRATA_PORTABLE", source)
+        # docs/mac/08 section 9: the release recipe's switches, which the release definitions pass.
+        self.assertIn("option(STRATA_PORTABLE", source)
+        self.assertIn("if(LLAMA_DIR)", source)
+        self.assertIn("set(GGML_METAL_EMBED_LIBRARY ON", source)
+        self.assertIn("if(STRATA_PORTABLE)\n  set(GGML_NATIVE OFF CACHE BOOL", source)
+
+    def test_release_workflow_publishes_only_a_verified_draft(self):
+        workflow = load_yaml(WORKFLOWS / "mac-release.yml")
+        self.assertEqual({"push"}, set(workflow["on"]))
+        self.assertEqual(["v*-metal.*"], workflow["on"]["push"]["tags"])
+        self.assertNotIn("pull_request", workflow["on"])
+        self.assertNotIn("pull_request_target", workflow["on"])
+        self.assertEqual(
+            {"group": "mac-release", "queue": "max", "cancel-in-progress": "false"},
+            workflow["concurrency"],
+        )
+
+        jobs = workflow["jobs"]
+        self.assertEqual(["build", "verify", "publish"], list(jobs))
+        self.assertEqual("build", jobs["verify"]["needs"])
+        self.assertEqual("verify", jobs["publish"]["needs"])
+        self.assertEqual("release", jobs["publish"]["environment"])
+        self.assertEqual("ubuntu-24.04", jobs["publish"]["runs-on"])
+        self.assertEqual(["self-hosted", "macOS", "ARM64", "strata-ref"], jobs["verify"]["runs-on"])
+        self.assertEqual("${{ vars.MAC_HOSTED_RUNNER || 'strata-ref' }}", jobs["build"]["runs-on"])
+
+        steps = {step.get("name"): step for step in jobs["build"]["steps"]}
+        create = steps["Create the draft release"]["run"]
+        self.assertIn("gh release create", create)
+        self.assertIn("--draft", create)
+        self.assertIn("--verify-tag", create)
+        self.assertIn("dist/SHA256SUMS", create)
+        self.assertNotIn("--draft=false", create)
+        self.assertIn("tools/metal/check_release_policy.py --remote", steps["Check release policy"]["run"])
+        self.assertIn("make_release.py", next(
+            step["run"] for step in jobs["build"]["steps"] if "make_release.py" in step.get("run", "")
+        ))
+
+        publish = jobs["publish"]["steps"][0]["run"]
+        self.assertIn("gh release edit", publish)
+        self.assertIn("--draft=false --latest", publish)
+        self.assertIn("verify_release.py", next(
+            step["run"] for step in jobs["verify"]["steps"] if "verify_release.py" in step.get("run", "")
+        ))
+
+    def test_release_signing_is_optional_and_its_keychain_is_always_removed(self):
+        workflow = load_yaml(WORKFLOWS / "mac-release.yml")
+        steps = workflow["jobs"]["build"]["steps"]
+        names = [step.get("name") for step in steps]
+
+        detect = steps[names.index("Detect the signing secrets")]
+        self.assertEqual("signing", detect["id"])
+        import_step = steps[names.index("Import the Developer ID certificate into a temporary keychain")]
+        self.assertEqual("steps.signing.outputs.certificate == 'true'", import_step["if"])
+        self.assertIn("security set-key-partition-list", import_step["run"])
+        self.assertIn("-T /usr/bin/codesign", import_step["run"])
+        self.assertIn("security set-keychain-settings -lut 21600", import_step["run"])
+        removal = steps[names.index("Remove the signing keychain and key")]
+        self.assertEqual("always()", removal["if"])
+        self.assertIn("security delete-keychain", removal["run"])
+
+    def test_ci_builds_and_checks_the_release_files_once_the_builder_exists(self):
+        workflow = load_yaml(WORKFLOWS / "ci.yml")
+        steps = workflow["jobs"]["mac-host"]["steps"]
+        build = next(step for step in steps if step.get("name") == "Build the release files and check them")
+
+        self.assertNotIn("if", build)
+        self.assertEqual(".venv/bin/python tools/metal/make_release.py --out dist", build["run"])
 
     def test_weekly_job_builds_in_its_own_checkout(self):
         workflow = load_yaml(WORKFLOWS / "mac-hardware.yml")

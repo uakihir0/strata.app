@@ -109,6 +109,10 @@
       "label": "host",
       "origin": "03 R6, 06 H5, D-IMPL-361, REV-158"
     },
+    "oneshot_loop_test": {
+      "label": "host",
+      "origin": "06 H7"
+    },
     "oneshot_output_test": {
       "label": "host",
       "origin": "06 H7"
@@ -116,6 +120,14 @@
     "metal_window_test": {
       "label": "host",
       "origin": "05 U2"
+    },
+    "metal_never_wrap_host_test": {
+      "label": "host",
+      "origin": "05 U4; D-IMPL-850; D-IMPL-851; D-IMPL-852; D-IMPL-853; D-IMPL-854; D-IMPL-855; D-IMPL-856"
+    },
+    "metal_window_offset_test": {
+      "label": "host",
+      "origin": "05 U3; D-IMPL-856; D-IMPL-857; D-IMPL-858"
     },
     "metal_window_scratch_layout_test": {
       "label": "host",
@@ -243,8 +255,7 @@
     },
     "idx_batch_eq_sequential": {
       "label": "metal",
-      "origin": "04 10.4",
-      "planned": "L6"
+      "origin": "04 10.4"
     },
     "metal_attn_test": {
       "label": "metal",
@@ -608,28 +619,27 @@
     },
     "metal_util_test": {
       "label": "metal",
-      "origin": "09 9.1",
-      "planned": "L3"
+      "origin": "09 9.1"
     },
     "mv_multi_eq_single": {
       "label": "metal",
-      "origin": "04 10.4",
-      "planned": "L3"
+      "origin": "04 10.4"
     },
     "pf_gdn_eq_step_norm": {
       "label": "metal",
-      "origin": "04 10.4",
-      "planned": "L13"
+      "origin": "04 10.4 / D-IMPL-740, D-IMPL-747"
     },
     "pf_sort_eq_host_grouping": {
       "label": "metal",
-      "origin": "04 10.4",
-      "planned": "L13"
+      "origin": "04 10.4 / D-IMPL-741, D-IMPL-742"
+    },
+    "pf_sort_eq_host_grouping_concurrent": {
+      "label": "metal",
+      "origin": "04 10.4 / D-IMPL-743"
     },
     "ple_batch_eq_sequential": {
       "label": "metal",
-      "origin": "04 10.4",
-      "planned": "L4"
+      "origin": "04 10.4"
     },
     "samp_coupled_eq_host": {
       "label": "metal",
@@ -643,6 +653,10 @@
     "dense_vs_gguf_test": {
       "label": "model",
       "origin": "03 R5"
+    },
+    "dump_format_host_test": {
+      "label": "host",
+      "origin": "03 R11"
     },
     "dump_eq_nodump": {
       "label": "model",
@@ -728,6 +742,10 @@
       "label": "model",
       "origin": "09 4.1",
       "planned": "T6"
+    },
+    "watchdog_host_test": {
+      "label": "host",
+      "origin": "06 H11"
     },
     "metal_watchdog_test": {
       "label": "model",

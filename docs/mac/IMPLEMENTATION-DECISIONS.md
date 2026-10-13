@@ -79,6 +79,9 @@ requirement.
   tests on their documented PC path.
 - **Review required:** Remove `create=True` in the same change that implements S3,
   so the tests fail if the production setting is ever removed.
+- **Status:** Resolved by the S3 change. `setup.MAC` is defined in `setup.py`, and no `create=True` remains in the
+  checkout. The setup test modules that the 07 section 10.1 names are not in this tree, so there was nothing to edit
+  (D-IMPL-842).
 
 ### D-IMPL-006: Fix the baseline MCP failures instead of hiding them
 
@@ -13364,6 +13367,36 @@ measuring L-15 remain open.
   definitions of section 6.1 and the phase 2 exit criteria of [10](10-implementation-plan.md) must be
   rewritten to name the per-kernel oracles. Until then, the end-to-end yardstick is absent.
 
+### D-IMPL-775: Hold the kernel environment disposition test until the seven mismatches are resolved
+
+- **Decision:** `kernel_env_dispositions_test` (L14) is not merged to main. Its work is on the branch
+  `worktree-agent-a89d10b204f21f04a`, and its `planned: L14` key stays in `tests/metal/test_map.json`.
+  The test compiles and runs, and it fails on seven places where the specification and the code disagree
+  (see D-IMPL-765 to D-IMPL-769 on that branch): `STRATA_KV_ROT`, `STRATA_PREFILL_TIMING`,
+  `STRATA_PREFILL_DUMP_R` and `STRATA_DBG_NAN` are documented as honoured but have no Mac reader;
+  `STRATA_METAL_ICB` must print a notice that no source prints; `--check-logits` is documented but unread;
+  and `STRATA_PREFILL_BF16X2` is documented as `atoi` while the code uses `strtol`.
+- **Reason:** Registering a failing test would make `ctest --preset mac-host` red on main, and the
+  push-run rule of [09](09-testing-and-validation.md) requires green runs. Relaxing the test or
+  marking the seven cases as expected failures would hide the mismatches. The mismatches are real, and
+  each needs a choice between implementing the reader or changing the specification to say it is not
+  implemented on the Mac. That choice is not made here.
+- **Review required:** For each of the seven, the owner chooses: implement it, or amend the
+  specification. After that the branch is rebased onto main, the test is registered, and its planned
+  key is removed in the same commit.
+
+### D-IMPL-776: Configure the Python of the CMake tests with the project venv
+
+- **Decision:** The local build directory is configured with `-DPython3_EXECUTABLE=<repo>/.venv/bin/python`.
+  The preset itself does not set this variable and is unchanged.
+- **Reason:** With `cmake --preset mac-dev` alone, CMake selects the Homebrew Python 3.14, which lacks `jinja2`.
+  `prompts_manifest_test` then fails at `import jinja2` in `make_prompts.py`. With the venv interpreter,
+  `ctest --preset mac-host` passes 46/46 on the merged main. The venv is the interpreter that
+  `requirements.txt` describes.
+- **Review required:** Decide whether the preset (or CI) should pass the venv interpreter explicitly, or
+  whether the dependency should be installed for the system interpreter. The preset is not changed here,
+  since AGENTS.md limits documented build commands to those in the presets.
+
 ### D-IMPL-680: Put the planner in `setup.py`, and keep `main()` fail-closed
 
 - **Decision:** `metal_plan`, `plan_class`, the PLAN parser and their constants are module-level code in `setup.py`,
@@ -13857,3 +13890,1611 @@ measuring L-15 remain open.
 - **Decision:** The Mac Python module table of `docs/mac/09-testing-and-validation.md`, section 9.3, has a row for `tools/metal/test_models.py` and `tools/metal/test_test_models.py`, with the wording and position that the same row has on main. `tools/metal/test_map.py` now exits 0 with no error. The two modules are the extra ones that the count check found: `tools/metal/test_*.py` matched them, and the row said 0. D-IMPL-773 named `tools/metal/lc_dump_format.py` and `tools/metal/test_lc_dump_format.py` as the extra modules. That was wrong: `test_lc_dump_format.py` is already listed separately, and `lc_dump_format.py` does not match the pattern.
 - **Reason:** `test_map` must exit 0 for L14. The branch is behind main, where commit 322c4fd records these two modules, so the row is added here as main has it. The merge check (`docs/mac/09`, this branch against main) does not conflict in this file. The other `test_map` messages about missing checks are notes without `--final`, so they do not change the exit code.
 - **Review required:** The owner of the test-model rows confirms the row. D-IMPL-773 is not edited, because existing entries stay as they are, but its module names are wrong, as recorded here.
+
+
+### D-IMPL-720: The PLE batch dispatches the four row-ordered kernels directly for up to 64 rows
+
+- **Decision:** `ple_batch_eq_sequential` runs its batch by dispatching `strata_ple_gate`, `strata_ple_broadcast`,
+  `strata_ple_conv_residual` and `strata_ple_history` itself, with the grids of `src/metal/engine/ple_dispatch.mm` and
+  n rows, for n = 1..64. It does not call the `encode_ple_*` wrappers for the batch, because they accept 1..8 rows
+  (`VERIFY_MAX_T`). The sequential reference is the engine's single-row path: the same wrappers with rows = 1, run n
+  times, with the history advanced after each row.
+- **Reason:** Section 10.4 requires n = 1..64. Prefill steps 3-8 are not wired, so no engine entry point above the
+  decode window exists yet, and the batch cannot go through the production API for n > 8.
+- **Review required:** Confirm that direct dispatch with the engine's grids is an acceptable stand-in for a future
+  batched entry point. If `ple_dispatch.mm` changes its grids, the test's copies must change with it.
+
+### D-IMPL-721: Each batch kernel is its own encoder segment
+
+- **Decision:** The batch encodes gate, broadcast, convolution-residual and history as four separate
+  `Encoder::encode` segments in one command buffer. `encode_ple_post_projection` puts the same kernels in one segment.
+- **Reason:** Segments of one command buffer run in order, so the batch's kernel order does not depend on how the
+  Encoder orders dispatches within a shared segment. The test is then about the kernels, not about segment
+  composition. The one-segment composition is exercised by the shared-Encoder cases of `metal_ple_test`.
+- **Review required:** Confirm that the shared-segment ordering of the engine has its own test, as this one does not
+  cover it.
+
+### D-IMPL-722: The weighted RMS norms are outside the PLE chain under test
+
+- **Decision:** `ple_batch_eq_sequential` takes the normalised key, query and `ple_norm` rows as inputs and runs the
+  four row-ordered kernels. It does not dispatch `strata_rms_norm_w` (section 5.4).
+- **Reason:** A norm row depends only on its own input row, so the batch and the sequential run agree on the norms by
+  construction. The norms are checked at T = 1..8 by `metal_ple_test`. The only row-order dependencies in the chain are
+  the convolution taps and the history, and this test covers those.
+- **Review required:** Confirm that norms need no batch check at n > 8. If the spec asks for the full chain at
+  n = 1..64, add the three norm dispatches to the batch and the sequential run.
+
+### D-IMPL-723: Batch versus sequential is bitwise; the CPU references use the existing tolerances
+
+- **Decision:** Every output and the history must equal the sequential run bitwise (class B, section 10.4). The CPU
+  references are: the gate oracle at U(64); an exact float product for the broadcast; the convolution-residual oracle
+  at U(16), with its four taps written out from the row formula and the history read before the batch; and the history
+  as the last nine rows of [old history, `ple_norm`]. The convolution is checked against the CPU oracle only for the
+  batch, because the sequential run must equal it bitwise.
+- **Reason:** A batch compared only with the sequential run could agree with it while both are wrong. The CPU
+  references make the comparison one between two checked results. The tolerances are the ones `metal_ple_test` already
+  uses for the same kernels.
+- **Review required:** Confirm U(64) for the gate and U(16) for the convolution against section 10.2, where n is 16 per
+  transcendental helper on the element's path.
+
+### D-IMPL-724: Two controls must be detected in every case
+
+- **Decision:** Each case runs two controls and requires both to be detected. In the first, one bit of a copy of the
+  batch residual is flipped and the copy must differ from the sequential residual. In the second, a batch that advances
+  the history before its convolution must differ from the sequential residual. The test fails unless every control is
+  detected.
+- **Reason:** The bitwise comparison has to see the faults it exists to catch: a changed element, and the ordering fault
+  that the property is about. The controls show that the comparison is not vacuous for those faults.
+- **Review required:** Confirm the two controls. A batch that skips the history update is not a control here; the
+  history check covers it.
+
+### D-IMPL-725: Both tests run all three input sets; the new modes ignore `--seed` and `--input-set`
+
+- **Decision:** Neither property names an input set. `ple_batch_eq_sequential` runs `random`, `edge` and `fixture` for
+  every n = 1..64. `idx_batch_eq_sequential` runs the spec's p0 and T matrix for each of the three sets, standalone and
+  shared-Encoder. Both new modes are selected by an exact `argv[2]` match before `parse_options`, as the existing
+  `--window-gdn-commit-batch` and `--indexer-commit-batch` modes are, so they run with seed 1.
+- **Reason:** Covering every set means the default `--input-set` does not hide a fault that depends on the set. Parsing
+  options in the new modes would need the flag removed from `argv` before `parse_options`, which the existing modes do
+  not do.
+- **Review required:** Decide whether the new modes should accept `--seed` and `--input-set` before the flag.
+
+### D-IMPL-726: One serial CTest per planned name
+
+- **Decision:** Each planned test is registered once, with `STRATA_METAL_DISPATCH=serial` and `TIMEOUT 600`, under
+  the name in `tests/metal/test_map.json`. No `_concurrent` twin is registered. Measured run times were 7.7 s for
+  `ple_batch_eq_sequential` and 0.8 s for `idx_batch_eq_sequential`.
+- **Reason:** `tools/metal/test_map.py` requires one test-map entry per CTest name, and the counts in section 9.1 of
+  `docs/mac/09-testing-and-validation.md` would change with a twin. The brief asked for the planned names only.
+- **Review required:** Decide whether to add concurrent twins. That needs two test-map entries and the section 9.1
+  count update, and the concurrent run of each must use the same CPU references.
+
+### D-IMPL-727: `idx_batch_eq_sequential` reuses the existing indexer-batch case
+
+- **Decision:** The L6 test is a mode of `metal_qsa_test` that calls the existing `run_prefill_indexer_batch_case` over
+  the spec's matrix for all three input sets. No new comparison was written. The default `metal_qsa_test` run keeps its
+  fixture-only pass of the same matrix.
+- **Reason:** The case already compares the Prefill batch's tails, block positions, dead and pooled keys with chunked
+  Window replay (windows of `VERIFY_MAX_T` = 8 rows), bytewise, and with the scalar oracle at U(64). A second copy would
+  drift from it.
+- **Review required:** Confirm that 8-row Window replay is the sequential reference section 6.5 intends.
+
+### D-IMPL-728: No kernel was changed
+
+- **Decision:** No `.metal` file and no engine source changed. The PLE and indexer kernels met the spec in every case of
+  both tests, and the injected faults used to check the tests were caught and then reverted.
+- **Reason:** The brief allows a kernel change only where the kernel is demonstrably wrong.
+- **Review required:** None beyond the test results.
+
+### D-IMPL-700: The `strata_util_*` kernels are added to `safe/util.metal` for `metal_util_test`
+
+- **Decision:** `src/metal/kernels/safe/util.metal` is created with `strata_util_copy_strided`, `strata_util_to_f16` and
+  `strata_util_to_bf16`, with the bodies that section 5.13 of `docs/mac/04-metal-kernels.md` gives. The three kernels
+  are listed in `src/metal/kernels/manifest.txt` (safe, 256 × 1 × 1). `metal_util_test` dispatches them through the
+  manifest-checked twin harness. No host encoder API is added.
+- **Reason:** `safe/util.metal` is in the documented file inventory, but the tree did not contain it, so the test had
+  no kernels to check. The kernels are kernel-level twins only; the encoders that the engine will need belong to
+  work item H3.
+- **Review required:** Confirm that the three kernels belong to this change and not to H3. Confirm the parameter
+  shape: the row count is read from a one-word buffer (bound at index 2 or 3), and the width and strides are setBytes
+  constants.
+
+### D-IMPL-701: A float32 denormal converts to a signed zero, which differs from the +0 recorded in A.10
+
+- **Decision:** `strata_util_to_f16` maps a negative float32 denormal to `0x8000` and a positive one to `0x0000`. The
+  `metal_util_test` reference does the same. Appendix A.10 records "float32 denormal input: +0". Its measured inputs
+  were positive, and the rule the spec gives for `as_type<ushort>(half(x))` keeps the sign.
+- **Reason:** The edge set, which contains both signs, shows `0x8000` on this Mac (Apple metal, macOS 27,
+  arm64), and the test passes with the signed-zero reference. Class B compares the sign of zero, so the choice matters.
+- **Review required:** Correct the A.10 row and the sentence in section 5.13 ("a float32 denormal becomes zero") to
+  say signed zero, or measure the negative-input result separately and record it. This change does not edit the spec.
+
+### D-IMPL-702: The BF16 low-part oracle models the GPU's flush of float32 denormal operands
+
+- **Decision:** The `metal_util_test` reference for `strata_util_to_bf16`'s low part computes the residual
+  `x - hi` after flushing float32 denormal operands to signed zeros (`x` and the float value of `hi`). A residual that
+  is a nonzero float32 denormal is marked "unmodelled" and fails the test rather than being predicted. No input in the
+  three sets produces one.
+- **Reason:** In the edge set, `x = 0x80000001` gives `hi = 0x8000`, and the GPU returns a low part of `0x0000`. Exact
+  residual arithmetic would give `0x8000`. Denormal operands therefore flush in the subtraction, as they do in the
+  conversion. The high part is bit arithmetic and keeps denormals.
+- **Review required:** Confirm the operand flush as the intended Metal behaviour. A denormal residual needs its own
+  measurement before a test can cover it.
+
+### D-IMPL-703: The util input sets are synthetic, and the util test has no real set
+
+- **Decision:** For `metal_util_test`, `random` is normal values at log-uniform magnitudes from 2^-30 to 2^20. `edge`
+  is an explicit list of bit patterns: signed zeros, both ends of the float32 denormal range, the half subnormal and
+  overflow boundaries, infinities, NaN payloads of both signs, and the float16 and BF16 ties. `fixture` is the A.10
+  anchors only, since the tree has no upstream utility fixtures. `--input-set real` exits with the skip code 77. Every
+  set runs at T = 1..8, with the row width of section 5.13 (10,240). Each of the three kernels is checked for each T,
+  and row t must equal its T = 1 dispatch.
+- **Reason:** The utilities read no model tensors (section 9.1 of `docs/mac/09-testing-and-validation.md` says so), so
+  a real set is not defined for them. The tolerance is B throughout, since every output is a copy or a conversion.
+- **Review required:** Confirm that A.10 anchors are an acceptable "fixture" for these kernels.
+
+### D-IMPL-704: `mv_multi_eq_single` is a flagged run of the existing mat-vec property code
+
+- **Decision:** `mv_multi_eq_single` is registered as `metal_mv_test --multi-eq-single`, in the same way as
+  `samp_coupled_eq_host` and `metal_mtp_shared_ffn_write_test`. The flag runs the seventeen existing
+  `run_*_multi_eq_single` functions: sixteen dense formats (Q8_0, Q4_0, Q5_0, Q2_0, IQ4_NL, IQ4_XS, IQ3_S, IQ2_XXS,
+  IQ2_XS, IQ2_S, IQ3_XXS, IQ1_M, Q4_K, Q5_K, Q3_K, Q6_K) and BF16. Each compares NC = 2, 4 and 8 column by column with
+  the single-column dispatch, bitwise. Every run is also checked against the scalar oracle of its format, through the
+  shape helpers.
+- **Reason:** These functions already implement the property and its negative controls for the dense formats (the
+  property of section 10.4 is a comparison of two Mac runs). A separate binary would duplicate their shape helpers
+  and oracles.
+- **Review required:** Confirm that the flag mode is an acceptable way to register a property, as for
+  `samp_coupled_eq_host`.
+
+### D-IMPL-705: The MoE expert kernels are outside this change's `mv_multi_eq_single`
+
+- **Decision:** `mv_multi_eq_single` as built does not cover `strata_moe_gu_<fmt>` and `strata_moe_down_<fmt>`, which
+  section 10.4 of `docs/mac/04-metal-kernels.md` lists. Their manifest names have no NC suffix. Their column unit is the
+  routed expert entry, and each dispatch needs a plan table, an address table and Q8_1 rows for 80 or 20 blocks. Only
+  `metal_moe_test` checks a grouped-versus-single-entry parity, and only for IQ4_NL down.
+- **Reason:** The L3 work item (section 12.1 of `docs/mac/04`) covers the Q8_1 quantiser and the dense and BF16
+  mat-vecs (sections 5.8 and 5.9). The expert kernels are L7 work.
+- **Review required:** Decide whether the MoE property belongs to L7 or to an extension of this test. Until then the
+  test map entry covers the dense and BF16 kernels only.
+
+### D-IMPL-706: The Q4_K and Q5_K negative controls now compare against the original-weight result
+
+- **Decision:** In `run_q4_k_multi_eq_single` and `run_q5_k_multi_eq_single` of `tests/metal/metal_mv_test.mm`, the
+  one-bit weight flip must change the NC = 4 result relative to the original weights. The check is
+  "negative control detects code-bit flip", as in the other formats. Their previous controls flipped one bit of an
+  output value and checked the comparator, which does not test the kernel's sensitivity to weight bits. Those checks
+  remain.
+- **Reason:** Section 10.4 requires a negative control that flips one weight bit in a copy and must fail. Without this
+  check, a kernel that ignored its weights could still pass those two controls.
+- **Review required:** Confirm the change to an existing test, which fixes a gap in its negative control.
+
+### D-IMPL-707: The low part of a NaN residual is checked for class only
+
+- **Decision:** In `metal_util_test`, when the BF16 residual `x - hi` is NaN (a NaN input, or infinity minus
+  infinity), the low output must be some BF16 NaN. Its bits are not compared. A finite residual is compared exactly.
+- **Reason:** Section 5.13 gives the low-part formula but no NaN payload for it, and the NaN payload that the subtraction
+  propagates is not defined by the spec. Class B would otherwise require a payload the spec does not fix.
+- **Review required:** Confirm that the class-only rule is acceptable, or specify the NaN payload of the low part.
+
+### D-IMPL-740: `pf_gdn_eq_step_norm` checks bits against the decode kernels and bounds against a host oracle
+
+- **Decision:** `tests/metal/pf_gdn_eq_step_norm.mm` runs the Prefill GDN chain (tiled convolution, history advance,
+  q/k L2, recurrence, output norm) over T = 1, 3, 64, 65 and 300 rows in one ordered Encoder. The primary check is class B
+  against the decode GPU kernels, run in windows of up to 8 rows in write-through mode: h, the history, the state, and
+  y_h = half(y) must match bit for bit. The host reference is `oracle::gdn_conv_l2`, `gdn_conv_commit` and
+  `gdn_step_norm` (`tests/metal/oracles/gdn.cpp`). Its stages are checked on the oracle's own inputs: conv + L2 at
+  U(128), the recurrence state at U(512), and y_h within 2^-10 |y| + 2^-24 + n 2^-24 m. The whole chain, decode and
+  prefill, is checked at U(640) for the state and y. Inputs are synthetic (`synth.cpp`, random tensors in the real
+  shapes), with the seed fixed per T.
+- **Reason:** Section 10.4 names the decode kernels as the reference, and the task asks for an independent host
+  reference. Both are used: the bit check is the tight criterion, and the host oracle is a separate implementation.
+  U(128) and U(512) are the bounds `metal_gdn_test` already uses for the same arithmetic. U(640) is their sum. Observed
+  n on this Mac is at most 7.7 for the chain and at most 5.8 for conv + L2, so the bounds leave wide margins. The
+  recurrence does not grow the error with T: the state map s -> exp(gate) (I - beta k k^T) s has norm at most exp(gate),
+  because k has unit length after L2 and 0 <= beta <= 1, and the synthetic gates lie below zero.
+- **Review required:** Confirm the U(640) chain bound, the F16 bound and the contraction argument. The argument depends on
+  gate < 0 and must be checked against the real `ssm_a` and `dt` values before any model-backed use. The test was
+  adversarially checked: a one-ulp flip in the prefill state fails the bit check and passes the U bound (as designed),
+  and a flipped F16 bit fails both the bit check and the F16 bound.
+
+### D-IMPL-741: The sort oracle follows section 6.6's description of upstream's loop, and the test files take the CTest names
+
+- **Decision:** `tests/metal/pf_sort_eq_host_grouping.mm` (and `pf_gdn_eq_step_norm.mm`) are named after their CTest
+  names, not `metal_*_test`. The sort oracle is a host transcription of upstream's grouping loop as section 6.6 describes
+  it (`prefill.cpp:1583-1615`): the exclusive prefix of the per-expert counts in id order gives each expert's first slot,
+  a stable cursor fill assigns each valid entry its slot, and each histogram row is the cursor at the start of its tile.
+- **Reason:** The property names in section 10.4 are CTest names. Upstream's `prefill.cpp` is not in this checkout
+  (`ref/` holds only `load.py`), so the transcription follows the document's description of the loop, not its source.
+- **Review required:** Compare the oracle with upstream `prefill.cpp:1583-1615` on a machine that has the upstream
+  source. Any difference in ordering, histogram layout, or `PfPlan` fill convention must be corrected in the oracle or
+  recorded here.
+
+### D-IMPL-742: `pf_sort_eq_host_grouping` duplicates the grouping oracle of `metal_prefill_moe_grouping_test` on purpose
+
+- **Decision:** The new test is kept separate from `metal_prefill_moe_grouping_test`, although both compare the grouping
+  kernels with an independent host oracle. The new test covers the section 10.4 list for every T: invalid ids at T = 1,
+  7, 25, 26, 64, 300 and 4,096, tiered residency at every T, both expert widths at every T, and 98 cases in all.
+  `metal_prefill_moe_grouping_test` checks invalid ids only in one T = 1 case.
+- **Reason:** The property is named separately in section 10.4 with a serial and a concurrent CTest. Its coverage is
+  wider than the existing grouping test's invalid-id coverage.
+- **Review required:** Decide whether to merge the two tests, with one oracle and one CTest pair, once L13's status is
+  reviewed. The two together add about 13 s of `metal` run time.
+
+### D-IMPL-743: `pf_sort_eq_host_grouping_concurrent` is a second CTest, and the section 9.1 counts change
+
+- **Decision:** The sort property has a serial CTest and a concurrent CTest, `pf_sort_eq_host_grouping_concurrent`, which
+  runs the same binary with `STRATA_METAL_DISPATCH=concurrent`. Both have their own entry in `tests/metal/test_map.json`
+  with label `metal`. Section 9.1 is updated: the total becomes 188 and the `metal` count 113, and the property row
+  lists the concurrent name.
+- **Reason:** Section 10.4 requires both CTests to compare with the same oracle. `tools/metal/test_map.py` rejects a
+  CTest without a map entry and a declared count that does not match the map.
+- **Review required:** Confirm that a concurrent CTest per property is the convention. `pf_gdn_eq_step_norm` has none
+  (see D-IMPL-751).
+
+### D-IMPL-744: Histogram columns at or past `n_experts` are not compared
+
+- **Decision:** The histogram check covers every tile and every expert column below `n_experts`. The count kernel writes
+  all 512 columns, and the scan converts only the first `n_experts`. The columns past `n_experts` therefore hold raw
+  counts, which are not offsets, and the test does not compare them.
+- **Reason:** Section 6.6 says the scan ignores columns at or past `n_expert`, and section 10.4 lists histogram offsets
+  only. Comparing those columns would pin a value the spec does not define.
+- **Review required:** If the spec later defines those columns, add them to the comparison.
+
+### D-IMPL-745: The sort negative control swaps `dst` and goes through the real comparator
+
+- **Decision:** The swap control swaps the first two entries of the expected `dst` map and checks that the same
+  comparator the real check uses rejects the swap. It does not swap `src`.
+- **Reason:** Two consecutive sorted entries of one token share a `src` row (`src = i / 10`), so swapping them leaves
+  `src` unchanged. The first run failed 43 times on a `src` control, all in cases where the first two sorted entries came
+  from one token. `dst` values are distinct route indices, so a swap always changes the map.
+- **Review required:** None beyond the comparator itself. `src` is still compared exactly in every case.
+
+### D-IMPL-746: Synthetic inputs and their ranges
+
+- **Decision:** GDN inputs are `synth.cpp`'s normal values, scaled per tensor: qkv by 0.5, history by 0.2, convolution
+  weights by 0.15, state by 0.02, gate as -2.5 + 0.3 N, beta as sigmoid(N), z by 1, and gamma as 1 + 0.1 N. Sort routes
+  come from fixed patterns and the mixed_h rows from a deterministic formula. No model file is read.
+- **Reason:** Section 10.4 defines a synthetic property as random weights in the real shapes from `synth.cpp`. No model
+  files are present in this checkout.
+- **Review required:** Compare the gate and beta ranges with the real model's `ssm_a`, `dt` and alpha/beta values before
+  treating the chain bounds as applicable to the model. The contraction argument in D-IMPL-740 needs gate < 0.
+
+### D-IMPL-747: The windowed decode and the whole-T host reference compute the same recurrence
+
+- **Decision:** The host oracle runs over all T rows in one call, while the decode GPU path runs in windows of up to 8
+  rows. The test treats them as the same recurrence, since each row reads only the state and the history left by earlier
+  rows.
+- **Reason:** `oracle::gdn_step_norm` tracks error magnitudes (`twin::tf`) across all rows, and the U(n) bound needs them.
+  Calling the oracle once per window would drop those magnitudes at each window boundary.
+- **Review required:** Confirm the claim with the existing decode test, which checks 8-row windows against the same
+  oracle (`metal_gdn_test`, `run_step_norm_set`).
+
+### D-IMPL-748: No kernel changed; both GDN paths and the sort path pass as written
+
+- **Decision:** No kernel or engine source was changed. The prefill GDN chain agrees bit for bit with the decode GDN
+  kernels at T = 1, 3, 64, 65 and 300, and the grouping kernels match the host oracle exactly for every planned case.
+- **Reason:** The task allows a kernel change only when the kernel is shown to be wrong, and no such case was found.
+- **Review required:** These results come from one Apple M5 Pro on macOS 27 (the build reports the macOS 27.0 SDK).
+  Re-run `pf_gdn_eq_step_norm` and both sort CTests on the reference Mac before relying on them for L13.
+
+### D-IMPL-749: CTest timeouts
+
+- **Decision:** `pf_gdn_eq_step_norm` has `TIMEOUT 300`, and the two sort CTests have `TIMEOUT 180`. The T = 4096 cases
+  each allocate a 200 MiB gathered-row buffer. Measured run times on this Mac are about 6.6 s for each CTest.
+- **Reason:** The timeouts match `metal_gdn_test` (300 s) and the grouping tests (180 s), which have similar shapes.
+- **Review required:** Check the run time on the other families in the family runs.
+
+### D-IMPL-750: The `test_map` run still reports one error that these tests do not cause
+
+- **Decision:** Nothing in this change alters the Python-module count error. With `STRATA_BUILD_DIR=build-dev`,
+  `tools/metal/test_map.py` reports one error, `section 9.3 declares [14, 0, 6] ... found [14, 2, 6]`. It was present
+  before this change. The notes for other planned tests are unchanged.
+- **Reason:** That count belongs to section 9.3 and to other work items. Fixing it is out of scope here.
+- **Review required:** The owner of section 9.3 should reconcile the module count with the files.
+
+### D-IMPL-751: `pf_gdn_eq_step_norm` has no concurrent CTest
+
+- **Decision:** `pf_gdn_eq_step_norm` is registered once, with the default serial dispatch.
+- **Reason:** Section 10.4 names one CTest for this property. The prefill chain runs in one ordered Encoder, which is
+  barrier-separated under both dispatch modes.
+- **Review required:** If the family runs need both modes, register `pf_gdn_eq_step_norm_concurrent` and update
+  `test_map.json` and section 9.1 together.
+
+### D-IMPL-752: L13 is not marked complete
+
+- **Decision:** The L13 row of section 12.1 keeps its status. `pf_gdn_eq_step_norm` and `pf_sort_eq_host_grouping` now
+  exist and pass. The row's "done when" also needs `idx_batch_eq_sequential`, `prefill_chunk_independent` and the
+  prompt-path criterion, and those remain planned.
+- **Reason:** The task asks for the two properties only. Marking L13 done would overstate the prompt path's status.
+- **Review required:** Confirm that L13 stays open until those three items pass.
+
+### D-IMPL-800: Reject malformed serve id lists instead of skipping their fields
+
+- **Decision:** `GEN` and `GENI` accept the id list only as `<id>(,<id>)*`: base-10 integers in [0, 2147483647], single
+  commas, no spaces, no empty fields and no trailing comma. Any other form returns `bad request: invalid token id:
+  expected an integer in [0, 2147483647]`.
+- **Reason:** The previous parser replaced commas with spaces and read whitespace-separated tokens, so `1,,2`, `1 2`,
+  `1,2,` and `1,2 ` were accepted and produced a `DONE` for malformed input. The server writes `','.join(...)` with no
+  trailing space (`serve/server.py:415-416`), so the real client is unaffected. The new cases in
+  `serve_transcript_test.cpp` fail against the previous `serve.cpp`.
+- **Review required:** Confirm against the upstream parser (`generate.cpp:4510-5610`, not in this checkout) that upstream
+  also rejects these forms. If upstream accepts them, the Mac engine is stricter than upstream and this should be relaxed.
+
+### D-IMPL-801: Bound `temperature` below and `min_p` to [0, 1]
+
+- **Decision:** A negative `temperature`, or a `min_p` outside [0, 1], returns `bad request: temperature` or
+  `bad request: min_p`. `top_p` and the penalty keys keep their parsed values.
+- **Reason:** A negative temperature was silently treated as greedy, and `min_p` had no domain, so both produced a `DONE`
+  for malformed values. The server sends `temperature` only when it is above 0 and `min_p` only in (0, 1]
+  (`serve/server.py:355-369`). The spec gives no range for `top_p` or the penalties, so they are unchanged.
+- **Review required:** Confirm the upstream domains for `temperature` and `min_p`. 06 section 5.3 now states the bounds used.
+
+### D-IMPL-802: One pad-token run matches exactly one image record
+
+- **Decision:** The SVE1 loader requires each run of `<|image_pad|>` tokens to have exactly its record's `n_tokens` rows.
+  A longer run fails with `image k has n rows but more <|image_pad|> tokens`, which 06 section 5.7 lists as new. Before this
+  change, a run of four pads matched by two two-row records was accepted as two images, and a single record against
+  a longer run was reported as "the prompt has more images than the embeddings file".
+- **Reason:** 06 section 5.4 says each run consumes the next record. The server writes exactly `n_tokens` pad ids per image
+  (`serve/server.py:1073-1082`), so real requests do not change. The existing `extra_prompt` case in
+  `serve_transcript_test.cpp` now uses two separate runs so that it still checks a run with no record.
+- **Review required:** Confirm upstream's handling of a run longer than its record (`generate.cpp:4745-4804`). If upstream
+  accepts that case, this rejects a request upstream serves.
+
+### D-IMPL-803: The one-shot runner is a host seam, not part of `strata`
+
+- **Decision:** Add `run_one_shot` and the `OneShotBackend` interface (`oneshot.hpp`, `oneshot.cpp`). `main.cpp` does not
+  call them. `oneshot_loop_test` drives the runner with a synthetic backend.
+- **Reason:** H7 asks for a one-shot loop, but the Metal `Window` and `Prefill` do not exist (REV-015). D-IMPL-048 forbids
+  connecting a fake generator to `strata`. The seam applies the same validate-then-print rules as the serve loop
+  (D-IMPL-044) and can be tested now.
+- **Review required:** When the Window exists, the production backend implements `OneShotBackend`, `strata` calls
+  `run_one_shot`, and REV-015 closes.
+
+### D-IMPL-804: Print a one-shot report only after it validates
+
+- **Decision:** `run_one_shot` checks the request before the backend runs. An empty prompt, `max_new` below 1, or a prompt id
+  outside the vocabulary exits 2. A backend failure, a backend exception or an inconsistent report exits 1 with
+  `strata: <reason>` on stderr and nothing on stdout. A valid report is written with one `fwrite`.
+- **Reason:** Exit 2 matches the argument-error rule of 06 section 2.3 and exit 1 matches other fatal errors. Validating before
+  printing prevents a partial report that a parser could accept, as D-IMPL-046 does for the serve `DONE` line.
+- **Review required:** Confirm that the production driver maps invalid requests to exit 2 in the same way.
+
+### D-IMPL-805: The runner, not the backend, decides whether `--stats` prints
+
+- **Decision:** `run_one_shot` replaces the report's `include_stats` with the request's `--stats` flag. A backend that fills in
+  the Metal stats fields does not get them printed unless the flag is set.
+- **Reason:** 06 section 13.1 makes the block opt-in, and a backend should not change the plain output.
+- **Review required:** None beyond D-IMPL-803.
+
+### D-IMPL-806: Invariants that `run_one_shot` checks on a backend report
+
+- **Decision:** The report must echo the prompt and have at most `max_new` output ids, each in the vocabulary. Times and
+  stats must be finite and non-negative, and `rounds` must not be negative. With speculation enabled, `rounds` must not
+  exceed the decode windows, accepted drafts must not exceed offered drafts, the `accepted_per_round` counts must not
+  exceed the speculation rounds, and their weighted sum (index times count) must equal the accepted total. When prefetch
+  is available, warmed blob reads must not exceed blob reads. A short output is not rejected, because the runner
+  does not know which token ended generation.
+- **Reason:** Each printed rate or average divides by one of these quantities, and a backend that broke an invariant would
+  print a figure with no meaning. The histogram reading (index equals the accepted drafts in that round) is the only
+  semantics of "accepted per round" the code relies on.
+- **Review required:** Confirm the histogram semantics against `generate.cpp:6236-6470` (not in this checkout). Decide
+  whether a run that ends early without EOS should be an error.
+
+### D-IMPL-807: The H7 goldens are hand-written, not captured upstream output
+
+- **Decision:** `oneshot_output_test` and `oneshot_loop_test` compare against literal text written from the line shapes in
+  06 section 13.1 and 09 section 3.1. The checkout contains no captured upstream one-shot output, so H7's "matches
+  upstream line by line" is not claimed.
+- **Reason:** The checkout has no upstream `generate.cpp`, no captured one-shot output and no model. The only upstream
+  text is the audit (`docs/mac/audit/B-engine-host.md:1243-1280`), which paraphrases it. The formatter writes
+  `  per token` with two leading spaces, and the audit paraphrase shows none. Only captured output can settle that.
+- **Resolved (`per token` spacing):** The label is `per token` with no leading spaces, as 06 section 13.1 lists it.
+  `src/metal/program/stats.cpp`, `tests/metal/oneshot_loop_test.cpp` and `tests/metal/oneshot_output_test.cpp` now match
+  the spec text. The capture review below is still open.
+- **Review required:** Capture one-shot output with `--stats` from upstream and from the Mac engine on the reference Mac,
+  and compare every retained line. This closes REV-015 and H7.
+
+### D-IMPL-808: Spec 5.9 example conflicts with 5.5 on REUSED
+
+- **Decision:** Left unchanged. 06 section 5.9 shows `PP 4095 4096` before `REUSED`. Section 5.5 says REUSED is printed once
+  the prompt is fully read, and the implementation (`CallbackState::reused`, tested by "REUSED requires final prompt
+  progress to be complete") requires the last PP to report the full total.
+- **Reason:** The example is normative text outside this change, and only the spec owner can say whether the example or the
+  rule is intended.
+- **Review required:** Correct the example to `PP 4096 4096 ...`, or relax 5.5 and the implementation together.
+
+### D-IMPL-809: Dump summaries are not computed
+
+- **Decision:** `OneShotDumpSummary` still takes caller-supplied label, path and detail strings. Nothing computes the
+  figures that the audit gives for upstream's summary, `%-24s %s (%d x %lld, nonfinite %d, mean|.| %.4g, max|.| %.4g)`
+  (`docs/mac/audit/B-engine-host.md:1278`).
+- **Reason:** The meaning of `%d x %lld`, and whether nonfinite values enter the mean, are not stated in the spec or the
+  checkout. A helper would have to guess the format, so the detail strings in `oneshot_output_test` stay placeholders.
+- **Review required:** Confirm the summary form against upstream. Then add a helper that computes the figures from the
+  dumped array and test it with synthetic data.
+
+### D-IMPL-810: A GENI path that contains `=` is rejected with a misleading error
+
+- **Decision:** Unchanged. `GENI 4 /tmp/a=b.sve 1,2` and `GENI 4 /tmp/x.sve` (no ids) both return `bad request: max_new`.
+- **Reason:** 06 section 5.3 defines the path as everything between the last key=value token and the id list. Without a rule
+  the spec does not give, a `=` in the path cannot be told apart from an option. The server's temporary paths contain no `=`.
+- **Review required:** Choose a rule, for example naming the missing path in the error, and update 06 section 5.3.
+
+### D-IMPL-811: Image-pad ids are rejected in a plain GEN request
+
+- **Decision:** A `GEN` request whose id list contains 248056 (`<|image_pad|>`) returns `ERR bad request: image pad token
+  needs GENI`. The parser rejects it before the backend runs. `GENI` still accepts pad ids, and their runs are matched to
+  records as before (D-IMPL-802).
+- **Reason:** A pad run in a plain request has no embeddings record to match, so the backend would see image positions
+  with no image rows. Before this change, `GEN 2 248056,7` was accepted and generated as an ordinary token id. The server
+  writes pad ids for images only in `GENI` (`serve/server.py:1065-1082`), and a request without an embeddings path is sent
+  as `GEN` (`server.py:415-416`). A text-only message is encoded with `parse_special=True` (`server.py:1058`), so a literal
+  `<|image_pad|>` typed in a text-only message becomes pad id 248056 in a plain `GEN`, and that request now fails. The image
+  path already keeps such literals as text (`server.py:1076`, #150); the text-only path does not.
+- **Review required:** Choose between (a) the server encoding stray `<|image_pad|>` text in text-only prompts as literal
+  text, as it already does for images, and (b) the engine accepting pad ids in `GEN`. Until one is chosen, a text-only
+  prompt that contains the literal string fails with this error. Also confirm upstream's handling of pad ids in a plain
+  request (`generate.cpp:4510-5610`, not in this checkout).
+
+### D-IMPL-812: A key that is not `[a-z_]+` is not an option
+
+- **Decision:** An option key must match `[a-z_]+`. A `key=value` token with any other key (uppercase, a digit, or empty)
+  is not skipped. In `GEN` it starts the id list and fails the id rule, so `GEN 2 1,,2=3 5`, `GEN 2 1,2=3 5` and
+  `GEN 2 Temperature=0.4 1` return `ERR bad request: invalid token id: ...`. Unknown keys with a valid name are still
+  skipped silently. This extends the invariants of D-IMPL-800.
+- **Reason:** The previous parser skipped any `key=value` token it did not know, so `GEN 2 1,,2=3 5` was accepted with `5`
+  as its only id and produced a `DONE` for an id list the client did not send. The spec has no key rule. The rule used
+  is the lowercase-with-underscores form that every key in the 06 section 5.3 table has (`top_p`, `penalty_last_n`,
+  `pcie_frac`, ...).
+- **Review required:** Confirm upstream's key rule. If upstream skips unknown keys of any form, this check is stricter than
+  upstream and should be relaxed. 06 section 5.3 states the rule used.
+
+### D-IMPL-813: A GENI request needs a path and ids, and its path may not contain `=`
+
+- **Decision:** A `GENI` request with no embeddings path, with no id list, or with a path that contains `=`, replies with
+  the usage line `ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>`. Examples are
+  `GENI 4 /tmp/x.sve`, `GENI 4 1,2` and `GENI 4 /tmp/a=b.sve 1,2`. This replaces the reply `bad request: max_new` that
+  D-IMPL-810 recorded, and this entry supersedes D-IMPL-810's reply. A `GEN` with an empty id list gets the invalid-id error
+  of D-IMPL-800.
+- **Reason:** `max_new` was valid in these requests, so that reply named the wrong field. A missing path or id list means the
+  request does not match the grammar, and the usage line names the grammar. A `=` in a path cannot be told apart from a
+  misspelled option (D-IMPL-810), so such a path is refused rather than guessed. The server's temporary paths contain no
+  `=` (D-IMPL-810).
+- **Review required:** Choose a rule that accepts `=` in paths, for example requiring options to come before the path, as the
+  path definition in 06 section 5.3 suggests. Then update that section and this entry. Confirm the upstream path rule,
+  which is not in this checkout.
+
+### D-IMPL-814: A non-finite stat rejects the run without `--stats` (addendum to D-IMPL-805)
+
+- **Decision:** D-IMPL-805 is unchanged. Its rule decides only whether the stats block is printed. Validation runs before that
+  gate, so a NaN, an infinite or a negative stats value, or a negative slot-hit or dispatch count, rejects the run with
+  exit 1 and no stdout even when `--stats` is not given. `oneshot_loop_test` checks this case.
+- **Reason:** Printing is opt-in, but a malformed stat means the backend report is broken whether or not the block is
+  printed. Checking before the gate keeps the rule independent of the flag, so a backend cannot pass a broken report by
+  leaving the stats off. This note is recorded here because D-IMPL-805 is not edited.
+- **Review required:** None beyond D-IMPL-803.
+
+### D-IMPL-815: Window-size counts are not tied to the rounds
+
+- **Decision:** `validate_one_shot_report` rejects a negative window-size count. It does not require the counts to add up to
+  `rounds` or to `speculation.rounds`.
+- **Reason:** 06 section 13.1 keeps the `window sizes` line but does not say whether the counts cover every decode window
+  (`report.rounds`, which includes ordinary T=1 windows) or only speculative rounds (`speculation.rounds`). Upstream
+  `generate.cpp:6236-6470` is not in this checkout, so neither sum can be confirmed. Both readings satisfy
+  `speculation.rounds <= sum <= rounds`, so that bound is safe to add once the tie is known.
+- **Review required:** Confirm the tie against upstream. Then require the sum to equal the matching rounds count, or require
+  the bound, and add a test.
+
+### D-IMPL-816: Suffix-draft and stats counts are checked for sign and order
+
+- **Decision:** `validate_one_shot_report` rejects suffix counts that are negative or that accept more drafts than they offer.
+  `valid_times` rejects a negative `slot_hits`, `dispatches_at_t1` or `dispatches_at_t4`. The `dispatches_at_t4` check goes
+  beyond the two counts named in the review, because it prints on the same `dispatches` line. These extend the invariants
+  of D-IMPL-806.
+- **Reason:** Each of these values is printed, and a negative or inverted count prints a figure with no meaning. The other
+  printed counters (`resident_experts`, `page_cache_hits`, `ssd_blobs`, `experts_warmed`, `routing_layers_skipped`,
+  `miss_handshake_layers`, `adaptive_experts_swapped`) still have no sign check.
+- **Review required:** Decide whether those counters need the same check, and whether suffix drafts offered with zero suffix
+  windows is an inconsistent report.
+
+### D-IMPL-820: The watchdog starts a stall clock at the first poll that sees the current request and beat counts
+
+- **Decision:** `Watchdog::poll` keeps a baseline of (request count, beat count, poll time) while the engine is busy.
+  A poll that sees a changed request or beat count resets the baseline. The watchdog fires when the baseline is at
+  least the limit old, and once only.
+- **Reason:** Section 14.2 says "busy and `beats` has not changed for the limit" and that the watchdog checks once per
+  second. Keying on the request count makes a new request with no beat in between restart the clock.
+- **Review required:** The stall starts at the first poll that sees the stall, up to one second after the last beat.
+  Confirm whether the clock should start at the beat's own timestamp instead.
+
+### D-IMPL-821: STRATA_WATCHDOG_S accepts decimal digits, and anything else fails serve startup
+
+- **Decision:** Unset or empty means 60 s. `0` turns the watchdog off. Any other value must be a decimal integer that
+  fits in 64 bits, and a bad value makes `run_serve_loop` exit 2 before INFO, with `strata: STRATA_WATCHDOG_S needs
+  a decimal number of seconds (0 turns the watchdog off)`.
+- **Reason:** Section 14.2 gives the default and the meaning of 0, not the rules for other values. Failing closed
+  matches the other numeric options, which exit 2.
+- **Review required:** Confirm that an empty value should mean the default and not an error.
+
+### D-IMPL-822: The issue line prints the limit, and the header prints the stall duration and the layer count
+
+- **Decision:** `no progress for N s` uses the configured limit. The header's `for N s` uses whole seconds since the
+  baseline, rounded down. `L` is the tick count minus the tick count at the last beat, so a stopped engine reports 0.
+- **Reason:** The issue line states the limit that was exceeded. The header describes the stall, and "0 = stopped,
+  more = slow" only makes sense as ticks since the last step.
+- **Review required:** Section 14.2 does not say which value the issue line uses. Compare with the upstream
+  `stall_report` (`generate.cpp:763-808`) when the engine is wired.
+
+### D-IMPL-823: The progress record has no `chunk` or `since_ms`; the stage is `where` plus `detail`
+
+- **Decision:** `Progress` stores busy, requests, beats, ticks, the tick count at the last beat, `where` and `detail`.
+  The stage text is `where`, then a space and `detail` when `detail` is set. The stall duration comes from the
+  watchdog's own clock, not from a `since_ms` field.
+- **Reason:** No prefill chunking or window path reports stages yet, so a chunk index would have no source. A
+  `since_ms` field would duplicate the watchdog's clock.
+- **Review required:** Add `chunk` and `since_ms` when the prefill path (L13) and the window path (L9) report stages.
+
+### D-IMPL-824: The serve loop beats on every backend callback and runs each request under a BusyScope
+
+- **Decision:** `run_one_request` holds a `BusyScope` for the whole request. The resume, prompt progress, prompt reuse
+  and token callbacks each beat and set the stage (`resume`, `prompt done/total`, `decode`, `decode token N`). The
+  watchdog starts after INFO and before READY, and is stopped when the loop returns.
+- **Reason:** Section 14.1 says beats advance per token, prompt chunk or window, and BusyScope brackets each request.
+  The callbacks are the only progress points the serve loop can see.
+- **Review required:** Section 2.3 step 12 also puts the startup memory line before INFO. It is not printed, because
+  the startup protocol belongs to H6.
+- **Amended (H11 review):** The statement above is wrong. Step 12's "memory line" is the stderr line of section 5.2,
+  item 2 (`strata serve: N MiB of the GPU working set free ...`, with the `LOW` variant below 256 MiB). `serve.cpp`
+  prints it before `INFO` (about lines 1064-1076), so step 12 is met. The stall report's `memory:` line (section 14.2)
+  is a different line, and the watchdog prints it. The decision text above that says `run_one_request` holds the
+  `BusyScope` is also superseded: the scope now starts in `run_serve_loop` before the image load, so the image load is
+  inside the request's busy state (D-IMPL-838). The prompt, resume and token callbacks now set their beat and stage in
+  one call (D-IMPL-837).
+
+### D-IMPL-825: Stall-report lines go to stderr, one per flushed line, in the order the spec gives
+
+- **Decision:** The issue line, the header, two passes, the crash-report hint, then the GPU-wait release and the abort.
+  Each pass prints the engine's lines, the memory line, then the gpu line. Every line is flushed.
+- **Reason:** Sections 14.2 and 14.3 give this order, and the abort must not lose lines that were already written.
+- **Review required:** None beyond the order in 14.2 and 14.3.
+
+### D-IMPL-826: With no engine attached, the reporter prints no engine lines, a gpu line that says so, and releases nothing
+
+- **Decision:** `NoEngineStallReporter` prints `gpu: unavailable (no engine is attached to this serve loop)`, writes no
+  engine lines, and returns true from `release_gpu_waits`, because there is no GPU wait to release.
+- **Reason:** No Window, Context or Events object is reachable from the serve loop yet, and a fabricated gpu line would
+  be false.
+- **Review required:** The engine's reporter must print the 14.2 gpu format. It must also apply the consumer check of
+  14.2 step 3 before releasing any wait. The no-engine default releases nothing, so it is safe only until then.
+
+### D-IMPL-827: A failed memory probe prints "unavailable", and MiB values round down
+
+- **Decision:** The memory line uses `process_memory()` for resident, swap and major faults, and `available_memory()`
+  for RAM available, in MiB rounded down. If either probe fails, the line is `memory: unavailable (the memory probe
+  failed)`.
+- **Reason:** Section 14.2 says upstream prints zeros on macOS, and the Mac port must not do the same. Zeros would look
+  like a healthy reading.
+- **Review required:** The spec does not give the failure text, so the wording is ours.
+
+### D-IMPL-828: Release waits for 2 s, the passes are 2 s apart, and the watchdog wakes once per second
+
+- **Decision:** `release_gpu_waits` is called with 2000 ms. The passes are separated by a 2 s sleep through the injected
+  hook. The watchdog thread waits on a condition variable for one second between polls, and `stop()` joins it.
+- **Reason:** The 2 s spacing and the one-second poll come from section 14. The release timeout does not, so 2 s is a
+  judgement call.
+- **Review required:** Section 14.4 uses 20 s elsewhere for GPU waits. Confirm the release timeout.
+
+### D-IMPL-829: The stall test fork-runs a real serve loop, and each run writes a crash report on the developer's Mac
+
+- **Decision:** `watchdog_host_test` runs the serve loop in a forked child with `STRATA_WATCHDOG_S=1` and a stub
+  backend. A stalled request must end by SIGABRT with the stall lines, a beating request and an idle engine must not
+  fire, and a malformed limit must exit 2.
+- **Reason:** It is the only host-level check of the abort path. The model-backed `metal_watchdog_test` needs the engine.
+- **Review required:** Each stall run leaves a `watchdog_host_test-<date>.ips` file in
+  `~/Library/Logs/DiagnosticReports/` (the child is a fork of the test binary). The engine's own reports are
+  `strata-*.ips`. Decide whether CI should keep or suppress these.
+- **Resolved by seam (H11 review):** The child stall cases now end through `ServeLoopOptions::watchdog_abort`, which
+  writes one line on stderr and exits 86, so `watchdog_host_test` no longer calls `abort()` in a child and writes no
+  crash report. One run of `watchdog_host_test` left the `~/Library/Logs/DiagnosticReports/` count at 82 before and 82
+  after, with no `watchdog_host_test-*.ips`. The real `abort()` and its SIGABRT are checked only by
+  `metal_watchdog_test`, which is model-labelled and planned.
+
+### D-IMPL-830: The new host tests take the names `watchdog_host_test` and `dump_format_host_test`
+
+- **Decision:** The host tests are `watchdog_host_test` (06 H11) and `dump_format_host_test` (03 R11). Section 9.1 now
+  counts 49 host tests and 190 in total. `metal_watchdog_test`, `dump_formats_test` and `dump_eq_nodump` stay
+  model-labelled and planned, because they need the engine or the model.
+- **Reason:** The model names cannot be registered with a host label without contradicting the map, and their
+  model-backed parts cannot run here.
+- **Review required:** The owner of section 9 should confirm the split between host and model names.
+
+### D-IMPL-831: The dump writers are a byte-layout contract that the driver does not call yet
+
+- **Decision:** `src/metal/program/dump_format.cpp` writes `--dump-logits`, `STRATA_DUMP_FIRST_LOGITS`,
+  `--dump-residual`, `--dump-layers`, `--dump-halves` and `--dump-routing` records, validating sizes exactly. The driver
+  still rejects every dump flag as "not wired".
+- **Reason:** The host-verifiable part of R11 is the byte layout. The engine does not yet produce the values.
+- **Review required:** The engine path must call these writers with section 9.1 data, and the Mac dumps must pass
+  `tf_compare.py` and `make_profile.py` (`dump_formats_test`).
+
+### D-IMPL-832: `--logits-stride` keeps rows 0, N, 2N, ... and the final row
+
+- **Decision:** `logits_stride_rows` keeps row `r` when `r % N == 0` or `r` is the last row, with rows counted from 0.
+- **Reason:** Section 9.1 says "every Nth row plus the final input" and does not give the origin. Zero-based indexing
+  matches the engine's row numbering in `generate.cpp:3284-3305`.
+- **Review required:** Confirm the origin against `generate.cpp` when the dump path is wired.
+
+### D-IMPL-833: `--logits-stride` needs a positive integer and an explicit `--max-new 1`
+
+- **Decision:** The parser rejects a non-positive value with exit 2, and rejects the flag unless `--max-new` is given and
+  its last value is exactly `1`. The default of 16 is not accepted. The flag is not checked against `--dump-logits`.
+- **Reason:** Section 9.1 states the `--max-new 1` requirement. The other rules are ours.
+- **Review required:** Decide whether `--logits-stride` without `--dump-logits` should warn or fail.
+- **Amended (H11 review):** It now fails: `--logits-stride` without `--dump-logits` exits 2 with `--logits-stride needs
+  --dump-logits`, checked after the `--max-new 1` rule so the earlier messages stay the same. With `--dump-logits`, the
+  flag is accepted as before. Section 03 9.1 gives no byte layout for the strided rows. It says only "every Nth row plus
+  the final input" for the `--dump-logits` file, so no layout is invented here. `tools/metal/tf_compare.py` reads
+  contiguous rows and takes `first_position` as the header's declared count minus the rows present (D-IMPL-839), so a
+  strided file read by it would place its rows wrongly. Until 03 section 9.1 gives a strided layout, a strided dump is
+  not comparable with `tf_compare.py`, and the stride is not wired to any reader.
+
+### D-IMPL-834: Byte layouts follow the 09.1 and 09.2 tables, with optional and zero slots as stated
+
+- **Decision:** The formats are exactly the spec's: a header on logits and residual only, with no header on first-logits,
+  layers and halves. Halves slices sit at the documented float offsets, the 512 floats at 11784 are always zero, QSA
+  slices are all present or all absent, and the FP16 V-pool slice (12560) is optional and left zero when absent.
+  `ids` and `steps` are int32 bit patterns in float slots. A routing record needs at least one id, distinct and
+  non-negative ids, and finite non-negative weights, the same rules `tools/make_profile.py` applies on read. Its
+  model-dependent bounds (layer below 48, ids below 512, k at most 64) are not enforced by the writer.
+- **Reason:** Sections 9.1 and 9.2 give these layouts. The writer checks that its inputs match the layout, and the
+  routing rules keep it from writing a trace the reader would reject.
+- **Review required:** Section 9.2 does not say what the V-pool slots hold when the KV is not FP16. This implementation
+  leaves them zero.
+
+### D-IMPL-835: `--dump-mixed` and `--dump-final-r` have no format, so they are not written
+
+- **Decision:** No writer exists for `--dump-mixed` or `--dump-final-r`. Both stay rejected as "not wired".
+- **Reason:** Section 9.1 gives no byte layout for either, and an invented layout would break byte compatibility
+  (REQ-MOD-07).
+- **Review required:** Section 9.1 needs rows for both flags before the engine writes them.
+
+### D-IMPL-836: The Python reader reads the C++ logits writer's output, as a one-off check that is not registered
+
+- **Decision:** A one-off program outside the repository wrote a 5-vocabulary, 3-row `--dump-logits` file with
+  `write_logits_dump`. `tools/metal/tf_compare.py`'s `load()` read it back with the same header, row count and values.
+  A two-record `--dump-routing` trace written by `append_routing_record` was read by `tools/make_profile.py`'s
+  `iter_trace_records` as `(3, (5, 9))` and `(4, (7,))`. Nothing from these checks is in CTest.
+- **Reason:** The Python reader is the consumer that `dump_formats_test` names, and this shows the two sides agree.
+- **Review required:** Register this as the Python half of `dump_formats_test` if the Python test layer can take a
+  fixture written by the C++ writer.
+
+### D-IMPL-837: The watchdog compares whole seconds as unsigned, a beat and its stage are one update, and `poll` is private
+
+- **Decision:** `Watchdog::poll` compares the stall's whole seconds, as `uint64_t`, with the limit. It no longer converts
+  the limit into a duration of nanoseconds, which overflows at about 9.2e9 s and fired a huge limit about one second into
+  a request. A stall that the clock reports as negative never fires. `Progress::beat(where, detail)` records the beat and
+  its stage under one lock, and the resume, prompt, reused and token callbacks use it, so a snapshot never pairs a new
+  beat with an older stage. `poll` is private, and the test reaches it through the friend `WatchdogTestAccess`. The
+  header's layer count is the ticks since the last beat, and the test takes it after one tick before the beat and three
+  after, so the subtraction is visible.
+- **Reason:** A limit of UINT64_MAX means "never", so it must not fire after a 20 s stall. Keeping the comparison in
+  seconds changes nothing for limits that fit. A stage must never be reported with a beat that did not set it.
+- **Review required:** A clock that goes backwards is treated as no stall, so confirm that reading. The beat-and-stage
+  check is a concurrency test. Its two-lock mutant was caught in one run (48,653 torn snapshots), but a single run
+  does not prove the window is always hit.
+
+### D-IMPL-838: Stall-report lines share one locked write, the image load is watched, and a watchdog that cannot start is a startup error
+
+- **Decision:** `write_report_line` writes each line with one `fwrite` and a flush, under a process-wide mutex. The
+  watchdog's report and the request thread's diagnostics both go through it (`diagnostic_line` in `serve.cpp`), so their
+  lines do not interleave. `ServeLoopOptions::watchdog_abort` replaces the abort, and a test child writes one line and
+  exits 86. The request's `BusyScope` starts in `run_serve_loop` before the image load, with the stage `image`, so a
+  stuck read is reported like any other stall. `Watchdog::start()` returns false when the thread cannot be created, and
+  serve prints `strata: could not start the watchdog` and exits 2, as `InputReader::start` does.
+- **Reason:** Two writers on one stderr must not split a line. The seam lets the child stall cases end without a crash
+  report. Image loading reads up to 256 MiB from a path the client names, so a stuck read is part of the request.
+- **Review required:** Remaining risks, not fixed. (1) A stderr pipe that nobody drains blocks `write_report_line`
+  inside the watchdog thread, so the report and the abort never finish and the process hangs rather than aborts; the
+  watchdog has no timeout on its own writes. (2) Writers outside the mutex can still interleave with the report: the
+  startup lines, which run before the watchdog starts, and any `fprintf` in the engine. (3) An image read longer than
+  the limit (60 s by default) now ends the engine; confirm that is wanted. (4) The start-failure path has no test: a
+  probe on this Mac showed `std::thread` creation still succeeds under `RLIMIT_NPROC` 0 and `RLIMIT_AS` 1, so a test
+  would need a new seam.
+
+### D-IMPL-839: The dump writers take the declared row count and enforce the bounds the readers enforce
+
+- **Decision:** `write_logits_dump` takes `declared_rows`, the caller's `n_prompt - 1 + max_new`, and writes it as the
+  header's second integer. The file holds `0 < rows <= declared_rows` rows, so a prompt-path run keeps the full declared
+  count, and `tools/metal/tf_compare.py` takes `first_position = declared - rows`. A test covers declared 100 with 36
+  rows present: header 100, 36 rows, first position 64. The logits writers reject `n_vocab < 2` and non-finite values.
+  The routing writer rejects layers outside 0 to 47 and k above 64, the bounds `tools/make_profile.py` reads. A QSA
+  layer whose only slice is the FP16 V pool is rejected, not dropped. This supersedes D-IMPL-834 for the layer and k
+  bounds, which said the writer did not enforce them. The id bound stays with the reader, since it depends on the
+  expert count (512, or 256 for a pruned model).
+- **Reason:** A header that held the rows present would put a short dump's first row at position 0, mislabelling every
+  prompt-path comparison. A writer that accepts what the reader rejects produces files no reader can use. A one-off
+  check outside CTest, as in D-IMPL-836, wrote a 5-vocabulary, 36-row file with declared 100 through `write_logits_dump`;
+  `tf_compare.load()` read it as declared 100, 36 rows, first position 64.
+- **Review required:** The driver is not wired, so nothing checks that the caller's declared count is `n_prompt - 1 +
+  max_new`. Confirm whether `write_first_logits_dump` should reject non-finite values, since no reader checks that file.
+
+### D-IMPL-840: `setup.MAC` is `sys.platform == "darwin"`, defined in the top constants of setup.py
+
+- **Decision:** `setup.py` defines `MAC = sys.platform == "darwin"`, a bool, after the `tools.model_catalog` import and
+  above the Metal planner constants. It is the one switch the Mac branches test.
+- **Reason:** Section 4.1 gives this value and places it after `WIN` (`setup.py:60`). This checkout has no `WIN`:
+  `setup.py` is the fail-closed stub, so the definition goes in the top block instead.
+- **Review required:** None.
+
+### D-IMPL-841: S3 in this change is the `MAC` constant only, and `main()` stays the fail-closed stub
+
+- **Decision:** This change adds `MAC` and its test and nothing else from S3. Still open: the other section 4.1
+  constants, the `from serve import macos` import, the probes (section 4.2), the Mac step order and refusals (section
+  4.3) and `--check`. `main()` still prints `macOS setup is not implemented yet; no files were changed.` and exits 2.
+  Section 15 records S3 as in progress.
+- **Reason:** The S3 "Done when" (the four refusal profiles and `--check` on the reference Mac) needs a setup flow this
+  checkout does not have. An import of `serve.macos` with no caller would be unused code in a file that must refuse to
+  change anything.
+- **Review required:** Confirm this split before the step 1 work starts.
+
+### D-IMPL-842: No `create=True` exists in this checkout, so D-IMPL-005 resolves with nothing to remove
+
+- **Decision:** D-IMPL-005 is marked resolved. No Python file in the tree patches `setup.MAC`, and none uses
+  `create=True`. The setup test modules that 07 section 10.1 lists (`test_setup_amd`, `test_setup_choices`,
+  `test_setup_draft_vocab`, `test_setup_golden`, `test_setup_lowram`, `test_setup_pins`, `test_setup_prompts`,
+  `test_setup_risk`, `test_setup_rope`) are in no commit on any ref. The setup-related tests present are
+  `tools/test_setup_shell.py`, `tools/test_shards.py` and the four `tools/test_mtp_*.py` modules. None of the last five
+  imports `setup` or reads `setup.MAC`.
+- **Reason:** Adding `create=True` or new patches to modules that are not here would be code for nothing. The test in
+  D-IMPL-843 keeps `MAC` from being removed silently, which is the purpose the D-IMPL-005 review item names.
+- **Review required:** When the setup test modules are ported (07 section 10.1), each one takes
+  `mock.patch.object(setup, "MAC", False)` without `create=True`.
+
+### D-IMPL-843: The `MAC` regression test runs on every OS and loads setup.py under three platforms
+
+- **Decision:** `serve/test_macos.py::MacSetting::test_setup_mac_switch` is not skipped off macOS. It asserts that
+  `setup` has `MAC`, that `setup.MAC` is `sys.platform == "darwin"`, and that executing `setup.py` again with
+  `sys.platform` set to `darwin`, `linux` and `win32` gives True, False and False. The test copies `sys.path` for the
+  reloads, so the `sys.path.insert` in `setup.py` does not persist.
+- **Reason:** A presence check alone passes for a hard-coded `MAC = True`. Re-executing the file checks what the switch
+  selects, on any host.
+- **Review required:** Checked by removing the `MAC` lines from `setup.py`: the test fails with `setup.py must define
+  MAC`. The lines were restored afterwards.
+
+### D-IMPL-844: Three runner modules still fail without llama.cpp's gguf-py, and they are not hidden
+
+- **Decision:** `tools.test_iq_pack`, `tools.test_mtp_pack` and `tools.metal.test_dense_vs_gguf` are not changed, skipped
+  or excluded. They stop in `tools/_paths.py` with `llama.cpp's gguf-py was not found`; the last one has one erroring
+  test, `test_compat_conversion_bytes_are_recomputed`.
+- **Reason:** This worktree has no `.ref/llama.cpp`, no `third_party/llama.cpp` and no `STRATA_GGUF_PY`, and the project
+  venv has no `gguf` package. The failures do not involve `setup`, and D-IMPL-006 requires known failures to stay
+  visible. The runner gives 36 of 39 modules before and after this change.
+- **Review required:** Run the runner with `STRATA_GGUF_PY` set to a pinned llama.cpp `gguf-py` to confirm those three
+  modules pass. That run has not been done.
+
+### D-IMPL-850: U4 covers the section 6 rules; 05 has no ring-position never-wrap rule
+
+- **Decision:** The host-verifiable part of U4 is the section 6 rule set: an excluded PLE payload is covered only as
+  outward padding of at most one page beside a read tensor, no window extends past the mapped file, and every byte a
+  window covers is either read or counted in `wrapped_unread`. The brief's "a window or a position must never wrap
+  around the ring or file" is not a rule in 05. The only never-wrap statements in the mac documents concern GGUF bytes
+  mapped as Metal no-copy buffers ([02](02-architecture.md), section 5.3; 05, section 6). The position rings of 04 (the
+  two-slot WindowParams ring, the sampler history ring) are outside U4. The tiered no-GGUF rule (section 6, rule 2) is
+  not verified on the host (D-IMPL-858).
+- **Reason:** Section 6 is the only text that states the never-wrap conditions, so the tests use its wording and
+  boundaries and nothing else.
+- **Review required:** The owner of 05 should confirm that no ring-position rule was intended for U4.
+
+### D-IMPL-851: `verify_window_never_wrap` is the one verifier, and the loader returns its result
+
+- **Decision:** `verify_window_never_wrap` (`src/metal/engine/window_plan.cpp`, declared in
+  `include/strata/metal/window_plan.hpp`) holds the never-wrap checks. `validate_ple_window_exclusion` in
+  `src/metal/engine/window_storage.cpp` keeps its GGUF checks (the PLE tensor's location and its absence from sources and
+  slices) and returns the verifier's result in place of its own overlap loop. The verifier also checks the union on
+  every file, so the loader refuses any plan whose union differs from `wrapped_unread_bytes`.
+- **Reason:** The device-free tests and the loader must apply the same rule. The old loop bounded only the overlap size,
+  so it accepted a window with PLE bytes and no read tensor in their page, and it did not check the union.
+- **Review required:** None beyond the Metal runs, which pass with the change.
+
+### D-IMPL-852: The PLE padding rule reads "shares that page" literally
+
+- **Decision:** A window may overlap an excluded PLE payload only as padding. The overlap is at most `kWindowPageBytes`,
+  inclusive. If it covers the payload's first byte, a read tensor must end before the payload in the same 16 KiB page.
+  If it covers the payload's last byte, a read tensor must start after the payload in the same page. A window strictly
+  inside a payload is rejected. A payload that fits in one page shared by reads on both sides is accepted.
+- **Reason:** 05 section 6, rule 1: "outward page alignment may cover up to 16 KiB of its edge when the preceding or
+  following read tensor shares that page". A padding window with no read beside it is not outward alignment of a read.
+- **Review required:** The owner of 05 should confirm this reading, in particular that a read ending exactly on a page
+  boundary does not allow padding into the next page.
+
+### D-IMPL-853: The planner still merges across a short PLE gap, and the verifier rejects the plan
+
+- **Decision:** `plan_windows` is unchanged. It still merges neighbours closer than 256 MiB, including a PLE payload
+  between them. The verifier rejects that plan, and the loader fails closed with "more than one PLE boundary page", as
+  the existing `metal_window_storage_test` bridge case expects.
+- **Reason:** Splitting at the PLE would make that bridge plan valid and change its documented expectation. Real PLE
+  gaps are above 26 GiB ([05](05-memory-and-residency.md), section 4.2), so the case arises only in synthetic layouts.
+  `--plan-only` would still count the PLE bytes as unread for such a layout.
+- **Review required:** Decide whether the planner should split at the PLE, so that the PLAN line never reports a plan
+  that the loader rejects.
+
+### D-IMPL-854: The union counts overlapping windows once
+
+- **Decision:** The union check is the merged union of each file's windows, minus its included tensor bytes, summed over
+  files, which must equal `wrapped_unread_bytes`. An identical duplicate window adds nothing. For planner output the
+  planner's per-group value equals this union, because groups are at least 256 MiB apart and their spans do not overlap.
+- **Reason:** 05 section 6, rule 3: "the union counts those bytes once".
+- **Review required:** None.
+
+### D-IMPL-855: Exact fit is the window end at the read's page-rounded end, and the page limit is inclusive
+
+- **Decision:** For a read tensor beside a PLE payload, exact fit is a window that ends at the page-rounded end of the
+  read. One page more is one over and is rejected. The limit is inclusive, but outward rounding never produces exactly
+  16 KiB of PLE, because the overlap is at most 16 KiB minus one byte. The tests therefore use the rounded-end fit and
+  one page over, and the planner cannot produce an exact 16 KiB overlap.
+- **Reason:** 05 section 4.2 defines a window end by rounding out, and section 6 gives the limit as "up to 16 KiB".
+- **Review required:** None.
+
+### D-IMPL-856: The new host tests are `metal_never_wrap_host_test` and `metal_window_offset_test`
+
+- **Decision:** Two host-labelled tests are registered in `cmake/metal/tests.cmake`, documented in 09 section 9.1, and
+  listed in `tests/metal/test_map.json` without a `planned` key. `metal_never_wrap_host_test` covers the U4 boundary
+  cases and the verifier. `metal_window_offset_test` covers the U3 offsets and tables at full shape. The Metal
+  `metal_never_wrap_test` and `metal_tiered_copy_test` remain the gate for the live loader.
+- **Reason:** The spec's test names are Metal-labelled. The host halves get their own names so that the labels in the
+  map stay true, as D-IMPL-830 did for the watchdog and dump tests.
+- **Review required:** The owner of 09 should confirm the host and Metal split.
+
+### D-IMPL-857: U3's host arithmetic needs no new production code
+
+- **Decision:** `build_full_mode_layout`, `order_full_mode_warm_experts` and `plan_windows` already implement the spec's
+  formulas: window offset `file_offset - window.start`, GPU address `window.gpuAddress + offset`, expert table index
+  `(l * n_expert + e) * 3 + role`, resident entry `l * n_expert + e`, unused tail zero, and table sizes of 590 KB and 96 KiB
+  at full capacity. This change adds tests only. They check the arithmetic at the full 48 x 512 x 3 shape, against a
+  sparse file and against hand-computed indices.
+- **Reason:** The brief asks for code only where the spec gives an exact formula that is missing. For U3 the formulas
+  were implemented and tested only at 2 and 256 experts.
+- **Review required:** None.
+
+### D-IMPL-858: Sparse-file markers are sampled, and the tiered and warm-up parts stay Metal-side
+
+- **Decision:** `metal_window_offset_test` writes 4-byte markers only at sampled slabs (each window's first and last slab,
+  and every 9973rd slab), so the 1.125 GiB sparse file allocates a few blocks. It checks every slab's table entry against
+  its window base and offset, and reads the sampled markers at the position the table entry implies. The tiered no-GGUF
+  assertion needs the tiered loader (U5) and stays in `metal_tiered_copy_test`. The warm-up wave barrier and the 64 MiB
+  chunk partition live in `window_storage.cpp`, on the Metal side, and are not extracted for host tests.
+- **Reason:** Writing every slab would allocate about 300 MB of blocks for a check that needs a few positions. There is
+  no host object for tiered storage before U5.
+- **Review required:** None.
+
+### D-IMPL-870: T11 is done on the host in its pure-logic form; the reference Mac's runs stay open
+
+- **Decision:** The host-verifiable part of T11 is `tools/metal/accept/bench.py`, tested by `tools/metal/test_bench.py` on
+  synthetic text in the formats of 09 section 3.1. It covers how a run becomes a value (through `engine.py`), the spread
+  rule, PF-1 and PF-2, the regression bar and comparison with their skips, the trend rule, the BENCH rows and the host
+  checks of section 5.1. `accept.py pf` is wired to PF-1 and PF-2. Still open: the reference Mac's `bench` and `pf` runs,
+  `tools/metal/accept/engines.py`, and `tests/metal/upstream_speed.json` (section 5.3, outside the goal's sections).
+  Section 12 and the phase 2 table of 10 say so.
+- **Reason:** A run needs a model, the reference Mac and the previous release. None of these exists in this checkout, so
+  only the logic the spec makes exact can be verified here.
+- **Review required:** The owner of 09 should confirm that this split is the "host logic done" of the T11 row.
+
+### D-IMPL-871: `pf` gets its measure; `bench` does not, until its baseline exists
+
+- **Decision:** `RunSpec("pf")` takes `measure=measure_pf`. `RunSpec("bench")` keeps no measure, so a live `accept.py bench`
+  still stops with `criteria not measured yet: ... (task T11)` before any step. `bench_verdicts` and `regression_verdicts`
+  are tested and ready for the wiring.
+- **Reason:** The bench run lists REG.decode, REG.prefill and REG.trend. Those need the previous release's baseline
+  (`engines.py`, absent), and the spread re-run of 5.1 step 3 is not in its plan. A measure now would either invent a
+  baseline or print a PASS without the REG rows. PF-1 and PF-2 need neither.
+- **Review required:** None. Wiring `bench` is a follow-up with `engines.py`.
+
+### D-IMPL-872: A criterion the spec lets a run skip is NOT RUN, and it does not block
+
+- **Decision:** `criteria.Verdict` has a `skipped` flag (default false), and `criteria.skip(id, note)` returns a verdict
+  with `passed` None and `skipped` true. `blocks` is false for a skipped verdict. The PASS line names the skipped IDs, for
+  example `accept bench: PASS (7 criteria, 1.2 min) (NOT RUN, skipped: REG.decode, REG.prefill, REG.trend)`, and the
+  criterion row in `result.json` has `pass: null`. A missing baseline therefore gives NOT RUN for the criterion, never a
+  pass.
+- **Reason:** The gating column of 5.4 reads "Yes, unless skipped or noisy", so a skip must not fail the run. It must not
+  read as a pass either, so the line names it.
+- **Review required:** The owner of 09 should confirm that a run with a skipped REG.* is PASS with the names, and not NOT
+  RUN as a whole. This is the one place where the spec allows either reading, and the choice is one line in `accept.py`.
+
+### D-IMPL-873: A three-run spread above 5% is NOT RUN until the re-run is in the plan
+
+- **Decision:** `measure_arm` raises `BenchError` when the three-run spread of decode or prefill is above 5%, because
+  5.1 step 3 then needs three more runs. `summarize` implements the six-run rule too (median of six, `noisy` above 5%), but
+  no plan produces six runs yet.
+- **Reason:** The plan is static, and a conditional re-run needs a runner change. A three-run median is not used as if it
+  were settled.
+- **Review required:** None. The live T11 work adds the re-run step, which then needs its own check.
+
+### D-IMPL-874: Medians, spread and the 5% boundary
+
+- **Decision:** The median is `statistics.median`, so for six runs it is the mean of the middle two. The spread is
+  `(max - min) / median`, and it is over the limit only when strictly greater than 0.05. A rate must be a finite positive
+  number. Run counts other than 3 and 6 are refused.
+- **Reason:** 5.1 steps 2 and 3 give the median and the spread, and "above 5%" is strict.
+- **Review required:** None.
+
+### D-IMPL-875: The regression bar uses T-4's provisional default until T-4 records a value
+
+- **Decision:** `regression_bar(None)` is 0.95, the provisional default of section 11 (coefficient of variation at most
+  2%). Above 2% the bar is 1 - 2.5 x CV. A negative or non-finite CV is refused. The spec gives no upper bound on CV, so at
+  CV 0.4 or more the bar is zero or less and the check cannot fail. That case is left open.
+- **Reason:** Sections 5.4 and 11 say the default stands until the measurement is recorded.
+- **Review required:** The owner of 09 should say whether a CV bound is wanted, for example NOT RUN above some CV.
+
+### D-IMPL-876: REG.decode is judged on its worst prompt, and noisy points are excluded
+
+- **Decision:** REG.decode is the lowest current-over-previous ratio of the mtp decode medians on ca-1k, ca-4k and ca-32k.
+  A point whose current or previous summary is noisy is not judged and is named in the note. If every point is noisy the
+  criterion is skipped. REG.prefill is the same rule on the ca-32k prefill median.
+- **Reason:** The criterion is "for each", so the worst ratio decides it. 5.4 says a noisy result cannot fail the check.
+  One number is the criterion's value, so the message names one ratio.
+- **Review required:** None.
+
+### D-IMPL-877: A refused flag is a skip; any other failure of the previous release is NOT RUN
+
+- **Decision:** `previous_engine_skip(exit, stderr)` returns the skip note `previous release refused the arguments:
+  unknown argument: <flag>` when stderr has `unknown argument:`. A non-zero exit without that line raises `BenchError`,
+  which is NOT RUN. Section 5.4 also skips an exit while loading the model or the pack. The loader's message is not in the
+  spec, so that case is not recognised and is NOT RUN until the message is known.
+- **Reason:** Failing closed. A guessed skip would hide a broken previous release.
+- **Review required:** The live T11 work should record the previous release's loader message, to make the skip exact.
+
+### D-IMPL-878: REG.trend is the largest change among the four REG points
+
+- **Decision:** The value is the change, against the previous night of the same engine, of whichever point moved most: the
+  mtp decode medians on ca-1k, ca-4k and ca-32k, and the ca-32k prefill median. The note says "printed: more than 3%" when
+  the size is above 3% (strictly). It is reported and never gating. With no previous night it is skipped.
+- **Reason:** 5.4 says "a change of more than 3% is printed" but does not name the numbers. These are the numbers REG.*
+  compare.
+- **Review required:** The owner of 09 should confirm which numbers the trend means.
+
+### D-IMPL-879: PF-2 and PF-1 are medians from one `pf` run, with the chunk checked
+
+- **Decision:** PF-2 is the median of the three ca-32k prefill rates. PF-1 is the ca-128k median over the ca-32k median,
+  both from the same invocation of `pf`. The time to first token on ca-32k (median) is in the PF-2 note. The chunk line is
+  required for both prompts, and it must give the same chunk in all three runs of a prompt. The chunks are in the notes.
+- **Reason:** 5.2 defines the rates and the same-run comparison, and says the chunk is read and recorded. A chunk that
+  changes between identical runs makes the rates incomparable, so that is an error rather than a number.
+- **Review required:** None.
+
+### D-IMPL-880: The benchmark reuses `engine.py`'s parser and adds none
+
+- **Decision:** `bench.parse_run` calls `engine.parse_one_shot` with `need_prefill=True`, because every benchmark prompt is
+  longer than one token and prints a prefill line, and with `need_chunk=True` for PF. `bench.py` has no regular
+  expression of its own.
+- **Reason:** 09 section 3.1 names `engine.py` as the one parser of these lines.
+- **Review required:** None.
+
+### D-IMPL-881: The section 5.1 host checks: their rules, and which runs they apply to
+
+- **Decision:** `bench.host_checks()` makes four checks before a benchmark run. `pmset -g batt` must name `AC Power`.
+  `pmset -g` must report `lowpowermode` or `powermode` as 0. `pmset -g therm` must show both `No thermal warning level has
+  been recorded` and `No performance warning level has been recorded`. `sysctl -n kern.memorystatus_level` must be at
+  least 50. The pgrep check is `checks.no_engine_running`, which every run already makes. An unmet check is NOT RUN with
+  exit 2 before any step. The checks run for every run with `RunSpec.benchmark`: `bench`, `pf`, `g1` and `g2`, because
+  g1 and g2 time the BENCH arms (section 6).
+- **Reason:** Section 5.1 lists these checks and their values. G1 and G2 time the benchmark arms, so the same host rule
+  applies to them.
+- **Review required:** This Mac has no thermal warning, so the warning form of `pmset -g therm` is unverified. The parse
+  follows 09's wording. The first throttled run on the reference Mac should confirm it.
+
+### D-IMPL-882: The thermal rule fails closed
+
+- **Decision:** A thermal state passes only when both `No ... warning level has been recorded` lines are present. Any other
+  line that names a thermal or performance warning level counts as a warning and fails. Output with neither line set is
+  unreadable and fails, so a missing line is never a pass.
+- **Reason:** A host that cannot report its thermal state must not be measured. The captured text of this Mac has the two
+  No lines and a third line about CPU power status, which is not a warning.
+- **Review required:** None, beyond D-IMPL-881's note on the warning form.
+
+### D-IMPL-883: `result.json` records the thermal state and the memory level
+
+- **Decision:** The `host` object gains `thermal_warning` (true, false, or null) and `memory_status_level` (an integer or
+  null). Both are best effort, as the other host fields are. `power` and `low_power_mode` now come from parsers in
+  `result.py` with the same values as before.
+- **Reason:** Section 5.1 says each host check value is recorded in `result.json`. The new keys are additions to schema 1,
+  and the schema's readers ignore unknown keys, as `build_result` documents for `restricted`.
+- **Review required:** The owner of 09 should confirm that adding keys does not need a schema bump.
+
+### D-IMPL-884: BENCH.other is one verdict per other point, and it never blocks
+
+- **Decision:** Each arm and prompt other than mtp and plain on ca-4k gets one `BENCH.other` verdict with its decode median.
+  `BENCH.mtp.target` is judged against 60 tok/s and is reported, not blocking, because its row is not gating.
+- **Reason:** One verdict per point keeps every value in `result.json`, and the row's gating flag carries the rule.
+- **Review required:** None.
+
+### D-IMPL-885: Runner rules for benchmark runs are tested in `test_bench.py`
+
+- **Decision:** `test_bench.py` loads `accept.py` as `test_accept.py` does, and tests: a `bench` or `pf` dry run without
+  models is NOT RUN with the models reason; a `pf` run with a battery stops with exit 2 before any step and writes no
+  result folder; `pf` has a measure and `bench` does not; a skipped criterion passes the run and is named on the PASS
+  line. `test_accept.py` is unchanged.
+- **Reason:** The T11 rules sit with the T11 tests. `test_accept.py` keeps covering the runner's shared behaviour.
+- **Review required:** None.
+
+### D-IMPL-886: The 9.3 row is a concrete path, and the glob count stays at 0
+
+- **Decision:** `tools/metal/test_bench.py` is a row of its own in 09 section 9.3, so `test_map.py` excludes it from the
+  `tools/metal/test_*.py (0 modules)` glob count. The section's count sentence reads 40/40 modules on 2026-10-13, the
+  result of `run_python_tests.py` in this worktree with `STRATA_GGUF_PY` set to the main checkout's gguf-py, because
+  three modules need it (the same three fail without it, before this change).
+- **Reason:** `test_map.py` documents that concrete paths in backticks are separately documented and not counted by the
+  glob. The gguf-py path is an environment setting, not a code change.
+- **Review required:** None.
+
+### D-IMPL-887: The `skipped` flag is a field of `Verdict`, not a new criterion value
+
+- **Decision:** A skip is a `Verdict` with `skipped` true, not a new value such as "NOT RUN" in `passed`. `passed` stays
+  `True`, `False` or `None`, and `None` now means "report" or "skipped". `blocks` decides the run, so the change is in
+  one place.
+- **Reason:** The existing rows and tests depend on `passed` being a boolean or `None` for reported rows, and `blocks` is
+  the single rule that decides a run. A new flag keeps both.
+- **Review required:** None.
+
+
+### D-IMPL-888: A skipped gating criterion makes the run NOT RUN, not PASS
+
+- **Decision:** In `tools/metal/accept.py`, a run in which a gating criterion is skipped (section 5.4, for
+  example `REG.decode` with no previous release) ends with `accept <run>: NOT RUN: skipped (section 5.4): <ids>`,
+  exit code 2, and `status: not-run` in `result.json`, with the skipped criteria still listed. A skipped
+  criterion that does not gate the run is still named on a PASS line.
+- **Reason:** The rule that a NOT RUN never becomes a PASS (AGENTS.md, and the exit-code contract of
+  section 3.2) applies to measurements that were not taken. The first version let a skipped regression check
+  pass the run, which would let a release or gate pass without its regression check. Failing closed is the
+  conservative reading of the spec, which allows the skip but does not say that the run passes without it.
+- **Review required:** Confirm that a skipped `REG.*` must stop the run from counting for a gate. If the
+  owner wants the skip to pass a non-release run, change the single branch in `accept.py` and its test
+  `test_a_skipped_gating_criterion_makes_the_run_not_run_never_pass`.
+
+### D-IMPL-940: The section 8 functions live in setup.py, and nothing calls them yet
+
+- **Decision:** `setup.py` gains `metal_engine_defs`, `metal_vision_defs`, `source_hash`, `find_tool`,
+  `xcode_and_toolchain` and `metal_build_json` (docs/mac/08 section 8), and, for make_release and verify_release,
+  `llama_pin`, `get_llama_cpp` and `cmake_build`. `main()` is main's. The build flow (07 S8) stays open.
+  After the merge with main, `metal_build_json` uses main's `source_version()` and `metal_source_rev()`, and my
+  `metal_source_rev` is dropped; the S7 install functions are main's.
+- **Reason:** B8 asks for the section 8 functions. The S-track owns the setup flow, but the definitions must be
+  written once for the local build and the release.
+- **Review required:** Confirm the S7 and S8 owner accepts these signatures. The spec names upstream versions of
+  `cmake_build` and `get_llama_cpp` (setup.py:1746 and :868); this checkout has neither, so these are minimal.
+
+### D-IMPL-941: The vision CMake gets the portable recipe and an embedded Metal library
+
+- **Decision:** `tools/vision/CMakeLists.txt` accepts `-DLLAMA_DIR=<checkout>`, which skips FetchContent, and
+  `STRATA_PORTABLE`, which sets `GGML_NATIVE` OFF (ON otherwise). It forces `GGML_METAL_EMBED_LIBRARY` ON. OpenMP
+  stays forced OFF in both modes.
+- **Reason:** 08 section 9 and 11.3 step 4 require these cache values, and the file had none of them. Apple clang has
+  no OpenMP (08 section 8.2), so OFF in both modes is the safer reading than ggml's default.
+- **Review required:** `test_workflows` used to assert that `STRATA_PORTABLE` is absent from this file; the assertion
+  now requires the portable branch.
+
+### D-IMPL-942: `metal_vision_defs` omits `-DSTRATA_VISION_CUDA=OFF`
+
+- **Decision:** The definitions of 08 section 8.2 are followed except `-DSTRATA_VISION_CUDA=OFF`, which the file does
+  not read. CUDA stays off because the file forces `GGML_CUDA` OFF.
+- **Reason:** CMake warns about an unused manually specified variable on every configure, and `test_workflows` requires
+  that the file never names `STRATA_VISION_CUDA`.
+- **Review required:** None.
+
+### D-IMPL-943: The source identity inputs
+
+- **Decision:** `ENGINE_SOURCES` is the root `CMakeLists.txt`, `CMakePresets.json`, `cmake/metal`, `src`, `include`,
+  `METAL_REV`, and `third_party/ggml/VERSION.txt`, the pinned llama.cpp commit that 08 section 8.3 names.
+  `VISION_SOURCES` is `tools/vision`. An identity is the first 16 hex digits of SHA-256 over each file's relative
+  path, size and bytes, in path order, with `.DS_Store` skipped.
+- **Reason:** 08 8.3 lists the engine inputs without the pin file's name; 07 4.7.2 adds `METAL_REV` and `cmake/metal`.
+  The 16-digit length comes from 08 11.7, check 9.
+- **Review required:** Confirm that `third_party/ggml/VERSION.txt` is the intended "pinned llama.cpp revision" input.
+
+### D-IMPL-944: drift.json records the setup.py marker count
+
+- **Decision:** `tools/metal/drift.json` sets the `setup.py` marker count from 0 to 10, the number of `# MAC:` lines
+  that B8 and B10 added. 10 section 4.3 says the work item that patches a file sets its count.
+- **Reason:** `check_drift.py` fails on any other count. It passes now.
+- **Review required:** The reviewer checks those ten lines in the diff.
+
+### D-IMPL-945: make_release uses a minimal `cmake_build`, and fetches llama.cpp only when it is missing
+
+- **Decision:** `setup.cmake_build(src, build, target, defs)` configures with Ninja, using the venv's cmake and ninja,
+  then builds the target. `setup.get_llama_cpp()` clones the pin when `third_party/llama.cpp` is absent. It refuses a
+  checkout whose `git rev-parse HEAD` is not the pin, including a copy without `.git`.
+- **Reason:** 08 11.3 calls both. The release worktree that verify_release creates copies `third_party/llama.cpp` with
+  `cp -cR`, which keeps `.git`, so the check still works there.
+- **Review required:** The clone is network access inside make_release and in CI. The owner confirms that is allowed.
+
+### D-IMPL-946: The release tools are host-tested with synthetic inputs, and run for real on this Mac
+
+- **Decision:** make_release, check_asset and verify_release have synthetic unit tests (09 section 9.3). The real
+  release was built twice on this Mac (Apple M5 Pro, macOS 27.0, Xcode 27.0 27A266a, Metal toolchain
+  `com.apple.dt.toolchain.Metal.32023.921.5`): once in the worktree and once in a clone at another path. Both used
+  `--allow-dirty` at commit `ec3bd04`, and llama.cpp at the pin through a symlink to the dev checkout's clone. The two
+  asset zips are byte-identical (SHA-256 `866a942b…`). `check_asset.py --symbols --run` passes on it.
+- **Reason:** B10 and B11 Done-when. The reference Mac was not used.
+- **Review required:** Repeat the two-checkout comparison on the reference Mac (08 11.4 records it there).
+
+### D-IMPL-947: The symbols zip differs across checkout paths, as 11.4 predicts
+
+- **Decision:** B10's Done-when says "the same member hashes in both zips". The asset zip meets it. The symbols zip
+  differs in `strata.metallibsym` only: `metal-dsymutil` records the build folder, as in
+  `/private/tmp/b10-checkout-b/build-release/metal/safe/attention.air`. The dSYM members are identical. This is left as
+  is. 08 11.4 keeps the symbols zip out of the reproducibility check, and verify_release compares only asset members
+  (11.8).
+- **Reason:** A path-independent `strata.metallibsym` changes the metallib link in `cmake/metal` (B3), outside this
+  scope.
+- **Review required:** Decide whether B10's "both zips" or 11.4 governs. A path-independent metallib symbol file would
+  be the B3 follow-up.
+
+### D-IMPL-948: The CI release step runs make_release.py without a file guard
+
+- **Decision:** `.github/workflows/ci.yml` runs `make_release.py --out dist` in the step named "Build the release files
+  and check them", with no `hashFiles` guard. It is in `mac-host`, which stays off until `MAC_HOSTED_RUNNER` is set.
+- **Reason:** The guard waited for the builder, which now exists. The step clones llama.cpp when it is missing and runs
+  `check_asset.py`.
+- **Review required:** Confirm the hosted runner can clone llama.cpp and finish within the job's 60 minutes. The local
+  run took about 3.5 minutes.
+
+### D-IMPL-949: The licence excerpts come from the pinned tree, and the vendor counts match 08 11.9
+
+- **Decision:** `tools/metal/licenses/` holds four excerpts (`yarn-rope.txt`, `stb_image.txt`, `miniaudio.txt`,
+  `subprocess.txt`). Each is copied from the pinned llama.cpp (3cf03257…), with its comment markers removed and a
+  `source:` line. On the real build the vendor check counted `stbi_` 153, `ma_decoder` 17, `subprocess_` 18 and
+  `sha256_` 6, and 0 for `httplib`, `nlohmann`, `XXH` and `SHA1`. These are the counts of 08 11.9.
+- **Reason:** B20's host part: the excerpt check and the vendor check run in make_release, and each fails on a fixture
+  in test_make_release.
+- **Review required:** The licence review (review:B20) is still for a person to confirm the table and the texts.
+
+### D-IMPL-950: verify_release fails closed at steps 5 and 6
+
+- **Decision:** Step 5 installs the draft with setup's `get_prebuilt_metal(url, updating=True)` and `smoke_test` (07 S7,
+  on main), into a fresh engine folder: `setup.ENGINE_DIR` is pointed there for the install and restored afterwards.
+  A `None` install or a `SetupError` fails the step. The download is served with `python3 -m http.server` on
+  127.0.0.1, as the spec says. Step 6 needs `tools/metal/accept.py` (09 T15), which is absent, so it refuses. Step 7 compares the asset members, not the symbols zip. A
+  different toolchain prints the spec's note and reports `ok (rebuild skipped)`, and `--no-rebuild` reports the same.
+- **Reason:** A draft must not verify without its install and acceptance. Passing without them would be wrong.
+- **Review required:** Confirm that `ok (rebuild skipped)` for `--no-rebuild` is the intended output, since the spec does
+  not name it.
+
+### D-IMPL-951: mac-release.yml is written and has not run
+
+- **Decision:** `.github/workflows/mac-release.yml` follows 12.3. It triggers on tags `v*-metal.*` with group
+  `mac-release`, `queue: max` and `cancel-in-progress: false`. `build` (runner `vars.MAC_HOSTED_RUNNER` or `strata-ref`,
+  contents write) runs the remote policy check and make_release (signing and notarisation only when their secrets are
+  set), then `gh release create --draft --verify-tag`. `verify` runs verify_release on `strata-ref`. `publish` runs on
+  ubuntu-24.04 in the `release` environment and alone runs `gh release edit --draft=false --latest`. The action SHAs are
+  those pinned in `ci.yml` and `mac-hardware.yml`, so no new action is introduced.
+- **Reason:** The host part of B18. The trial in a test repository is open.
+- **Review required:** Merging this file to main makes every `v*-metal.*` tag push start a build. The owner decides when
+  that happens. The `release` environment's reviewer is repository configuration, which this checkout does not contain.
+
+### D-IMPL-952: Release jobs may request contents write; every other job stays read-only
+
+- **Decision:** `test_workflows` requires `contents: write` for the `build`, `verify` and `publish` jobs of
+  `mac-release.yml`, and `contents: read` for every other job and workflow. New tests cover the release workflow's
+  triggers, needs chain, environment, optional signing and always-run keychain removal.
+- **Reason:** 12.3 gives those jobs contents write. The earlier test required read everywhere, which would fail the
+  workflow by design.
+- **Review required:** None.
+
+### D-IMPL-953: requirements.json has no checks for the release tools yet
+
+- **Decision:** The Verified-by cells of REQ-BLD-01, -03 and -05 (01-requirements.md) name `tools/test_metal_build.py`,
+  the B5 module. test_map accepts only the checks named in those cells, so the check_asset and make_release tests are
+  not listed. `requirements.json` is unchanged.
+- **Reason:** test_map treats an unlisted check as an error, and changing a requirement's verification is a spec
+  change.
+- **Review required:** Decide whether REQ-BLD-01, -03 and -05 name the check_asset tests, or whether B5's module takes
+  them.
+
+### D-IMPL-954: release_metadata holds the release layout
+
+- **Decision:** `tools/metal/release_metadata.py` gains the asset and symbols member lists with their modes, the file
+  names, `BUILD_JSON_KEYS` and `LICENSE_TITLES`. `source_version` takes a checkout root, defaulting to the current
+  one. setup, check_asset, make_release and verify_release read the layout from there.
+- **Reason:** One definition of the layout. check_release_policy still calls `source_version()` with no argument.
+- **Review required:** None.
+
+### D-IMPL-955: Check 8 runs metal-nm and metal-dsymutil on the library itself
+
+- **Decision:** Check 8 lists the defined names with `xcrun metal-nm -j -U` and compares them with the manifest's first
+  words. It copies the library and runs `xcrun metal-dsymutil -flat -remove-source` on the copy. The development library
+  (`STRATA_METAL_EMBED_SOURCES=ON` in build-dev) fails the second part, as designed.
+- **Reason:** The release library has its sources removed (`STRATA_METAL_EMBED_SOURCES=OFF`, 08 5.7).
+- **Review required:** None.
+
+### D-IMPL-956: B13's table was mostly covered; five rows were added
+
+- **Decision:** `test_check_release_policy.py` already covered most rows of 11.1's table. Five tests were added for the
+  rest: the branch name from `GITHUB_REF_NAME` and from `git branch --show-current`, draft releases excluded from the
+  revision history, an unannotated tag on a published release branch, and a release-branch pull request whose latest
+  release differs.
+- **Reason:** B13's Done-when asks for a test per row.
+- **Review required:** None.
+
+### D-IMPL-957: Vision reproducibility, checked on this Mac
+
+- **Decision:** B9 is checked on this Mac (Apple M5 Pro, macOS 27.0, Xcode 27.0 27A266a), not on the reference Mac.
+  Two builds of `vision-repro.sh` in `/tmp/b9-vision/vpa` and `vpb`, against llama.cpp at 3cf03257 (the dev checkout's
+  clone), give identical binaries: 8,191,600 B, SHA-256 `23c08ce9…`. Stripped, both are 7,468,320 B, SHA-256
+  `faebac15…`. Checks 2 to 6 of 11.7 pass on the stripped binary, and its one allowed string is the only
+  `/tmp/` occurrence.
+- **Reason:** The spec's figures (8,180,336 B and 7,453,408 B) come from the reference Mac. They are recorded as measured,
+  not forced.
+- **Review required:** The reference Mac still has to confirm the spec's figures (08 section 9).
+
+### D-IMPL-958: BUILD.json's text and commit rules
+
+- **Decision:** Check 9 requires the file to end with a newline and to hold the documented keys and values. It does not
+  compare the bytes with `json.dumps(meta, indent=1)`. The commit is 40 hex, with `-dirty` accepted only under
+  `--allow-dirty`.
+- **Reason:** This follows the wording of 11.7, check 9. The writer produces the canonical text anyway.
+- **Review required:** None.
+
+### D-IMPL-959: What is not verified
+
+- **Decision:** Not done: B22 (its measurements need the reference Mac and the models); the test-repository trial of
+  `mac-release.yml`, and the draft verification (both need GitHub and a test repository, and this task forbids
+  publication); Developer ID signing and notarisation (no certificate, so those command lines are untested); the
+  reference-Mac repeats of B9 and B10; the licence review (review:B20); and verify_release's step 6 (09 T15, which is absent; step 5 uses 07 S7 from main). The worktree's `third_party/llama.cpp` is an ignored symlink to the dev checkout's pinned clone, which the
+  builds used.
+- **Reason:** The scope of this task, and parts that do not exist yet.
+- **Review required:** The owner reads this list before the coordinator merges.
+
+### D-IMPL-900: The S-track host items chosen here, and the four left for later
+
+- **Decision:** Done in this change (host part only): S2, S7, S10, S11 (the data folder, section 4.12), S12 and S13.
+  Not started: S5 (geometry files), S6 (menus, consent and `--check`), S8 (`build_engine_metal`) and S9 (steps 6 and
+  7). `main()` stays the fail-closed stub.
+- **Reason:** S5 needs the engine's `--write-geometry` output from real GGUF files. S6 needs the family table, which
+  `tools/model_catalog.py` lacks for IQ2_XS and IQ3_XXS (07 section 4.4.3 ships them for qwen and swift), and its
+  `--check` needs S3 step 1. S8 needs `cmake_build` and `metal_engine_defs` (B8), which are not in this checkout. S9 is
+  the body of `main()`, which must stay fail-closed. Each of the other items is host-checkable with a fake engine.
+- **Review required:** Confirm the S6 deferral, and decide the IQ2_XS and IQ3_XXS families (D-IMPL-917) before S6 starts.
+
+### D-IMPL-901: The two launchers ship now and forward to the fail-closed `setup.sh`
+
+- **Decision:** `START-HERE.command` and `SETUP.command` are added at the repository root, exactly as section 5.2 gives
+  them, with a second comment line saying that `setup.sh` stops with exit code 2. They are mode 0755 with LF endings,
+  and `.gitattributes` gains `*.command text eol=lf`. Section 5.2's opening sentence is replaced to say they ship.
+  `test_command_launchers` checks the on-disk mode and LF endings, checks the index mode (100755) when the file is
+  tracked, and runs both launchers through `/bin/sh` with a stub `setup.sh`.
+- **Reason:** Section 15 names S2 as the launchers; they only forward, so a double-click reports the existing stop
+  message rather than a partial install. A file that is not yet tracked has no index mode to check, so the coordinator's
+  `git add` must take the 0755 bit from disk.
+- **Review required:** Confirm that the launchers may ship before the installer. The first double-click shows exit 2.
+
+### D-IMPL-902: The setup and launcher tests live in `serve/test_macos.py`
+
+- **Decision:** The new tests are classes in `serve/test_macos.py`, the module section 10.3 names for them. No new test
+  module is added, so the rows of 09 section 9.3 do not change.
+- **Reason:** Section 10.3 lists `test_command_launchers`, `test_run_script_quoting`, `test_data_folder`,
+  `test_ssl_setup`, `test_port_probe`, `test_sighup_shutdown`, `test_death_note` and `test_keep_awake` there.
+
+### D-IMPL-903: `setup.py` imports `serve.macos` now; `main()` does not call the new functions
+
+- **Decision:** `setup.py` imports `from serve import macos` (section 4.1). The new functions (`write_run_script`,
+  `data_folder`, `create_data_folder`, `get_prebuilt_metal`, `smoke_test`, `use_ssl_bundle`, `strip_quarantine_targets`)
+  are called only from tests. `main()` still prints the stub message and exits 2, and `tools/test_setup_shell.py` still
+  passes.
+- **Reason:** D-IMPL-841 deferred the import until a caller existed. These are the first callers, and they are tested
+  one piece at a time, as the brief allows for a fail-closed product path.
+
+### D-IMPL-904: The engine install checks the unpacked files before anything moves
+
+- **Decision:** `get_prebuilt_metal` unpacks into `engine/_unpack`, reads `BUILD.json`, and runs the section 4.7.1 checks
+  (version, Metal rev, backend, arch, macOS minimum, GPU families) and the presence of `strata` and `strata.metallib`.
+  Only after all of them pass are the files moved with `os.replace`. A symbolic link in the asset raises `SetupError`
+  before any extraction. A failed check prints `warn: ... compiling instead` and returns None. The temporary folder is
+  removed on every path.
+- **Reason:** Section 4.7.1 says "fails the install" for a symbolic link, and "warns and returns None" for a failed
+  check. A replaced signed binary must never be half-written.
+- **Review required:** None.
+
+### D-IMPL-905: `updating=True` downloads again and replaces the engine; there is no version comparison
+
+- **Decision:** With `updating=True`, the installed engine is not reused. The asset is downloaded and checked, and it
+  replaces the installed files only if the checks pass. Nothing compares the installed version with the release first.
+- **Reason:** Section 4.7.1 does not say how `update_installed_engine` decides that a release is newer. A comparison
+  would be a new rule.
+- **Review required:** Decide whether an update should compare BUILD.json first, to save a download.
+
+### D-IMPL-906: The smoke test parses the engine's actual device output
+
+- **Decision:** `smoke_test` reads `strata --version` as `strata <v> metal <rev>`. For `--list-devices` it reads the
+  `device_name=` and `families=` lines that `src/metal/program/main.cpp` prints, and requires exactly one
+  `device_name=` line and the families `apple7` and `metal4`. The fake engines in the tests are shell scripts that print
+  those lines.
+- **Reason:** Section 06 gives the fields of `--list-devices` but not its line format. The engine's source in this
+  checkout is the only format there is.
+- **Review required:** Confirm that `device_name=` and `families=` are the contract, and tell the engine owner so the
+  format does not change silently.
+
+### D-IMPL-907: No release URL is configured; the override and the bases list are in place
+
+- **Decision:** `RELEASE_REPOSITORY` stays None, so `prebuilt_bases()` returns `[]` by default. `--prebuilt` and
+  `STRATA_PREBUILT_URL` replace the release folders, and a local folder becomes a `file://` URL. With a repository set,
+  the tag folder comes first and the latest folder second. The HEAD probe is kept before the GET.
+- **Reason:** Section 4.1 sets the repository only after the publication destination is chosen (OQ-01).
+- **Review required:** None. OQ-01 stays open.
+
+### D-IMPL-908: A certificate failure stops the install; any other download failure compiles instead
+
+- **Decision:** A `CERTIFICATE_VERIFY_FAILED` error raises `SetupError` with the python.org hint of section 4.7.4. Any
+  other network failure prints `no ready-made engine at <url> (<reason>): compiling instead` and returns None.
+- **Reason:** Without certificates a compile cannot download its sources either, so continuing would only defer the
+  same error.
+- **Review required:** None.
+
+### D-IMPL-909: `data_folder` takes the saved folder as an argument; `create_data_folder` does not fail on a failed exclusion
+
+- **Decision:** `data_folder(root, saved=None)` returns the saved folder when given. The settings file is read by its
+  caller, because the settings reader of section 4.12 is not in this checkout, and no settings format is invented. On a
+  Mac inside a protected or synced folder, it returns `~/Strata-data` and prints an ok line that names the folder. If
+  `tmutil addexclusion` fails, `create_data_folder` prints a note and continues.
+- **Reason:** Section 4.12 gives the Time Machine line as a success message only, and does not make a failed exclusion
+  fatal.
+- **Review required:** Confirm that a failed exclusion is a note, not a stop.
+
+### D-IMPL-910: The run scripts take their arguments explicitly and accept only plain model names
+
+- **Decision:** `write_run_script(root, model, python, config, port)` writes `run-<model>.sh` and `.command` with the
+  arguments of section 4.10 and `shlex.quote` on every word. `model` must match `[A-Za-z0-9][A-Za-z0-9._-]*`, or it
+  raises `ValueError`. `quarantine_targets` returns the two launchers, `setup.sh` and the `engine` folder, and nothing
+  else.
+- **Reason:** The model name becomes a file name and a window title. `quarantine_targets` is tested against real
+  `xattr` on a Mac; `main()` does not call it.
+- **Review required:** None.
+
+### D-IMPL-911: The server's port probe, SIGHUP handler and keep-awake, with the engine side still open
+
+- **Decision:** `port_in_use(host, port)` is a module function (section 6.1), and `main()` calls it. The SIGHUP handler
+  is installed on darwin only (section 6.2). `--keep-awake` is a `store_true` flag with default None, so the config's
+  `keep_awake` applies when the flag is absent (section 6.9). `Service` starts caffeinate after the engine's READY and
+  stops it on unload. A `--lazy` server starts it at its first load, not at startup, so no sleep is blocked while the
+  model is unloaded (`KeepAwakeLazyStart`). The ready text about sleep is printed on darwin only, when the host is not loopback and
+  `keep_awake` is off. The engine's own SIGHUP ignore (06 section 2.4) is not changed, so a Terminal close with a real
+  engine is still unverified.
+- **Reason:** The spec's items are the Done-when of S12. The engine change is a C++ item (H-track).
+- **Review required:** None for the server. The engine side belongs to the H-track owner.
+
+### D-IMPL-912: The Mac's CPU name is the brand string, with no `platform.processor()` fallback
+
+- **Decision:** `serve/telemetry.py` `_cpu_name()` returns `macos.cpu_brand() or None` on a Mac. Off a Mac it still uses
+  `platform.processor()`.
+- **Reason:** Section 7.2 says `_cpu_name()` returns `macos.cpu_brand()` on darwin, and that the upstream fallback
+  returns `"arm"` there. A Mac whose brand cannot be read therefore shows no CPU name, not `arm`.
+- **Review required:** None.
+
+### D-IMPL-913: The death-note test runs a real fake engine, and does not patch `macos.MAC`
+
+- **Decision:** `EngineDeath` starts a Python stand-in through a shell wrapper that uses `exec`, so the signal reaches the
+  Python process, then kills it with SIGKILL or SIGSEGV. It does not patch `macos.MAC`, because `death_note` does not read
+  it. Section 10.3 asks for that patch, which would have no effect.
+- **Reason:** Testing the real subprocess path catches what a stub would hide.
+- **Review required:** None.
+
+### D-IMPL-914: Host, network and build directory for these tests
+
+- **Decision:** The tests ran on Darwin 27.0.1, arm64, with `machdep.cpu.brand_string` `Apple M5 Pro`. That is not a
+  reference-Mac run, and no reference-Mac result is claimed. No test uses the network: asset downloads go to a local
+  `http.server` on 127.0.0.1, and `build-dev` in this worktree is configured with
+  `FETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP` pointing at the main checkout's fetched sources, with
+  `FETCHCONTENT_FULLY_DISCONNECTED=ON`.
+- **Reason:** The brief forbids the reference Mac and network downloads, and the CMake presets would fetch llama.cpp
+  from GitHub otherwise.
+- **Review required:** None.
+
+### D-IMPL-915: The keep-awake end-to-end test uses the mock engine
+
+- **Decision:** `KeepAwakeFromTheServer` starts `serve/server.py --engine mock --config <file>`. It checks that one
+  caffeinate runs under the server process with the config key, with the flag, and not without either. The
+  `--engine strata` path is not used.
+- **Reason:** `keep_awake` is read for both engines, and the strata path needs a tokenizer folder that is not in this
+  checkout.
+- **Review required:** None.
+
+### D-IMPL-916: One mutation run reported a survivor that did not reproduce
+
+- **Decision:** The first full mutation run (39 scripted mutations, one unique snippet each, run against its test class,
+  then restored with a SHA-256 check) reported `run-script-model-name` as surviving. Run alone, and in a second full run with bytecode writing
+  disabled, the same mutation was killed by its test. The second run killed all 39. The cause of the first result is not
+  established. The runner now sets `PYTHONDONTWRITEBYTECODE=1`.
+- **Reason:** The survivor was not reproducible, so it is recorded rather than explained away.
+- **Review required:** None.
+
+### D-IMPL-917: S6's family-table gap is recorded, not fixed
+
+- **Decision:** `tools/model_catalog.py` gives `IQ2_XS` and `IQ3_XXS` no `families` key, while 07 section 4.4.3 ships them
+  for qwen and swift. This change does not edit the catalog, because `tools/strata_mcp.py` reads it too.
+- **Reason:** Fixing it changes the MCP model table, which belongs to S15. S6 cannot list the right models until it is
+  decided.
+- **Review required:** Decide the family lists of IQ2_XS and IQ3_XXS before S6 starts.
+
+### D-IMPL-918: The Mac branches of `setup.py` carry `# MAC:` markers, and the drift count is 3
+
+- **Decision:** The three Mac branches of `setup.py` (the protected-folder rule of `data_folder`, the TCC hint and the
+  Spotlight and Time Machine steps of `create_data_folder`) end with `# MAC:` comments, the convention of section 4.2 and
+  of `serve/server.py`. `tools/metal/drift.json` records `setup.py` at 3 (it was 0), the count `check_drift.py` gives.
+  `--update` was not run, so no other value of the snapshot changed.
+- **Reason:** `check_drift.py` counts `MAC:` on every line. Without the comments, the two `if not MAC:` branches were
+  unmarked Mac edits in a patched upstream file, and the check failed with "marker count expected 0, found 2". Section
+  4.2 says to re-check each marked edit and then record the count, which is what was done.
+- **Review required:** Confirm that the three branches are the only Mac edits to `setup.py`, and that the count is
+  recorded in the merge's diff of `tools/metal/drift.json`.
+
+### D-IMPL-919: The merge keeps main's server features, and only the S-track tests that main does not cover
+
+- **Decision:** For the server features (port probe, SIGHUP handler, `--keep-awake`, the keep-awake state, the ready text
+  and the firewall text), `serve/server.py` is main's version, byte for byte. My ten hunks in it were the same features in
+  another shape, and `keep_awake_sync()` also covers a lazy start and a reload. The `serve/test_macos.py` tests that
+  duplicate main's were dropped: `PortProbe` (main's `test_port_probe`), `SighupShutdown` (`test_sighup_shutdown`),
+  `KeepAwake` (`test_keep_awake`), the Apple reader and sampler tests of `TelemetryMac` (main's `MacTelemetry`), and the
+  stubbed signal cases of `EngineDeath` (main's `MacEngineDiagnostics`). Kept: `KeepAwakeFromTheServer` (the config key
+  and the flag, end to end), `KeepAwakeLazyStart` (a lazy start keeps the Mac awake only after its first load),
+  `EngineDeath.test_death_note_ignores_earlier_runs_in_the_log` (a real fake engine's normal exit), and
+  `TelemetryCpuName` (the brand on a Mac). The S-track setup classes are kept unchanged. The symlink member of the engine
+  test is named `strata-link`, because the zip had a duplicate `strata.metallib` entry.
+- **Reason:** Rule 1 of the merge: one implementation per feature, main's where it covers the spec. Rule 2: keep what
+  main's tests do not cover. This entry supersedes the server parts of D-IMPL-911 (the port probe, SIGHUP, keep-awake and
+  ready text, now main's) and the stub-free part of D-IMPL-913 (the death test now keeps one real-engine case).
+- **Review required:** Confirm that the 07 status names the death diagnostic test as `test_death_note_ignores_earlier_runs_in_the_log`
+  in `serve/test_macos.py`, and that `test_death_note` stays in `serve/test_server.py`.
+
+### D-IMPL-920: The server items the host can check, and the ones it cannot
+
+- **Decision:** Done, host part only: S12 (07 section 6: 6.1, 6.2, 6.3, 6.4, 6.9, 6.10, 6.11), S13 (one off-darwin
+  test and one `/health` test; the `_Apple` reader and the sampler were already in place), S15 (one darwin
+  system-folder test; the MCP rules were already in place) and S19 (the four section 10.3 server tests the host can
+  run). S16 is withdrawn, so there is no work for it. Not done because a fake engine cannot check it: S14 (the Monitor
+  and About texts need a screenshot review on the reference Mac). Outside the server track: the setup items
+  (S2-S11, S18), S17, S20 and S21.
+- **Reason:** The work was scoped to the server track with a fake engine. S14's Done-when is a screenshot review, and
+  the other open parts need the reference Mac or an engine.
+- **Review required:** None.
+
+### D-IMPL-921: The port probe is tested with loopback sockets on the host
+
+- **Decision:** `test_port_probe` binds real sockets on 127.0.0.1 and 0.0.0.0 on a free port, as section 10.3 specifies.
+  The listeners set SO_REUSEADDR, as the server's own socket does. The four rows run only on darwin, because the BSD
+  behaviour they test is darwin's; elsewhere `port_in_use` answers by bind alone.
+- **Reason:** A mock would test only the mock. The sockets are local, and no packet leaves the host.
+- **Review required:** Confirm that wildcard binds on loopback are acceptable under "no network". If not, move the
+  rows to a reference-Mac run.
+
+### D-IMPL-922: The SIGHUP handler stays where section 6.2 puts it, and the test waits 0.5 s
+
+- **Decision:** `main()` installs the SIGHUP handler after the ready text, next to SIGTERM, as section 6.2 gives it.
+  `test_sighup_shutdown` waits for the ready text, then 0.5 s, then sends SIGHUP to the server's process group, as a
+  closed Terminal does.
+- **Reason:** Installing the handler before loading would let a KeyboardInterrupt escape the loading code. The cost is a
+  window between the ready text and the handler in which SIGHUP still ends the process at once. The test's 0.5 s covers
+  that window by timing, not by construction.
+- **Review required:** Decide whether that window matters: a Terminal closed during a real load also ends the process at
+  once.
+
+### D-IMPL-923: `keep_awake` is a `Service` state: started by READY and each load, ended by each unload
+
+- **Decision:** `Service.keep_awake_sync()` runs `macos.keep_awake(os.getpid())` while the model is loaded and ends the
+  process when it is not, so a later load starts a new one. `ensure_loaded()` calls it in a `finally`, `unload()` calls
+  it, and `main()` calls it after READY. The config key is read with `is True`, like the other booleans. `--keep-awake`
+  is a store-true flag, so it can turn the setting on, not off.
+- **Reason:** Section 6.9 starts caffeinate at READY and ends it at an unload. Section 10.3's `test_keep_awake` calls
+  `ensure_loaded()` on a stub engine, so the hook must sit in `Service`.
+- **Review required:** Confirm that a flag which cannot override a `true` config value is acceptable. The config is
+  edited to turn it off.
+
+### D-IMPL-924: The firewall and tight-RAM texts are the section 6.3 and 6.4 texts
+
+- **Decision:** `firewall_note()` returns the section 6.3 paragraph with the real Python path. `warn_tight_ram()` prints
+  the section 6.4 text. The keep-awake line of section 6.9 prints on darwin when the host is not loopback and
+  `keep_awake` is off. The earlier wording differed from these texts and had no tests. The psutil fallback for total RAM
+  off darwin stays, as upstream has it.
+- **Reason:** The 07 texts are the specification of user-facing wording.
+- **Review required:** Check the firewall paragraph against a real Deny-then-Allow run on the reference Mac (not done).
+
+### D-IMPL-925: The vision folder moves only on darwin; the cache check runs on every OS
+
+- **Decision:** A `$TMPDIR` with a space sends the helper's folder to `/private/tmp`, on darwin only (section 6.11, the
+  first change). A cached image whose embeddings file has gone is dropped and encoded again on every OS (section 6.11
+  calls the second change safe everywhere).
+- **Reason:** Follows section 6.11's own split.
+- **Review required:** None.
+
+### D-IMPL-926: The MCP child's PATH is appended, and the command lookup uses the same PATH
+
+- **Decision:** `mac_path()` appends `/opt/homebrew/bin` and `/usr/local/bin` when they are missing from PATH and exist.
+  It never prepends, and it returns PATH unchanged when it adds nothing. On darwin, `StdioTransport.start()` applies it
+  before `shutil.which`, so the command is looked up on the PATH the child gets.
+- **Reason:** Section 6.10's failure is `npx` not found. A lookup on the old PATH would still fail before the child
+  starts.
+- **Review required:** Confirm that searching the extended PATH for the configured command is wanted.
+
+### D-IMPL-927: Tests sit beside the code they test; no new module was added
+
+- **Decision:** `test_death_note` stays in `serve/test_server.py` (`MacEngineDiagnostics`), which already covers the
+  section 6.5 cases, rather than moving to `serve/test_macos.py`. `test_system_folders` is `SystemFolders` in
+  `tools/test_strata_mcp.py`, beside `is_system_folder`. The server texts, vision, off-darwin telemetry and `/health`
+  tests are in `serve/test_server.py`; the PATH tests are in `serve/test_mcp.py`; the section 10.3 server tests are in
+  `serve/test_macos.py`. No module was added, so 09 section 9.3 needs no row and the glob counts are unchanged.
+- **Reason:** A moved copy of the death-note tests would test the same code twice. Section 10.3 names the file only in
+  its table of tests.
+- **Review required:** None.
+
+### D-IMPL-928: `ServerLifecycle` clears the `macos_version` cache
+
+- **Decision:** `ServerLifecycle.setUp` clears the `lru_cache` of `macos.macos_version`. `test_no_raise_anywhere` calls
+  it with `MAC` patched False, which caches `()` for the rest of the process. In the combined run,
+  `test_sighup_shutdown` then skipped with "cannot determine the macOS version". The product code is unchanged.
+- **Reason:** The skip was a test-order effect, not a fact about the host.
+- **Review required:** None.
+
+### D-IMPL-929: The S13 tests check absence off darwin, and the `/health` field
+
+- **Decision:** The off-darwin telemetry test checks that the static keys are exactly the upstream set and that no Mac key
+  appears in `static` or in a sample. `test_health_names_the_computer` starts the mock server and reads `/health`.
+  Neither compares with an upstream key list, which the repository does not hold.
+- **Reason:** S13's "identical to upstream" can be checked here only as the absence of the Mac keys.
+- **Review required:** None.
+
+### D-IMPL-930: The system-folder test runs on any OS, and no existing test changed
+
+- **Decision:** `SystemFolders` checks the section 8.1 list on any OS: the listed folders are refused; `/private/tmp`,
+  `/private/var/folders`, `/usr/local` and a temporary folder are allowed. The case rule of `norm()` is already tested
+  by `tools/metal/test_macos_paths.py`. No existing test was changed, so S15's "no test change" holds.
+- **Reason:** The list is pure path logic and does not need a Mac.
+- **Review required:** None.
+
+### D-IMPL-931: What `test_module_rules` checks
+
+- **Decision:** It parses `serve/macos.py` with `feature_version=(3, 9)`. Every import must be `__future__` or in
+  `sys.stdlib_module_names`. For each call of `subprocess.run`, `Popen`, `call`, `check_call` or `check_output`, and of
+  the module's `_tool` helper, whose first argument is a list literal, the program must be a literal absolute path. It
+  runs on every OS and skips only below Python 3.10.
+- **Reason:** These are section 3.1's rules as the spec states them. `_tool` is the module's own launcher wrapper.
+- **Review required:** None.
+
+### D-IMPL-932: `WebHealthAuthContract` is not added
+
+- **Decision:** The JavaScript contract test of section 10.3 is not in this change. It needs a DOM harness for
+  `serve/web/app.js`, and the repository has none. The host has `node`, but writing a harness is a separate change.
+- **Reason:** A harness is more than the server track covers here.
+- **Review required:** Decide whether the page tests belong with S14.
+
+### D-IMPL-933: The 10 table's S16 follows 07
+
+- **Decision:** 10 section 3.4 listed "S16 | The tools". 07 section 15 withdraws S16 (the PC calibration utility,
+  D-IMPL-236). The 10 row now says withdrawn.
+- **Reason:** 07 is the specification of the item, and the 10 row was stale.
+- **Review required:** Confirm that no other "tools" work is meant under S16.
+
+### D-IMPL-934: The drift record counts the server's MAC markers
+
+- **Decision:** `check_drift.py --update` changed one field of `tools/metal/drift.json` (after a backup): `serve/server.py`
+  from 0 to 3 `# MAC:` markers. Without it `check_drift.py` fails on the new markers. After the update it passes.
+- **Reason:** The check treats any change in a marker count as an item to record. The markers are the P8 convention that
+  section 6 asks for.
+- **Review required:** The next upstream sync must keep this count in step with the markers.
+
+### D-IMPL-935: What "host part" means here
+
+- **Decision:** "Host part" means the tests in the repository that run on macOS 27.0.1, arm64 (Apple M5 Pro), with a mock
+  engine or stubs. No model, no engine process and no reference-Mac acceptance run were used. The machine is the same
+  model as the reference Mac, but this change does not treat it as the reference Mac.
+- **Reason:** The Done-when of each S item is set on the reference Mac, and the user's constraints exclude it here.
+- **Review required:** Decide whether this host counts as a reference Mac for later items.
+
+### D-IMPL-936: What is not done in this change, and why
+
+- **Decision:** Left open: the engine's own SIGHUP ignore in `--serve` mode (06 section 2.4; C++ outside the server
+  track); the reference-Mac checks of S12, S13, S15 and S19; the setup- and engine-owned tests of section 10.3
+  (`test_setup_sh`, `test_command_launchers`, `test_run_script_quoting`, `test_data_folder`, `test_ssl_setup`,
+  `test_engine_swap`, `test_sigint_handler`, `test_geometry_plans`, `test_geometry_equals_files`); S14; S17; S20; S21.
+- **Reason:** Each needs the engine, the reference Mac or the setup track, none of which this change used.
+- **Review required:** Schedule the engine SIGHUP change with the engine's H6 work.
+

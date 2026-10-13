@@ -21,7 +21,7 @@ std::string format_one_shot_stats(const OneShotMetalStats& stats, std::int64_t r
         (output).append(strata_buffer.data(), static_cast<std::size_t>(strata_written));                     \
     } while (false)
 
-    STRATA_APPEND_FORMAT(output, "%-24s %.3f ms/token (WALL CLOCK: embed, layers, head, sample)\n", "  per token",
+    STRATA_APPEND_FORMAT(output, "%-24s %.3f ms/token (WALL CLOCK: embed, layers, head, sample)\n", "per token",
                          decode_ms_per_token);
     if (rounds > 0 && stats.gpu_window_available) {
         const double divisor = static_cast<double>(rounds);

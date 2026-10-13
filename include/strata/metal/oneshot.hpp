@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,8 @@ struct OneShotSpeculationStats {
     std::uint64_t mtp_vram_bytes = 0;
 };
 
+// Timing and byte fields are totals over every window of the run unless named per layer. The formatter divides
+// the totals by `rounds`, and computes the bandwidth as gpu_bytes_read over gpu_total_ms.
 struct OneShotMetalStats {
     bool gpu_window_available = false;
     double encode_total_ms = 0.0;
@@ -96,5 +99,29 @@ std::string format_one_shot_report(const OneShotReport& report);
 /// Format the `--stats` lines. `decode_ms_per_token` is the one-shot wall-clock average.
 std::string format_one_shot_stats(const OneShotMetalStats& stats, std::int64_t rounds,
                                   double decode_ms_per_token);
+
+/// One `strata --tokens ... --max-new N` run, as the driver builds it.
+struct OneShotRequest {
+    std::vector<std::int64_t> prompt_ids;
+    std::int64_t max_new = 16;
+    bool include_stats = false;  // `--stats`
+};
+
+/// The engine side of one-shot mode. The Metal Window implements it when it exists; host tests use a synthetic one.
+class OneShotBackend {
+public:
+    virtual ~OneShotBackend() = default;
+    /// Generate for `request` and fill `report`. On failure, set `error` to one line of text.
+    virtual bool run(const OneShotRequest& request, OneShotReport& report, std::string& error) = 0;
+};
+
+/// Check a backend report against the request it answers. Returns an empty string when the report is consistent,
+/// otherwise the reason it is not.
+std::string validate_one_shot_report(const OneShotRequest& request, const OneShotReport& report);
+
+/// Run one request and print its report on `output` only after the report validates. Returns 0 on success, 1 when
+/// the backend fails or its report is inconsistent (nothing is printed to `output`), and 2 for an invalid request.
+int run_one_shot(OneShotBackend& backend, const OneShotRequest& request, std::FILE* output,
+                 std::FILE* diagnostics);
 
 }  // namespace strata::metal

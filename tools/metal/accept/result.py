@@ -25,23 +25,61 @@ def run_text(argv: list[str]) -> str | None:
     return result.stdout.strip() or None
 
 
+NO_THERMAL_WARNING = re.compile(r"No thermal warning level has been recorded")
+NO_PERFORMANCE_WARNING = re.compile(r"No performance warning level has been recorded")
+WARNING_LEVEL = re.compile(r"(?:thermal|performance) warning level", re.IGNORECASE)
+
+
+def power_source(batteries: str | None) -> str | None:
+    """The source named by `pmset -g batt`, e.g. `AC Power`; None when the text does not name one."""
+    source = re.search(r"Now drawing from '([^']+)'", batteries or "")
+    return source.group(1) if source else None
+
+
+def low_power_mode(power: str | None) -> bool | None:
+    """From `pmset -g`: True unless the key is 0. macOS names it `lowpowermode` or `powermode`."""
+    value = re.search(r"(?:lowpowermode|powermode)\s+(\d+)", power or "")
+    return None if value is None else value.group(1) != "0"
+
+
+def thermal_warning(therm: str | None) -> bool | None:
+    """From `pmset -g therm`: True when a thermal or performance warning level is recorded, False when both
+    `No ... warning level has been recorded` lines are present and nothing else names a warning, None otherwise.
+    """
+    if not therm:
+        return None
+    lines = therm.splitlines()
+    for line in lines:
+        if WARNING_LEVEL.search(line) and not (NO_THERMAL_WARNING.search(line) or NO_PERFORMANCE_WARNING.search(line)):
+            return True
+    if any(NO_THERMAL_WARNING.search(line) for line in lines) and any(
+        NO_PERFORMANCE_WARNING.search(line) for line in lines
+    ):
+        return False
+    return None
+
+
+def memory_status_level(text: str | None) -> int | None:
+    """From `sysctl -n kern.memorystatus_level`: the percentage of memory free for use, or None."""
+    value = (text or "").strip()
+    return int(value) if value.isdigit() else None
+
+
 def host_info() -> dict[str, object]:
     product = run_text(["sw_vers", "-productVersion"])
     build = run_text(["sw_vers", "-buildVersion"])
     memory = run_text(["sysctl", "-n", "hw.memsize"])
     displays = run_text(["system_profiler", "SPDisplaysDataType"])
-    batteries = run_text(["pmset", "-g", "batt"])
-    power = run_text(["pmset", "-g"])
     cores = re.search(r"Total Number of Cores: (\d+)", displays or "")
-    source = re.search(r"Now drawing from '([^']+)'", batteries or "")
-    low_power = re.search(r"(?:lowpowermode|powermode)\s+(\d+)", power or "")
     return {
         "macos": None if product is None and build is None else {"product": product, "build": build},
         "chip": run_text(["sysctl", "-n", "machdep.cpu.brand_string"]),
         "memory_gib": None if not memory or not memory.isdigit() else int(memory) // (1 << 30),
         "gpu_cores": int(cores.group(1)) if cores else None,
-        "power": source.group(1) if source else None,
-        "low_power_mode": None if low_power is None else low_power.group(1) != "0",
+        "power": power_source(run_text(["pmset", "-g", "batt"])),
+        "low_power_mode": low_power_mode(run_text(["pmset", "-g"])),
+        "thermal_warning": thermal_warning(run_text(["pmset", "-g", "therm"])),
+        "memory_status_level": memory_status_level(run_text(["sysctl", "-n", "kern.memorystatus_level"])),
     }
 
 
