@@ -12802,6 +12802,51 @@ measuring L-15 remain open.
   finalizing this review entry. All inputs are synthetic and this does not
   establish model parity or production inference.
 
+### D-IMPL-413: Compose runtime-bound MTP full-layer stages 1–20
+
+- **Decision:** Add `encode_mtp_full_layer` as a T=1 coordinator over the
+  existing runtime binders and stage encoders. Require the `selected_token`
+  source mode and use the input projection's parameter slot for every stage.
+  The caller must encode the token producer earlier in the same ordered
+  command buffer. Resolve every stage view before encoding any MTP dispatch,
+  then order input projection, stream addition, attention GR read and KV
+  projection (stages 7–8), attention/KV stages 9–14, feed-forward read,
+  routing, routed experts, shared FFN/writeback and final mixer. Provide both
+  caller-owned `Encoder` and transactional
+  `CommandBuffer` forms. Keep draft-head projection and sampling (stages 21–22)
+  as a separate pass.
+- **Reason:** The runtime already owned the inputs, scratch and weights needed
+  for the complete T=1 MTP layer, but callers had to bind and order each stage
+  themselves. Reusing the existing binders keeps each stage's format, extent,
+  alias and Context checks authoritative while giving callers one ordered
+  layer operation. Requiring the selected-token source mode prevents choosing
+  the separate `MtpParams::tokens` path. A shared Metal buffer does not expose
+  whether its current bytes came from CPU or GPU work, so this API cannot
+  verify the producer; same-command-buffer GPU production is an explicit
+  caller precondition. Prebinding the full view set avoids partial MTP
+  recording when a later storage binding is invalid. A failed caller-owned
+  encode must discard the entire unsubmitted command buffer, including earlier work in
+  that buffer. One runtime has mutable scratch and drafter K/V, so its passes
+  must be serialized through GPU completion. The synthetic full-head fixture
+  remains separate because the main output head and cached vocabulary map are
+  caller-owned, distinct inputs; the compact tail avoids a roughly 417 MiB
+  synthetic head allocation. Production scheduling, full-head execution and
+  inspected-model parity remain open.
+- **Review required:** See REV-209. Challenge T=1/token-source constraints
+  and the caller-owned producer precondition, the shared parameter slot and
+  attention mode/window handoff, prebinding
+  before dispatch, exact stages 1–20 ordering, command-buffer rollback,
+  runtime/view lifetimes and serialization, and the stated stage-21/22 and
+  production-scheduler boundary.
+- **Validation:** `mac-dev` built the new engine source and
+  `metal_mtp_storage_test` passed 1/1, including params-token-mode refusal and
+  a late stage-9 StepRow-position failure after an earlier caller dispatch.
+  The test verifies that commit is refused after automatic command-buffer
+  discard and that the producer output and MTP scratch remain unchanged. The
+  complete MTP CTest selection passed 28/28 after the rollback refinement;
+  `test_map.py` passed with its existing planned and missing-requirement
+  diagnostics, and `git diff --check` passed.
+
 ### D-IMPL-412: Extend the synthetic MTP runtime chain through draft sampling
 
 - **Decision:** Continue the runtime-owned MTP smoke chain from its stage-20
@@ -12845,6 +12890,40 @@ measuring L-15 remain open.
   stage-20 sample. The runtime-bound 8-byte head is rejected before dispatch
   for the real full-head extent. Final review and broader regression
   validation are recorded in REV-208.
+
+### REV-209: Hostile review of the runtime-bound MTP full-layer coordinator
+
+- **Scope:** Review `encode_mtp_full_layer` API and stage ordering; selected
+  token and T=1 requirements; shared parameter slot; complete prebinding;
+  attention window and rotation mode; late-stage transaction rollback;
+  runtime/scratch/KV lifetime and serialization; CMake and test registration;
+  documentation accuracy; and the boundary between stages 1–20 and the
+  synthetic stages 21–22 tail.
+- **Findings:** The first hostile review found that a nonempty shared
+  `selected_token` view does not prove GPU write provenance, the rollback
+  fixture's `width=0` actually failed in stage 12 rather than stage 9, the
+  fixture explicitly discarded its command buffer before asserting rollback,
+  and the API contract did not say that the selected `MtpParams` slot and
+  StepRows stay unchanged through completion. A second reviewer independently
+  confirmed the rollback assertion gap and then found that this review record
+  still described the final suite rerun as pending.
+- **Disposition:** Keep producer provenance as a caller precondition because
+  the shared Metal view has no trustworthy CPU/GPU-writer metadata. The
+  coordinator now requires only selected-token source mode and a nonempty
+  view, and comments, error text and docs say the caller must encode its
+  producer earlier in the same ordered command buffer. Changed the late
+  failure to `StepRow.pos = -1`, which is rejected by stage 9 after stages 1–8
+  and an earlier caller producer dispatch. Before any manual discard, the
+  regression attempts commit and requires the discarded-buffer refusal; it
+  also checks that the producer output and MTP scratch were not changed. The
+  API now requires MtpParams/StepRows to remain unchanged until completion.
+  Updated the stale validation record only after rerunning the complete MTP
+  selection and map check. The isolated compact stages 21–22 tail and open
+  production/model-parity boundary remain explicit.
+- **Validation:** `mac-dev` rebuilt the changed source and test;
+  `metal_mtp_storage_test` passed 1/1; the complete MTP CTest selection passed
+  28/28; `test_map.py` passed with its existing planned and missing-requirement
+  diagnostics; and `git diff --check` passed.
 
 ### REV-208: Hostile review of the MTP stage-21/22 runtime tail
 
