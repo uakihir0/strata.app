@@ -464,7 +464,7 @@ The upstream `--help` and `-h` flags remain KEEP and print the Metal driver's us
 | `--no-capture` | off | MAC: forces re-encoding even when indirect command buffers are implemented. A no-op before that. |
 | `--no-pool`, `--gpu-only-full`, `--graph-only`, `--gpu-stages` | off | IGNORE, without a warning. Always GPU-only. |
 | `--shared-late`, `--keep-canonical`, `--no-token-graph`, `--no-fused-gr`, `--no-fast-attn`, `--no-publish-kernel`, `--no-fused-gdn`, `--no-fast-select`, `--stream-token` | off | IGNORE. `--stream-token` without a warning (always on); the others with one. Each row is in [04](04-metal-kernels.md), section 9.2. |
-| `--check-logits` | off | KEEP: the host scans row 0 of the window's logits after the wait; upstream's message and exit code ([04](04-metal-kernels.md), section 9.2) |
+| `--check-logits` | off | KEEP, not read in Phase 1: the CLI rejects it with the other inference options. Once the window exists, the host scans row 0 of the window's logits after the wait, with upstream's message and exit code ([04](04-metal-kernels.md), section 9.2; D-IMPL-962) |
 
 ### 3.10 New flags
 
@@ -491,8 +491,9 @@ The upstream `--help` and `-h` flags remain KEEP and print the Metal driver's us
 ### 4.1 Rule
 
 Every upstream `STRATA_*` variable keeps its name. On a Mac it is either honoured with the same meaning, or ignored
-silently. Variables are not warned about, because the server passes the user's `env` dictionary through. The tables
-below give the disposition of every variable in [audit B 1.3](audit/B-engine-host.md).
+silently. Variables are not warned about, because the server passes the user's `env` dictionary through, except
+`STRATA_METAL_ICB`, whose notice is required by [04](04-metal-kernels.md), section 8.3. The tables below give the
+disposition of every variable in [audit B 1.3](audit/B-engine-host.md).
 
 ### 4.2 Honoured with the same meaning
 
@@ -501,7 +502,6 @@ below give the disposition of every variable in [audit B 1.3](audit/B-engine-hos
 | `STRATA_TRACE` | `strata trace:` progress lines. `mem_mark` prints the GPU working-set free space instead of VRAM. |
 | `STRATA_PREFILL_AUTO_MAX` | Largest auto prefill chunk (8192) |
 | `STRATA_RESIDENT_HEADROOM_GIB` | RAM headroom kept free when the memory plan is computed |
-| `STRATA_KV_ROT` | Hadamard rotation for int8 KV (a kernel variant) |
 | `STRATA_SSD_KEEPALIVE`, `STRATA_SSD_KEEPALIVE_WINDOW` | Periodic reads that keep the SSD awake. Keep them; their value on Apple SSDs is a measurement item. |
 | `STRATA_FETCH_THREADS` | Tiered mode: expert fetch threads (default 8) |
 | `STRATA_LOOKAHEAD`, `STRATA_LOOKAHEAD_K` | Tiered mode: router lookahead prefetch |
@@ -511,13 +511,10 @@ below give the disposition of every variable in [audit B 1.3](audit/B-engine-hos
 | `STRATA_CKPT_REREAD` | Re-read the prompt instead of restoring a checkpoint |
 | `STRATA_LOGPOS`, `STRATA_LOGPOS_EXTRA`, `STRATA_LOGPOS_TOPK` | Position logging |
 | `STRATA_DECODE_TIMING` | Per-request `strata decode timing:` line |
-| `STRATA_PREFILL_TIMING` | Prompt-path GPU time by phase (`prefill.cpp:948-1007`); on a Mac it comes from counter sample buffers |
 | `STRATA_PREFILL_BF16X2` | The prompt path's BF16-weight GEMMs also multiply the activations' BF16 remainder (`prefill.cpp:108-121`, read with `atoi`): 1, every BF16 projection, the hyper-connection's included; any other non-zero value, all but the hyper-connection's; 0 or unset, off ([04](04-metal-kernels.md), section 6.2) |
-| `STRATA_PREFILL_DUMP_R` | A file path. After each chunk the host appends `int64 pos` and the 10,240 floats of R for every position that is a multiple of 64, read from the prefill arena; the file is opened `wb` at a call's first chunk and `ab` after ([04](04-metal-kernels.md), section 6.1) |
 | `STRATA_STATE_HASH`, `STRATA_STATE_HASH_GDN` | State fingerprints, the same hash function over the same bytes (gate C3) |
 | `STRATA_DUMP_FIRST_LOGITS` | Diagnostic dump |
 | `STRATA_VERIFY_DEBUG`, `STRATA_VERIFY_PROFILE`, `STRATA_VERIFY_NODES` | Window diagnostics. `VERIFY_NODES` prints the dispatch count of the encoded window. |
-| `STRATA_DBG_NAN` | Non-finite diagnostics, any value. **Window** (`verify.cpp:1183-1197`): after a window's wait the host scans its T rows of logits in window scratch. For the first row with a non-finite value, once per process, it prints `strata dbg: verify window at position <pos0>, row <t>: <bad> of <n_vocab> logits non-finite (token out <id>)` (the `printf` format of upstream, `%lld` and `%d` as there). **Prompt path:** upstream's MoE layer line and end-of-prompt line, verbatim ([04](04-metal-kernels.md), sections 6.6 and 6.1). |
 | `STRATA_TEST_VERIFY_STALL` | Test hook: simulate a stalled window to exercise the watchdog |
 | `STRATA_COMMIT_SYNC` | Wait for every commit before continuing |
 | `STRATA_MTP_PREFILL_SYNC` | Diagnostic |
@@ -545,8 +542,9 @@ These are discrete-GPU, Windows, x86, PCIe or multi-GPU only:
 - `CUDA_MODULE_LOADING`, `CUDA_VISIBLE_DEVICES`
 
 The kernel-scope variables of [audit B 1.3](audit/B-engine-host.md), the prompt path's included, each have a row in
-[04](04-metal-kernels.md), section 9.3. Those honoured are in section 4.2 (`STRATA_KV_ROT`, `STRATA_PREFILL_BF16X2`,
-`STRATA_PREFILL_TIMING`, `STRATA_PREFILL_DUMP_R`, `STRATA_DBG_NAN`). The rest are ignored:
+[04](04-metal-kernels.md), section 9.3. Only `STRATA_PREFILL_BF16X2` is honoured in Phase 1 (section 4.2). Four are
+ignored until the window or the prompt path reads them (D-IMPL-960): `STRATA_KV_ROT`, `STRATA_PREFILL_TIMING`,
+`STRATA_PREFILL_DUMP_R` and `STRATA_DBG_NAN`. The rest are ignored:
 - CUDA and HIP A/B and tuning arms: `STRATA_GR_UNFUSED`, `STRATA_GR_V3`, `STRATA_HC_SPLIT`, `STRATA_PREFILL_MMQ`,
   `STRATA_PLE_BATCH`, `STRATA_GDN_CONV_SERIAL`, `STRATA_GDN_REC_HEADS`, `STRATA_GDN_PIPELINE`,
   `STRATA_INDEXER_PER_TOKEN`, `STRATA_MTP_BATCH`, `STRATA_MTP_BATCH_F16`, `STRATA_ROPE_TABLE`, `STRATA_QSA_WARP`,
@@ -572,7 +570,7 @@ A Metal kernel variant switch that corresponds to one of them reuses its name an
 | `STRATA_METAL_WAIT` | `block` | How the host waits for a window: `block` (`waitUntilCompleted`) or `spin` (spin on a `MTLSharedEvent`'s `signaledValue` with `__builtin_arm_yield()`). The default is chosen by measurement M-1 (section 15). |
 | `STRATA_METAL_ERRORS` | 0 in release, 1 in debug | 1 sets `MTLCommandBufferDescriptor.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus`, so errors name the failing encoder |
 | `STRATA_METAL_SMALL_TILES` | 0 | Reserved and ignored. It would select 32 KiB variants if a later kernel uses more threadgroup memory; no Phase-1 kernel does. |
-| `STRATA_METAL_ICB` | 0 | 1 uses indirect command buffers per T, once implemented ([04](04-metal-kernels.md), section 8) |
+| `STRATA_METAL_ICB` | 0 | 1 prints the notice of [04](04-metal-kernels.md), section 8.3, once at start (D-IMPL-961), and uses indirect command buffers per T once implemented (section 8) |
 | `STRATA_METAL_DISPATCH` | `serial` | Unset, empty or `serial`: every segment uses `MTLDispatchTypeSerial`; `concurrent`: `MTLDispatchTypeConcurrent` with a buffer-scope memory barrier after each singleton or declared group of independent dispatches. Other values fail the generic Encoder call and discard its unsubmitted command buffer. The caller is responsible for declaring only groups with no write/read or write/write dependency. The standalone `metal_encoder_test` checks the generic policy; production bitwise parity across both modes remains the L-14 `metal_dispatch_modes_test` gate. The default stays `serial` unless L-14 shows a gain ([04](04-metal-kernels.md), section 8.2). |
 | `STRATA_METAL_GEMM` | Unset or empty: `mpp` on Apple10 for n >= 64, `simd` otherwise | The isolated `encode_prefill_gemm` API selects the F16/BF16 component. n < 64 always uses `simd`; `simd` forces that backend; `mpp` forces MPP on Apple10 and is rejected on other families until L-6 validates them. Other values fail and discard the unsubmitted command buffer. The selected API is not yet wired into production Prefill; its kernel numerical tolerance remains KL-gated ([04](04-metal-kernels.md), section 6.2). |
 | `STRATA_GPU_BUDGET_MIB` | - | Same as `--gpu-budget-mib` |
@@ -1488,7 +1486,8 @@ Instruments' Metal System Trace then lines CPU and GPU up on one timeline.
 ### 13.3 Serve-side telemetry
 
 - The INFO line and the post-DONE stderr lines (section 5).
-- `STRATA_DECODE_TIMING`, `STRATA_TRACE`, `STRATA_VERIFY_PROFILE`, `STRATA_VERIFY_NODES` and `STRATA_PREFILL_TIMING`.
+- `STRATA_DECODE_TIMING`, `STRATA_TRACE`, `STRATA_VERIFY_PROFILE` and `STRATA_VERIFY_NODES`. `STRATA_PREFILL_TIMING` joins
+  them when the prompt path reads it (section 4.3).
 - `--dump-routing`, flushed after every DONE.
 
 The Monitor's hardware cards are fed by the server's own `_Apple` telemetry reader (ioreg), not by the engine

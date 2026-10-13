@@ -3679,6 +3679,9 @@ Upstream: `Prefill::run` (`src/prefill/prefill.cpp:994-1973`), the kernels of `s
 In this section a file reference without a directory is to `src/prefill/`. A pair such as "84/694" gives a kernel's
 line and its launcher's line in `kernels.cu`. T is the chunk's row count, 1 ≤ T ≤ C, not a window width.
 
+Status: the prompt path is work item L13 (section 12). `Prefill::run` is not wired into the Mac engine, so the
+statements below are the design that L13 implements. Until then the prompt-path variables of section 9.3 are ignored.
+
 The prompt path has no bitwise contract with decode ([03](03-model-reference.md), section 6). As upstream's do, its
 GEMMs sum in the tile's order and take F16 or BF16 activations. Section 10.3 gives the tolerances. Two properties
 hold anyway:
@@ -5707,7 +5710,7 @@ section 15) measures it.
 
 **Indirect command buffers.** `STRATA_METAL_ICB=1` is reserved for an ICB per T and per mode combination, recorded at
 startup and executed with `executeCommandsInBuffer:withRange:`. Phase 1 does not implement it: the variable prints
-`strata: STRATA_METAL_ICB is not implemented; encoding each window` once and is ignored. It becomes work item L17
+`strata: STRATA_METAL_ICB is not implemented; encoding each window` once, when the process starts (D-IMPL-961), and is ignored. Until the window encoder (L9) exists, the process start is the only point where every run passes. It becomes work item L17
 (section 12) only if H-4 measures an encode time above 1 ms. Tiered mode's event calls cannot live inside an ICB,
 so an ICB would hold one range per segment.
 
@@ -5804,7 +5807,7 @@ Upstream lines are in `src/program/generate.cpp`.
 | `--gr-fp32-activations` | FP32 activations in the canonical `gr.cu` kernels (182, 1066). `gr.cu:363` already uses FP32 when `--gr-native-mmvf` is set. | Always on in effect. IGNORE without a warning. |
 | `--cpu-oracle-q8-0` | Pinned x86 activation scales for the CPU expert kernels (209, 1079) | IGNORE: the Mac has no CPU expert path. |
 | `--stream-token` | Orders the token's work on the session stream instead of synchronising the device (180). `--native` sets it (1519). | Always on: one queue, and the host waits only for the window ([06](06-engine-host-port.md), section 8). IGNORE without a warning. |
-| `--check-logits` | Reads the logits back each token and fails on a non-finite value (181, 5875-5887) | **KEEP.** After the window's wait the host scans row 0 of the window's logits, which are in window scratch, a Shared buffer ([05](05-memory-and-residency.md), sections 2.3 and 7), with no copy. The message and exit code are upstream's: `strata generate: <n> of <n_vocab> logits are not finite at position <pos>`, exit 1. |
+| `--check-logits` | Reads the logits back each token and fails on a non-finite value (181, 5875-5887) | **KEEP, not read in Phase 1** (D-IMPL-962). The CLI rejects the flag with the other inference options, exit 2, so it is never accepted silently. The check comes with the window (work item L9): after the window's wait the host scans row 0 of the window's logits, which are in window scratch, a Shared buffer ([05](05-memory-and-residency.md), sections 2.3 and 7), with no copy. The message and exit code will be upstream's: `strata generate: <n> of <n_vocab> logits are not finite at position <pos>`, exit 1. |
 | `--shared-late` | Plan v0.3 A/B: the shared expert inside `post[l]`, the old order (314, 1497) | IGNORE. The order is fixed (section 8.3). |
 | `--keep-canonical` | Loads canonical copies of natively served tensors (315, 1848-1869) | IGNORE. The Mac loads no canonical tensor ([06](06-engine-host-port.md), section 6.1). |
 | `--no-token-graph` | Two CUDA graphs per layer instead of one per token (316, 3617) | IGNORE. The Mac has no graphs; `--no-capture` is its own switch ([06](06-engine-host-port.md), section 3.9). |
@@ -5822,16 +5825,16 @@ Every variable of [audit B 1.3](audit/B-engine-host.md)'s kernel-scope list. "Ig
 
 | Variable (upstream line) | Upstream meaning | Mac |
 | --- | --- | --- |
-| `STRATA_KV_ROT` | Hadamard rotation of int8 KV | **Honoured** (sections 5.6 and 5.11) |
-| `STRATA_PREFILL_BF16X2` (`prefill.cpp:108-121`) | 1: each BF16-weight prompt GEMM also multiplies the activation's BF16 remainder, hyper-connection projections included; 2: all but those; 0 (default): off | **Honoured**, same modes (section 6.2) |
-| `STRATA_PREFILL_TIMING` (960) | Prompt-path GPU time by phase | **Honoured**, from counter sample buffers ([06](06-engine-host-port.md), section 4.2) |
-| `STRATA_PREFILL_DUMP_R` (1886-1897) | After each chunk, appends `int64 pos` and the D = 10,240 floats of R for every position that is a multiple of 64 (the file is truncated at chunk 0) | **Honoured**, same format. The host reads the rows from the prefill arena after the chunk's wait (section 6.1). |
+| `STRATA_KV_ROT` | Hadamard rotation of int8 KV | **Ignored in Phase 1** (D-IMPL-960). Read by nothing on the Mac. The spec does not yet give one meaning: section 5.11 sets the drafter's int8 rotation from it (`STRATA_KV_ROT=1`), section 5.6 gates the window's q4 rotation on it, and section 6.5 says q4 always rotates, with the optional rotation of f16 and i8 as a separate argument. The window (L9), the drafter (L11) and the prompt path (L13) read it once these sections state one meaning. |
+| `STRATA_PREFILL_BF16X2` (`prefill.cpp:108-121`) | 1: each BF16-weight prompt GEMM also multiplies the activation's BF16 remainder, hyper-connection projections included; 2: all but those; 0 (default): off | **Honoured** for on or off (D-IMPL-963): the memory plan reads it ([05](05-memory-and-residency.md), section 2.4). The modes 1 and 2 are the prompt path's (section 6.2) and come with it (L13). |
+| `STRATA_PREFILL_TIMING` (960) | Prompt-path GPU time by phase | **Ignored in Phase 1** (D-IMPL-960). Honoured with the prompt path (L13), from counter sample buffers ([06](06-engine-host-port.md), section 4.2). |
+| `STRATA_PREFILL_DUMP_R` (1886-1897) | After each chunk, appends `int64 pos` and the D = 10,240 floats of R for every position that is a multiple of 64 (the file is truncated at chunk 0) | **Ignored in Phase 1** (D-IMPL-960). Honoured with the prompt path (L13), in the same format: the host reads the rows from the prefill arena after the chunk's wait (section 6.1). |
 | `STRATA_PROMPT_ATTN_OLD` (1549) | Prefill attention through the decode kernel, 32 queries at a time | Phase 1 always runs this arm (section 6.5). Once `strata_pf_prompt_attn_*` exists (section 2.6), honoured with upstream's meaning. |
 | `STRATA_SELECT_OLD` (1448) | Prefill block scores through the warp kernel instead of tensor cores | As `STRATA_PROMPT_ATTN_OLD`, for `strata_pf_sel_scores_mma` |
 | `STRATA_ROPE_TABLE` (`native_rope.cu:97`) | RoPE from the host table instead of fast-math angles | Ignored: every Mac path reads the table ([03](03-model-reference.md), section 6.7) |
 | `STRATA_MTP_BATCH` (740), `STRATA_MTP_BATCH_F16` (772) | `MTP_BATCH=0` turns the batched E-9 drafter prefill off; `_F16=1` makes it F16 GEMMs | Ignored. The Mac always runs the drafter prefill as `mtp.prefill`, upstream's `MTP_BATCH=0` arm (section 5.11). |
 | `STRATA_PLE_BATCH` (1026) | 0 keeps the per-token PLE block in prefill | Ignored: the Mac runs only the batched block, upstream's default (section 6.7). Upstream's per-token arm takes F32 activations for the value, so its bits differ; CUDA references are taken with the variable unset. |
-| `STRATA_DBG_NAN` (`prefill.cpp:1814-1836`, 1915-1931; `verify.cpp:1183-1197`) | Non-finite counts: the first MoE layer of a chunk with any, the state the prompt leaves, and the first window row with non-finite logits | **Honoured**, all three lines verbatim. The prompt path's two are sections 6.1 and 6.6; the window's is [06](06-engine-host-port.md), section 4.2. |
+| `STRATA_DBG_NAN` (`prefill.cpp:1814-1836`, 1915-1931; `verify.cpp:1183-1197`) | Non-finite counts: the first MoE layer of a chunk with any, the state the prompt leaves, and the first window row with non-finite logits | **Ignored in Phase 1** (D-IMPL-960). Honoured, all three lines verbatim, with the window (L9) and the prompt path (L13). The prompt path's two are sections 6.1 and 6.6; the window's is [06](06-engine-host-port.md), section 4.2. |
 | `STRATA_INDEXER_PER_TOKEN` (1427) | The old per-token indexer append | Ignored: `strata_idx_append_*` (section 6.5) |
 | `STRATA_GR_UNFUSED` (125) | Keeps an FP32 copy of the normalised rows in the prompt GR (the F-1 A/B arm) | Ignored: one prompt GR form (section 6.3) |
 | `STRATA_PREFILL_MMQ` (476) | 0 turns off the integer (Q8_1 × quantised) expert GEMMs of the prompt path, upstream's default | Ignored: the Mac's expert GEMM is the FP16 arm, which upstream runs under `=0` (section 6.6). CUDA references of the prompt path are taken with `STRATA_PREFILL_MMQ=0` ([09](09-testing-and-validation.md)). |
