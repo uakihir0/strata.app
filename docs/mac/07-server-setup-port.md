@@ -1616,4 +1616,23 @@ Each item becomes one task in [10-implementation-plan.md](10-implementation-plan
 probes of section 4.2, the Mac step order and refusals of section 4.3, and `--check`. `main()` still refuses to change
 files (D-IMPL-841).
 
+**Server track status (2026-10-13).** The host part is done for S12, S13, S15 and S19, and S16 is withdrawn. S14 needs a
+review of the screenshots on the reference Mac. The tests run on a macOS 27.0.1 arm64 host with a mock engine or
+stubs; they need no model, engine or network, and no reference-Mac acceptance is claimed (D-IMPL-920 to 936).
+- S12: the port probe (section 6.1), the SIGHUP shutdown (6.2), the firewall and tight-RAM texts (6.3, 6.4),
+  `keep_awake` (6.9), the MCP child's PATH (6.10) and the vision folder and cache (6.11) are implemented.
+  `test_port_probe`, `test_sighup_shutdown` and `test_keep_awake` are in `serve/test_macos.py`. `test_death_note` stays
+  in `serve/test_server.py`, where it already covers section 6.5. Open: the engine's own SIGHUP ignore (section 6.2)
+  and the reference-Mac `kill -9` check.
+- S13: the `_Apple` reader and the sampler keys were already in place. `serve/test_server.py` now checks that no Mac
+  key appears off darwin and that `/health` names the computer. Open: the `/metrics` and `/v1/status` readings on the
+  reference Mac, and the Monitor review (S14).
+- S15: the host rules of section 8 are tested by `tools/test_strata_mcp.py` and `tools/metal/test_macos_paths.py`,
+  and the darwin system-folder list is tested too. `tools.test_strata_mcp` passes with no existing test changed.
+  Open: the reference-Mac run, `strata_models` with an engine plan (S18) and the Claude Desktop install (section 8.4).
+- S19: `serve/test_macos.py` has four of the section 10.3 server tests that the host runs (`test_port_probe`,
+  `test_sighup_shutdown`, `test_keep_awake`, `test_module_rules`). Open: the setup- and engine-owned tests of that list
+  (for example `test_setup_sh` and `test_engine_swap`), `WebHealthAuthContract` (it needs a page harness), and the
+  reference-Mac pass.
+
 ---
