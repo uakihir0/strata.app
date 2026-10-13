@@ -94,6 +94,7 @@ need a model loading window of their own, and produce result files rather than a
 | `tests/metal/requirements.json`, `tests/metal/reviews.json` | Each requirement of [01](01-requirements.md) with its checks; the records of the reviews | 6.3, 7.6, 9.4 |
 | `tools/metal/test_map.py` | The host test that the CTest list, this document's map, the requirements and the reviews agree | 9.4 |
 | `tools/metal/test_tf_compare.py`, `test_ladder_compare.py`, `test_make_prompts.py` | The unit tests of the comparison tools and the prompt builder | 9.3 |
+| `tools/metal/test_models.py`, `tools/metal/test_test_models.py` | The test-model checker (`check`, `check --quick`, `fetch --plan`) and its unit tests | 2.3, 9.3 |
 
 Results are written outside the checkout, to `STRATA_RESULTS` (default `/Users/Shared/strata-results` on the
 reference Mac), as section 3.2 describes.
@@ -1390,6 +1391,7 @@ run. `tools/metal/test_map.py` is a CLI checker exercised through CTest, not a u
 | --- | --- | --- |
 | Mac-supported Python modules not listed individually (the separately listed modules below are excluded): `tools/test_*.py` (14 modules), `tools/metal/test_*.py` (0 modules), `serve/test_*.py` (6 modules) | [07](07-server-setup-port.md), section 10.1; current checkout discovery | Hosted macOS CI and reference Mac |
 | `tools/test_artifact_set_lock.py`, `tools/test_mtp_vocab.py`, `tools/test_mtp_pack.py` | [05](05-memory-and-residency.md), sections 13-14 | macOS/POSIX shared and exclusive locks, symlink aliases, inherited lock descriptors, killed-writer partial-publication recovery, interrupted GGUF/MTP recovery, selected MTP revision matching, inventory/manifest/sidecar/hash validation, pending-marker refusal, runtime-size/index validation, and locked atomic draft-vocabulary replacement |
+| `tools/metal/test_models.py`, `tools/metal/test_test_models.py` | [09](09-testing-and-validation.md), section 2.3 (T3): the test-model checker and its 26 unit tests on sparse temporary files | macOS Python suite (stdlib only); no model files needed |
 | `serve/test_macos.py` | [07](07-server-setup-port.md), section 10.3 | macOS Python suite; engine-and-model cases run on the reference Mac nightly, step 3 (section 7.2). |
 | `tools/test_hit_curve.py` | [05](05-memory-and-residency.md), section 10.1 | macOS Python suite; tests distinct held-out routing data including aliases, copies, order and weight-only differences, snapshot consistency after source mutation, nonblocking FIFO refusal, partial runtime-compatible profiles and exact route-miss metrics |
 | `tools/test_make_profile.py` | [05](05-memory-and-residency.md), section 10.1 | macOS Python suite; validates STRP dimensions, ranking bounds, producer route-count/uniqueness limits and finite non-negative weights |
