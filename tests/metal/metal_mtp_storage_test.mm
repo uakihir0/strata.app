@@ -1372,12 +1372,84 @@ int main(int argc, char** argv) {
                 std::fill_n(seed_value_scales + row * 4u, 4u,
                             std::uint16_t{0x3c00u});
             }
+            MtpFullLayerSources full_layer_sources;
+            full_layer_sources.input_projection = projection_sources;
+            full_layer_sources.attention_window = 1u;
+            full_layer_sources.kv_rot = attention_mode.kv_rot();
+
+            MtpFullLayerSources invalid_full_layer_sources =
+                full_layer_sources;
+            invalid_full_layer_sources.input_projection.token_source =
+                MtpInputTokenSource::params_tokens;
+            auto rejected_cpu_token_command =
+                rollback_context->make_command_buffer(
+                    "MTP full-layer CPU token refusal", error);
+            const bool full_layer_requires_gpu_token =
+                rejected_cpu_token_command != nullptr &&
+                !encode_mtp_full_layer(*rollback_context,
+                                       *rejected_cpu_token_command,
+                                       *provisional_runtime,
+                                       invalid_full_layer_sources, error) &&
+                error.find("GPU-produced selected token") !=
+                    std::string::npos;
+            if (rejected_cpu_token_command) {
+                rejected_cpu_token_command->discard();
+            }
+            require(full_layer_requires_gpu_token,
+                    "MTP full layer refuses a CPU parameter-token source");
+
+            const auto snapshot_view = [](BufferRef view) {
+                std::vector<std::uint8_t> bytes(view.length);
+                std::memcpy(bytes.data(), view.contents, bytes.size());
+                return bytes;
+            };
+            const auto unchanged_view = [](BufferRef view,
+                                          const std::vector<std::uint8_t>& bytes) {
+                return view.length == bytes.size() &&
+                       std::memcmp(view.contents, bytes.data(), bytes.size()) == 0;
+            };
+            const auto embedding_before_failed_pass =
+                snapshot_view(projection_buffers.embedding);
+            const auto residual_before_failed_pass =
+                snapshot_view(add_streams_buffers.output);
+            const auto sample_before_failed_pass =
+                snapshot_view(final_mixer_buffers.mixed);
+            const MtpParams valid_full_layer_params = projection_params;
+            projection_params.step[0].width = 0;
+            std::memcpy(provisional_params_slot.contents, &projection_params,
+                        sizeof(projection_params));
+            auto rejected_full_layer_command =
+                rollback_context->make_command_buffer(
+                    "MTP full-layer late StepRow rollback", error);
+            const bool full_layer_late_failure_rolls_back =
+                rejected_full_layer_command != nullptr &&
+                !encode_mtp_full_layer(*rollback_context,
+                                       *rejected_full_layer_command,
+                                       *provisional_runtime,
+                                       full_layer_sources, error) &&
+                error.find("StepRow width does not match") !=
+                    std::string::npos;
+            if (rejected_full_layer_command) {
+                rejected_full_layer_command->discard();
+            }
+            projection_params = valid_full_layer_params;
+            std::memcpy(provisional_params_slot.contents, &projection_params,
+                        sizeof(projection_params));
+            require(full_layer_late_failure_rolls_back &&
+                        unchanged_view(projection_buffers.embedding,
+                                      embedding_before_failed_pass) &&
+                        unchanged_view(add_streams_buffers.output,
+                                       residual_before_failed_pass) &&
+                        unchanged_view(final_mixer_buffers.mixed,
+                                      sample_before_failed_pass),
+                    "late MTP stage-9 validation discards the encoded full-layer prefix");
+
             auto projection_command = rollback_context->make_command_buffer(
-                "MTP runtime-bound input projection smoke", error);
+                "MTP runtime-bound full-layer smoke", error);
             require(projection_command != nullptr &&
                         Encoder::encode(
                             *rollback_context, *projection_command,
-                            "MTP runtime-bound GPU token producer and input projection",
+                            "MTP runtime-bound GPU token producer and full layer",
                             [&](Encoder& encoder,
                                 std::string& encode_error) {
                                 return encoder.dispatch(
@@ -1386,73 +1458,19 @@ int main(int argc, char** argv) {
                                            projection_token_output,
                                            projection_token_input, no_bytes,
                                            no_memory, encode_error) &&
-                                       encode_mtp_input_projection(
+                                       encode_mtp_full_layer(
                                            *rollback_context, encoder,
-                                           projection_buffers, encode_error) &&
-                                       encode_mtp_add_streams(
-                                           *rollback_context, encoder,
-                                           add_streams_buffers, encode_error) &&
-                                       encode_mtp_attention_read(
-                                           *rollback_context, encoder,
-                                           attention_read_buffers,
-                                           encode_error) &&
-                                       encode_mtp_attention_kv_projection(
-                                           *rollback_context, encoder,
-                                           kv_projection_buffers,
-                                           encode_error) &&
-                                       encode_mtp_attention_pass(
-                                           *rollback_context, encoder,
-                                           attention_pass_buffers,
-                                           encode_error) &&
-                                       encode_mtp_feed_forward_read(
-                                           *rollback_context, encoder,
-                                           feed_forward_buffers,
-                                           encode_error) &&
-                                       encode_mtp_router(
-                                           *rollback_context, encoder,
-                                           router_buffers, encode_error) &&
-                                       encode_mtp_routed_experts(
-                                           *rollback_context, encoder,
-                                           routed_expert_buffers,
-                                           encode_error);
+                                           *provisional_runtime,
+                                           full_layer_sources, encode_error);
                             },
                             error) &&
                         projection_command->commit(error) &&
                         projection_command->wait_until_completed(error),
-                    "dispatch MTP stages 1–17 after a GPU-produced selected token: " +
-                        error);
-            const BufferRef finite_attention_output =
-                attention_pass_buffers.attention().attn;
-            std::vector<std::uint8_t> finite_attention_bytes(
-                finite_attention_output.length);
-            std::memcpy(finite_attention_bytes.data(),
-                        finite_attention_output.contents,
-                        finite_attention_bytes.size());
-            auto shared_output_command =
-                rollback_context->make_command_buffer(
-                    "MTP runtime-bound stages 18–20", error);
-            require(shared_output_command != nullptr &&
-                        Encoder::encode(
-                            *rollback_context, *shared_output_command,
-                            "MTP runtime-bound shared expert to final mixer",
-                            [&](Encoder& encoder,
-                                std::string& encode_error) {
-                                return encode_mtp_shared_ffn_write(
-                                           *rollback_context, encoder,
-                                           shared_ffn_buffers,
-                                           encode_error) &&
-                                       encode_mtp_final_mixer(
-                                           *rollback_context, encoder,
-                                           final_mixer_buffers,
-                                           encode_error);
-                            },
-                            error) &&
-                        shared_output_command->commit(error) &&
-                        shared_output_command->wait_until_completed(error),
-                    "dispatch MTP runtime-bound stages 18–20 after routed experts: " +
+                    "dispatch runtime-bound MTP stages 1–20 after a GPU-produced selected token: " +
                         error);
             const auto* const stage20_sample_values_for_check =
-                static_cast<const float*>(final_mixer_buffers.mixed.contents);
+                static_cast<const float*>(
+                    final_mixer_buffers.mixed.contents);
             require(std::all_of(
                         stage20_sample_values_for_check,
                         stage20_sample_values_for_check + N_EMBD,
@@ -1463,6 +1481,13 @@ int main(int argc, char** argv) {
                         stage20_sample_values_for_check + N_EMBD,
                         [](float value) { return value != 0.0f; }),
                     "synthetic MTP stages 1–20 produce a nonzero sample");
+            const BufferRef finite_attention_output =
+                attention_pass_buffers.attention().attn;
+            std::vector<std::uint8_t> finite_attention_bytes(
+                finite_attention_output.length);
+            std::memcpy(finite_attention_bytes.data(),
+                        finite_attention_output.contents,
+                        finite_attention_bytes.size());
 
             // Keep the indexed-head fixture small while running the same
             // runtime-owned stage-20 sample, Q8_1/logit scratch, and sampler

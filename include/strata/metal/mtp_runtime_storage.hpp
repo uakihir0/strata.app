@@ -131,6 +131,16 @@ struct MtpInputProjectionSources {
     BufferRef residual;
 };
 
+/// Caller-owned inputs that select one T=1 runtime-bound MTP full-layer pass.
+/// The input projection must use the GPU-produced `selected_token` source. Its
+/// parameter slot is shared by stages 1–20. Stages 21–22 (draft-head
+/// projection and sampling) are encoded separately.
+struct MtpFullLayerSources {
+    MtpInputProjectionSources input_projection;
+    std::uint32_t attention_window = 0;
+    bool kv_rot = false;
+};
+
 /// Own MTP weights, bind scratch, parameter slots, and drafter K/V from one
 /// fitting memory plan.
 ///
@@ -271,5 +281,28 @@ private:
     explicit MtpRuntimeStorage(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
 };
+
+/// Bind and encode the T=1 MTP full layer in stage order, from stages 1–5
+/// through the stage-20 final mixer. All runtime views are resolved before
+/// this pass records its first stage. Use the Encoder form inside
+/// Encoder::encode and propagate false so a later-stage failure discards the
+/// entire unsubmitted command buffer, including any earlier caller-encoded
+/// work. The caller owns the GPU-produced token, token embedding table and
+/// main-model residual supplied in `sources`; the Context, runtime, main KV
+/// owner (when its RoPE is borrowed), parameters and every view must stay
+/// alive through GPU completion. One runtime owns one set of mutable scratch
+/// and drafter K/V, so callers must serialize passes using the same runtime
+/// until each command buffer completes. The stage-20 sample remains in the
+/// runtime's `sample` bind region for subsequent draft-head and sampler
+/// encoders.
+bool encode_mtp_full_layer(Context& context, Encoder& encoder,
+                           const MtpRuntimeStorage& runtime,
+                           const MtpFullLayerSources& sources,
+                           std::string& error);
+/// Transactional command-buffer form of the ordered MTP stages 1–20 pass.
+bool encode_mtp_full_layer(Context& context, CommandBuffer& command_buffer,
+                           const MtpRuntimeStorage& runtime,
+                           const MtpFullLayerSources& sources,
+                           std::string& error);
 
 }  // namespace strata::metal
