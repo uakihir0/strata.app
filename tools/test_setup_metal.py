@@ -201,7 +201,6 @@ class BuildJson(unittest.TestCase):
         self.git_ok = True
         self.patches = [
             mock.patch.object(setup, "ROOT", self.root),
-            mock.patch.object(release_metadata, "source_version", return_value="0.1.34"),
             mock.patch.object(setup.subprocess, "run", side_effect=self.fake_run),
         ]
         for patch in self.patches:

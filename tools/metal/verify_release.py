@@ -5,9 +5,8 @@
 
 It runs on the reference Mac, from a checkout of the project, in the verify job of mac-release.yml. A draft is visible
 only to people with push access, so gh needs a token with `contents: write`. Any failure exits 1, and the release stays
-a draft. Two steps need parts this checkout does not have yet, and fail closed until they exist: the install from the
-download (step 5 needs setup.get_prebuilt_metal and setup.smoke_test, docs/mac/07 S7) and the acceptance runs (step 6
-needs tools/metal/accept.py, docs/mac/09 T15).
+a draft. The acceptance runs (step 6) need tools/metal/accept.py (docs/mac/09 T15), which this checkout does not have, so
+the step fails closed until it exists. Step 5 installs with setup's get_prebuilt_metal and smoke_test (docs/mac/07 S7).
 """
 
 from __future__ import annotations
@@ -67,15 +66,22 @@ def check_sums(runner: Runner, folder: Path) -> None:
 
 
 def default_installer(url_base: str, folder: Path) -> None:
-    """Step 5's install, as setup does it. Refuses until setup has the S7 functions."""
-    if not hasattr(setup, "get_prebuilt_metal") or not hasattr(setup, "smoke_test"):
-        raise VerifyError(
-            "step 5 needs setup.get_prebuilt_metal and setup.smoke_test (docs/mac/07 S7), which this checkout lacks"
-        )
+    """Step 5's install, as setup does it (docs/mac/07 sections 4.7.1 and 4.7.5): the draft's engine from `url_base`
+    into a fresh folder, then the smoke test. setup's engine folder is pointed at the fresh one for the install and
+    restored afterwards, so the checkout's own engine is never replaced."""
     with tempfile.TemporaryDirectory(prefix="verify-install-") as home:
-        setup.ROOT = Path(home)
-        engine = setup.get_prebuilt_metal(url_base)
-        setup.smoke_test(engine)
+        saved = setup.ENGINE_DIR
+        setup.ENGINE_DIR = Path(home) / "engine"
+        try:
+            engine = setup.get_prebuilt_metal(url_base, updating=True)
+            if engine is None:
+                raise VerifyError(f"step 5 (install): setup did not install the draft's engine from {url_base} "
+                                  "(its messages say why)")
+            setup.smoke_test(engine)
+        except setup.SetupError as exc:
+            raise VerifyError(f"step 5 (install): {exc}") from exc
+        finally:
+            setup.ENGINE_DIR = saved
 
 
 def install_check(folder: Path, installer: Installer | None) -> None:

@@ -749,8 +749,9 @@ checks; it does not run this proposed test.
 
 ## 8. Setup build integration: definitions, identity and metadata
 
-`setup.py` still exits with status 2 before changing files, and no install or build step calls the functions below
-yet: the setup flows of 07 (S7 and S8) are open. The functions exist in `setup.py`, with the release helpers
+`setup.py`'s `main()` still exits with status 2 before changing files. No flow calls the functions below yet: the
+install flow of 07 (S7, merged from main) does not use them, and the build flow (S8) is open. The functions exist in
+`setup.py` next to main's S-track helpers, with the release helpers
 `llama_pin`, `get_llama_cpp` and `cmake_build` that make_release.py uses (work item B8; D-IMPL-940 and D-IMPL-945). The
 tests are in `tools/test_setup_metal.py`. Sections 8.3 to 8.5 describe them as implemented.
 
@@ -985,8 +986,8 @@ Verified with the skeleton: an 80 KB trace of the self-test dispatches.
 The release tools are in `tools/metal/`: `make_release.py` (11.3), `check_asset.py` (11.7) and `verify_release.py`
 (11.8), and the workflow `mac-release.yml` (12.3). Their host parts are tested in the macOS Python suite (09 section
 9.3). The asset of 11.3 was built and checked on a Mac (B10, B11; D-IMPL-946). No release has been published from this
-checkout, and the publication path has not been tried in a test repository (B12, B18). verify_release's steps 5 and 6
-refuse until 07 S7 and 09 T15 exist (D-IMPL-950). Signing and notarisation are not yet tested (D-IMPL-959).
+checkout, and the publication path has not been tried in a test repository (B12, B18). verify_release's step 5
+installs with setup's S7 functions, and step 6 refuses until 09 T15 exists (D-IMPL-950). Signing and notarisation are not yet tested (D-IMPL-959).
 
 ### 11.1 Versions and the release policy
 
@@ -1606,7 +1607,7 @@ Each item becomes one task in [10-implementation-plan.md](10-implementation-plan
 "Done when" holds on the reference Mac, so each line says what is host-verified and what stays open.
 
 - **B8:** host part done. `setup.py` has the section 8 functions and the release helpers, with `tools/test_setup_metal.py`.
-  Open: the setup flows that call them (07 S7 and S8), and the Mac setup test that B5's module names.
+  Open: the build flow that calls `cmake_build` and `metal_build_json` (07 S8), and the Mac setup test that B5's module names.
 - **B9:** host part done. `tools/vision/CMakeLists.txt` has the release recipe, and two builds on a Mac that is not the
   reference Mac are identical. Open: the reference Mac's two builds and the spec's figures.
 - **B10:** host part done. `tools/metal/make_release.py` builds and checks the asset; two checkouts at different paths
@@ -1615,7 +1616,7 @@ Each item becomes one task in [10-implementation-plan.md](10-implementation-plan
 - **B11:** host part done. `tools/metal/check_asset.py` runs checks 1 to 12, with fixtures in the macOS suite, and a
   real asset passes. Open: a Developer ID asset, which has not been built.
 - **B12:** host part done. `tools/metal/verify_release.py` runs steps 1 to 4, 7 and 8. Open: a draft verified in a test
-  repository, and steps 5 and 6 (07 S7 and 09 T15).
+  repository, and step 6 (09 T15).
 - **B13:** done as a host test, with every row of section 11.1 covered by `test_check_release_policy.py`.
 - **B18:** host part done. `.github/workflows/mac-release.yml` is written and checked locally, and has not run. Open: the
   trial in a test repository and the `release` environment's reviewer.

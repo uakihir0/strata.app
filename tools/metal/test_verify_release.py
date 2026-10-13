@@ -183,11 +183,50 @@ class VerifyRelease(unittest.TestCase):
         self.assertEqual(("ok (rebuild skipped)", "rebuild skipped: --no-rebuild"), (status, note))
         self.assertFalse(runner.ran("make_release.py"))
 
-    def test_the_install_step_refuses_until_setup_has_the_engine_install(self):
+    def test_the_default_install_uses_setups_prebuilt_install_in_a_fresh_engine_folder(self):
+        seen = {}
+
+        def get_prebuilt_metal(url_base, updating=False):
+            seen["url"] = url_base
+            seen["updating"] = updating
+            seen["engine_dir"] = verify_release.setup.ENGINE_DIR
+            return Path(verify_release.setup.ENGINE_DIR)
+
+        def smoke_test(engine=None):
+            seen["smoke"] = engine
+            return {"version": "0.1.34", "metal_rev": 1, "families": []}
+
+        original = verify_release.setup.ENGINE_DIR
+        with mock.patch.object(verify_release.setup, "get_prebuilt_metal", side_effect=get_prebuilt_metal), \
+                mock.patch.object(verify_release.setup, "smoke_test", side_effect=smoke_test):
+            verify_release.default_installer("http://127.0.0.1:9/", self.folder)
+
+        self.assertTrue(seen["url"].startswith("http://127.0.0.1:9/"))
+        self.assertTrue(seen["updating"])
+        self.assertNotEqual(original, seen["engine_dir"])
+        self.assertEqual(seen["engine_dir"], seen["smoke"])
+        self.assertEqual(original, verify_release.setup.ENGINE_DIR)
+
+    def test_an_install_setup_refuses_stops_step_five_and_restores_the_engine_folder(self):
+        original = verify_release.setup.ENGINE_DIR
+        with mock.patch.object(verify_release.setup, "get_prebuilt_metal", return_value=None):
+            with self.assertRaisesRegex(verify_release.VerifyError, "did not install the draft's engine"):
+                verify_release.default_installer("http://127.0.0.1:9/", self.folder)
+        self.assertEqual(original, verify_release.setup.ENGINE_DIR)
+
+    def test_a_smoke_test_failure_is_reported_as_step_five(self):
+        with mock.patch.object(verify_release.setup, "get_prebuilt_metal", side_effect=lambda url, updating: Path("/x")), \
+                mock.patch.object(verify_release.setup, "smoke_test",
+                                  side_effect=verify_release.setup.SetupError("the engine did not answer")):
+            with self.assertRaisesRegex(verify_release.VerifyError, "step 5 \\(install\\): the engine did not answer"):
+                verify_release.default_installer("http://127.0.0.1:9/", self.folder)
+
+    def test_a_draft_that_fails_the_install_leaves_the_worktree_removed(self):
         runner = FakeGh(self.draft, rebuild=self.matching)
 
-        with self.assertRaisesRegex(verify_release.VerifyError, "step 5 needs setup.get_prebuilt_metal"):
-            self.verify(runner, installer=None)
+        with self.assertRaisesRegex(verify_release.VerifyError, "step 5"):
+            with mock.patch.object(verify_release.setup, "get_prebuilt_metal", return_value=None):
+                self.verify(runner, installer=None)
         self.assertTrue(runner.called("git", "worktree", "remove", "--force"))
 
     def test_the_acceptance_step_refuses_until_accept_py_exists(self):
