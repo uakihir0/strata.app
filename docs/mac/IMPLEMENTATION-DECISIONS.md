@@ -14086,3 +14086,113 @@ measuring L-15 remain open.
 - **Reason:** The task asks for the two properties only. Marking L13 done would overstate the prompt path's status.
 - **Review required:** Confirm that L13 stays open until those three items pass.
 
+### D-IMPL-800: Reject malformed serve id lists instead of skipping their fields
+
+- **Decision:** `GEN` and `GENI` accept the id list only as `<id>(,<id>)*`: base-10 integers in [0, 2147483647], single
+  commas, no spaces, no empty fields and no trailing comma. Any other form returns `bad request: invalid token id:
+  expected an integer in [0, 2147483647]`.
+- **Reason:** The previous parser replaced commas with spaces and read whitespace-separated tokens, so `1,,2`, `1 2`,
+  `1,2,` and `1,2 ` were accepted and produced a `DONE` for malformed input. The server writes `','.join(...)` with no
+  trailing space (`serve/server.py:415-416`), so the real client is unaffected. The new cases in
+  `serve_transcript_test.cpp` fail against the previous `serve.cpp`.
+- **Review required:** Confirm against the upstream parser (`generate.cpp:4510-5610`, not in this checkout) that upstream
+  also rejects these forms. If upstream accepts them, the Mac engine is stricter than upstream and this should be relaxed.
+
+### D-IMPL-801: Bound `temperature` below and `min_p` to [0, 1]
+
+- **Decision:** A negative `temperature`, or a `min_p` outside [0, 1], returns `bad request: temperature` or
+  `bad request: min_p`. `top_p` and the penalty keys keep their parsed values.
+- **Reason:** A negative temperature was silently treated as greedy, and `min_p` had no domain, so both produced a `DONE`
+  for malformed values. The server sends `temperature` only when it is above 0 and `min_p` only in (0, 1]
+  (`serve/server.py:355-369`). The spec gives no range for `top_p` or the penalties, so they are unchanged.
+- **Review required:** Confirm the upstream domains for `temperature` and `min_p`. 06 section 5.3 now states the bounds used.
+
+### D-IMPL-802: One pad-token run matches exactly one image record
+
+- **Decision:** The SVE1 loader requires each run of `<|image_pad|>` tokens to have exactly its record's `n_tokens` rows.
+  A longer run fails with `image k has n rows but more <|image_pad|> tokens`, which 06 section 5.7 lists as new. Before this
+  change, a run of four pads matched by two two-row records was accepted as two images, and a single record against
+  a longer run was reported as "the prompt has more images than the embeddings file".
+- **Reason:** 06 section 5.4 says each run consumes the next record. The server writes exactly `n_tokens` pad ids per image
+  (`serve/server.py:1073-1082`), so real requests do not change. The existing `extra_prompt` case in
+  `serve_transcript_test.cpp` now uses two separate runs so that it still checks a run with no record.
+- **Review required:** Confirm upstream's handling of a run longer than its record (`generate.cpp:4745-4804`). If upstream
+  accepts that case, this rejects a request upstream serves.
+
+### D-IMPL-803: The one-shot runner is a host seam, not part of `strata`
+
+- **Decision:** Add `run_one_shot` and the `OneShotBackend` interface (`oneshot.hpp`, `oneshot.cpp`). `main.cpp` does not
+  call them. `oneshot_loop_test` drives the runner with a synthetic backend.
+- **Reason:** H7 asks for a one-shot loop, but the Metal `Window` and `Prefill` do not exist (REV-015). D-IMPL-048 forbids
+  connecting a fake generator to `strata`. The seam applies the same validate-then-print rules as the serve loop
+  (D-IMPL-044) and can be tested now.
+- **Review required:** When the Window exists, the production backend implements `OneShotBackend`, `strata` calls
+  `run_one_shot`, and REV-015 closes.
+
+### D-IMPL-804: Print a one-shot report only after it validates
+
+- **Decision:** `run_one_shot` checks the request before the backend runs. An empty prompt, `max_new` below 1, or a prompt id
+  outside the vocabulary exits 2. A backend failure, a backend exception or an inconsistent report exits 1 with
+  `strata: <reason>` on stderr and nothing on stdout. A valid report is written with one `fwrite`.
+- **Reason:** Exit 2 matches the argument-error rule of 06 section 2.3 and exit 1 matches other fatal errors. Validating before
+  printing prevents a partial report that a parser could accept, as D-IMPL-046 does for the serve `DONE` line.
+- **Review required:** Confirm that the production driver maps invalid requests to exit 2 in the same way.
+
+### D-IMPL-805: The runner, not the backend, decides whether `--stats` prints
+
+- **Decision:** `run_one_shot` replaces the report's `include_stats` with the request's `--stats` flag. A backend that fills in
+  the Metal stats fields does not get them printed unless the flag is set.
+- **Reason:** 06 section 13.1 makes the block opt-in, and a backend should not change the plain output.
+- **Review required:** None beyond D-IMPL-803.
+
+### D-IMPL-806: Invariants that `run_one_shot` checks on a backend report
+
+- **Decision:** The report must echo the prompt and have at most `max_new` output ids, each in the vocabulary. Times and
+  stats must be finite and non-negative, and `rounds` must not be negative. With speculation enabled, `rounds` must not
+  exceed the decode windows, accepted drafts must not exceed offered drafts, the `accepted_per_round` counts must not
+  exceed the speculation rounds, and their weighted sum (index times count) must equal the accepted total. When prefetch
+  is available, warmed blob reads must not exceed blob reads. A short output is not rejected, because the runner
+  does not know which token ended generation.
+- **Reason:** Each printed rate or average divides by one of these quantities, and a backend that broke an invariant would
+  print a figure with no meaning. The histogram reading (index equals the accepted drafts in that round) is the only
+  semantics of "accepted per round" the code relies on.
+- **Review required:** Confirm the histogram semantics against `generate.cpp:6236-6470` (not in this checkout). Decide
+  whether a run that ends early without EOS should be an error.
+
+### D-IMPL-807: The H7 goldens are hand-written, not captured upstream output
+
+- **Decision:** `oneshot_output_test` and `oneshot_loop_test` compare against literal text written from the line shapes in
+  06 section 13.1 and 09 section 3.1. The checkout contains no captured upstream one-shot output, so H7's "matches
+  upstream line by line" is not claimed.
+- **Reason:** The checkout has no upstream `generate.cpp`, no captured one-shot output and no model. The only upstream
+  text is the audit (`docs/mac/audit/B-engine-host.md:1243-1280`), which paraphrases it. The formatter writes
+  `  per token` with two leading spaces, and the audit paraphrase shows none. Only captured output can settle that.
+- **Review required:** Capture one-shot output with `--stats` from upstream and from the Mac engine on the reference Mac,
+  and compare every retained line. This closes REV-015 and H7.
+
+### D-IMPL-808: Spec 5.9 example conflicts with 5.5 on REUSED
+
+- **Decision:** Left unchanged. 06 section 5.9 shows `PP 4095 4096` before `REUSED`. Section 5.5 says REUSED is printed once
+  the prompt is fully read, and the implementation (`CallbackState::reused`, tested by "REUSED requires final prompt
+  progress to be complete") requires the last PP to report the full total.
+- **Reason:** The example is normative text outside this change, and only the spec owner can say whether the example or the
+  rule is intended.
+- **Review required:** Correct the example to `PP 4096 4096 ...`, or relax 5.5 and the implementation together.
+
+### D-IMPL-809: Dump summaries are not computed
+
+- **Decision:** `OneShotDumpSummary` still takes caller-supplied label, path and detail strings. Nothing computes the
+  figures that the audit gives for upstream's summary, `%-24s %s (%d x %lld, nonfinite %d, mean|.| %.4g, max|.| %.4g)`
+  (`docs/mac/audit/B-engine-host.md:1278`).
+- **Reason:** The meaning of `%d x %lld`, and whether nonfinite values enter the mean, are not stated in the spec or the
+  checkout. A helper would have to guess the format, so the detail strings in `oneshot_output_test` stay placeholders.
+- **Review required:** Confirm the summary form against upstream. Then add a helper that computes the figures from the
+  dumped array and test it with synthetic data.
+
+### D-IMPL-810: A GENI path that contains `=` is rejected with a misleading error
+
+- **Decision:** Unchanged. `GENI 4 /tmp/a=b.sve 1,2` and `GENI 4 /tmp/x.sve` (no ids) both return `bad request: max_new`.
+- **Reason:** 06 section 5.3 defines the path as everything between the last key=value token and the id list. Without a rule
+  the spec does not give, a `=` in the path cannot be told apart from an option. The server's temporary paths contain no `=`.
+- **Review required:** Choose a rule, for example naming the missing path in the error, and update 06 section 5.3.
+
