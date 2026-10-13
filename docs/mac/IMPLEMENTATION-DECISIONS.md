@@ -15631,3 +15631,25 @@ measuring L-15 remain open.
 - **Decision:** Not done: no measurement, and no run. There is no model in this checkout, no reference on the reference Mac, and `ctest --preset mac-metal` was not run. Other documents still name CUDA or the golden set as the yardstick and were not rewritten: [00](00-feasibility-study.md) (the 256-token and 10-prompt claim of the G1 gate, which 09 6.1 now makes NOT RUN), [02](02-architecture.md), [03](03-model-reference.md) section 9's text below its new scope note, and R-5's CUDA procedure in section 10, [04](04-metal-kernels.md) section 10.5's note, [06](06-engine-host-port.md), [08](08-build-and-distribution.md) (no C1 text), [11](11-risks-and-open-questions.md) (the CUDA PC risk and its owner), [README](README.md), and the audit folder. The S18 "Mac golden set" of [07](07-server-setup-port.md) is a different, Mac-recorded set for the setup plans, and is not in this change. The plan has no step for G1's step 1 (`ctest --preset mac-model`), and none existed before this change. `RunnerEndToEnd` does not isolate `checks.no_engine_running()`, so a running `strata` process on the Mac fails seven of its tests (D-IMPL-976); the fix is a patch in its setUp, which the owner may approve. Existing entries were edited only to add the status lines to D-IMPL-629 and D-IMPL-671. Nothing is committed.
 - **Reason:** The scope of the request is C1, G1, the criteria code and the rows named in it. The other documents are listed so that the owner can decide.
 - **Review required:** The owner reads this list before the coordinator merges.
+
+### D-IMPL-980: The end-to-end runner tests do not depend on other strata processes
+
+- **Decision:** `RunnerEndToEnd` in `tools/metal/test_accept.py` replaces `checks.no_engine_running` with a
+  passing check for its duration. The real `pgrep -x strata` decision stays covered by
+  `test_pgrep_decides_the_strata_process_check`.
+- **Reason:** The end-to-end tests ran the real `pgrep`. While another strata process (for example a developer's
+  server) was running, seven of them failed for a reason unrelated to the runner. The check's own behaviour is
+  already tested with its exit codes, so the end-to-end tests do not need it.
+- **Review required:** Confirm that fixing the check in these tests is preferred to adding a test-only environment
+  switch to the production check.
+
+### D-IMPL-981: The python3.12 crash reports from 15:13 to 15:32 are not reproduced by the test suite
+
+- **Decision:** No change. Seven `python3.12` SIGSEGV reports sit in `~/Library/Logs/DiagnosticReports`. Their
+  responsible process is T3 Code (Alpha), and their parent `python` process (pid 8204) had already exited. Two
+  further runs of `tools/metal/run_python_tests.py` created no new report.
+- **Reason:** The crashing process cannot be tied to a test in this checkout. Its parent is not one of the
+  runner's processes, and the suite does not reproduce the crash. Recording it avoids guessing a cause.
+- **Review required:** If the reports recur, capture the crashing process's command line when it occurs; the
+  reports do not contain it.
+

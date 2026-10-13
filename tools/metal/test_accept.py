@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import unittest.mock
 import time
 import struct
 import unittest
@@ -637,6 +638,12 @@ class RunnerEndToEnd(unittest.TestCase):
     """The runner with the fake engine and a test-only registry (no production run has a measurement yet)."""
 
     def setUp(self):
+        # The real `pgrep -x strata` is covered by test_pgrep_decides_the_strata_process_check. Here it would make the
+        # result depend on any engine another session happens to run, so the check is fixed to pass.
+        patcher = unittest.mock.patch.object(checks, "no_engine_running",
+                                             return_value=checks.Check("no other strata process", True, "none"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name, "root")
         self.out = Path(self.temp.name, "out")
