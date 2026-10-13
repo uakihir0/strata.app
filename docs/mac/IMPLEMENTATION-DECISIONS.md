@@ -14167,6 +14167,9 @@ measuring L-15 remain open.
 - **Reason:** The checkout has no upstream `generate.cpp`, no captured one-shot output and no model. The only upstream
   text is the audit (`docs/mac/audit/B-engine-host.md:1243-1280`), which paraphrases it. The formatter writes
   `  per token` with two leading spaces, and the audit paraphrase shows none. Only captured output can settle that.
+- **Resolved (`per token` spacing):** The label is `per token` with no leading spaces, as 06 section 13.1 lists it.
+  `src/metal/program/stats.cpp`, `tests/metal/oneshot_loop_test.cpp` and `tests/metal/oneshot_output_test.cpp` now match
+  the spec text. The capture review below is still open.
 - **Review required:** Capture one-shot output with `--stats` from upstream and from the Mac engine on the reference Mac,
   and compare every retained line. This closes REV-015 and H7.
 
@@ -14195,4 +14198,81 @@ measuring L-15 remain open.
 - **Reason:** 06 section 5.3 defines the path as everything between the last key=value token and the id list. Without a rule
   the spec does not give, a `=` in the path cannot be told apart from an option. The server's temporary paths contain no `=`.
 - **Review required:** Choose a rule, for example naming the missing path in the error, and update 06 section 5.3.
+
+### D-IMPL-811: Image-pad ids are rejected in a plain GEN request
+
+- **Decision:** A `GEN` request whose id list contains 248056 (`<|image_pad|>`) returns `ERR bad request: image pad token
+  needs GENI`. The parser rejects it before the backend runs. `GENI` still accepts pad ids, and their runs are matched to
+  records as before (D-IMPL-802).
+- **Reason:** A pad run in a plain request has no embeddings record to match, so the backend would see image positions
+  with no image rows. Before this change, `GEN 2 248056,7` was accepted and generated as an ordinary token id. The server
+  writes pad ids for images only in `GENI` (`serve/server.py:1065-1082`), and a request without an embeddings path is sent
+  as `GEN` (`server.py:415-416`). A text-only message is encoded with `parse_special=True` (`server.py:1058`), so a literal
+  `<|image_pad|>` typed in a text-only message becomes pad id 248056 in a plain `GEN`, and that request now fails. The image
+  path already keeps such literals as text (`server.py:1076`, #150); the text-only path does not.
+- **Review required:** Choose between (a) the server encoding stray `<|image_pad|>` text in text-only prompts as literal
+  text, as it already does for images, and (b) the engine accepting pad ids in `GEN`. Until one is chosen, a text-only
+  prompt that contains the literal string fails with this error. Also confirm upstream's handling of pad ids in a plain
+  request (`generate.cpp:4510-5610`, not in this checkout).
+
+### D-IMPL-812: A key that is not `[a-z_]+` is not an option
+
+- **Decision:** An option key must match `[a-z_]+`. A `key=value` token with any other key (uppercase, a digit, or empty)
+  is not skipped. In `GEN` it starts the id list and fails the id rule, so `GEN 2 1,,2=3 5`, `GEN 2 1,2=3 5` and
+  `GEN 2 Temperature=0.4 1` return `ERR bad request: invalid token id: ...`. Unknown keys with a valid name are still
+  skipped silently. This extends the invariants of D-IMPL-800.
+- **Reason:** The previous parser skipped any `key=value` token it did not know, so `GEN 2 1,,2=3 5` was accepted with `5`
+  as its only id and produced a `DONE` for an id list the client did not send. The spec has no key rule. The rule used
+  is the lowercase-with-underscores form that every key in the 06 section 5.3 table has (`top_p`, `penalty_last_n`,
+  `pcie_frac`, ...).
+- **Review required:** Confirm upstream's key rule. If upstream skips unknown keys of any form, this check is stricter than
+  upstream and should be relaxed. 06 section 5.3 states the rule used.
+
+### D-IMPL-813: A GENI request needs a path and ids, and its path may not contain `=`
+
+- **Decision:** A `GENI` request with no embeddings path, with no id list, or with a path that contains `=`, replies with
+  the usage line `ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>`. Examples are
+  `GENI 4 /tmp/x.sve`, `GENI 4 1,2` and `GENI 4 /tmp/a=b.sve 1,2`. This replaces the reply `bad request: max_new` that
+  D-IMPL-810 recorded, and this entry supersedes D-IMPL-810's reply. A `GEN` with an empty id list gets the invalid-id error
+  of D-IMPL-800.
+- **Reason:** `max_new` was valid in these requests, so that reply named the wrong field. A missing path or id list means the
+  request does not match the grammar, and the usage line names the grammar. A `=` in a path cannot be told apart from a
+  misspelled option (D-IMPL-810), so such a path is refused rather than guessed. The server's temporary paths contain no
+  `=` (D-IMPL-810).
+- **Review required:** Choose a rule that accepts `=` in paths, for example requiring options to come before the path, as the
+  path definition in 06 section 5.3 suggests. Then update that section and this entry. Confirm the upstream path rule,
+  which is not in this checkout.
+
+### D-IMPL-814: A non-finite stat rejects the run without `--stats` (addendum to D-IMPL-805)
+
+- **Decision:** D-IMPL-805 is unchanged. Its rule decides only whether the stats block is printed. Validation runs before that
+  gate, so a NaN, an infinite or a negative stats value, or a negative slot-hit or dispatch count, rejects the run with
+  exit 1 and no stdout even when `--stats` is not given. `oneshot_loop_test` checks this case.
+- **Reason:** Printing is opt-in, but a malformed stat means the backend report is broken whether or not the block is
+  printed. Checking before the gate keeps the rule independent of the flag, so a backend cannot pass a broken report by
+  leaving the stats off. This note is recorded here because D-IMPL-805 is not edited.
+- **Review required:** None beyond D-IMPL-803.
+
+### D-IMPL-815: Window-size counts are not tied to the rounds
+
+- **Decision:** `validate_one_shot_report` rejects a negative window-size count. It does not require the counts to add up to
+  `rounds` or to `speculation.rounds`.
+- **Reason:** 06 section 13.1 keeps the `window sizes` line but does not say whether the counts cover every decode window
+  (`report.rounds`, which includes ordinary T=1 windows) or only speculative rounds (`speculation.rounds`). Upstream
+  `generate.cpp:6236-6470` is not in this checkout, so neither sum can be confirmed. Both readings satisfy
+  `speculation.rounds <= sum <= rounds`, so that bound is safe to add once the tie is known.
+- **Review required:** Confirm the tie against upstream. Then require the sum to equal the matching rounds count, or require
+  the bound, and add a test.
+
+### D-IMPL-816: Suffix-draft and stats counts are checked for sign and order
+
+- **Decision:** `validate_one_shot_report` rejects suffix counts that are negative or that accept more drafts than they offer.
+  `valid_times` rejects a negative `slot_hits`, `dispatches_at_t1` or `dispatches_at_t4`. The `dispatches_at_t4` check goes
+  beyond the two counts named in the review, because it prints on the same `dispatches` line. These extend the invariants
+  of D-IMPL-806.
+- **Reason:** Each of these values is printed, and a negative or inverted count prints a figure with no meaning. The other
+  printed counters (`resident_experts`, `page_cache_hits`, `ssd_blobs`, `experts_warmed`, `routing_layers_skipped`,
+  `miss_handshake_layers`, `adaptive_experts_swapped`) still have no sign check.
+- **Review required:** Decide whether those counters need the same check, and whether suffix drafts offered with zero suffix
+  windows is an inconsistent report.
 

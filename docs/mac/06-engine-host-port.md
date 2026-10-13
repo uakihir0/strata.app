@@ -655,10 +655,18 @@ QUIT
   `GENI`, the embeddings path is everything between the last `key=value` token and the id list. This allows a path with
   spaces, which is likely under `~/Library/Application Support` or `/Volumes/...`. A server that never sends spaces is
   unaffected.
-- Unknown keys are skipped silently.
+- **Option keys.** An option is a `key=value` token whose key matches `[a-z_]+`. Unknown options are skipped silently;
+  the table below lists the known ones. A `key=value` token with any other key (uppercase, a digit, or empty) is not an
+  option. In `GEN` it starts the id list and fails the id rule below. In `GENI` it starts the path, which may not
+  contain `=` (next bullet). (D-IMPL-812.)
+- **Usage.** `GENI` needs an embeddings path and an id list. A `GENI` request without either, or whose path contains
+  `=` (for example `GENI 4 /tmp/a=b.sve 1,2`), replies with the usage line of section 5.7. (D-IMPL-813.)
 - The id list is `<id>(,<id>)*`: base-10 integers in [0, 2147483647], separated by single commas, with no spaces,
   empty fields or trailing comma. Any other form is `ERR bad request: invalid token id: expected an integer in
-  [0, 2147483647]`. This is the form `serve/server.py` writes.
+  [0, 2147483647]`. This is the form `serve/server.py` writes. An empty list (`GEN 2`, `GEN 2 temperature=0.4`) is one
+  empty field and gets the same error.
+- **Image-pad ids.** A `GEN` request whose id list contains 248056 (`<|image_pad|>`) replies `ERR bad request: image
+  pad token needs GENI`. Pad runs are matched to embeddings records only in `GENI` (section 5.4). (D-IMPL-811.)
 
 | Key | Type / clamp | Default |
 | --- | --- | --- |
@@ -675,7 +683,8 @@ QUIT
 
 ### 5.4 Image embeddings for GENI
 
-The rules match upstream `:4745-4804`.
+The rules match upstream `:4745-4804`, except the exact-count pad-run rule below. That rule is a Mac rule. Upstream
+`generate.cpp` is not in this checkout, so the rule is not confirmed against upstream; it is a review item (D-IMPL-802).
 
 **File format.**
 - The file is a concatenation of `SVE1` records.
@@ -685,7 +694,8 @@ The rules match upstream `:4745-4804`.
 **Matching records to the prompt.** Each run of `<|image_pad|>` (248056) tokens consumes the next record, in order,
 and the run must have exactly the record's `n_tokens` rows. A shorter run fails with `image k has n rows but fewer
 <|image_pad|> tokens`; a longer run fails with `image k has n rows but more <|image_pad|> tokens`, so that no run is
-shared by two records.
+shared by two records. The exact-count rule in this paragraph is the Mac rule of D-IMPL-802 and is not confirmed against
+upstream `generate.cpp`.
 
 **M-RoPE positions.**
 - Text token: (p, p, p).
@@ -778,6 +788,7 @@ These messages are new:
 - `ERR gpu error: <description>` (section 2.4)
 - `ERR expert read failed: layer L expert E: <strerror>` (tiered mode, fatal)
 - `ERR image k has n rows but more <|image_pad|> tokens` (section 5.4: the run is longer than the record)
+- `ERR bad request: image pad token needs GENI` (section 5.3: an image-pad id in a plain `GEN` request)
 
 ### 5.8 stderr after each DONE
 
@@ -1588,8 +1599,8 @@ Each item becomes one task in [10-implementation-plan.md](10-implementation-plan
 | H3 | `Context`, `Buffers`, `Events`: device checks, metallib and its hash, pipelines, binary archive (with [08](08-build-and-distribution.md) B6), residency set, labels, error reporting | `metal_list_devices_test`, `metal_context_test`, `metal_buffers_test`, `metal_events_test` and `metal_fault_test` pass; the event test proves higher signals and dependent GPU waits cannot be submitted before their producers, a GPU signal after an unsignaled host gate remains pending, and Context teardown drains committed work; the fault test submits a deliberately invalid GPU read, verifies the section 2.4 diagnostic and proves a following command buffer completes; a metallib from another build exits 1 with the message of section 2.3 |
 | H4 | `options.cpp` copy with all section 3 dispositions, plus every flag of section 3.10 | `options_dispositions_test` parses every upstream flag, checks its disposition, and preserves values beginning with `--`; it tests the exit-2 combinations of `--geometry`, `--plan-w-mib` and `--plan-ram-mib`. `metal_cli_modes_test` checks empty and conflicting modes; `metal_self_test` exercises the explicit CLI smoke-test path on the GPU. |
 | H5 | `WeightStore` with format rules 1-9, and the light `--plan-only` / `--write-geometry` path (section 2.3) over `Geometry` and `Plan` ([05](05-memory-and-residency.md) work item U1) | Host fixtures cover the complete 1,224-tensor inventory, role/type constraints, split metadata, the Swift-style 342/882 shard layout, native expert v3/v4 rows, index/conversion/MTP validation and CLI export. Acceptance still requires every catalogue model's live `--plan-only` time and PLAN parity against its geometry file ([07](07-server-setup-port.md), section 4.4.3); no real model pack is present in this checkout. |
-| H6 | Serve loop and protocol (section 5), first with a fake `Window` | `serve_transcript_test` passes byte-for-byte protocol fixtures, bounded SVE1 loading and M-RoPE checks, callback/EOS invariants, bounded input, STOP/EOF ordering and signal cases. Ready input, EOF finalization and the request-finish snapshot share one mutex; request completion drains at most 64 MiB before failing closed; the host asks the backend to stop after EOS and rejects later token callbacks. The host-only `ServeBackend` seam is ready for L9/H8's real Window adapter. The production `strata --serve` path and upstream `serve/test_*` parity remain pending until model initialization and a real request backend are connected. |
-| H7 | One-shot loop and `--stats` | Output format matches upstream line by line for the kept lines |
+| H6 | Serve loop and protocol (section 5), first with a fake `Window` | `serve_transcript_test` passes byte-for-byte protocol fixtures, bounded SVE1 loading and M-RoPE checks, callback/EOS invariants, bounded input, STOP/EOF ordering and signal cases. Ready input, EOF finalization and the request-finish snapshot share one mutex; request completion drains at most 64 MiB before failing closed; the host asks the backend to stop after EOS and rejects later token callbacks. The host-only `ServeBackend` seam is ready for L9/H8's real Window adapter. The production `strata --serve` path and upstream `serve/test_*` parity remain pending until model initialization and a real request backend are connected. **Status: open, test-only.** The protocol, the request parser and the loop are implemented and tested with a fake `Window`. No production code calls `run_serve_loop`, so `strata --serve` is not wired; H6 stays open until REV-011 (the Metal backend connection) closes. |
+| H7 | One-shot loop and `--stats` | Output format matches upstream line by line for the kept lines. **Status: open, test-only.** `run_one_shot`, the formatter and the `--stats` lines are implemented and tested with a synthetic backend and hand-written goldens (D-IMPL-807). `strata` does not call them, and this checkout has no captured upstream output, so line-by-line parity is not claimed. H7 stays open until REV-015 (the Metal generation loop) closes. |
 | H8 | `Window` + spec round + MTP host side (section 10) | Gate C2 (spec equals greedy) passes |
 | H9 | Prompt cache, resume, snapshots, parking, memory pressure (section 11) | Gate C3 (conversation cache) passes |
 | H10 | `ExpertStore` tiered mode: `MissResolver`, slot pool, adapt, lookahead (section 9) | Gate C4 (full equals tiered) passes; gate G2 throughput |
