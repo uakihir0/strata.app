@@ -5525,6 +5525,144 @@ requirement.
 - **Validation:** Workflow configuration tests passed 11/11 after the trigger and runner-condition changes; CMake host and Metal suites passed 37/37 and 41/41. No remote CI run was possible because this checkout has no Git remote.
 - **Review required:** Configure the repository's trusted Mac runner and runner-group policy before enabling these workflows; the local YAML checks do not verify GitHub-side runner permissions.
 
+### D-IMPL-600: Declare every run and criterion now, and measure none until its owner lands
+
+- **Decision:** T4 provides the run registry (`tools/metal/accept/runs.py`), the criteria table
+  (`tools/metal/accept/criteria.py`) and the command plans of section 3.2. No production run has a `measure` hook. A
+  live run whose criteria have no measurement stops with `NOT RUN: criteria not measured yet: ... (task Tn)` before
+  any step starts. The work items that own the measurements (T5-T12) add each hook with its planted-difference tests.
+- **Reason:** The T4 Done-when is the framework and the planted differences. The measurements depend on later items
+  (T5 `tf_compare`, T6 C1, T8 C2, T9 C3, T10 C4, T11 benchmark, T12 needles and server). A criterion without a
+  measurement must never pass, so the runner fails closed instead of reporting a default.
+- **Review required:** Each owning work item adds its hook and its test before its criterion can gate a run. Until
+  then `accept.py <run>` cannot report PASS on this code.
+
+### D-IMPL-601: Dry-run runs the engine's two start commands and exits 2 unless everything is ready
+
+- **Decision:** `--dry-run` lists every step's command, runs the pre-run checks of section 3.2 (the manifests, the
+  `test_models.py check --quick` precondition, `--version`, `--list-devices`, `pgrep -x strata`) and prints each check.
+  It exits 0 with `accept <run>: DRY RUN: ...` only when every check passes, the plan has no unresolved `<...>` input,
+  and the run has a measurement. Otherwise it exits 2 with the first reason as `NOT RUN`. No model is loaded.
+- **Reason:** A dry run must not claim a run is ready when a live run would stop at the same check. `DRY RUN` is an
+  added status line; the three status formats of section 3.2 are unchanged for live runs.
+- **Review required:** Confirm that CI reads the `DRY RUN` line as "not a run", never as a pass.
+
+### D-IMPL-602: Derived thresholds come from the caller, and missing values never pass
+
+- **Decision:** A criterion whose threshold comes from a yardstick (T-1 to T-9, the previous release, the CV bar) has
+  `threshold=None`. `criteria.judge()` raises when no threshold is given, and it records a missing value as a failure.
+  A `report` row never blocks a run. A run must have a verdict for every criterion it names (`no verdict for ...`). A
+  measurement that raises `ValueError`, `KeyError`, `TypeError` or `IndexError` is NOT RUN, not FAIL.
+- **Reason:** Each of these paths could turn a missing or unjudgeable value into a pass, or into a criterion failure with
+  the wrong exit code. Exit 1 means a criterion failed; exit 2 means it could not be judged.
+- **Review required:** The owning work items supply each derived threshold, and none passes `None` for a criterion that
+  needs one.
+
+### D-IMPL-603: Manifest and CLI shapes are assumed until T1-T3 define them
+
+- **Decision:** The checks read `tests/metal/prompts/MANIFEST.json` as `schema: 1` with a `sets` list of
+  `{name, ids_sha256}` and `builder_version`; `tests/metal/golden/MANIFEST.json` with `upstream_sync` (checked against
+  `UPSTREAM_SYNC`) and a `files` list of `{path, sha256}`; `<models>/<tag>/config.json` with an `args` list of strings;
+  and `tools/metal/test_models.py check --quick --models <dir> <tag>`. All four are absent on this checkout, so the
+  checks report them as unmet, never as passed.
+- **Reason:** The spec names the files and the hash rule (the canonical `",".join(ids)` string) but not the JSON layout
+  or the `test_models.py` argument order, which T1-T3 define. Recording the assumption keeps those tasks from silently
+  diverging from the runner.
+- **Review required:** T1, T2 and T3 use these shapes, or they change this runner in the same commit.
+
+### D-IMPL-604: Parser errors name the file and the label, and a count mismatch is an error
+
+- **Decision:** `engine.py` raises `EngineOutputError` with `accept: <file>: no <label> line` when a required line is
+  missing, and `accept: <file>: <n> <label> lines, want one` when one repeats. The `decode` token count must equal the
+  id count of the `output` line. `prefill`, `speculation` and the stderr `chunk` line are required only when the caller
+  asks for them. `--list-devices` is checked only for one non-empty line, because the spec does not fix its format.
+- **Reason:** The spec forbids reading a default for a missing line. The count cross-check catches a formatter change
+  that would otherwise shift a comparison silently.
+- **Review required:** When a real CUDA or Mac capture exists (T-1), confirm the formats and the device-line rule.
+
+### D-IMPL-605: Result folders only for runs that started, and two additive keys in result.json
+
+- **Decision:** A run that cannot start writes no result folder (exit 2, last line only). A run that starts writes
+  `result.json` with the schema 1 keys, plus two additive keys: `schema` at the top level and `restricted` (true when
+  `--model` or `--prompt` limits the run). Each step row also names the step. A restricted run's PASS line says that it
+  does not count for a gate or a release, as section 3.2 requires.
+- **Reason:** Section 3.2 lists no field for restriction, and a restricted run must be visibly distinct in the artifact.
+  Readers of schema 1 ignore unknown keys.
+- **Review required:** Section 3.2 lists `schema`, `restricted` and the step `name` when the documentation is next revised.
+
+### D-IMPL-606: One time limit for every step until T-6 is measured
+
+- **Decision:** Every step gets the ten-minute minimum, because no expected time (T-6) is recorded yet.
+  `steps.step_limit` already implements three times the expected time with that floor. A step past its limit is sent
+  SIGTERM to its process group, then SIGKILL 30 s later, and the run fails with `STEP.timeout`. A step that exits
+  nonzero fails the run with `STEP.exit` and stops it.
+- **Reason:** A fixed floor fails closed: a long step that is killed fails the run, and no run is judged on partial
+  output. The spec's rule needs T-6, which is not recorded.
+- **Review required:** Once T-6 gives expected times, check the 262K needle runs and `ca-262k`, which may exceed ten
+  minutes.
+
+### D-IMPL-607: The runs live in one registry module for now, not one module per run
+
+- **Decision:** `tools/metal/accept/runs.py` holds every run's plan, criteria and hook, and `tools/metal/accept.py` holds
+  the CLI. Section 3.2's layout note says "one module per run". The split happens when a run gets its measurement, so
+  each module stays with its owner.
+- **Reason:** No run has a measurement yet, so one module per run would be empty files. The registry keeps every run and
+  its status in one place for the dry-run check.
+- **Review required:** Each owner that adds a measurement moves its run to its own module, and the wording of section
+  3.2 is updated then.
+
+### D-IMPL-608: Arm references, the oracle and the CTest step in the command plans
+
+- **Decision:** In C2 the sampled `--spec 0` arm (`g.plain`) is the reference for the sampled arms `g.spec` and
+  `g.coupled`, so `g.plain` carries no criterion. Arm (d)'s `--spec-oracle` is an unresolved input (the output of arm
+  (a) for the same prompt), so a live run cannot start it before arm (a) has produced its file. C1.4 is a CTest step
+  (`ctest --preset mac-model -R metal_router_replay`). C3.http belongs to the server run, which runs the HTTP smoke tool.
+- **Reason:** These follow section 4.2's arm definitions and the table of section 3.2. The unresolved oracle is why the
+  production C2 plan reports NOT RUN today.
+- **Review required:** T8 makes arm (d)'s oracle a runtime step. T6 confirms the CTest name and the preset.
+
+### D-IMPL-609: The fake engine stands in for the command line only, and runs through the interpreter
+
+- **Decision:** `tools/metal/accept/fake_engine.py` answers `--version` (`strata 0.0.0-fake metal 1`) and
+  `--list-devices`, prints the one-shot lines in the formats of `src/metal/program/oneshot.cpp`, writes the
+  `--dump-logits` file and `STRATA_DUMP_FIRST_LOGITS`, and applies one planted difference from `FAKE_ENGINE_PLANT`. A
+  `.py` engine path runs under the current interpreter; any other path is executed directly.
+- **Reason:** The fake is a fixed function of the prompt and the sampling flags, so equal arms agree and a planted arm
+  differs. It is not a model and produces no measurement. The interpreter rule lets the tests use it as `--engine`
+  without a build.
+- **Review required:** Keep the fake's formats in step with `oneshot.cpp`; the parser test on the formatter's sample is
+  the check.
+
+### D-IMPL-610: The parser test uses the formatter's sample, not a CUDA capture
+
+- **Decision:** The captured-output case in `test_accept.py` is the one-shot text that
+  `tests/metal/oneshot_output_test.cpp` expects from the engine's formatter. No CUDA capture is in the repository.
+  Section 9.3 said the parser test uses captured CUDA output; that sentence now says "captured output (today the
+  formatter's sample; a CUDA capture is added with T-1)".
+- **Reason:** A CUDA capture needs the reference PC and the golden set (T-1, T2), and this checkout has neither.
+  Stating the sample's origin keeps the claim accurate.
+- **Review required:** Add the CUDA capture with T-1 and extend the parser test to it.
+
+### D-IMPL-611: PF-1 and PF-2 do not match test_map's criterion pattern
+
+- **Decision:** The criteria table uses the IDs `PF-1` and `PF-2` exactly as section 3.2 names them. `test_map.py`'s
+  `CRITERION_ID` pattern needs a dot, so `test_map` does not read these two IDs from `criteria.py`, and an
+  `accept:PF-1` check in `requirements.json` would be reported as unknown. The table is not renamed to fit the checker.
+- **Reason:** Renaming an ID changes the names in result files. The checker's pattern is the defect, and it is outside
+  T4.
+- **Review required:** The owner of `test_map.py` widens `CRITERION_ID` (or gives the PF rows a dotted alias) before T11
+  adds `requirements.json` checks that use these IDs.
+
+### D-IMPL-612: What T4 leaves out, and where each gap is judged
+
+- **Decision:** T4 does not implement the measurement of any run (D-IMPL-600); the host checks of section 5.1 (`pmset`,
+  thermal state, memory level); the previous-release engine of section 5.4 (`engines.py`); the balloon of section 6.2;
+  the C4 branch for a Mac without full mode; the composition of `nightly`, `weekly` and `family` (T14, T16); the
+  memory-pressure smoke step (`tools/metal/accept/pressure_smoke.py`).
+- **Reason:** Each belongs to the item named in the registry's `task` column, and each needs a model or the reference
+  Mac to test. Listing the gaps keeps T4's "Done when" from being read as more than it is.
+- **Review required:** Each owning task removes its gap from this list when it lands.
+
 ## Adversarial review findings
 
 - **2026-10-07, Descartes, Prefill GR normalization:** The reviewer found no concrete implementation flaw, but identified two proof gaps. Added a scale-separated 4096²-plus-31 fixture that proves the ordered butterfly differs from a linear sum by more than the scale tolerance, and made the late-failure test assert the command buffer's discarded state. The changes pass the targeted serial/concurrent CTests and are covered by the test-map check.

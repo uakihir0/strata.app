@@ -500,10 +500,13 @@ gating flag. These are the IDs that `result.json`'s `criteria`, the `FAIL` line 
 | Gates | `G1.tf`, `G1.free`, `G2.speed` | 6 |
 | Release | `PLAN.models`: step 1 of the release run | 8 |
 
-**Planned runner tests.** The not-yet-created `tools/metal/test_accept.py` will run in the macOS Python test layer. It will use
+**The runner's tests.** `tools/metal/test_accept.py` runs in the macOS Python test layer. It uses
 `tools/metal/accept/fake_engine.py`, a script that takes the engine's arguments, prints the one-shot lines and writes
-dump files, with differences planted on request (`FAKE_ENGINE_PLANT=<kind>:<where>`). Each criterion of sections 4
-and 5 has a test that it passes on equal inputs and fails on its planted difference, with its message.
+dump files, with differences planted on request (`FAKE_ENGINE_PLANT=<kind>:<where>`). Every criterion ID of
+`tools/metal/accept/criteria.py` has a test that it passes on equal inputs and fails on its planted difference, with
+its message. The parser is tested on captured output (the formatter's sample in `tests/metal/oneshot_output_test.cpp`,
+not a CUDA capture). No run has a measurement yet, so the runs' criteria are judged only in their tests; a live run of
+any run stops with NOT RUN before a step starts.
 
 ### 3.3 Comparing logits: `tools/metal/tf_compare.py`
 
@@ -1380,14 +1383,14 @@ run. `tools/metal/test_map.py` is a CLI checker exercised through CTest, not a u
 | `tools/metal/test_run_python_tests.py` | [08](08-build-and-distribution.md), section 12.1, work item B14 | macOS Python suite |
 | `tools/metal/test_model_headers.py` | [03](03-model-reference.md), work item R1 | macOS Python suite. Checks shard sizes and tensor totals, fixed metadata and the shared PLE shard, rejects duplicate fixture JSON keys, and invokes `ggufhdr.py` on a generated header. |
 | `tools/metal/test_dense_vs_gguf.py` | [03](03-model-reference.md), work item R5 | Synthetic single- and split-shard packs; deterministic sampling; source-hash and pack-form checks for converted rows; full comparison and rejection of a flipped byte, missing or native-marked float row, stale shard size, duplicate conversion, duplicate catalogue identity and unknown model identity. |
-| `tools/metal/test_accept.py` | Section 3.2 | Planned; file absent |
+| `tools/metal/test_accept.py` | Section 3.2 | macOS Python suite; the criteria table (every ID, a planted difference per ID, the message), the engine parser on captured output, the fake engine's planted kinds, the pre-run checks, and end-to-end runs through a test-only registry |
 | `tools/metal/test_tf_compare.py`, `tools/metal/test_ladder_compare.py` | Sections 3.3 and 4.1 | Planned; files absent |
 | `tools/metal/test_make_prompts.py` | Section 2.2 | Planned; file absent |
 | `tools/metal/test_map.py` | Section 9.4 | macOS host CTest preset, without check 1; through the `test_map` CTest test with it |
 | `tools/metal/test_test_map.py` | Section 9.4 | macOS Python suite; the extra CMake-test and `--final` failure cases |
 `tools/metal/check_drift.py` itself runs in CI as a check, not as a test module ([08](08-build-and-distribution.md),
 section 12.1). The format of the one-shot lines (work item H7 of [06](06-engine-host-port.md)) is checked by
-`test_accept.py`'s parser cases on captured CUDA output, and again by every acceptance run, which fails on a missing
+`test_accept.py`'s parser cases on captured output (today the formatter's sample; a CUDA capture is added with T-1), and again by every acceptance run, which fails on a missing
 line (section 3.1).
 
 ### 9.4 `tools/metal/test_map.py`
@@ -1554,7 +1557,7 @@ Each item becomes one task in [10-implementation-plan.md](10-implementation-plan
 | T1 | The prompt sets (sections 2.1-2.2): `tests/metal/prompts/src/`, `make_prompts.py`, the sets, `test_make_prompts.py` and `prompts_manifest_test` | Every set builds and round-trips; `--check` passes; a changed source byte fails `prompts_manifest_test` |
 | T2 | `record_golden.py`, the golden manifest and the first golden set (section 2.5), with [03](03-model-reference.md) R12, and the IQ formats' `tf-code` files | The set is on the reference Mac, its manifest is in git, and T-7 is in appendix A |
 | T3 | `models.json` with `cc_pressure_mib` and the `mmproj` entries, `test_models.py`, the pack fixtures of section 9.1, the disk of section 2.3 | `fetch` gives every model of section 2.3 on the reference Mac; `check` passes; a changed byte fails `check --quick` when it is in the first or last 64 MiB, and the full check otherwise |
-| T4 | The planned `accept.py` framework (section 3.2): runs, options, exit codes, `result.json`, step limits, crash-report copies; `engine.py`, `criteria.py`, `fake_engine.py`, `test_accept.py` | Planned: the macOS Python suite covers planted differences; the runner dry-run lists each acceptance command |
+| T4 | The `accept.py` framework (section 3.2): runs, options, exit codes, `result.json`, step limits, crash-report copies; `engine.py`, `criteria.py`, `fake_engine.py`, `test_accept.py` | Done in its framework form: the macOS Python suite covers planted differences (`test_accept.py`); the runner dry-run lists the commands of each run with a plan. The nightly, weekly and family runs have no plan yet (T14, T16), and no run is measured yet (T5-T12) |
 | T5 | `tf_compare.py` and its synthetic comparison tests (section 3.3); `lc_dump` (section 2.5) | The tests pass; `lc_dump` writes files that `tf_compare.py` and `ladder_compare.py` read, and fails on a renamed graph node |
 | T6 | C1 (section 4.1): `ladder_compare.py` and its test, `metal_router_replay`, `metal_layer_replay`, the twins' `--layer` option | `accept.py c1` passes on Q2_0 and Coder; a planted ulp error in one layer's `strata_gr_down` is found at that layer by the steps of section 10.1 |
 | T7 | The gates (section 6): `accept.py g1`, `g2`, `g3`; `balloon.py`; `docs/mac/gates/` | Each gate's run gives its result folder; `balloon.py --gib 16` holds 16 GiB without swap-outs growing by more than 1 GiB |
