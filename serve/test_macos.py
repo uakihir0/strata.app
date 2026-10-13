@@ -9,6 +9,244 @@ from pathlib import Path
 from unittest import mock
 
 from serve import macos
+import setup
+
+# PLAN lines built from the field order in docs/mac/05-memory-and-residency.md, section 3.4, and plan_line() in
+# src/metal/engine/plan.cpp. They are constructed for these tests, not captured from an engine run.
+PLAN_FIELDS_FULL = {
+    "fits": 1, "mode": "full", "gpu": "Apple_M5_Pro", "w_mib": 53084, "reserve_mib": 700, "ram_mib": 65536,
+    "avail_mib": 41210, "dense_mib": 3471, "unread_mib": 1, "pack_mib": 0, "mtp_mib": 786, "mtp_bind_mib": 17,
+    "fixed_mib": 256, "kv_mib": 1648, "mtp_kv_mib": 130, "kv": "fp16", "context": 65536, "prefill_chunk": 8192,
+    "prefill_mib": 2194, "experts_total": 24576, "experts_total_mib": 32400, "experts_resident": 24576,
+    "experts_resident_mib": 32400, "slots": 0, "slot_mib": 0, "ssd_experts": 0, "total_mib": 40904,
+    "free_mib": 11480, "ram_warning": 0, "w_full_mib": 40905, "mtp_params_mib": 1, "session_state_mib": 113,
+    "window_scratch_mib": 47,
+}
+NO_FIT_REASON = "the_model_does_not_fit:_needs_30000_MiB_of_GPU_memory_with_no_expert_resident,_25000_MiB_available"
+
+
+def plan_line(*, drop=(), **changes) -> str:
+    """A PLAN line with the full field set, changed or without the keys named in `changes` and `drop`."""
+    fields = dict(PLAN_FIELDS_FULL)
+    for key in drop:
+        del fields[key]
+    if "reason" in changes:
+        reason = changes.pop("reason")
+        fields = {**fields, **changes}
+        ordered = {}
+        for key, value in fields.items():
+            if key == "mtp_params_mib":
+                ordered["reason"] = reason  # the engine prints reason between w_full_mib and mtp_params_mib
+            ordered[key] = value
+        fields = ordered
+    else:
+        fields.update(changes)
+    return "PLAN " + " ".join(f"{key}={value}" for key, value in fields.items())
+
+
+class FakeRunner:
+    """Replaces setup.PLAN_RUNNER (subprocess.run). Records each command and returns the canned result or raises."""
+
+    def __init__(self, returncode=0, stdout="", stderr="", raises=None):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.raises = raises
+        self.calls = []
+        self.kwargs = None
+
+    def __call__(self, cmd, *, capture_output, text, timeout):
+        self.calls.append(list(cmd))
+        self.kwargs = {"capture_output": capture_output, "text": text, "timeout": timeout}
+        if self.raises is not None:
+            raise self.raises
+        return subprocess.CompletedProcess(list(cmd), self.returncode, self.stdout, self.stderr)
+
+
+class MetalPlanParse(unittest.TestCase):
+    def setUp(self):
+        setup.metal_plan.cache_clear()
+        self.addCleanup(setup.metal_plan.cache_clear)
+
+    def plan(self, runner, *args, **kwargs):
+        setup.metal_plan.cache_clear()
+        with mock.patch.object(setup, "PLAN_RUNNER", runner):
+            return setup.metal_plan(*(args or ("qwen", "Q2_0", 65536, "fp16")), **kwargs)
+
+    def test_metal_plan_parse(self):
+        full = setup.parse_plan_line(plan_line())
+        self.assertEqual(1, full["fits"])
+        self.assertEqual("full", full["mode"])
+        self.assertEqual("Apple_M5_Pro", full["gpu"])
+        self.assertEqual(53084, full["w_mib"])
+        self.assertEqual(11480, full["free_mib"])
+        self.assertNotIn("reason", full)
+        self.assertEqual("full", setup.plan_class(full))
+
+        # avail_mib is -1 when the engine was not given the available memory, and free_mib can be negative.
+        unmeasured = setup.parse_plan_line(plan_line(avail_mib=-1, free_mib=-5))
+        self.assertEqual(-1, unmeasured["avail_mib"])
+        self.assertEqual(-5, unmeasured["free_mib"])
+
+        # A key appended by a later engine is kept (05 section 3.4).
+        self.assertEqual(7, setup.parse_plan_line(plan_line(future_key=7))["future_key"])
+
+        no_fit = setup.parse_plan_line(plan_line(fits=0, reason=NO_FIT_REASON))
+        self.assertEqual(0, no_fit["fits"])
+        self.assertEqual(NO_FIT_REASON, no_fit["reason_raw"])  # the underscores are kept
+        self.assertEqual("the model does not fit: needs 30000 MiB of GPU memory with no expert resident, "
+                         "25000 MiB available", no_fit["reason"])
+        self.assertEqual("none", setup.plan_class(no_fit))
+
+        unsupported = setup.parse_plan_line(plan_line(fits=0, reason="unsupported_type_q4_K"))
+        self.assertEqual("unsupported_type_q4_K", unsupported["reason_raw"])
+        self.assertEqual("unsupported type q4 K", unsupported["reason"])
+        self.assertEqual("unsupported", setup.plan_class(unsupported))
+
+        malformed = {
+            "not a PLAN line": "plan " + plan_line()[5:],
+            "empty line": "",
+            "bare token": plan_line() + " bogus",
+            "empty value": plan_line(w_mib=""),
+            "empty text value": plan_line(gpu=""),
+            "repeated key": plan_line() + " w_mib=1",
+            "non-integer count": plan_line(w_mib="53k"),
+            "negative count": plan_line(w_mib=-5),
+            "fits not 0 or 1": plan_line(fits=2),
+            "unknown mode": plan_line(mode="hybrid"),
+            "ram_warning not a flag": plan_line(ram_warning=2),
+            "unknown KV format": plan_line(kv="bf16"),
+            "avail_mib below -1": plan_line(avail_mib=-2),
+            "more resident than total": plan_line(experts_total=10, experts_resident=11),
+            "fits=1 with a reason": plan_line(reason=NO_FIT_REASON),
+            "fits=0 without a reason": plan_line(fits=0),
+            "reason the engine does not give": plan_line(fits=0, reason="out_of_memory"),
+        }
+        for label, line in malformed.items():
+            with self.subTest(malformed=label):
+                with self.assertRaises(setup.PlanError):
+                    setup.parse_plan_line(line)
+
+        # Every field the engine prints is required: a line cut short or missing any key must raise.
+        for key in setup.PLAN_FIELDS:
+            with self.subTest(missing=key):
+                with self.assertRaises(setup.PlanError):
+                    setup.parse_plan_line(plan_line(drop=(key,)))
+
+    def test_plan_class(self):
+        def tiered(total, resident):
+            return setup.parse_plan_line(plan_line(mode="tiered", experts_total=total, experts_resident=resident))
+
+        for total, resident, expected in ((100, 100, "ok"), (100, 90, "ok"), (100, 85, "ok"), (100, 84, "slow"),
+                                          (100, 40, "slow"), (100, 39, "very slow"), (100, 0, "very slow")):
+            with self.subTest(total=total, resident=resident):
+                self.assertEqual(expected, setup.plan_class(tiered(total, resident)))
+        for incomplete in ({}, {"fits": 0}, {"fits": 1, "mode": "tiered", "experts_resident": 1},
+                           {"fits": 1, "mode": "tiered", "experts_total": 0, "experts_resident": 0},
+                           {"fits": 2, "mode": "full"}):
+            with self.subTest(incomplete=incomplete):
+                with self.assertRaises(setup.PlanError):
+                    setup.plan_class(incomplete)
+
+    def test_metal_plan_runs_the_engine_and_reads_its_plan(self):
+        runner = FakeRunner(stdout=plan_line() + "\n")
+        plan = self.plan(runner)
+        self.assertEqual("full", plan["mode"])
+        self.assertEqual(1, len(runner.calls))
+        cmd = runner.calls[0]
+        self.assertEqual(str(setup.ENGINE_PATH), cmd[0])
+        self.assertEqual(1, cmd.count("--plan-only"))
+        self.assertEqual(str(setup.GEOMETRY_DIR / "qwen-Q2_0.txt"), cmd[cmd.index("--geometry") + 1])
+        self.assertEqual(str(setup.DATA_DIR / "expert-profile.bin"), cmd[cmd.index("--expert-profile") + 1])
+        for flag, value in (("--expert-cache", "auto"), ("--prefill", "auto"), ("--spec", "4"),
+                            ("--max-context", "65536"), ("--kv", "fp16"), ("--vram-reserve-mib", "700")):
+            self.assertEqual(value, cmd[cmd.index(flag) + 1], flag)
+        self.assertEqual({"capture_output": True, "text": True, "timeout": setup.PLAN_TIMEOUT_S}, runner.kwargs)
+        self.assertNotIn("--resident-budget-gib", cmd)
+
+        runner = FakeRunner(stdout=plan_line(context=8192) + "\n")
+        self.plan(runner, "coder", "IQ1_M", 8192, "fp16", vision="gpu", budget_gib=8.0, gpu_budget_mib=30000,
+                  files=("/m/pack", "/m/shard1.gguf", "/m/ple.gguf", "/m/mtp"))
+        cmd = runner.calls[0]
+        self.assertEqual(str(setup.DATA_DIR / "expert-profile-coder.bin"), cmd[cmd.index("--expert-profile") + 1])
+        self.assertNotIn("--geometry", cmd)
+        self.assertEqual("/m/pack", cmd[cmd.index("--pack") + 1])
+        self.assertEqual("/m/shard1.gguf", cmd[cmd.index("--native") + 1])
+        self.assertEqual("/m/ple.gguf", cmd[cmd.index("--ple-gguf") + 1])
+        self.assertEqual("/m/mtp", cmd[cmd.index("--mtp") + 1])
+        self.assertEqual("2100", cmd[cmd.index("--vram-reserve-mib") + 1])
+        self.assertEqual("8.0", cmd[cmd.index("--resident-budget-gib") + 1])
+        self.assertEqual("30000", cmd[cmd.index("--gpu-budget-mib") + 1])
+
+    def test_metal_plan_fit_result_and_no_fit_result(self):
+        plan = self.plan(FakeRunner(returncode=3, stdout=plan_line(fits=0, reason=NO_FIT_REASON) + "\n"))
+        self.assertEqual("none", setup.plan_class(plan))
+        plan = self.plan(FakeRunner(returncode=0, stdout=plan_line() + "\n"))
+        self.assertEqual("full", setup.plan_class(plan))
+
+    def test_metal_plan_refuses_a_plan_it_cannot_trust(self):
+        cases = {
+            "exit 0 with fits=0": FakeRunner(returncode=0, stdout=plan_line(fits=0, reason=NO_FIT_REASON) + "\n"),
+            "exit 3 with fits=1": FakeRunner(returncode=3, stdout=plan_line() + "\n"),
+            "exit 1 with a full plan on stdout": FakeRunner(returncode=1, stdout=plan_line() + "\n"),
+            "exit 2 with a full plan on stdout": FakeRunner(returncode=2, stdout=plan_line() + "\n"),
+            "SIGKILL with a full plan on stdout": FakeRunner(returncode=-9, stdout=plan_line() + "\n"),
+            "exit 0 with no stdout": FakeRunner(returncode=0, stdout=""),
+            "exit 0 with two PLAN lines": FakeRunner(returncode=0, stdout=plan_line() + "\n" + plan_line() + "\n"),
+            "exit 0 with text beside the PLAN line": FakeRunner(returncode=0, stdout="note\n" + plan_line() + "\n"),
+            "exit 0 with a malformed PLAN line": FakeRunner(returncode=0, stdout=plan_line(w_mib="x") + "\n"),
+            "a different context than requested": FakeRunner(returncode=0, stdout=plan_line(context=8192) + "\n"),
+            "a different KV than requested": FakeRunner(returncode=0, stdout=plan_line(kv="int8") + "\n"),
+        }
+        for label, runner in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(setup.PlanError):
+                    self.plan(runner)
+
+    def test_metal_plan_failure_hints(self):
+        messages = {}
+        messages["sigkill"] = self._failure_message(FakeRunner(returncode=-9))
+        messages["library"] = self._failure_message(
+            FakeRunner(returncode=1, stderr="dyld: Library not loaded: @rpath/libstrata.dylib\n"))
+        messages["timeout"] = self._failure_message(
+            FakeRunner(raises=subprocess.TimeoutExpired(["engine"], setup.PLAN_TIMEOUT_S)))
+        messages["missing binary"] = self._failure_message(FakeRunner(raises=FileNotFoundError("engine")))
+        messages["other"] = self._failure_message(
+            FakeRunner(returncode=1, stderr="\n".join(f"line {i}" for i in range(1, 8))))
+        self.assertIn("xattr -dr com.apple.quarantine", messages["sigkill"])
+        self.assertIn("files are incomplete", messages["library"])
+        self.assertIn("more than 30 s", messages["timeout"])
+        self.assertIn("cannot start", messages["missing binary"])
+        self.assertIn("delete the engine folder", messages["other"])
+        # Only the last five stderr lines are reported.
+        self.assertIn("line 7", messages["other"])
+        self.assertIn("line 3", messages["other"])
+        self.assertNotIn("line 2", messages["other"])
+
+    def _failure_message(self, runner) -> str:
+        with self.assertRaises(setup.PlanError) as context:
+            self.plan(runner)
+        return str(context.exception)
+
+    def test_metal_plan_rejects_bad_requests_before_the_engine_runs(self):
+        bad = {
+            "unknown family": (("nope", "Q2_0", 65536, "fp16"), {}),
+            "unknown model": (("qwen", "Q9", 65536, "fp16"), {}),
+            "zero context": (("qwen", "Q2_0", 0, "fp16"), {}),
+            "boolean context": (("qwen", "Q2_0", True, "fp16"), {}),
+            "unknown KV": (("qwen", "Q2_0", 65536, "q4"), {}),
+            "unknown vision": (("qwen", "Q2_0", 65536, "fp16"), {"vision": "tpu"}),
+            "incomplete files": (("qwen", "Q2_0", 65536, "fp16"), {"files": ("/p", "/s", None)}),
+            "empty MTP path": (("qwen", "Q2_0", 65536, "fp16"), {"files": ("/p", "/s", None, "")}),
+        }
+        for label, (args, kwargs) in bad.items():
+            with self.subTest(request=label):
+                runner = FakeRunner(stdout=plan_line() + "\n")
+                setup.metal_plan.cache_clear()
+                with mock.patch.object(setup, "PLAN_RUNNER", runner):
+                    with self.assertRaises(ValueError):
+                        setup.metal_plan(*args, **kwargs)
+                self.assertEqual([], runner.calls)
 
 
 class MacOSProbes(unittest.TestCase):
