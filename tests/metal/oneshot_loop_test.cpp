@@ -139,7 +139,7 @@ void test_stats_block_is_computed_from_the_run() {
     const Outcome outcome = run_case(backend, three_token_request(true));
     const std::string expected =
         kPlainOutput +
-        "  per token              2.000 ms/token (WALL CLOCK: embed, layers, head, sample)\n"
+        "per token                2.000 ms/token (WALL CLOCK: embed, layers, head, sample)\n"
         "gpu window               3.000 ms/round (encode 1.000, gpu 1.000, host wait 2.000)\n"
         "commit+draft             1.000 ms/round\n"
         "dispatches               144 per window at T=1, 160 at T=4\n"
@@ -150,6 +150,7 @@ void test_stats_block_is_computed_from_the_run() {
 
 void test_stats_are_suppressed_without_the_flag() {
     OneShotReport report = three_token_report();
+    report.include_stats = true;  // The backend asks for the block; the request's missing --stats must still win.
     report.stats.gpu_window_available = true;
     report.stats.gpu_total_ms = 3.0;
     report.stats.encode_total_ms = 3.0;
@@ -253,6 +254,59 @@ void test_inconsistent_reports_print_nothing() {
     prefetch.stats.file_reads = 4;
     prefetch.stats.warmed_file_reads = 5;
     expect_rejected("warmed blob reads cannot exceed the reads", prefetch, "warmed more blob reads");
+
+    OneShotReport negative_output = three_token_report();
+    negative_output.output_ids = {21, -1, 23};
+    expect_rejected("a negative output id is rejected", negative_output, "outside the vocabulary");
+
+    OneShotReport negative_first_token = three_token_report();
+    negative_first_token.time_to_first_token_ms = -1.0;
+    expect_rejected("a negative time to first token is rejected", negative_first_token,
+                    "non-finite or negative time");
+
+    OneShotReport negative_rounds = three_token_report();
+    negative_rounds.rounds = -1;
+    expect_rejected("a negative round count is rejected", negative_rounds, "negative round count");
+
+    OneShotReport too_many_rounds = three_token_report();
+    too_many_rounds.speculation.enabled = true;
+    too_many_rounds.speculation.rounds = 4;
+    expect_rejected("speculation rounds cannot exceed the decode windows", too_many_rounds,
+                    "exceed the decode windows");
+
+    OneShotReport histogram_rounds = three_token_report();
+    histogram_rounds.speculation.enabled = true;
+    histogram_rounds.speculation.rounds = 1;
+    histogram_rounds.speculation.drafts_offered = 4;
+    histogram_rounds.speculation.drafts_accepted = 3;
+    histogram_rounds.speculation.accepted_per_round = {0, 1, 1};
+    expect_rejected("the accepted-per-round histogram cannot count more rounds than speculation ran",
+                    histogram_rounds, "histogram disagrees");
+
+    OneShotReport suffix = three_token_report();
+    suffix.speculation.enabled = true;
+    suffix.speculation.suffix_draft = 2;
+    suffix.speculation.suffix_windows = 1;
+    suffix.speculation.suffix_drafts_offered = 1;
+    suffix.speculation.suffix_drafts_accepted = 2;
+    expect_rejected("suffix drafts cannot accept more drafts than they offered", suffix, "suffix draft counts");
+
+    OneShotReport negative_window = three_token_report();
+    negative_window.speculation.enabled = true;
+    negative_window.speculation.min_draft_probability = 0.25;
+    negative_window.speculation.window_counts = {0, -1, 2};
+    expect_rejected("a window size count cannot be negative", negative_window,
+                    "window size counts must not be negative");
+
+    OneShotReport negative_slots = three_token_report();
+    negative_slots.stats.slot_hits = -1;
+    expect_rejected("a negative slot hit count is rejected before it reaches the stats line", negative_slots,
+                    "non-finite or negative stats value");
+
+    OneShotReport negative_dispatches = three_token_report();
+    negative_dispatches.stats.dispatches_at_t1 = -1;
+    expect_rejected("a negative dispatch count is rejected before it reaches the stats line", negative_dispatches,
+                    "non-finite or negative stats value");
 }
 
 void test_backend_failures_and_invalid_requests() {
@@ -288,6 +342,22 @@ void test_backend_failures_and_invalid_requests() {
     const Outcome out_of_range = run_case(unused_vocab, bad_prompt);
     check(out_of_range.status == 2 && unused_vocab.calls() == 0 && out_of_range.out.empty(),
           "a prompt id outside the vocabulary exits 2 before the backend runs", out_of_range.diagnostics);
+
+    OneShotRequest negative_prompt = three_token_request(false);
+    negative_prompt.prompt_ids = {11, -1, 13};
+    SyntheticBackend unused_negative(three_token_report());
+    const Outcome negative_id = run_case(unused_negative, negative_prompt);
+    check(negative_id.status == 2 && unused_negative.calls() == 0 && negative_id.out.empty(),
+          "a negative prompt id exits 2 before the backend runs", negative_id.diagnostics);
+
+    // Validation runs before the --stats gate, so a non-finite stat still rejects a run without --stats (D-IMPL-814).
+    OneShotReport nan_stat = three_token_report();
+    nan_stat.stats.gpu_total_ms = std::nan("");
+    SyntheticBackend nan_backend(nan_stat);
+    const Outcome nan_plain = run_case(nan_backend, three_token_request(false));
+    check(nan_plain.status == 1 && nan_plain.out.empty() &&
+              nan_plain.diagnostics.find("non-finite or negative stats value") != std::string::npos,
+          "a NaN stat rejects the run even without --stats", nan_plain.diagnostics);
 }
 
 }  // namespace

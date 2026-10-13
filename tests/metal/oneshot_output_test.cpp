@@ -90,7 +90,7 @@ int main() {
         "decode                   2 tokens in 5.0 ms  ->  400.00 tok/s\n"
         "prefill                  1 tokens in 4.0 ms  ->  250.00 tok/s  (time to first token 6.5 ms)\n"
         "mixed dumped             mixed.bin (n_embd 2560, rms 0.1, mean|.| 0.2)\n"
-        "  per token              2.500 ms/token (WALL CLOCK: embed, layers, head, sample)\n"
+        "per token                2.500 ms/token (WALL CLOCK: embed, layers, head, sample)\n"
         "gpu window               2.000 ms/round (encode 0.500, gpu 0.400, host wait 1.500)\n"
         "commit+draft             1.000 ms/round\n"
         "dispatches               144 per window at T=1, 160 at T=4\n"
@@ -117,7 +117,7 @@ int main() {
         "prompt  : 7\n"
         "output  :\n"
         "decode                   0 tokens in 0.0 ms  ->  0.00 tok/s\n"
-        "  per token              0.000 ms/token (WALL CLOCK: embed, layers, head, sample)\n") {
+        "per token                0.000 ms/token (WALL CLOCK: embed, layers, head, sample)\n") {
         return fail("empty output or one-token prompt formatting is incorrect");
     }
 

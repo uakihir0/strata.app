@@ -129,7 +129,9 @@ bool valid_times(const OneShotMetalStats& stats) {
            finite_nonnegative(stats.ssd_megabytes_read) && finite_nonnegative(stats.milliseconds_per_layer) &&
            finite_nonnegative(stats.qsa_milliseconds_per_layer) &&
            finite_nonnegative(stats.gdn_milliseconds_per_layer) &&
-           finite_nonnegative(stats.experts_milliseconds_per_layer);
+           finite_nonnegative(stats.experts_milliseconds_per_layer) &&
+           // Counts printed by the stats lines: a negative value would print a figure with no meaning.
+           stats.slot_hits >= 0 && stats.dispatches_at_t1 >= 0 && stats.dispatches_at_t4 >= 0;
 }
 
 }  // namespace
@@ -159,6 +161,16 @@ std::string validate_one_shot_report(const OneShotRequest& request, const OneSho
         }
         if (speculation.drafts_accepted < 0 || speculation.drafts_accepted > speculation.drafts_offered) {
             return "speculation accepted more drafts than it offered";
+        }
+        if (speculation.suffix_windows < 0 || speculation.suffix_drafts_offered < 0 ||
+            speculation.suffix_drafts_accepted < 0 ||
+            speculation.suffix_drafts_accepted > speculation.suffix_drafts_offered) {
+            return "suffix draft counts are negative or accepted more drafts than they offered";
+        }
+        // Window sizes are counts. Their total is not tied to the rounds here, because the spec does not say whether
+        // the counts cover every decode window or only speculative rounds.
+        for (const std::int64_t count : speculation.window_counts) {
+            if (count < 0) return "window size counts must not be negative";
         }
         if (!finite_nonnegative(speculation.mtp_draft_total_ms) || !finite_nonnegative(speculation.mtp_prompt_ms)) {
             return "backend reported a non-finite or negative MTP time";
