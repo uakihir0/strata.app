@@ -609,13 +609,11 @@
     },
     "metal_util_test": {
       "label": "metal",
-      "origin": "09 9.1",
-      "planned": "L3"
+      "origin": "09 9.1"
     },
     "mv_multi_eq_single": {
       "label": "metal",
-      "origin": "04 10.4",
-      "planned": "L3"
+      "origin": "04 10.4"
     },
     "pf_gdn_eq_step_norm": {
       "label": "metal",
