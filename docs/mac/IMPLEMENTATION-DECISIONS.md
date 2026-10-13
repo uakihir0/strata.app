@@ -13738,3 +13738,135 @@ measuring L-15 remain open.
   would otherwise change that count and fail `test_map`.
 - **Review required:** Confirm the location. Moving the module into `lc_dump/` later is a rename plus the doc rows.
 
+### D-IMPL-740: `pf_gdn_eq_step_norm` checks bits against the decode kernels and bounds against a host oracle
+
+- **Decision:** `tests/metal/pf_gdn_eq_step_norm.mm` runs the Prefill GDN chain (tiled convolution, history advance,
+  q/k L2, recurrence, output norm) over T = 1, 3, 64, 65 and 300 rows in one ordered Encoder. The primary check is class B
+  against the decode GPU kernels, run in windows of up to 8 rows in write-through mode: h, the history, the state, and
+  y_h = half(y) must match bit for bit. The host reference is `oracle::gdn_conv_l2`, `gdn_conv_commit` and
+  `gdn_step_norm` (`tests/metal/oracles/gdn.cpp`). Its stages are checked on the oracle's own inputs: conv + L2 at
+  U(128), the recurrence state at U(512), and y_h within 2^-10 |y| + 2^-24 + n 2^-24 m. The whole chain, decode and
+  prefill, is checked at U(640) for the state and y. Inputs are synthetic (`synth.cpp`, random tensors in the real
+  shapes), with the seed fixed per T.
+- **Reason:** Section 10.4 names the decode kernels as the reference, and the task asks for an independent host
+  reference. Both are used: the bit check is the tight criterion, and the host oracle is a separate implementation.
+  U(128) and U(512) are the bounds `metal_gdn_test` already uses for the same arithmetic. U(640) is their sum. Observed
+  n on this Mac is at most 7.7 for the chain and at most 5.8 for conv + L2, so the bounds leave wide margins. The
+  recurrence does not grow the error with T: the state map s -> exp(gate) (I - beta k k^T) s has norm at most exp(gate),
+  because k has unit length after L2 and 0 <= beta <= 1, and the synthetic gates lie below zero.
+- **Review required:** Confirm the U(640) chain bound, the F16 bound and the contraction argument. The argument depends on
+  gate < 0 and must be checked against the real `ssm_a` and `dt` values before any model-backed use. The test was
+  adversarially checked: a one-ulp flip in the prefill state fails the bit check and passes the U bound (as designed),
+  and a flipped F16 bit fails both the bit check and the F16 bound.
+
+### D-IMPL-741: The sort oracle follows section 6.6's description of upstream's loop, and the test files take the CTest names
+
+- **Decision:** `tests/metal/pf_sort_eq_host_grouping.mm` (and `pf_gdn_eq_step_norm.mm`) are named after their CTest
+  names, not `metal_*_test`. The sort oracle is a host transcription of upstream's grouping loop as section 6.6 describes
+  it (`prefill.cpp:1583-1615`): the exclusive prefix of the per-expert counts in id order gives each expert's first slot,
+  a stable cursor fill assigns each valid entry its slot, and each histogram row is the cursor at the start of its tile.
+- **Reason:** The property names in section 10.4 are CTest names. Upstream's `prefill.cpp` is not in this checkout
+  (`ref/` holds only `load.py`), so the transcription follows the document's description of the loop, not its source.
+- **Review required:** Compare the oracle with upstream `prefill.cpp:1583-1615` on a machine that has the upstream
+  source. Any difference in ordering, histogram layout, or `PfPlan` fill convention must be corrected in the oracle or
+  recorded here.
+
+### D-IMPL-742: `pf_sort_eq_host_grouping` duplicates the grouping oracle of `metal_prefill_moe_grouping_test` on purpose
+
+- **Decision:** The new test is kept separate from `metal_prefill_moe_grouping_test`, although both compare the grouping
+  kernels with an independent host oracle. The new test covers the section 10.4 list for every T: invalid ids at T = 1,
+  7, 25, 26, 64, 300 and 4,096, tiered residency at every T, both expert widths at every T, and 98 cases in all.
+  `metal_prefill_moe_grouping_test` checks invalid ids only in one T = 1 case.
+- **Reason:** The property is named separately in section 10.4 with a serial and a concurrent CTest. Its coverage is
+  wider than the existing grouping test's invalid-id coverage.
+- **Review required:** Decide whether to merge the two tests, with one oracle and one CTest pair, once L13's status is
+  reviewed. The two together add about 13 s of `metal` run time.
+
+### D-IMPL-743: `pf_sort_eq_host_grouping_concurrent` is a second CTest, and the section 9.1 counts change
+
+- **Decision:** The sort property has a serial CTest and a concurrent CTest, `pf_sort_eq_host_grouping_concurrent`, which
+  runs the same binary with `STRATA_METAL_DISPATCH=concurrent`. Both have their own entry in `tests/metal/test_map.json`
+  with label `metal`. Section 9.1 is updated: the total becomes 188 and the `metal` count 113, and the property row
+  lists the concurrent name.
+- **Reason:** Section 10.4 requires both CTests to compare with the same oracle. `tools/metal/test_map.py` rejects a
+  CTest without a map entry and a declared count that does not match the map.
+- **Review required:** Confirm that a concurrent CTest per property is the convention. `pf_gdn_eq_step_norm` has none
+  (see D-IMPL-751).
+
+### D-IMPL-744: Histogram columns at or past `n_experts` are not compared
+
+- **Decision:** The histogram check covers every tile and every expert column below `n_experts`. The count kernel writes
+  all 512 columns, and the scan converts only the first `n_experts`. The columns past `n_experts` therefore hold raw
+  counts, which are not offsets, and the test does not compare them.
+- **Reason:** Section 6.6 says the scan ignores columns at or past `n_expert`, and section 10.4 lists histogram offsets
+  only. Comparing those columns would pin a value the spec does not define.
+- **Review required:** If the spec later defines those columns, add them to the comparison.
+
+### D-IMPL-745: The sort negative control swaps `dst` and goes through the real comparator
+
+- **Decision:** The swap control swaps the first two entries of the expected `dst` map and checks that the same
+  comparator the real check uses rejects the swap. It does not swap `src`.
+- **Reason:** Two consecutive sorted entries of one token share a `src` row (`src = i / 10`), so swapping them leaves
+  `src` unchanged. The first run failed 43 times on a `src` control, all in cases where the first two sorted entries came
+  from one token. `dst` values are distinct route indices, so a swap always changes the map.
+- **Review required:** None beyond the comparator itself. `src` is still compared exactly in every case.
+
+### D-IMPL-746: Synthetic inputs and their ranges
+
+- **Decision:** GDN inputs are `synth.cpp`'s normal values, scaled per tensor: qkv by 0.5, history by 0.2, convolution
+  weights by 0.15, state by 0.02, gate as -2.5 + 0.3 N, beta as sigmoid(N), z by 1, and gamma as 1 + 0.1 N. Sort routes
+  come from fixed patterns and the mixed_h rows from a deterministic formula. No model file is read.
+- **Reason:** Section 10.4 defines a synthetic property as random weights in the real shapes from `synth.cpp`. No model
+  files are present in this checkout.
+- **Review required:** Compare the gate and beta ranges with the real model's `ssm_a`, `dt` and alpha/beta values before
+  treating the chain bounds as applicable to the model. The contraction argument in D-IMPL-740 needs gate < 0.
+
+### D-IMPL-747: The windowed decode and the whole-T host reference compute the same recurrence
+
+- **Decision:** The host oracle runs over all T rows in one call, while the decode GPU path runs in windows of up to 8
+  rows. The test treats them as the same recurrence, since each row reads only the state and the history left by earlier
+  rows.
+- **Reason:** `oracle::gdn_step_norm` tracks error magnitudes (`twin::tf`) across all rows, and the U(n) bound needs them.
+  Calling the oracle once per window would drop those magnitudes at each window boundary.
+- **Review required:** Confirm the claim with the existing decode test, which checks 8-row windows against the same
+  oracle (`metal_gdn_test`, `run_step_norm_set`).
+
+### D-IMPL-748: No kernel changed; both GDN paths and the sort path pass as written
+
+- **Decision:** No kernel or engine source was changed. The prefill GDN chain agrees bit for bit with the decode GDN
+  kernels at T = 1, 3, 64, 65 and 300, and the grouping kernels match the host oracle exactly for every planned case.
+- **Reason:** The task allows a kernel change only when the kernel is shown to be wrong, and no such case was found.
+- **Review required:** These results come from one Apple M5 Pro on macOS 27 (the build reports the macOS 27.0 SDK).
+  Re-run `pf_gdn_eq_step_norm` and both sort CTests on the reference Mac before relying on them for L13.
+
+### D-IMPL-749: CTest timeouts
+
+- **Decision:** `pf_gdn_eq_step_norm` has `TIMEOUT 300`, and the two sort CTests have `TIMEOUT 180`. The T = 4096 cases
+  each allocate a 200 MiB gathered-row buffer. Measured run times on this Mac are about 6.6 s for each CTest.
+- **Reason:** The timeouts match `metal_gdn_test` (300 s) and the grouping tests (180 s), which have similar shapes.
+- **Review required:** Check the run time on the other families in the family runs.
+
+### D-IMPL-750: The `test_map` run still reports one error that these tests do not cause
+
+- **Decision:** Nothing in this change alters the Python-module count error. With `STRATA_BUILD_DIR=build-dev`,
+  `tools/metal/test_map.py` reports one error, `section 9.3 declares [14, 0, 6] ... found [14, 2, 6]`. It was present
+  before this change. The notes for other planned tests are unchanged.
+- **Reason:** That count belongs to section 9.3 and to other work items. Fixing it is out of scope here.
+- **Review required:** The owner of section 9.3 should reconcile the module count with the files.
+
+### D-IMPL-751: `pf_gdn_eq_step_norm` has no concurrent CTest
+
+- **Decision:** `pf_gdn_eq_step_norm` is registered once, with the default serial dispatch.
+- **Reason:** Section 10.4 names one CTest for this property. The prefill chain runs in one ordered Encoder, which is
+  barrier-separated under both dispatch modes.
+- **Review required:** If the family runs need both modes, register `pf_gdn_eq_step_norm_concurrent` and update
+  `test_map.json` and section 9.1 together.
+
+### D-IMPL-752: L13 is not marked complete
+
+- **Decision:** The L13 row of section 12.1 keeps its status. `pf_gdn_eq_step_norm` and `pf_sort_eq_host_grouping` now
+  exist and pass. The row's "done when" also needs `idx_batch_eq_sequential`, `prefill_chunk_independent` and the
+  prompt-path criterion, and those remain planned.
+- **Reason:** The task asks for the two properties only. Marking L13 done would overstate the prompt path's status.
+- **Review required:** Confirm that L13 stays open until those three items pass.
+
