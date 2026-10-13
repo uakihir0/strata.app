@@ -306,7 +306,7 @@ def data_folder(root: Path = ROOT, saved: str | None = None) -> Path:
     if saved:
         return Path(saved).expanduser()
     default = root.parent / "Strata-data"
-    if not MAC:
+    if not MAC:  # MAC: the protected-folder rule of section 4.12 applies on a Mac only
         return default
     home = Path.home()
     parent = root.parent.resolve()
@@ -325,10 +325,10 @@ def create_data_folder(folder: Path) -> None:
     try:
         folder.mkdir(parents=True, exist_ok=True)
     except PermissionError as exc:
-        if MAC and exc.errno == errno.EPERM:
+        if MAC and exc.errno == errno.EPERM:  # MAC: the TCC hint of section 4.12
             raise SetupError(f"cannot create {folder}. {HINT_TCC}") from exc
         raise
-    if not MAC:
+    if not MAC:  # MAC: Spotlight and Time Machine apply on a Mac only (section 4.12)
         return
     (folder / ".metadata_never_index").touch(exist_ok=True)
     if macos.tm_exclude(folder):

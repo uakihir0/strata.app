@@ -255,12 +255,12 @@ A person with a 64 GB Mac can install Strata with `./setup.sh`, run it, and use 
 | S9 | Steps 6 and 7: pack, MTP, disk, args, the final plan, the config | S6, S7 |
 | S10 | Run scripts, `.command` files, quarantine | S9 |
 | S11 | `start()` on a Mac, the data folder, sleep, flags and texts | S9 |
-| S12 | `serve/server.py`: port probe, SIGHUP, the death texts, `keep_awake` | S1 |
-| S13 | `serve/telemetry.py` | S1 |
-| S15 | `tools/strata_mcp.py` | S4 |
-| S16 | The tools | |
+| S12 | `serve/server.py`: port probe, SIGHUP, the death texts, `keep_awake`. **Status: host part done (2026-10-13).** The probe, SIGHUP, `keep_awake`, the texts, the vision folder and the MCP PATH are tested with a mock engine (D-IMPL-920 to 928). Open: the engine's SIGHUP ignore (06, section 2.4) and the reference-Mac checks. | S1 |
+| S13 | `serve/telemetry.py`. **Status: host part done (2026-10-13).** The `_Apple` reader and the Mac sampler keys are tested with stubs, and no Mac key appears off darwin. Open: the reference-Mac readings and S14. | S1 |
+| S15 | `tools/strata_mcp.py`. **Status: host part done (2026-10-13).** The section 8 rules are tested with a fake engine. Open: the reference-Mac run, the MCP golden case (S18) and the Claude Desktop install. | S4 |
+| S16 | Withdrawn, as in 07 section 15: no CUDA calibration utility is shipped on macOS (D-IMPL-236). | |
 | S18 | The Mac golden set and `record_mac_plans.py` | S6, S9 |
-| S19 | `serve/test_macos.py` | S2, S10-S12 |
+| S19 | `serve/test_macos.py`. **Status: server tests done in part (2026-10-13).** Four section 10.3 tests that the host runs pass (`test_port_probe`, `test_sighup_shutdown`, `test_keep_awake`, `test_module_rules`). Open: the setup- and engine-owned tests of that list, `WebHealthAuthContract`, and the reference-Mac pass (07, section 15). | S2, S10-S12 |
 | T12 | The needles and the server run, with S.image | H9, H13 |
 | T14 | The nightly job's five steps and the weekly job | T7-T9, T11, T12 |
 | T18 | The Python layer in the nightly run | T14, S5 |

@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -19,9 +20,9 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, MockEngine, Service, StrataEngine,
-                          configured_backend, configured_min_free_unified_memory_mib, min_free_unified_memory_warning,
-                          request_timings, serve)  # noqa: E402
+from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, MockEngine, Service, StrataEngine, Vision,
+                          configured_backend, configured_min_free_unified_memory_mib, firewall_note,
+                          min_free_unified_memory_warning, request_timings, serve, warn_tight_ram)  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -1905,6 +1906,17 @@ class MacTelemetry(unittest.TestCase):
         self.assertEqual((sample["thermal"], sample["thermal_level"], sample["mem_pressure"], sample["swap_used"]),
                          ("serious", 2, "warn", 3 << 30))
 
+    def test_off_darwin_the_monitor_keeps_the_upstream_keys(self):
+        """docs/mac/07, section 7.2 and S13: off darwin no Mac key appears, so the readings keep upstream's names."""
+        with mock.patch.object(self.telemetry, "MAC", False):
+            monitor = self.telemetry.Telemetry(backend="metal")
+            sample = monitor.sample()
+        self.assertEqual(set(monitor.static), {"gpu_name", "gpu_count", "cpu_name", "cores", "threads", "psutil"})
+        mac_keys = {"thermal", "thermal_level", "mem_pressure", "swap_used", "unified", "gpu_cores", "perflevels",
+                    "computer"}
+        self.assertFalse(mac_keys & (set(sample) | set(monitor.static)))
+        self.assertFalse(any(key.startswith("gpu_") for key in sample))
+
     def test_server_free_memory_uses_metal_reader(self):
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
@@ -1969,6 +1981,90 @@ class MacMemoryAdvisory(unittest.TestCase):
         warning = min_free_unified_memory_warning(100, 99)
         self.assertIn("unvalidated estimate", warning)
         self.assertIn("will not block model loading", warning)
+
+
+class MacReadyTexts(unittest.TestCase):
+    def test_firewall_paragraph_names_the_real_python_binary(self):
+        """docs/mac/07, section 6.3: the text the ready message prints when the macOS firewall is on."""
+        text = firewall_note("/opt/python/bin/python3")
+        self.assertIn("The macOS firewall asks once whether Python may accept incoming connections: click Allow.", text)
+        self.assertIn('set Python to "Allow incoming', text)
+        self.assertIn("socketfilterfw --add /opt/python/bin/python3", text)
+        self.assertIn("socketfilterfw --unblockapp /opt/python/bin/python3", text)
+
+    def test_tight_memory_warning_names_the_resident_model_only_below_6_gb(self):
+        """docs/mac/07, section 6.4: the warning says what the model keeps resident and what is left."""
+        out = io.StringIO()
+        with mock.patch("serve.macos.ram_bytes", return_value=16 << 30), contextlib.redirect_stdout(out):
+            warn_tight_ram(12 << 10)                       # 12 GiB resident leaves 4 GiB
+            warn_tight_ram(8 << 10)                        # 8 GiB resident leaves 8 GiB: silent
+        text = out.getvalue()
+        self.assertEqual(text.count("WARNING"), 1)
+        self.assertIn("[strata] WARNING: memory is tight - the model keeps 12.0 GB of this Mac's 16 GB resident, "
+                      "leaving 4.0 GB for everything else.", text)
+        self.assertIn("./setup.sh --setup", text)
+
+
+class VisionFiles(unittest.TestCase):
+    class FakeEncoder:
+        """Stands in for strata-vision: an `ENC <img> <out>` line writes the embeddings file and answers OK."""
+
+        def __init__(self):
+            self.encodes, self.line, self.stdin, self.stdout = 0, "", self, self
+
+        def write(self, text):
+            self.line = text
+
+        def flush(self):
+            _, _, out = self.line.split()
+            Path(out).write_bytes(b"embeddings")
+            self.encodes += 1
+
+        def readline(self):
+            return "OK 7\n"
+
+    def test_a_cached_image_whose_file_was_cleaned_is_encoded_again(self):
+        """docs/mac/07, section 6.11: macOS may clean $TMPDIR, so a cache hit needs its file."""
+        with tempfile.TemporaryDirectory() as temp:
+            v = Vision.__new__(Vision)
+            v.dir, v.lock, v.cache, v.proc = Path(temp), threading.Lock(), {}, self.FakeEncoder()
+            with mock.patch.object(Vision, "load", lambda self, source: b"image"), \
+                    mock.patch.object(Vision, "normalize", lambda self, data: data):
+                first = v.encode("picture")
+                self.assertEqual(v.proc.encodes, 1)
+                self.assertEqual(v.encode("picture"), first)
+                self.assertEqual(v.proc.encodes, 1)
+                first[0].unlink()
+                again = v.encode("picture")
+                self.assertEqual(v.proc.encodes, 2)
+                self.assertTrue(again[0].exists())
+                self.assertEqual(again[1], 7)
+
+    def test_a_temporary_folder_with_spaces_moves_to_private_tmp(self):
+        """docs/mac/07, section 6.11: the ENC line is space-separated, so a TMPDIR with spaces is not used."""
+        if sys.platform != "darwin":
+            self.skipTest("the /private/tmp move is macOS only")
+        with tempfile.TemporaryDirectory(prefix="with spaces ") as spaced:
+            with mock.patch.object(tempfile, "tempdir", spaced), mock.patch.object(Vision, "_start"):
+                v = Vision({"exe": "strata-vision", "mmproj": "mmproj.gguf", "model": "model.gguf"})
+            self.addCleanup(os.rmdir, v.dir)
+        self.assertEqual(str(v.dir.parent), "/private/tmp")
+        self.assertTrue(v.dir.is_dir())
+        self.assertNotIn(" ", str(v.dir))
+
+
+class MacHealth(unittest.TestCase):
+    def test_health_names_the_computer(self):
+        """docs/mac/07, section 7.2: GET /health says "computer": "Mac", so the chat page can say "this Mac"."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        with urllib.request.urlopen(f"http://127.0.0.1:{httpd.server_address[1]}/health", timeout=10) as r:
+            body = json.loads(r.read())
+        self.assertEqual(body["computer"], "Mac")
+        self.assertEqual(body["service"], "strata")
 
 
 if __name__ == "__main__":

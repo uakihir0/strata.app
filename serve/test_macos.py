@@ -21,14 +21,11 @@ import unittest
 import urllib.error
 import urllib.request
 import zipfile
-from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from unittest import mock
 
 from serve import macos, server, telemetry
 import setup
-
-ROOT = Path(__file__).resolve().parents[1]
 
 # PLAN lines built from the field order in docs/mac/05-memory-and-residency.md, section 3.4, and plan_line() in
 # src/metal/engine/plan.cpp. They are constructed for these tests, not captured from an engine run.
@@ -348,6 +345,166 @@ class MacOSProbes(unittest.TestCase):
         self.assertEqual(identity, macos.proc_identity(os.getpid()))
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class ServerSockets(unittest.TestCase):
+    @unittest.skipUnless(macos.MAC, "macOS only")
+    def test_port_probe(self):
+        """docs/mac/07, section 6.1: the four rows of the table, with real loopback sockets on a free port.  The
+        listeners set SO_REUSEADDR as the server's own socket does."""
+        from serve import server
+        port = free_port()
+        cases = (
+            ("0.0.0.0 listening, probe 127.0.0.1", "0.0.0.0", "127.0.0.1", True),
+            ("127.0.0.1 listening, probe 0.0.0.0", "127.0.0.1", "0.0.0.0", True),
+            ("127.0.0.1 listening, probe 127.0.0.1", "127.0.0.1", "127.0.0.1", True),
+            ("nothing listening, probe 127.0.0.1", None, "127.0.0.1", False),
+            ("nothing listening, probe 0.0.0.0", None, "0.0.0.0", False),
+        )
+        for label, listen_on, probe, expected in cases:
+            with self.subTest(label):
+                listener = None
+                try:
+                    if listen_on:
+                        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        listener.bind((listen_on, port))
+                        listener.listen(1)
+                    self.assertIs(server.port_in_use(probe, port), expected)
+                finally:
+                    if listener is not None:
+                        listener.close()
+
+
+class ServerLifecycle(unittest.TestCase):
+    def setUp(self):
+        # test_no_raise_anywhere caches macos_version() as () while MAC is patched False: read the host's value again
+        macos.macos_version.cache_clear()
+
+    @unittest.skipUnless(macos.MAC, "macOS only")
+    def test_sighup_shutdown(self):
+        """docs/mac/07, section 6.2: closing the Terminal window sends SIGHUP to the session.  The mock-engine server
+        exits 0 within 10 s and its port is free again."""
+        from serve import server
+        reason = server.macos_host_error()
+        if reason:
+            self.skipTest(reason)
+        port = free_port()
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "server.log"
+            with open(log, "w", encoding="utf-8") as out:
+                proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "mock",
+                                         "--port", str(port)], cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=out,
+                                        stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                deadline = time.monotonic() + 60
+                while "ready:" not in log.read_text(encoding="utf-8"):
+                    if proc.poll() is not None:
+                        self.fail(f"the server exited before it was ready ({proc.returncode}): "
+                                  + log.read_text(encoding="utf-8"))
+                    if time.monotonic() > deadline:
+                        self.fail("the server was not ready within 60 s")
+                    time.sleep(0.2)
+                time.sleep(0.5)     # the SIGHUP handler is installed just after the ready text
+                os.killpg(proc.pid, signal.SIGHUP)
+                try:
+                    returned = proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.fail("the server did not exit within 10 s of SIGHUP")
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        self.assertEqual(returned, 0)
+        self.assertFalse(server.port_in_use("127.0.0.1", port))
+
+    @unittest.skipUnless(macos.MAC, "macOS only")
+    def test_keep_awake(self):
+        """docs/mac/07, section 6.9: caffeinate runs while the model is loaded and ends at an unload; it starts again
+        at the next load, and with keep_awake off none runs.  The stub engine has no process of its own."""
+        from serve import server
+        from serve.frontend import ChatTemplate
+
+        class StubEngine:
+            def __init__(self):
+                self.up = False
+
+            def alive(self):
+                return self.up
+
+            def restart(self):
+                self.up = True
+
+            def unload(self):
+                self.up = False
+
+        def caffeinate_children():
+            r = subprocess.run(["/usr/bin/pgrep", "-P", str(os.getpid()), "caffeinate"], capture_output=True,
+                               text=True, timeout=10)
+            return [int(x) for x in r.stdout.split()]
+
+        svc = server.Service(StubEngine(), server.ByteTokenizer(), ChatTemplate(ROOT / "serve" / "chat_template.jinja"))
+        self.addCleanup(lambda: (setattr(svc, "keep_awake", False), svc.keep_awake_sync()))
+        svc.keep_awake = True
+        svc.ensure_loaded()
+        first = caffeinate_children()
+        self.assertEqual(len(first), 1)
+        argv = subprocess.run(["/bin/ps", "-o", "command=", "-p", str(first[0])], capture_output=True, text=True,
+                              timeout=10).stdout.split()
+        self.assertTrue(argv[0].endswith("caffeinate"))
+        self.assertEqual(argv[-3:], ["-i", "-w", str(os.getpid())])
+        self.assertEqual(svc.unload(), "unloaded")
+        self.assertEqual(caffeinate_children(), [])
+        svc.ensure_loaded()
+        second = caffeinate_children()
+        self.assertEqual(len(second), 1)
+        self.assertNotEqual(second, first)
+        svc.keep_awake = False
+        svc.unload()
+        self.assertEqual(caffeinate_children(), [])
+        svc.ensure_loaded()
+        self.assertEqual(caffeinate_children(), [])
+
+
+class SourceRules(unittest.TestCase):
+    def test_module_rules(self):
+        """Runs everywhere: serve/macos.py parses as Python 3.9, imports only the standard library and starts every
+        subprocess with an absolute path (docs/mac/07, sections 3.1 and 10.3)."""
+        import ast
+        if not hasattr(sys, "stdlib_module_names"):
+            self.skipTest("the standard-library list needs Python 3.10+")
+        tree = ast.parse((ROOT / "serve" / "macos.py").read_text(encoding="utf-8"), feature_version=(3, 9))
+        allowed = set(sys.stdlib_module_names) | {"__future__"}
+        launchers = {"run", "Popen", "call", "check_call", "check_output", "_tool"}
+        checked = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                self.assertEqual(node.level, 0, "relative import in serve/macos.py")
+                names = [node.module or ""]
+            else:
+                names = []
+            for name in names:
+                self.assertIn(name.split(".")[0], allowed, f"{name} is not a standard-library module")
+            if isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.List):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                if name in launchers:
+                    checked += 1
+                    first = node.args[0].elts[0] if node.args[0].elts else None
+                    self.assertIsInstance(first, ast.Constant, f"line {node.lineno}: no literal program")
+                    self.assertTrue(str(first.value).startswith("/"), f"line {node.lineno}: {first.value!r}")
+        self.assertGreater(checked, 0, "no subprocess call was checked")
+
+
 def _stub_setup_sh(path: Path) -> None:
     """A setup.sh stand-in that prints its arguments, one per line."""
     path.write_text('#!/bin/sh\nfor a in "$@"; do printf \'%s\\n\' "$a"; done\n', encoding="utf-8")
@@ -654,7 +811,7 @@ class EngineInstall(unittest.TestCase):
         self.assertIn("compiling instead", out.getvalue())
 
     def test_a_symbolic_link_in_the_asset_fails_before_anything_is_written(self):
-        self.asset(self.members(), symlinks=[("strata.metallib", "/etc/passwd")])
+        self.asset(self.members(), symlinks=[("strata-link", "/etc/passwd")])
         with contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(setup.SetupError) as context:
                 setup.get_prebuilt_metal(self.asset_server().base)
@@ -770,68 +927,6 @@ class SslSetup(unittest.TestCase):
             self.assertEqual(path, os.environ["SSL_CERT_FILE"])
 
 
-@unittest.skipUnless(sys.platform == "darwin", "macOS only: the BSD bind rule is what the probe corrects")
-class PortProbe(unittest.TestCase):
-    """Section 6.1: a port with a listener is in use, even where a SO_REUSEADDR bind on macOS succeeds."""
-
-    def free_port(self) -> int:
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            return probe.getsockname()[1]
-
-    def listen(self, host: str, port: int) -> socket.socket:
-        listener = socket.socket()
-        self.addCleanup(listener.close)
-        listener.bind((host, port))
-        listener.listen()
-        return listener
-
-    def test_port_probe(self):
-        port = self.free_port()
-        self.assertFalse(server.port_in_use("127.0.0.1", port))
-        self.assertFalse(server.port_in_use("0.0.0.0", port))
-
-        wildcard = self.listen("0.0.0.0", port)
-        # The probe's own bind succeeds beside the wildcard listener on macOS, so only the connect can say "in use".
-        server.Server(("127.0.0.1", port), BaseHTTPRequestHandler).server_close()
-        self.assertTrue(server.port_in_use("127.0.0.1", port))
-        wildcard.close()
-
-        self.listen("127.0.0.1", port)
-        self.assertTrue(server.port_in_use("0.0.0.0", port))
-        self.assertTrue(server.port_in_use("127.0.0.1", port))
-
-    def test_port_probe_leaves_a_free_port_free(self):
-        port = self.free_port()
-        self.assertFalse(server.port_in_use("127.0.0.1", port))
-
-
-@unittest.skipUnless(sys.platform == "darwin", "macOS only")
-class SighupShutdown(unittest.TestCase):
-    """Section 6.2: a SIGHUP (the Terminal window closed) shuts the mock server down cleanly, as Ctrl+C does."""
-
-    def test_sighup_shutdown(self):
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
-        proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "mock",
-                                 "--host", "127.0.0.1", "--port", str(port)], cwd=ROOT, start_new_session=True,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.addCleanup(lambda: proc.poll() is None and proc.kill())
-        deadline = time.monotonic() + 30
-        while True:
-            try:
-                socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
-                break
-            except OSError:
-                if time.monotonic() > deadline or proc.poll() is not None:
-                    self.fail("the mock server did not start")
-                time.sleep(0.2)
-        os.kill(proc.pid, signal.SIGHUP)
-        self.assertEqual(0, proc.wait(timeout=10))
-        self.assertFalse(server.port_in_use("127.0.0.1", port))
-
-
 FAKE_ENGINE = """\
 import sys
 print("INFO engine=0.1.34", flush=True)
@@ -842,8 +937,8 @@ for _ in sys.stdin:
 
 
 class EngineDeath(unittest.TestCase):
-    """Section 6.5: the diagnostic for a dead engine comes from its own log output since it started. A fake engine
-    (a Python script behind a shell wrapper, as `--serve` would be) is started and killed for real."""
+    """Section 6.5: the diagnostic reads only the engine's own output since it started. Main's MacEngineDiagnostics
+    covers the stubbed signal cases; this starts a fake engine for real and covers the normal exit."""
 
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -856,49 +951,16 @@ class EngineDeath(unittest.TestCase):
         self.wrapper.chmod(0o755)
         self.log = self.dir / "strata.log"
 
-    def start(self):
-        engine = server.StrataEngine(str(self.wrapper), ["--max-context", "8192"], log=str(self.log))
-        self.addCleanup(lambda: engine.proc.poll() is None and engine.proc.kill())
-        return engine
-
-    def test_death_note_for_sigkill_is_the_same_with_unchanged_or_grown_log(self):
-        notes = []
-        for grown in (False, True):
-            engine = self.start()
-            if grown:
-                with self.log.open("a", encoding="utf-8") as log:
-                    log.write("decoding: 12 tokens so far\n")
-            os.kill(engine.proc.pid, signal.SIGKILL)
-            engine.proc.wait(timeout=10)
-            notes.append(engine.death_note())
-        self.assertEqual(notes[0], notes[1])
-        self.assertIn("received SIGKILL", notes[0])
-        self.assertIn("check Console and system memory pressure", notes[0])
-
-    def test_death_note_names_other_signals(self):
-        engine = self.start()
-        os.kill(engine.proc.pid, signal.SIGSEGV)
-        engine.proc.wait(timeout=10)
-        self.assertIn("The engine ended on signal SIGSEGV (11).", engine.death_note())
-
-    def test_death_note_reports_a_watchdog_line(self):
-        engine = self.start()
-        with self.log.open("a", encoding="utf-8") as log:
-            log.write("watchdog: no token for 120 s\n")
-        os.kill(engine.proc.pid, signal.SIGKILL)
-        engine.proc.wait(timeout=10)
-        note = engine.death_note()
-        self.assertIn("stopped making progress", note)
-        self.assertIn("watchdog: no token for 120 s", note)
-
     def test_death_note_ignores_earlier_runs_in_the_log(self):
         self.log.write_text("ERR the earlier run failed\n", encoding="utf-8")
-        engine = self.start()
+        engine = server.StrataEngine(str(self.wrapper), ["--max-context", "8192"], log=str(self.log))
+        self.addCleanup(lambda: engine.proc.poll() is None and engine.proc.kill())
         engine.proc.stdin.close()
         engine.proc.wait(timeout=10)
         self.assertNotIn("earlier run", engine.death_note())
         self.assertIn("ended unexpectedly", engine.death_note())
-        engine2 = self.start()
+        engine2 = server.StrataEngine(str(self.wrapper), ["--max-context", "8192"], log=str(self.log))
+        self.addCleanup(lambda: engine2.proc.poll() is None and engine2.proc.kill())
         with self.log.open("a", encoding="utf-8") as log:
             log.write("strata: finished the request\n")
         engine2.proc.stdin.close()
@@ -1018,119 +1080,19 @@ class KeepAwakeLazyStart(unittest.TestCase):
         self.assertEqual(1, len(_wait_for_caffeinate(proc.pid)))
 
 
-@unittest.skipUnless(sys.platform == "darwin", "macOS only: caffeinate")
-class KeepAwake(unittest.TestCase):
-    """Section 6.9: with keep_awake, one caffeinate runs while the model is loaded; an unload ends it."""
-
-    class StubEngine:
-        def __init__(self):
-            self.up = False
-
-        def alive(self):
-            return self.up
-
-        def restart(self):
-            self.up = True
-
-        def unload(self):
-            self.up = False
-
-    def caffeinate_pids(self) -> list[int]:
-        found = subprocess.run(["/usr/bin/pgrep", "-P", str(os.getpid()), "-x", "caffeinate"], capture_output=True,
-                               text=True, check=False).stdout
-        return [int(pid) for pid in found.split()]
-
-    def test_keep_awake(self):
-        svc = server.Service(self.StubEngine(), server.ByteTokenizer(), None)
-        self.addCleanup(svc.unload)
-        svc.keep_awake = False
-        svc.ensure_loaded()
-        self.assertEqual([], self.caffeinate_pids())
-        svc.unload()
-
-        svc.keep_awake = True
-        svc.ensure_loaded()
-        pids = self.caffeinate_pids()
-        self.assertEqual(1, len(pids))
-        command = subprocess.run(["/bin/ps", "-o", "args=", "-p", str(pids[0])], capture_output=True,
-                                 text=True, check=False).stdout
-        self.assertIn(f"-i -w {os.getpid()}", command)
-        svc.unload()
-        self.assertEqual([], self.caffeinate_pids())
-        svc.ensure_loaded()
-        again = self.caffeinate_pids()
-        self.assertEqual(1, len(again))
-        self.assertNotEqual(pids, again)
-        svc.unload()
-
-
-class TelemetryMac(unittest.TestCase):
-    """Section 7: the Mac's GPU reader and the sampler's extra readings, with the macOS probes faked."""
-
-    DEVICE = {"name": "Apple M5 Pro", "working_set": 51 << 30, "cores": 20, "families": ["apple7", "metal4"]}
-
-    def make(self, mac: bool, devices=(), **probes):
-        _enter(self, mock.patch.object(telemetry, "MAC", mac))
-        _enter(self, mock.patch.object(telemetry.threading, "Thread"))
-        _enter(self, mock.patch.object(macos, "metal_devices", return_value=tuple(devices)))
-        for name, value in probes.items():
-            _enter(self, mock.patch.object(macos, name, return_value=value))
-        return telemetry.Telemetry(backend="metal")
-
-    def test_apple_reader_maps_the_ioregistry_counters(self):
-        _enter(self, mock.patch.object(telemetry, "MAC", True))
-        _enter(self, mock.patch.object(macos, "metal_devices", return_value=(self.DEVICE,)))
-        _enter(self, mock.patch.object(macos, "ioreg_gpu",
-                                       return_value={"util": 42, "in_use": 300, "recovery": 0}))
-        reader = telemetry._Apple(backend="metal")
-        self.assertEqual("Apple M5 Pro", reader.name())
-        reading = reader.read()
-        self.assertEqual(42, reading["util"])
-        self.assertEqual(300, reading["mem_used"])
-        self.assertEqual(51 << 30, reading["mem_total"])
-        self.assertEqual(0, reading["recovery"])
-        for key in ("temp", "power", "power_limit", "pcie_gen", "pcie_width"):
-            self.assertIsNone(reading[key], key)
-
-    def test_apple_reader_asks_ioregistry_at_most_every_two_seconds(self):
-        _enter(self, mock.patch.object(telemetry, "MAC", True))
-        _enter(self, mock.patch.object(macos, "metal_devices", return_value=(self.DEVICE,)))
-        ioreg = _enter(self, mock.patch.object(macos, "ioreg_gpu", return_value={"util": 1}))
-        reader = telemetry._Apple(backend="metal")
-        reader.read()
-        reader.read()
-        self.assertEqual(1, ioreg.call_count)
-
-    def test_sample_adds_the_four_mac_readings_only_on_a_mac(self):
-        mac = self.make(True, thermal_state="fair", pressure_level="warn", swap_used=4096)
-        sample = mac.sample()
-        self.assertEqual("fair", sample["thermal"])
-        self.assertEqual(1, sample["thermal_level"])
-        self.assertEqual("warn", sample["mem_pressure"])
-        self.assertEqual(4096, sample["swap_used"])
-        other = self.make(False, thermal_state="fair", pressure_level="warn", swap_used=4096)
-        sample = other.sample()
-        for key in ("thermal", "thermal_level", "mem_pressure", "swap_used"):
-            self.assertNotIn(key, sample)
-
-    def test_static_gains_the_mac_facts_on_a_mac(self):
-        perf = [{"name": "Super", "cores": 6}, {"name": "Performance", "cores": 12}]
-        mac = self.make(True, devices=(self.DEVICE,), perf_levels=perf, cpu_brand="Apple M5 Pro")
-        static = mac.static
-        self.assertIs(True, static["unified"])
-        self.assertEqual(20, static["gpu_cores"])
-        self.assertEqual("Mac", static["computer"])
-        self.assertEqual(perf, static["perflevels"])
-        self.assertEqual("Apple M5 Pro", static["cpu_name"])
-        self.assertNotIn("computer", self.make(False).static)
+class TelemetryCpuName(unittest.TestCase):
+    """Section 7.2: on a Mac the CPU name is the brand string, never platform.processor()'s "arm". Main's
+    test_server.py covers the other Mac telemetry readings."""
 
     def test_cpu_name_is_the_brand_and_never_arm_on_a_mac(self):
-        _enter(self, mock.patch.object(telemetry, "MAC", True))
-        _enter(self, mock.patch.object(macos, "cpu_brand", return_value=""))
-        _enter(self, mock.patch.object(telemetry.platform, "processor", return_value="arm"))
-        self.assertIsNone(telemetry._cpu_name())
-        _enter(self, mock.patch.object(telemetry, "MAC", False))
-        self.assertEqual("arm", telemetry._cpu_name())
+        with mock.patch.object(telemetry, "MAC", True), mock.patch.object(macos, "cpu_brand", return_value=""), \
+                mock.patch.object(telemetry.platform, "processor", return_value="arm"):
+            self.assertIsNone(telemetry._cpu_name())
+            with mock.patch.object(macos, "cpu_brand", return_value="Apple M5 Pro"):
+                self.assertEqual("Apple M5 Pro", telemetry._cpu_name())
+        with mock.patch.object(telemetry, "MAC", False), \
+                mock.patch.object(telemetry.platform, "processor", return_value="arm"):
+            self.assertEqual("arm", telemetry._cpu_name())
 
 
 if __name__ == "__main__":
