@@ -12802,6 +12802,76 @@ measuring L-15 remain open.
   finalizing this review entry. All inputs are synthetic and this does not
   establish model parity or production inference.
 
+### D-IMPL-412: Extend the synthetic MTP runtime chain through draft sampling
+
+- **Decision:** Continue the runtime-owned MTP smoke chain from its stage-20
+  sample through stage-21 indexed projection and stage-22 greedy sampling in
+  one ordered Encoder segment. Seed the T=1 synthetic embedding and main-model
+  residual so stage 20 must produce a finite, nonzero sample. Verify the stage
+  21 Q8_1 activations and mapped logits against independent CPU oracles, then
+  verify stage 22's mapped token and softmax probability against those logits.
+  Preserve input views and check every inactive runtime scratch tail. Use a
+  compact 32-row Q5_K head and four-row map for this dispatch; separately keep
+  the caller-supplied head-view identity and 106,299-row synthetic device
+  vocabulary assertions. Verify that the binder's 8-byte head fixture is
+  rejected against the required full-head extent before dispatch. This does
+  not execute the full 248,320-row head.
+- **Reason:** The prior synthetic ordered chain stopped after the final MTP
+  mixer, even though stages 21–22 had runtime bindings and independent
+  component tests. A compact head covers the same indexed projection,
+  vocabulary mapping and sampler handoff without allocating a synthetic
+  full-head buffer of roughly 417 MiB. The runtime-owned sample and scratch
+  retain their real view identity; the caller-supplied head view, head data
+  and map are synthetic fixtures. The full-head extent failure path remains
+  checked without allocating that backing.
+  The synthetic embedding/residual seed prevents an all-zero output from
+  hiding a broken stage-20 write. Production drafter scheduling and
+  inspected-model parity remain open.
+- **Fixture judgment:** Use distinct packed Q5_K block patterns and an
+  unsorted four-ID map. Derive quantized activations and indexed expected
+  logits from the GPU-produced sample using the scalar test oracles; derive
+  the expected token and probability from only those four logits. Snapshot
+  runtime views before dispatch and verify read-only inputs and inactive
+  tails after GPU completion. No full-model data or model-sized head backing
+  is required.
+- **Review required:** See REV-208. Challenge the stage-20 sample/view
+  identity, compact-head extent and map semantics, stage ordering, oracle
+  independence, sampler fields, inactive-tail checks, full-head extent
+  rejection before dispatch, and the boundary between synthetic composition
+  and full-head/runtime-model claims.
+- **Validation:** The `mac-dev` target built and
+  `metal_mtp_storage_test` passed 1/1 after the initial composition and again
+  after seeding a nonzero T=1 residual and requiring a finite, nonzero
+  stage-20 sample. The runtime-bound 8-byte head is rejected before dispatch
+  for the real full-head extent. Final review and broader regression
+  validation are recorded in REV-208.
+
+### REV-208: Hostile review of the MTP stage-21/22 runtime tail
+
+- **Scope:** The runtime stage-20 sample handoff, compact indexed-head fixture,
+  runtime-owned Q8_1/logit/sampler views, stage-21/22 ordering and numerical
+  oracles, input/tail preservation, CMake linkage, test map, and documentation
+  claims.
+- **Findings:** The initial hostile review found no ordering, dataflow,
+  sampler, alias, lifetime, tail or oracle defect. It identified that the
+  compact fixture replaced the runtime-bound 8-byte main-head view before
+  stage 21, so the positive chain did not exercise full-head extent
+  rejection. It also found stale stage-17 and stage-18–20 status text in the
+  kernel and host-port guides, plus this review entry was incomplete.
+- **Disposition:** Added a pre-dispatch negative case using the bound
+  caller-head view, the full 248,320-row vocabulary and the Q5_K row extent.
+  The 8-byte view must be rejected as undersized, and Q8_1/logit scratch must
+  remain byte-identical. Kept the compact positive stage-21/22 chain and
+  clarified that the full-head view identity and synthetic vocabulary map
+  assertions do not verify the real head-weight extent. Updated the stale
+  stage-chain status text. The hostile follow-up confirmed the runtime-binding
+  status is consistent across the kernel guide, host-port guide, test plan and
+  review ledger, and found no further actionable findings.
+- **Validation:** The `mac-dev` target built; the focused MTP/storage CTests
+  passed 28/28 after the full-head negative case; `test_map.py` passed with
+  its existing planned/missing-work diagnostics; and `git diff --check`
+  passed after the final documentation edits.
+
 ### REV-206: Adversarial review of full-mode Prefill MoE composition
 
 - **Scope:** Review the 13-stage ordering and its API boundary; checked active

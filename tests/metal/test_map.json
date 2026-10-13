@@ -100,11 +100,11 @@
     },
     "metal_mtp_storage_fixture": {
       "label": "host",
-      "origin": "06 10.3, D-IMPL-360, REV-157"
+      "origin": "06 10.3, D-IMPL-360/412, REV-157/208"
     },
     "metal_mtp_storage_test": {
       "label": "metal",
-      "origin": "06 10.3, D-IMPL-360, REV-157"
+      "origin": "06 10.3, D-IMPL-360/412, REV-157/208"
     },
     "metal_weight_store_cli_test": {
       "label": "host",
