@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import functools
+import hashlib
+import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from tools.model_catalog import CONTEXTS, FAMILIES, MODELS  # noqa: E402
+from tools.metal import release_metadata  # noqa: E402
 
 # True on macOS. Every Mac branch tests this one switch (docs/mac/07-server-setup-port.md, section 4.1).
 MAC = sys.platform == "darwin"
@@ -226,6 +231,160 @@ def metal_plan(family, model, ctx, kv, vision="none", budget_gib=None, files=Non
     if plan["kv"] != kv:
         raise PlanError(f"the engine planned KV {plan['kv']!r}, not the requested {kv!r}")
     return plan
+
+
+# ---- Mac build definitions, source identity and BUILD.json (docs/mac/08-build-and-distribution.md, section 8) ----
+# Only these functions exist; no build or install step calls them yet (S8 and S7 in docs/mac/07 are open).
+# The inputs of the source identity are the list of docs/mac/08 section 8.3, with METAL_REV and cmake/metal from 07 4.7.2.
+ENGINE_SOURCES = ("CMakeLists.txt", "CMakePresets.json", "cmake/metal", "src", "include", "METAL_REV",
+                  "third_party/ggml/VERSION.txt")
+VISION_SOURCES = ("tools/vision",)
+METALLIB = "strata.metallib"
+FINDER_FILE = ".DS_Store"
+
+
+def metal_engine_defs(llama) -> list:  # MAC:
+    """The CMake definitions of the Mac engine. CMakePresets.json mac-release must hold the same values."""
+    return ["-DSTRATA_BUILD_TESTS=OFF", "-DCMAKE_OSX_ARCHITECTURES=arm64",
+            "-DCMAKE_OSX_DEPLOYMENT_TARGET=27.0", f"-DSTRATA_GGML_DIR={llama}"]
+
+
+def metal_vision_defs(llama, portable) -> list:  # MAC:
+    """strata-vision on a Mac: Metal with ggml's shaders embedded, no OpenMP, and the pinned llama.cpp in `llama`.
+    `portable` adds STRATA_PORTABLE, which turns off the build's native CPU tuning (docs/mac/08 section 9)."""
+    return [f"-DLLAMA_DIR={llama}", "-DGGML_METAL=ON", "-DGGML_METAL_EMBED_LIBRARY=ON", "-DGGML_OPENMP=OFF",
+            "-DCMAKE_OSX_ARCHITECTURES=arm64", "-DCMAKE_OSX_DEPLOYMENT_TARGET=27.0",
+            *(["-DSTRATA_PORTABLE=ON"] if portable else [])]
+
+
+def metal_source_rev() -> int:  # MAC:
+    """METAL_REV as an integer. release_metadata and check_release_policy.py validate its one-line form."""
+    return int((ROOT / "METAL_REV").read_text(encoding="ascii").strip())
+
+
+def source_hash(paths) -> str:  # MAC:
+    """The 16-hex identity of the files under `paths` (relative to ROOT). It is SHA-256 over each file's path, size and
+    bytes, in path order. Finder's .DS_Store files are not part of it (docs/mac/08 section 8.3)."""
+    files: list[Path] = []
+    for rel in paths:
+        target = ROOT / rel
+        if target.is_dir():
+            files.extend(path for path in target.rglob("*") if path.is_file())
+        elif target.is_file():
+            files.append(target)
+        else:
+            raise FileNotFoundError(f"source input {rel} is missing")
+    digest = hashlib.sha256()
+    for path in sorted(files, key=lambda item: item.relative_to(ROOT).as_posix()):
+        if path.name == FINDER_FILE:
+            continue
+        name = path.relative_to(ROOT).as_posix()
+        data = path.read_bytes()
+        digest.update(f"{name}\0{len(data)}\0".encode("utf-8"))
+        digest.update(data)
+    return digest.hexdigest()[:16]
+
+
+def find_tool(name: str) -> str | None:  # MAC:
+    """The tool `name`: the bin folder of the running Python (the venv's pinned tools) before PATH (08 section 8.5)."""
+    venv_tool = Path(sys.executable).parent / name
+    if venv_tool.is_file() and os.access(venv_tool, os.X_OK):
+        return str(venv_tool)
+    return shutil.which(name)
+
+
+def _command_output(*cmd: str) -> str:
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def xcode_and_toolchain() -> tuple[str, str]:  # MAC:
+    """This Mac's Xcode, as `27.0 (27A266a)`, and its Metal toolchain identifier (docs/mac/08 section 8.4). Either is
+    "" when the tool does not answer. verify_release.py compares them with a release's BUILD.json."""
+    xcode_lines = _command_output("xcodebuild", "-version").splitlines()
+    xcode = f"{xcode_lines[0].split()[-1]} ({xcode_lines[1].split()[-1]})" if len(xcode_lines) == 2 else ""
+    try:
+        toolchain = json.loads(_command_output("xcodebuild", "-showComponent", "MetalToolchain", "-json") or "{}")
+    except json.JSONDecodeError:
+        toolchain = {}
+    if not isinstance(toolchain, dict):
+        toolchain = {}
+    return xcode, toolchain.get("toolchainIdentifier", "")
+
+
+def metal_build_json(eng: Path, source: str) -> dict:  # MAC:
+    """BUILD.json of the Mac engine in `eng` (docs/mac/07 section 4.7.2, docs/mac/08 section 8.4). A local build and a
+    release both write it, so the two describe themselves the same way. The caller writes
+    `json.dumps(meta, indent=1) + "\\n"`."""
+    xcode, metal_toolchain = xcode_and_toolchain()
+    out = _command_output
+    commit = out("git", "-C", str(ROOT), "rev-parse", "HEAD")
+    if commit and out("git", "-C", str(ROOT), "status", "--porcelain"):
+        commit += "-dirty"
+    vision = "gpu" if (eng / "strata-vision").exists() else "none"
+    return {
+        "version": release_metadata.source_version(),
+        "metal_rev": metal_source_rev(),
+        "backend": "metal",
+        "arch": "arm64",
+        "macos_min": "27.0",
+        "gpu_families": ["apple7", "metal4"],
+        "metal_std": "metal4.0",
+        "source": source,
+        "lib_dirs": [],
+        "vision": vision,
+        "src": source_hash(ENGINE_SOURCES),
+        "vision_src": source_hash(VISION_SOURCES) if vision == "gpu" else None,
+        "xcode": xcode,
+        "metal_toolchain": metal_toolchain,
+        "commit": commit,
+        "metallib_sha256": hashlib.sha256((eng / METALLIB).read_bytes()).hexdigest(),
+    }
+
+
+LLAMA_REPO = "https://github.com/ggml-org/llama.cpp.git"
+
+
+def llama_pin(root: Path | None = None) -> str:  # MAC:
+    """The pinned llama.cpp commit: the first word of third_party/ggml/VERSION.txt, which must be 40 hex digits."""
+    text = ((ROOT if root is None else root) / "third_party" / "ggml" / "VERSION.txt").read_text(encoding="utf-8")
+    words = text.split()
+    if not words or not re.fullmatch(r"[0-9a-f]{40}", words[0]):
+        raise RuntimeError("third_party/ggml/VERSION.txt must start with a full llama.cpp commit")
+    return words[0]
+
+
+def get_llama_cpp(root: Path | None = None, runner=subprocess.run) -> Path:  # MAC:
+    """The pinned llama.cpp in third_party/llama.cpp (docs/mac/08 section 11.3, step 1). A missing checkout is cloned
+    and set to the pin; an existing one must report the pin as its HEAD. A copy without .git cannot be verified."""
+    base = ROOT if root is None else root
+    pin = llama_pin(base)
+    target = base / "third_party" / "llama.cpp"
+    if not target.exists():
+        for command in (["git", "clone", "--no-checkout", LLAMA_REPO, str(target)],
+                        ["git", "-C", str(target), "checkout", "--detach", pin]):
+            result = runner(command, capture_output=True, text=True, check=False)
+            if result.returncode:
+                raise RuntimeError(f"cannot fetch the pinned llama.cpp: {result.stderr.strip()}")
+    head = runner(["git", "-C", str(target), "rev-parse", "HEAD"], capture_output=True, text=True, check=False)
+    if head.returncode or head.stdout.strip() != pin:
+        raise RuntimeError(f"third_party/llama.cpp is not verified at the pin {pin}")
+    return target
+
+
+def cmake_build(src: Path, build: Path, target: str, defs: list[str]) -> None:  # MAC:
+    """Configure `src` into the folder `build` with Ninja, then build `target`. The tools are the pinned ones next to
+    this Python (find_tool). Output goes to the terminal; a failure raises CalledProcessError."""
+    cmake = find_tool("cmake")
+    ninja = find_tool("ninja")
+    if cmake is None or ninja is None:
+        raise RuntimeError("cmake and ninja are needed: create .venv from requirements.txt and run this with its Python")
+    subprocess.run([cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(build),
+                    "-DCMAKE_BUILD_TYPE=Release", *defs], check=True)
+    subprocess.run([cmake, "--build", str(build), "--target", target], check=True)
 
 
 def main() -> int:

@@ -14,14 +14,22 @@ if(NOT _llama_pin_length EQUAL 40)
   message(FATAL_ERROR "third_party/ggml/VERSION.txt must contain a full llama.cpp commit SHA")
 endif()
 
-include(FetchContent)
-FetchContent_Declare(strata_vision_llama
-  GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-  GIT_TAG "${_llama_pin}"
-  GIT_SHALLOW FALSE
-  SOURCE_SUBDIR strata-populate-only)
-FetchContent_MakeAvailable(strata_vision_llama)
-set(_llama_dir "${strata_vision_llama_SOURCE_DIR}")
+# STRATA_PORTABLE: no native CPU tuning, so the binary runs on any Apple silicon Mac (docs/mac/08 section 9).
+option(STRATA_PORTABLE "Build without native CPU tuning, for a release asset" OFF)
+
+if(LLAMA_DIR)
+  # A local llama.cpp checkout at the pin, given by the release recipe (docs/mac/08 section 11.3, step 4).
+  set(_llama_dir "${LLAMA_DIR}")
+else()
+  include(FetchContent)
+  FetchContent_Declare(strata_vision_llama
+    GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
+    GIT_TAG "${_llama_pin}"
+    GIT_SHALLOW FALSE
+    SOURCE_SUBDIR strata-populate-only)
+  FetchContent_MakeAvailable(strata_vision_llama)
+  set(_llama_dir "${strata_vision_llama_SOURCE_DIR}")
+endif()
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
@@ -34,7 +42,12 @@ set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
 set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
 set(GGML_METAL ON CACHE BOOL "" FORCE)
-set(GGML_NATIVE ON CACHE BOOL "" FORCE)
+set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
+if(STRATA_PORTABLE)
+  set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+else()
+  set(GGML_NATIVE ON CACHE BOOL "" FORCE)
+endif()
 foreach(_backend GGML_CUDA GGML_HIP GGML_VULKAN GGML_SYCL GGML_OPENCL GGML_BLAS GGML_ACCELERATE
                  GGML_OPENMP GGML_BACKEND_DL)
   set(${_backend} OFF CACHE BOOL "" FORCE)
