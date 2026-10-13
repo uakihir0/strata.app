@@ -30,6 +30,7 @@
 #include <random>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -4192,18 +4193,540 @@ bool run_set(Context& context, twin::InputSet set,
 
 }  // namespace
 
+// ---- ple_batch_eq_sequential (docs/mac/04 §5.3, §10.4) -----------------------------------------------------------
+// Synthetic inputs only: random, edge and fixture rows in the real PLE shapes. No model files are read.
+// The batch runs the gate, broadcast, convolution-residual and history kernels once each over n rows (n = 1..64),
+// with the grids of src/metal/engine/ple_dispatch.mm. The public encode_ple_* wrappers accept only 1..8 rows, so
+// the batch dispatches the kernels directly. The sequential reference is the engine's single-row path
+// (encode_ple_* with rows = 1), run n times with the history advanced after each row, as the decode window does
+// at T = 1. The batch must equal the sequential run bitwise on every output and on the history. Both runs are also
+// checked against CPU references written from the row formula: the gate oracle, an exact product for the broadcast,
+// the convolution-residual oracle with its four taps written out (the batch convolution reads the history from
+// before the batch), and the history as the last nine rows of [old history, ple_norm]. The convolution residual is
+// checked against the CPU oracle only for the batch, since the sequential run must equal it bitwise.
+// Controls: one perturbed batch element must differ from the sequential run, and a batch that advances the history
+// before its convolution must differ from it. Both must be detected in every case.
+
+constexpr std::uint32_t kPLEBatchMaxRows = 64u;
+constexpr std::uint32_t kPLEWideThreads = 256u;  // broadcast, convolution-residual and history groups
+constexpr std::uint32_t kPLEWideGroups = HC_DIM / kPLEWideThreads;
+
+struct PleChainBuffers {
+    BufferRef key;
+    BufferRef query;
+    BufferRef value;
+    BufferRef ple_norm;
+    BufferRef conv1d;
+    BufferRef residual;
+    BufferRef gate;
+    BufferRef gated;
+    BufferRef history;
+};
+
+struct PleInputBuffers {
+    twin::GuardedBuffer key;
+    twin::GuardedBuffer query;
+    twin::GuardedBuffer value;
+    twin::GuardedBuffer ple_norm;
+    twin::GuardedBuffer conv1d;
+};
+
+struct PleChainRun {
+    twin::GuardedBuffer gate;
+    twin::GuardedBuffer gated;
+    twin::GuardedBuffer residual;
+    twin::GuardedBuffer history;
+};
+
+struct PleBatchTally {
+    int controls = 0;
+    int detected = 0;
+};
+
+bool batch_gate(Encoder& encoder, std::uint32_t rows, const PleChainBuffers& buffers,
+                std::string& error) {
+    const std::size_t input_bytes =
+        static_cast<std::size_t>(rows) * HC_DIM * sizeof(float);
+    const std::size_t gate_bytes = static_cast<std::size_t>(rows) * HC * sizeof(float);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(N_EMBD));
+    const std::array bindings{
+        EncoderBufferBinding{buffers.key, 0u, input_bytes, alignof(float)},
+        EncoderBufferBinding{buffers.query, 1u, input_bytes, alignof(float)},
+        EncoderBufferBinding{buffers.gate, 2u, gate_bytes, alignof(float)},
+    };
+    const std::array scale_bytes{EncoderBytesBinding{&scale, sizeof(scale), 3u}};
+    return encoder.dispatch("strata_ple_gate",
+                            EncoderSize{static_cast<std::size_t>(rows) * HC, 1u, 1u},
+                            EncoderSize{kGateThreads, 1u, 1u}, bindings, scale_bytes, {},
+                            error);
+}
+
+bool batch_broadcast(Encoder& encoder, std::uint32_t rows, const PleChainBuffers& buffers,
+                     std::string& error) {
+    const std::array bindings{
+        EncoderBufferBinding{buffers.value, 0u,
+                             static_cast<std::size_t>(rows) * N_EMBD * sizeof(float),
+                             alignof(float)},
+        EncoderBufferBinding{buffers.gate, 1u,
+                             static_cast<std::size_t>(rows) * HC * sizeof(float),
+                             alignof(float)},
+        EncoderBufferBinding{buffers.gated, 2u,
+                             static_cast<std::size_t>(rows) * HC_DIM * sizeof(float),
+                             alignof(float)},
+    };
+    return encoder.dispatch("strata_ple_broadcast",
+                            EncoderSize{kPLEWideGroups, rows, 1u},
+                            EncoderSize{kPLEWideThreads, 1u, 1u}, bindings, {}, {}, error);
+}
+
+bool batch_convolution(Context& context, Encoder& encoder, std::uint32_t rows,
+                       const PleChainBuffers& buffers, std::string& error) {
+    const std::size_t row_bytes = static_cast<std::size_t>(rows) * HC_DIM * sizeof(float);
+    const std::size_t history_bytes =
+        static_cast<std::size_t>(HC_DIM) * PLE_HISTORY_ROWS * sizeof(float);
+    const std::size_t conv_bytes =
+        static_cast<std::size_t>(HC_DIM) * 4u * sizeof(std::uint16_t);
+    const std::array writable{
+        EncoderBufferBinding{buffers.residual, 4u, row_bytes, alignof(float)},
+    };
+    const std::array read_only_inputs{
+        EncoderReadOnlyBufferBinding{context.buffers().read_only(buffers.ple_norm), 0u,
+                                     row_bytes, alignof(float)},
+        EncoderReadOnlyBufferBinding{context.buffers().read_only(buffers.history), 1u,
+                                     history_bytes, alignof(float)},
+        EncoderReadOnlyBufferBinding{context.buffers().read_only(buffers.conv1d), 2u,
+                                     conv_bytes, alignof(std::uint16_t)},
+        EncoderReadOnlyBufferBinding{context.buffers().read_only(buffers.gated), 3u,
+                                     row_bytes, alignof(float)},
+    };
+    return encoder.dispatch("strata_ple_conv_residual",
+                            EncoderSize{kPLEWideGroups, rows, 1u},
+                            EncoderSize{kPLEWideThreads, 1u, 1u}, writable, read_only_inputs,
+                            {}, {}, error);
+}
+
+bool batch_history(Encoder& encoder, std::uint32_t rows, const PleChainBuffers& buffers,
+                   std::string& error) {
+    const std::size_t history_bytes =
+        static_cast<std::size_t>(HC_DIM) * PLE_HISTORY_ROWS * sizeof(float);
+    const std::array bindings{
+        EncoderBufferBinding{buffers.history, 0u, history_bytes, alignof(float)},
+        EncoderBufferBinding{buffers.ple_norm, 1u,
+                             static_cast<std::size_t>(rows) * HC_DIM * sizeof(float),
+                             alignof(float)},
+    };
+    const std::array row_bytes{EncoderBytesBinding{&rows, sizeof(rows), 2u}};
+    return encoder.dispatch("strata_ple_history", EncoderSize{kPLEWideGroups, 1u, 1u},
+                            EncoderSize{kPLEWideThreads, 1u, 1u}, bindings, row_bytes, {},
+                            error);
+}
+
+// One kernel per segment, in one command buffer, so each kernel starts after the previous one has finished.
+// history_first is the control: the convolution then reads the history already advanced by the batch.
+bool encode_ple_batch(Context& context, CommandBuffer& command, std::uint32_t rows,
+                      const PleChainBuffers& buffers, bool history_first,
+                      std::string& error) {
+    const auto segment = [&](std::string_view label, auto body) {
+        return Encoder::encode(
+            context, command, label,
+            [&](Encoder& encoder, std::string& segment_error) {
+                return body(encoder, segment_error);
+            },
+            error);
+    };
+    const auto convolution = [&] {
+        return segment("PLE batch convolution residual",
+                       [&](Encoder& encoder, std::string& segment_error) {
+                           return batch_convolution(context, encoder, rows, buffers,
+                                                    segment_error);
+                       });
+    };
+    const auto history = [&] {
+        return segment("PLE batch history",
+                       [&](Encoder& encoder, std::string& segment_error) {
+                           return batch_history(encoder, rows, buffers, segment_error);
+                       });
+    };
+    if (!segment("PLE batch gate", [&](Encoder& encoder, std::string& segment_error) {
+            return batch_gate(encoder, rows, buffers, segment_error);
+        })) {
+        return false;
+    }
+    if (!segment("PLE batch broadcast", [&](Encoder& encoder, std::string& segment_error) {
+            return batch_broadcast(encoder, rows, buffers, segment_error);
+        })) {
+        return false;
+    }
+    return history_first ? (history() && convolution()) : (convolution() && history());
+}
+
+// The sequential reference: the engine's single-row path for each row in turn, with the history advanced after
+// each row. Every row is its own set of dispatches, in command order.
+bool encode_ple_single_rows(Context& context, CommandBuffer& command, std::uint32_t rows,
+                            const PleChainBuffers& buffers, std::string& error) {
+    constexpr std::size_t vector_bytes = static_cast<std::size_t>(HC_DIM) * sizeof(float);
+    constexpr std::size_t value_bytes = static_cast<std::size_t>(N_EMBD) * sizeof(float);
+    constexpr std::size_t gate_bytes = static_cast<std::size_t>(HC) * sizeof(float);
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        const std::size_t vector_offset = static_cast<std::size_t>(row) * vector_bytes;
+        const BufferRef key = buffers.key.slice(vector_offset, vector_bytes);
+        const BufferRef query = buffers.query.slice(vector_offset, vector_bytes);
+        const BufferRef ple_norm = buffers.ple_norm.slice(vector_offset, vector_bytes);
+        const BufferRef residual = buffers.residual.slice(vector_offset, vector_bytes);
+        const BufferRef gated = buffers.gated.slice(vector_offset, vector_bytes);
+        const BufferRef value =
+            buffers.value.slice(static_cast<std::size_t>(row) * value_bytes, value_bytes);
+        const BufferRef gate =
+            buffers.gate.slice(static_cast<std::size_t>(row) * gate_bytes, gate_bytes);
+        if (!encode_ple_gate(context, command, 1u, PLEGateBuffers{key, query, gate}, error) ||
+            !encode_ple_broadcast(context, command, 1u,
+                                  PLEBroadcastBuffers{value, gate, gated}, error) ||
+            !encode_ple_conv_residual(
+                context, command, 1u,
+                PLEConvResidualBuffers{
+                    context.buffers().read_only(ple_norm),
+                    context.buffers().read_only(buffers.history),
+                    context.buffers().read_only(buffers.conv1d),
+                    context.buffers().read_only(gated), residual},
+                error) ||
+            !encode_ple_history(context, command, 1u,
+                                PLEHistoryBuffers{buffers.history, ple_norm}, error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename Encode>
+bool run_ple_command(Context& context, const std::string& label, Encode&& encode,
+                     std::string& error) {
+    auto command = context.make_command_buffer(label, error);
+    if (!command) return false;
+    if (!encode(*command, error)) {
+        command->discard();
+        return false;
+    }
+    return submit_and_wait(command, label, error);
+}
+
+template <typename T>
+bool allocate_copy(twin::GuardedBuffer& buffer, Context& context, const std::string& label,
+                   const std::vector<T>& data, std::string& error) {
+    if (!buffer.allocate(context, label, data.size() * sizeof(T), error)) return false;
+    std::memcpy(buffer.payload().data(), data.data(), data.size() * sizeof(T));
+    return true;
+}
+
+bool allocate_chain_run(PleChainRun& run, Context& context, const std::string& label,
+                        std::size_t gate_count, std::size_t width,
+                        std::span<const float> residual_initial,
+                        std::span<const float> history_initial, std::string& error) {
+    const std::size_t gate_bytes = gate_count * sizeof(float);
+    const std::size_t width_bytes = width * sizeof(float);
+    const std::size_t history_bytes = history_initial.size_bytes();
+    if (!run.gate.allocate(context, label + " gate", gate_bytes, error) ||
+        !run.gated.allocate(context, label + " gated", width_bytes, error) ||
+        !run.residual.allocate(context, label + " residual", width_bytes, error) ||
+        !run.history.allocate(context, label + " history", history_bytes, error)) {
+        return false;
+    }
+    // Outputs start as 0xFF bytes, which are NaN patterns; the residual and history start from their inputs.
+    std::fill(run.gate.payload().begin(), run.gate.payload().end(), std::uint8_t{0xFFu});
+    std::fill(run.gated.payload().begin(), run.gated.payload().end(), std::uint8_t{0xFFu});
+    std::memcpy(run.residual.payload().data(), residual_initial.data(), width_bytes);
+    std::memcpy(run.history.payload().data(), history_initial.data(), history_bytes);
+    return true;
+}
+
+PleChainBuffers chain_views(const PleInputBuffers& inputs, const PleChainRun& run) {
+    return PleChainBuffers{
+        inputs.key.view(),      inputs.query.view(),   inputs.value.view(),
+        inputs.ple_norm.view(), inputs.conv1d.view(),  run.residual.view(),
+        run.gate.view(),        run.gated.view(),      run.history.view(),
+    };
+}
+
+std::span<const float> float_view(const twin::GuardedBuffer& buffer, std::size_t count) {
+    return std::span<const float>(reinterpret_cast<const float*>(buffer.payload().data()),
+                                  count);
+}
+
+bool same_bits(std::span<const float> left, std::span<const float> right) {
+    return left.size() == right.size() &&
+           std::memcmp(left.data(), right.data(), left.size_bytes()) == 0;
+}
+
+bool run_ple_batch_case(Context& context, std::uint32_t rows, twin::InputSet set,
+                        const twin::Options& options, PleBatchTally& tally) {
+    const std::string label = "ple_batch_eq_sequential rows=" + std::to_string(rows) +
+                              " set=" + twin::input_set_name(set);
+    const std::size_t width = static_cast<std::size_t>(rows) * HC_DIM;
+    const std::size_t gate_count = static_cast<std::size_t>(rows) * HC;
+    const std::size_t value_count = static_cast<std::size_t>(rows) * N_EMBD;
+    const std::size_t history_count = static_cast<std::size_t>(HC_DIM) * PLE_HISTORY_ROWS;
+    const std::size_t conv_count = static_cast<std::size_t>(HC_DIM) * 4u;
+    const std::uint64_t mix = (static_cast<std::uint64_t>(rows) << 8u) ^
+                              (static_cast<std::uint64_t>(set) << 4u);
+    const auto rng_for = [&](std::uint64_t tag) {
+        return std::mt19937_64(options.seed ^ mix ^ tag);
+    };
+
+    std::vector<float> key(width);
+    std::vector<float> query(width);
+    std::vector<float> value(value_count);
+    std::vector<float> ple_norm(width);
+    std::vector<float> residual0(width);
+    std::vector<float> history0(history_count);
+    std::vector<std::uint16_t> conv1d(conv_count);
+    auto key_rng = rng_for(0x504c454b4559ull);
+    auto query_rng = rng_for(0x504c45515259ull);
+    auto value_rng = rng_for(0x504c4556414cull);
+    auto norm_rng = rng_for(0x504c454e524dull);
+    auto residual_rng = rng_for(0x504c455245534cull);
+    auto history_rng = rng_for(0x504c4548495354ull);
+    auto weight_rng = rng_for(0x504c4543564731ull);
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        for (std::uint32_t col = 0u; col < HC_DIM; ++col) {
+            const std::size_t index = static_cast<std::size_t>(row) * HC_DIM + col;
+            key[index] = value_input(set, row, col, key_rng);
+            query[index] = value_input(set, row + 1u, col, query_rng);
+            ple_norm[index] = value_input(set, row + 3u, col, norm_rng);
+            residual0[index] = value_input(set, row + 4u, col, residual_rng);
+        }
+        for (std::uint32_t col = 0u; col < N_EMBD; ++col) {
+            value[static_cast<std::size_t>(row) * N_EMBD + col] =
+                value_input(set, row + 2u, col, value_rng);
+        }
+    }
+    for (std::uint32_t channel = 0u; channel < HC_DIM; ++channel) {
+        for (std::uint32_t history_row = 0u; history_row < PLE_HISTORY_ROWS; ++history_row) {
+            history0[static_cast<std::size_t>(channel) * PLE_HISTORY_ROWS + history_row] =
+                value_input(set, channel, history_row, history_rng);
+        }
+        for (std::uint32_t tap = 0u; tap < 4u; ++tap) {
+            conv1d[static_cast<std::size_t>(channel) * 4u + tap] =
+                strata::kernels::f16_from_f32(value_input(set, channel, tap, weight_rng));
+        }
+    }
+
+    std::string error;
+    PleInputBuffers inputs;
+    PleChainRun batch;
+    PleChainRun sequential;
+    PleChainRun control;
+    const bool allocated =
+        allocate_copy(inputs.key, context, label + " key", key, error) &&
+        allocate_copy(inputs.query, context, label + " query", query, error) &&
+        allocate_copy(inputs.value, context, label + " value", value, error) &&
+        allocate_copy(inputs.ple_norm, context, label + " ple_norm", ple_norm, error) &&
+        allocate_copy(inputs.conv1d, context, label + " conv1d", conv1d, error) &&
+        allocate_chain_run(batch, context, label + " batch", gate_count, width, residual0,
+                           history0, error) &&
+        allocate_chain_run(sequential, context, label + " sequential", gate_count, width,
+                           residual0, history0, error) &&
+        allocate_chain_run(control, context, label + " control", gate_count, width, residual0,
+                           history0, error);
+    check(allocated, label + " allocations", error);
+    if (!allocated) return false;
+
+    const PleChainBuffers batch_views = chain_views(inputs, batch);
+    const PleChainBuffers sequential_views = chain_views(inputs, sequential);
+    const PleChainBuffers control_views = chain_views(inputs, control);
+    for (twin::GuardedBuffer* buffer :
+         {&inputs.key, &inputs.query, &inputs.value, &inputs.ple_norm, &inputs.conv1d,
+          &batch.gate, &batch.gated, &batch.residual, &batch.history, &sequential.gate,
+          &sequential.gated, &sequential.residual, &sequential.history, &control.gate,
+          &control.gated, &control.residual, &control.history}) {
+        buffer->capture_before_dispatch();
+    }
+
+    const bool dispatched =
+        run_ple_command(context, label + " batch",
+                        [&](CommandBuffer& command, std::string& command_error) {
+                            return encode_ple_batch(context, command, rows, batch_views,
+                                                    false, command_error);
+                        },
+                        error) &&
+        run_ple_command(context, label + " sequential",
+                        [&](CommandBuffer& command, std::string& command_error) {
+                            return encode_ple_single_rows(context, command, rows,
+                                                          sequential_views, command_error);
+                        },
+                        error) &&
+        run_ple_command(context, label + " control",
+                        [&](CommandBuffer& command, std::string& command_error) {
+                            return encode_ple_batch(context, command, rows, control_views,
+                                                    true, command_error);
+                        },
+                        error);
+    check(dispatched, label + " dispatch", error);
+    if (!dispatched) return false;
+
+    const auto batch_gate_values = float_view(batch.gate, gate_count);
+    const auto batch_gated_values = float_view(batch.gated, width);
+    const auto batch_residual_values = float_view(batch.residual, width);
+    const auto batch_history_values = float_view(batch.history, history_count);
+    const auto sequential_gate_values = float_view(sequential.gate, gate_count);
+    const auto sequential_gated_values = float_view(sequential.gated, width);
+    const auto sequential_residual_values = float_view(sequential.residual, width);
+    const auto sequential_history_values = float_view(sequential.history, history_count);
+
+    // CPU references, written from the row formula rather than from the kernels.
+    const float scale = 1.0f / std::sqrt(static_cast<float>(N_EMBD));
+    std::vector<twin::tf> expected_gate(gate_count);
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        for (std::uint32_t stream = 0u; stream < HC; ++stream) {
+            const std::size_t offset = static_cast<std::size_t>(row) * HC_DIM +
+                                       static_cast<std::size_t>(stream) * N_EMBD;
+            expected_gate[static_cast<std::size_t>(row) * HC + stream] = gate_oracle(
+                std::span<const float>(key.data() + offset, N_EMBD),
+                std::span<const float>(query.data() + offset, N_EMBD), scale);
+        }
+    }
+    const auto expected_gated_from = [&](std::span<const float> gate_values) {
+        std::vector<float> expected(width);
+        for (std::uint32_t row = 0u; row < rows; ++row) {
+            for (std::uint32_t index = 0u; index < HC_DIM; ++index) {
+                expected[static_cast<std::size_t>(row) * HC_DIM + index] =
+                    value[static_cast<std::size_t>(row) * N_EMBD + index % N_EMBD] *
+                    gate_values[static_cast<std::size_t>(row) * HC + index / N_EMBD];
+            }
+        }
+        return expected;
+    };
+    const std::vector<float> expected_batch_gated = expected_gated_from(batch_gate_values);
+    const std::vector<float> expected_sequential_gated =
+        expected_gated_from(sequential_gate_values);
+    std::vector<twin::tf> expected_residual(width);
+    for (std::uint32_t row = 0u; row < rows; ++row) {
+        for (std::uint32_t channel = 0u; channel < HC_DIM; ++channel) {
+            std::array<float, 4> taps{};
+            std::array<float, 4> weights{};
+            for (std::uint32_t tap = 0u; tap < 4u; ++tap) {
+                const std::int64_t source = static_cast<std::int64_t>(row) -
+                                            static_cast<std::int64_t>(PLE_HISTORY_ROWS) +
+                                            3 * static_cast<std::int64_t>(tap);
+                taps[tap] =
+                    source >= 0
+                        ? ple_norm[static_cast<std::size_t>(source) * HC_DIM + channel]
+                        : history0[static_cast<std::size_t>(channel) * PLE_HISTORY_ROWS +
+                                   static_cast<std::size_t>(
+                                       source + static_cast<std::int64_t>(PLE_HISTORY_ROWS))];
+                weights[tap] = strata::kernels::f32_from_f16(
+                    conv1d[static_cast<std::size_t>(channel) * 4u + tap]);
+            }
+            const std::size_t index = static_cast<std::size_t>(row) * HC_DIM + channel;
+            expected_residual[index] = conv_residual_oracle(
+                taps, weights, expected_batch_gated[index], residual0[index]);
+        }
+    }
+    std::vector<float> expected_history(history_count);
+    for (std::uint32_t channel = 0u; channel < HC_DIM; ++channel) {
+        for (std::uint32_t history_row = 0u; history_row < PLE_HISTORY_ROWS; ++history_row) {
+            const std::size_t position = static_cast<std::size_t>(rows) + history_row;
+            expected_history[static_cast<std::size_t>(channel) * PLE_HISTORY_ROWS + history_row] =
+                position < PLE_HISTORY_ROWS
+                    ? history0[static_cast<std::size_t>(channel) * PLE_HISTORY_ROWS + position]
+                    : ple_norm[(position - PLE_HISTORY_ROWS) * HC_DIM + channel];
+        }
+    }
+
+    std::string failed;
+    const auto note = [&](bool ok, const char* item) {
+        if (!ok) {
+            if (!failed.empty()) failed += ", ";
+            failed += item;
+        }
+        return ok;
+    };
+    bool ok = true;
+    ok &= note(same_bits(batch_gate_values, sequential_gate_values), "batch gate != sequential");
+    ok &= note(same_bits(batch_gated_values, sequential_gated_values), "batch gated != sequential");
+    ok &= note(same_bits(batch_residual_values, sequential_residual_values),
+               "batch residual != sequential");
+    ok &= note(same_bits(batch_history_values, sequential_history_values),
+               "batch history != sequential");
+    ok &= note(!twin::compare_floats(batch_gate_values, expected_gate,
+                                     {twin::Comparison::units, kGateToleranceUnits, 0.0, 0u}),
+               "batch gate != CPU oracle");
+    ok &= note(!twin::compare_floats(sequential_gate_values, expected_gate,
+                                     {twin::Comparison::units, kGateToleranceUnits, 0.0, 0u}),
+               "sequential gate != CPU oracle");
+    ok &= note(same_bits(batch_gated_values, expected_batch_gated),
+               "batch gated != CPU product");
+    ok &= note(same_bits(sequential_gated_values, expected_sequential_gated),
+               "sequential gated != CPU product");
+    ok &= note(!twin::compare_floats(batch_residual_values, expected_residual,
+                                     {twin::Comparison::units, kConvToleranceUnits, 0.0, 0u}),
+               "batch residual != CPU oracle");
+    ok &= note(same_bits(batch_history_values, expected_history),
+               "batch history != CPU history");
+    ok &= note(same_bits(sequential_history_values, expected_history),
+               "sequential history != CPU history");
+
+    const auto unchanged = [](const twin::GuardedBuffer& buffer) {
+        return !buffer.first_unwritten_change({});
+    };
+    const auto fully_written = [](const twin::GuardedBuffer& buffer, std::size_t bytes) {
+        const std::array<twin::ByteRange, 1> written{{{0u, bytes}}};
+        return !buffer.first_unwritten_change(written);
+    };
+    ok &= note(unchanged(inputs.key) && unchanged(inputs.query) && unchanged(inputs.value) &&
+                   unchanged(inputs.ple_norm) && unchanged(inputs.conv1d),
+               "inputs changed");
+    for (const PleChainRun* run : {&batch, &sequential, &control}) {
+        ok &= note(fully_written(run->gate, gate_count * sizeof(float)) &&
+                       fully_written(run->gated, width * sizeof(float)) &&
+                       fully_written(run->residual, width * sizeof(float)) &&
+                       fully_written(run->history, history_count * sizeof(float)),
+                   "guard bytes changed");
+    }
+    check(ok, label, failed);
+
+    // Controls: each must differ from the sequential run, or the comparison above would not see the fault.
+    tally.controls += 2;
+    std::vector<float> perturbed(batch_residual_values.begin(), batch_residual_values.end());
+    const std::size_t last = width - 1u;
+    perturbed[last] = std::bit_cast<float>(std::bit_cast<std::uint32_t>(perturbed[last]) ^ 1u);
+    const bool perturbation_detected = !same_bits(perturbed, sequential_residual_values);
+    const bool order_detected = !same_bits(float_view(control.residual, width),
+                                           sequential_residual_values);
+    tally.detected += (perturbation_detected ? 1 : 0) + (order_detected ? 1 : 0);
+    return ok;
+}
+
+bool run_ple_batch_eq_sequential(Context& context, const twin::Options& options) {
+    constexpr std::array sets{
+        twin::InputSet::random, twin::InputSet::edge, twin::InputSet::fixture};
+    PleBatchTally tally;
+    bool passed = true;
+    for (const twin::InputSet set : sets) {
+        for (std::uint32_t rows = 1u; rows <= kPLEBatchMaxRows; ++rows) {
+            passed &= run_ple_batch_case(context, rows, set, options, tally);
+        }
+    }
+    const bool controls_ok = tally.controls > 0 && tally.detected == tally.controls;
+    check(controls_ok, "ple batch controls: perturbed batch element and wrong-order batch are detected",
+          "detected " + std::to_string(tally.detected) + " of " +
+              std::to_string(tally.controls));
+    return passed && controls_ok;
+}
+
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: metal_ple_test strata.metallib "
-                     "[--seed N] [--input-set random|edge|fixture]\n");
+                     "[--seed N] [--input-set random|edge|fixture|"
+                     "--ple-batch-eq-sequential]\n");
         return 2;
     }
 
+    const bool ple_batch_only =
+        argc == 3 && std::string_view(argv[2]) == "--ple-batch-eq-sequential";
     twin::Options options;
     std::string err;
-    if (!twin::parse_options(argc, argv, 2, options, err)) {
+    if (!ple_batch_only && !twin::parse_options(argc, argv, 2, options, err)) {
         std::fprintf(stderr, "%s\n", err.c_str());
         return 2;
     }
@@ -4218,6 +4741,13 @@ int main(int argc, char** argv) {
     auto context = Context::open(context_options, err);
     check(context != nullptr, "open Metal context", err);
     if (!context) return 1;
+    if (ple_batch_only) {
+        const bool passed = run_ple_batch_eq_sequential(*context, options);
+        check(passed && g_failures == 0,
+              "PLE batch equals n single-row runs and the CPU references");
+        std::printf("metal_ple_test: %d failures\n", g_failures);
+        return g_failures == 0 ? 0 : 1;
+    }
 
     bool passed = test_gate_encoder_validation(*context, argv[1]);
     passed &= test_broadcast_encoder_validation(*context, argv[1]);
