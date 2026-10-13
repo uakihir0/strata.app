@@ -558,6 +558,10 @@ outputs aliasing inputs through either the same path or a hard link.
 
 ### 4.1 C1: the Mac computes the same model as CUDA
 
+> **Owner decision (2026-10-13, D-IMPL-671):** The reference for C1 and G1.tf is a per-kernel FP64 oracle
+> (sections 2.4-2.5 are no longer the yardstick). The criteria below are NOT RUN until this section is rewritten
+> to match that decision.
+
 C1 compares the Mac with the references of section 2. It gates on Q2_0 and Coder. The other formats run C1.1 on
 `tf-code` in the weekly rotation (section 7.2).
 

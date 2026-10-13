@@ -13344,6 +13344,26 @@ measuring L-15 remain open.
   Confirm also that the golden-set tasks (R12, T2) and the `golden` manifest checks of the accept runs
   are removed from the phase 1 exit criteria.
 
+### D-IMPL-671: The correctness yardstick for C1 and G1.tf is a per-kernel FP64 oracle
+
+- **Decision:** The owner chose a per-kernel FP64 oracle as the reference for the correctness criteria
+  that the CUDA golden set used to supply: `C1.1.*` and `G1.tf` (see [09](09-testing-and-validation.md),
+  sections 4.1 and 6.1). Each kernel is checked against an FP64 host reference of the same operation
+  with the same quantized inputs, in the twin harness of L2 ([04](04-metal-kernels.md), section 10).
+  The model-level comparison with CUDA is replaced by the per-kernel comparison plus the existing
+  synthetic full-layer compositions.
+- **Reason:** Given by the project owner on 2026-10-13, when asked to choose the replacement for the
+  CUDA reference (D-IMPL-629). It needs no model pack and no second machine, and it runs on the
+  reference Mac. It is weaker than an end-to-end comparison with CUDA: it shows each kernel's
+  arithmetic, not the whole model's agreement with upstream. That gap is stated, not hidden.
+- **Consequences:** `C1.1.kl`, `C1.1.top1`, `C1.1.ppl` and `G1.tf` cannot pass on this basis as written,
+  because they compare whole-model logits with the golden data. Their criteria in
+  `tools/metal/accept/criteria.py` stay reported as NOT RUN until the specification is changed in the
+  same commit as the criteria. No criterion is reported as passing from kernel oracles alone.
+- **Review required:** The owner must confirm the replacement, and then the criteria IDs, the gate
+  definitions of section 6.1 and the phase 2 exit criteria of [10](10-implementation-plan.md) must be
+  rewritten to name the per-kernel oracles. Until then, the end-to-end yardstick is absent.
+
 ### D-IMPL-680: Put the planner in `setup.py`, and keep `main()` fail-closed
 
 - **Decision:** `metal_plan`, `plan_class`, the PLAN parser and their constants are module-level code in `setup.py`,
