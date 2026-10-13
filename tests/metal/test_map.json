@@ -616,13 +616,15 @@
     },
     "pf_gdn_eq_step_norm": {
       "label": "metal",
-      "origin": "04 10.4",
-      "planned": "L13"
+      "origin": "04 10.4 / D-IMPL-740, D-IMPL-747"
     },
     "pf_sort_eq_host_grouping": {
       "label": "metal",
-      "origin": "04 10.4",
-      "planned": "L13"
+      "origin": "04 10.4 / D-IMPL-741, D-IMPL-742"
+    },
+    "pf_sort_eq_host_grouping_concurrent": {
+      "label": "metal",
+      "origin": "04 10.4 / D-IMPL-743"
     },
     "ple_batch_eq_sequential": {
       "label": "metal",
