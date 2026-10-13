@@ -17,8 +17,7 @@ bool encode_mtp_full_layer(Context& context, Encoder& encoder,
     if (sources.input_projection.token_source !=
             MtpInputTokenSource::selected_token ||
         !sources.input_projection.selected_token) {
-        error =
-            "MTP full-layer encoding requires a GPU-produced selected token";
+        error = "MTP full-layer encoding requires the selected-token binding";
         return false;
     }
 

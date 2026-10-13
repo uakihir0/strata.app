@@ -1384,19 +1384,25 @@ int main(int argc, char** argv) {
             auto rejected_cpu_token_command =
                 rollback_context->make_command_buffer(
                     "MTP full-layer CPU token refusal", error);
-            const bool full_layer_requires_gpu_token =
+            const bool full_layer_requires_selected_token_mode =
                 rejected_cpu_token_command != nullptr &&
                 !encode_mtp_full_layer(*rollback_context,
                                        *rejected_cpu_token_command,
                                        *provisional_runtime,
                                        invalid_full_layer_sources, error) &&
-                error.find("GPU-produced selected token") !=
+                error.find("selected-token binding") !=
                     std::string::npos;
-            if (rejected_cpu_token_command) {
-                rejected_cpu_token_command->discard();
-            }
-            require(full_layer_requires_gpu_token,
-                    "MTP full layer refuses a CPU parameter-token source");
+            std::string rejected_cpu_token_commit_error;
+            const bool cpu_token_command_was_discarded =
+                rejected_cpu_token_command != nullptr &&
+                !rejected_cpu_token_command->commit(
+                    rejected_cpu_token_commit_error) &&
+                rejected_cpu_token_commit_error.find(
+                    "cannot commit a discarded Metal command buffer") !=
+                    std::string::npos;
+            require(full_layer_requires_selected_token_mode &&
+                        cpu_token_command_was_discarded,
+                    "MTP full layer requires the selected-token source mode and discards a rejected command buffer");
 
             const auto snapshot_view = [](BufferRef view) {
                 std::vector<std::uint8_t> bytes(view.length);
@@ -1408,6 +1414,8 @@ int main(int argc, char** argv) {
                 return view.length == bytes.size() &&
                        std::memcmp(view.contents, bytes.data(), bytes.size()) == 0;
             };
+            const auto selected_token_before_failed_pass =
+                snapshot_view(selected_token_view);
             const auto embedding_before_failed_pass =
                 snapshot_view(projection_buffers.embedding);
             const auto residual_before_failed_pass =
@@ -1415,34 +1423,60 @@ int main(int argc, char** argv) {
             const auto sample_before_failed_pass =
                 snapshot_view(final_mixer_buffers.mixed);
             const MtpParams valid_full_layer_params = projection_params;
-            projection_params.step[0].width = 0;
+            projection_params.step[0].pos = -1;
             std::memcpy(provisional_params_slot.contents, &projection_params,
                         sizeof(projection_params));
             auto rejected_full_layer_command =
                 rollback_context->make_command_buffer(
-                    "MTP full-layer late StepRow rollback", error);
-            const bool full_layer_late_failure_rolls_back =
+                    "MTP full-layer stage-9 rollback", error);
+            const bool full_layer_late_failure_at_stage9 =
                 rejected_full_layer_command != nullptr &&
-                !encode_mtp_full_layer(*rollback_context,
-                                       *rejected_full_layer_command,
-                                       *provisional_runtime,
-                                       full_layer_sources, error) &&
-                error.find("StepRow width does not match") !=
+                !Encoder::encode(
+                    *rollback_context, *rejected_full_layer_command,
+                    "MTP token producer and failing full layer",
+                    [&](Encoder& encoder, std::string& encode_error) {
+                        return encoder.dispatch(
+                                   "strata_selftest_copy_u32_one",
+                                   {1u, 1u, 1u}, {1u, 1u, 1u},
+                                   projection_token_output,
+                                   projection_token_input, no_bytes,
+                                   no_memory, encode_error) &&
+                               encode_mtp_full_layer(
+                                   *rollback_context, encoder,
+                                   *provisional_runtime, full_layer_sources,
+                                   encode_error);
+                    },
+                    error) &&
+                error.find("StepRow position is outside the KV capacity") !=
                     std::string::npos;
+            std::string failed_full_layer_commit_error;
+            bool full_layer_command_was_discarded = false;
             if (rejected_full_layer_command) {
-                rejected_full_layer_command->discard();
+                if (!rejected_full_layer_command->commit(
+                        failed_full_layer_commit_error)) {
+                    full_layer_command_was_discarded =
+                        failed_full_layer_commit_error.find(
+                            "cannot commit a discarded Metal command buffer") !=
+                        std::string::npos;
+                } else {
+                    (void)rejected_full_layer_command->wait_until_completed(
+                        failed_full_layer_commit_error);
+                }
             }
             projection_params = valid_full_layer_params;
             std::memcpy(provisional_params_slot.contents, &projection_params,
                         sizeof(projection_params));
-            require(full_layer_late_failure_rolls_back &&
+            require(full_layer_late_failure_at_stage9 &&
+                        full_layer_command_was_discarded &&
+                        unchanged_view(selected_token_view,
+                                       selected_token_before_failed_pass) &&
                         unchanged_view(projection_buffers.embedding,
-                                      embedding_before_failed_pass) &&
+                                       embedding_before_failed_pass) &&
                         unchanged_view(add_streams_buffers.output,
                                        residual_before_failed_pass) &&
                         unchanged_view(final_mixer_buffers.mixed,
                                       sample_before_failed_pass),
-                    "late MTP stage-9 validation discards the encoded full-layer prefix");
+                    "late MTP stage-9 validation discards earlier caller work and preserves every sampled view");
 
             auto projection_command = rollback_context->make_command_buffer(
                 "MTP runtime-bound full-layer smoke", error);

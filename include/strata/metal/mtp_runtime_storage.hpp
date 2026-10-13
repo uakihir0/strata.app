@@ -132,9 +132,12 @@ struct MtpInputProjectionSources {
 };
 
 /// Caller-owned inputs that select one T=1 runtime-bound MTP full-layer pass.
-/// The input projection must use the GPU-produced `selected_token` source. Its
-/// parameter slot is shared by stages 1–20. Stages 21–22 (draft-head
-/// projection and sampling) are encoded separately.
+/// The input projection must use the `selected_token` source, and the caller
+/// must encode the GPU producer of that view earlier in the same ordered
+/// command buffer. The coordinator checks the source mode and view, but cannot
+/// prove who wrote the shared buffer. Its parameter slot is shared by stages
+/// 1–20. Stages 21–22 (draft-head projection and sampling) are encoded
+/// separately.
 struct MtpFullLayerSources {
     MtpInputProjectionSources input_projection;
     std::uint32_t attention_window = 0;
@@ -287,14 +290,17 @@ private:
 /// this pass records its first stage. Use the Encoder form inside
 /// Encoder::encode and propagate false so a later-stage failure discards the
 /// entire unsubmitted command buffer, including any earlier caller-encoded
-/// work. The caller owns the GPU-produced token, token embedding table and
-/// main-model residual supplied in `sources`; the Context, runtime, main KV
-/// owner (when its RoPE is borrowed), parameters and every view must stay
-/// alive through GPU completion. One runtime owns one set of mutable scratch
-/// and drafter K/V, so callers must serialize passes using the same runtime
-/// until each command buffer completes. The stage-20 sample remains in the
-/// runtime's `sample` bind region for subsequent draft-head and sampler
-/// encoders.
+/// work. The caller owns the selected-token view and must have encoded its GPU
+/// producer earlier in the same ordered command buffer; this function cannot
+/// verify the view's write provenance. The caller also owns the token
+/// embedding table and main-model residual supplied in `sources`. Keep the
+/// Context, runtime, main KV owner (when its RoPE is borrowed), parameters and
+/// every view alive through GPU completion, and keep the selected MtpParams
+/// slot and its StepRows unchanged until then. One runtime owns one set of
+/// mutable scratch and drafter K/V, so callers must serialize passes using
+/// the same runtime until each command buffer completes. The stage-20 sample
+/// remains in the runtime's `sample` bind region for subsequent draft-head
+/// and sampler encoders.
 bool encode_mtp_full_layer(Context& context, Encoder& encoder,
                            const MtpRuntimeStorage& runtime,
                            const MtpFullLayerSources& sources,
