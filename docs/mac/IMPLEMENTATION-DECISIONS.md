@@ -79,6 +79,9 @@ requirement.
   tests on their documented PC path.
 - **Review required:** Remove `create=True` in the same change that implements S3,
   so the tests fail if the production setting is ever removed.
+- **Status:** Resolved by the S3 change. `setup.MAC` is defined in `setup.py`, and no `create=True` remains in the
+  checkout. The setup test modules that the 07 section 10.1 names are not in this tree, so there was nothing to edit
+  (D-IMPL-842).
 
 ### D-IMPL-006: Fix the baseline MCP failures instead of hiding them
 
@@ -14496,4 +14499,58 @@ measuring L-15 remain open.
   `tf_compare.load()` read it as declared 100, 36 rows, first position 64.
 - **Review required:** The driver is not wired, so nothing checks that the caller's declared count is `n_prompt - 1 +
   max_new`. Confirm whether `write_first_logits_dump` should reject non-finite values, since no reader checks that file.
+
+### D-IMPL-840: `setup.MAC` is `sys.platform == "darwin"`, defined in the top constants of setup.py
+
+- **Decision:** `setup.py` defines `MAC = sys.platform == "darwin"`, a bool, after the `tools.model_catalog` import and
+  above the Metal planner constants. It is the one switch the Mac branches test.
+- **Reason:** Section 4.1 gives this value and places it after `WIN` (`setup.py:60`). This checkout has no `WIN`:
+  `setup.py` is the fail-closed stub, so the definition goes in the top block instead.
+- **Review required:** None.
+
+### D-IMPL-841: S3 in this change is the `MAC` constant only, and `main()` stays the fail-closed stub
+
+- **Decision:** This change adds `MAC` and its test and nothing else from S3. Still open: the other section 4.1
+  constants, the `from serve import macos` import, the probes (section 4.2), the Mac step order and refusals (section
+  4.3) and `--check`. `main()` still prints `macOS setup is not implemented yet; no files were changed.` and exits 2.
+  Section 15 records S3 as in progress.
+- **Reason:** The S3 "Done when" (the four refusal profiles and `--check` on the reference Mac) needs a setup flow this
+  checkout does not have. An import of `serve.macos` with no caller would be unused code in a file that must refuse to
+  change anything.
+- **Review required:** Confirm this split before the step 1 work starts.
+
+### D-IMPL-842: No `create=True` exists in this checkout, so D-IMPL-005 resolves with nothing to remove
+
+- **Decision:** D-IMPL-005 is marked resolved. No Python file in the tree patches `setup.MAC`, and none uses
+  `create=True`. The setup test modules that 07 section 10.1 lists (`test_setup_amd`, `test_setup_choices`,
+  `test_setup_draft_vocab`, `test_setup_golden`, `test_setup_lowram`, `test_setup_pins`, `test_setup_prompts`,
+  `test_setup_risk`, `test_setup_rope`) are in no commit on any ref. The setup-related tests present are
+  `tools/test_setup_shell.py`, `tools/test_shards.py` and the four `tools/test_mtp_*.py` modules. None of the last five
+  imports `setup` or reads `setup.MAC`.
+- **Reason:** Adding `create=True` or new patches to modules that are not here would be code for nothing. The test in
+  D-IMPL-843 keeps `MAC` from being removed silently, which is the purpose the D-IMPL-005 review item names.
+- **Review required:** When the setup test modules are ported (07 section 10.1), each one takes
+  `mock.patch.object(setup, "MAC", False)` without `create=True`.
+
+### D-IMPL-843: The `MAC` regression test runs on every OS and loads setup.py under three platforms
+
+- **Decision:** `serve/test_macos.py::MacSetting::test_setup_mac_switch` is not skipped off macOS. It asserts that
+  `setup` has `MAC`, that `setup.MAC` is `sys.platform == "darwin"`, and that executing `setup.py` again with
+  `sys.platform` set to `darwin`, `linux` and `win32` gives True, False and False. The test copies `sys.path` for the
+  reloads, so the `sys.path.insert` in `setup.py` does not persist.
+- **Reason:** A presence check alone passes for a hard-coded `MAC = True`. Re-executing the file checks what the switch
+  selects, on any host.
+- **Review required:** Checked by removing the `MAC` lines from `setup.py`: the test fails with `setup.py must define
+  MAC`. The lines were restored afterwards.
+
+### D-IMPL-844: Three runner modules still fail without llama.cpp's gguf-py, and they are not hidden
+
+- **Decision:** `tools.test_iq_pack`, `tools.test_mtp_pack` and `tools.metal.test_dense_vs_gguf` are not changed, skipped
+  or excluded. They stop in `tools/_paths.py` with `llama.cpp's gguf-py was not found`; the last one has one erroring
+  test, `test_compat_conversion_bytes_are_recomputed`.
+- **Reason:** This worktree has no `.ref/llama.cpp`, no `third_party/llama.cpp` and no `STRATA_GGUF_PY`, and the project
+  venv has no `gguf` package. The failures do not involve `setup`, and D-IMPL-006 requires known failures to stay
+  visible. The runner gives 36 of 39 modules before and after this change.
+- **Review required:** Run the runner with `STRATA_GGUF_PY` set to a pinned llama.cpp `gguf-py` to confirm those three
+  modules pass. That run has not been done.
 

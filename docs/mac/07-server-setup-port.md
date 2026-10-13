@@ -1611,4 +1611,9 @@ Each item becomes one task in [10-implementation-plan.md](10-implementation-plan
 | S20 | Mac-only project documentation (section 11) | Root and docs describe the supported target and clearly mark any unimplemented setup or inference path |
 | S21 | Measurements X-1 to X-8 (section 14) | Each result is in appendix A and the default it drives is updated here |
 
+**Status (2026-10-13).** S3 is in progress. `setup.py` defines `MAC = sys.platform == "darwin"` (section 4.1), and
+`serve/test_macos.py` tests it. Not yet implemented: the other constants of section 4.1, the `serve.macos` import, the
+probes of section 4.2, the Mac step order and refusals of section 4.3, and `--check`. `main()` still refuses to change
+files (D-IMPL-841).
+
 ---
