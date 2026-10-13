@@ -13321,3 +13321,26 @@ measuring L-15 remain open.
   approve re-pinning `UPSTREAM_SYNC` and the documents to the v0.1.34 tag commit. This is a
   provenance decision; no automatic change was made.
 
+
+### D-IMPL-629: The CUDA reference PC is out of project scope
+
+- **Decision:** The owner states that the CUDA reference PC is not part of this project. The
+  project does not acquire, set up or wait for a CUDA reference machine, and no task is blocked on
+  one. The CUDA-recorded golden set (R12, T2, the `record_golden.py` run of section 2.5 of
+  [09](09-testing-and-validation.md)) is not pursued as a prerequisite.
+- **Reason:** Stated by the project owner on 2026-10-13 ("CUDA is outside the project's scope").
+  It was previously recorded as a blocker for C1 and G1 (D-IMPL-003), and that blocker no longer
+  applies as a work item.
+- **Consequences, not yet resolved:** The specification still names CUDA as the correctness yardstick
+  in 16 documents (208 mentions, mostly in [09](09-testing-and-validation.md) sections 2.4-2.5, 4.1,
+  6.1 and 11, and [03](03-model-reference.md) R12). C1 (the Mac computes the same model as CUDA),
+  `G1.tf` and every criterion whose reference is the golden set therefore have no reference data.
+  This record does not rewrite those specifications. Replacing the yardstick is a normative change
+  and needs the owner's choice of a new reference (for example, a host-side FP64 oracle per kernel
+  from [04](04-metal-kernels.md), or upstream's own engine on another machine). Until that choice is
+  made, those criteria are reported as NOT RUN, never as passing.
+- **Review required:** The owner must choose the replacement correctness yardstick, and then the
+  specs above and the criteria in `tools/metal/accept/criteria.py` must be changed in the same commit.
+  Confirm also that the golden-set tasks (R12, T2) and the `golden` manifest checks of the accept runs
+  are removed from the phase 1 exit criteria.
+
