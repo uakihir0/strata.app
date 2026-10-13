@@ -7,17 +7,22 @@
 #include "strata/metal/plan.hpp"
 #include "strata/metal/window_scratch.hpp"
 #include "strata/metal/weights.hpp"
+#include "strata/kernels/f16_bits.hpp"
+#include "oracles/q5_k_mv.hpp"
+#include "oracles/q8_1.hpp"
 
 #include <algorithm>
 #include <cerrno>
 #include <array>
 #include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -817,6 +822,17 @@ int main(int argc, char** argv) {
             projection_params.T = 1u;
             projection_params.hid[0] = 4u;
             projection_params.step[0] = StepRow{2, 3, 0, 1};
+            std::fill_n(static_cast<std::uint16_t*>(projection_table.contents),
+                        N_EMBD, std::uint16_t{0x3f80u});
+            auto* const t1_projection_residual =
+                static_cast<float*>(projection_residual.contents);
+            for (std::size_t index = 0; index < HC_DIM; ++index) {
+                const auto centered = static_cast<std::int32_t>(
+                                          (index * 13u + 5u) % 65u) -
+                                      32;
+                t1_projection_residual[index] =
+                    static_cast<float>(centered) * 0.015625f;
+            }
             std::memcpy(provisional_params_slot.contents, &projection_params,
                         sizeof(projection_params));
             projection_sources.token_source =
@@ -1435,6 +1451,290 @@ int main(int argc, char** argv) {
                         shared_output_command->wait_until_completed(error),
                     "dispatch MTP runtime-bound stages 18–20 after routed experts: " +
                         error);
+            const auto* const stage20_sample_values_for_check =
+                static_cast<const float*>(final_mixer_buffers.mixed.contents);
+            require(std::all_of(
+                        stage20_sample_values_for_check,
+                        stage20_sample_values_for_check + N_EMBD,
+                        [](float value) { return std::isfinite(value); }),
+                    "synthetic MTP stages 1–20 produce a finite sample");
+            require(std::any_of(
+                        stage20_sample_values_for_check,
+                        stage20_sample_values_for_check + N_EMBD,
+                        [](float value) { return value != 0.0f; }),
+                    "synthetic MTP stages 1–20 produce a nonzero sample");
+
+            // Keep the indexed-head fixture small while running the same
+            // runtime-owned stage-20 sample, Q8_1/logit scratch, and sampler
+            // outputs through stages 21–22. The separately asserted runtime
+            // binding above still retains the inspected 106,299-row map.
+            constexpr std::uint32_t compact_head_rows = 32u;
+            constexpr std::array<std::int32_t, 4> compact_draft_ids{
+                7, 2, 5, 1,
+            };
+            constexpr std::uint32_t compact_draft_rows =
+                static_cast<std::uint32_t>(compact_draft_ids.size());
+            constexpr std::uint32_t q5_blocks_per_row = N_EMBD / 256u;
+            static_assert(N_EMBD % 256u == 0u);
+            std::vector<block_q5_K> compact_head_weights(
+                static_cast<std::size_t>(compact_head_rows) *
+                q5_blocks_per_row);
+            for (std::size_t block = 0; block < compact_head_weights.size();
+                 ++block) {
+                block_q5_K& weight = compact_head_weights[block];
+                const auto d = strata::kernels::f16_from_f32(0.25f);
+                const auto dmin = strata::kernels::f16_from_f32(0.125f);
+                weight.dm = static_cast<std::uint32_t>(d) |
+                            (static_cast<std::uint32_t>(dmin) << 16u);
+                std::fill_n(weight.scales, 12u,
+                            static_cast<std::uint8_t>(0x11u + block % 3u));
+                std::fill_n(weight.qh, 32u,
+                            static_cast<std::uint8_t>(0x69u + block));
+                std::fill_n(weight.qs, 128u,
+                            static_cast<std::uint8_t>(0x3du + block * 7u));
+            }
+            BufferRef compact_head_weights_buffer =
+                rollback_context->buffers().allocate(
+                    "MTP runtime compact Q5_K head fixture",
+                    compact_head_weights.size() * sizeof(block_q5_K), error);
+            BufferRef compact_draft_ids_buffer =
+                rollback_context->buffers().allocate(
+                    "MTP runtime compact draft vocabulary fixture",
+                    compact_draft_ids.size() * sizeof(std::int32_t), error);
+            require(compact_head_weights_buffer && compact_draft_ids_buffer,
+                    "allocate compact MTP draft-head fixtures: " + error);
+            std::memcpy(compact_head_weights_buffer.contents,
+                        compact_head_weights.data(),
+                        compact_head_weights.size() * sizeof(block_q5_K));
+            std::memcpy(compact_draft_ids_buffer.contents,
+                        compact_draft_ids.data(),
+                        compact_draft_ids.size() * sizeof(std::int32_t));
+            MtpDraftVocabularyMap compact_draft_vocabulary;
+            require(make_mtp_draft_vocabulary_map(
+                        *rollback_context,
+                        rollback_context->buffers().read_only(
+                            compact_draft_ids_buffer),
+                        compact_head_rows, compact_draft_vocabulary, error),
+                    "validate compact MTP draft-head map: " + error);
+
+            projection_params.samp.greedy = 1u;
+            projection_params.samp.hist_off = 0u;
+            projection_params.samp.hist_len = 0u;
+            std::memcpy(provisional_params_slot.contents, &projection_params,
+                        sizeof(projection_params));
+            constexpr std::size_t full_head_q5k_bytes =
+                static_cast<std::size_t>(kMtpFullVocabularySize) *
+                (N_EMBD / 256u) * sizeof(block_q5_K);
+            const bool bound_full_head_is_aligned_but_short =
+                draft_head_buffers.weights &&
+                draft_head_buffers.weights.offset() %
+                        alignof(std::uint16_t) ==
+                    0u &&
+                draft_head_buffers.weights.length() < full_head_q5k_bytes;
+            std::vector<std::uint8_t> rejected_head_q8_before(
+                draft_head_buffers.activations_q8_1.length);
+            std::vector<std::uint8_t> rejected_head_logits_before(
+                draft_head_buffers.logits.length);
+            std::memcpy(rejected_head_q8_before.data(),
+                        draft_head_buffers.activations_q8_1.contents,
+                        rejected_head_q8_before.size());
+            std::memcpy(rejected_head_logits_before.data(),
+                        draft_head_buffers.logits.contents,
+                        rejected_head_logits_before.size());
+            auto rejected_full_head_command =
+                rollback_context->make_command_buffer(
+                    "MTP runtime full-head extent refusal", error);
+            const bool rejected_full_head =
+                rejected_full_head_command != nullptr &&
+                !encode_mtp_draft_head(
+                    *rollback_context, *rejected_full_head_command,
+                    MatVecWeightFormat::q5_k, kMtpFullVocabularySize,
+                    draft_head_buffers, error);
+            const bool full_head_failure_is_transactional =
+                std::memcmp(
+                    rejected_head_q8_before.data(),
+                    draft_head_buffers.activations_q8_1.contents,
+                    rejected_head_q8_before.size()) == 0 &&
+                std::memcmp(rejected_head_logits_before.data(),
+                            draft_head_buffers.logits.contents,
+                            rejected_head_logits_before.size()) == 0;
+            if (rejected_full_head_command) {
+                rejected_full_head_command->discard();
+            }
+            require(bound_full_head_is_aligned_but_short &&
+                        rejected_full_head &&
+                        error.find("undersized or misaligned") !=
+                            std::string::npos &&
+                        full_head_failure_is_transactional,
+                    "MTP runtime-bound main-head view rejects the real full-head extent before dispatch");
+            const BufferRef stage20_sample = final_mixer_buffers.mixed;
+            require(stage20_sample &&
+                        stage20_sample.length >=
+                            static_cast<std::size_t>(N_EMBD) * sizeof(float),
+                    "MTP stage 20 sample does not cover the draft-head input");
+            std::vector<float> stage20_sample_values(N_EMBD);
+            std::memcpy(stage20_sample_values.data(), stage20_sample.contents,
+                        stage20_sample_values.size() * sizeof(float));
+            std::vector<Q81> expected_draft_q8;
+            require(twin::quantize_q8_1_reference(
+                        stage20_sample_values, N_EMBD, 1u, expected_draft_q8,
+                        error),
+                    "compute MTP stage-20-to-21 Q8_1 oracle: " + error);
+            std::vector<float> expected_full_draft_logits;
+            require(twin::q5_k_matvec_reference(
+                        compact_head_weights, expected_draft_q8, N_EMBD,
+                        compact_head_rows, 1u, 1u,
+                        expected_full_draft_logits, error),
+                    "compute compact MTP draft-head logits oracle: " + error);
+            std::vector<float> expected_mapped_draft_logits;
+            expected_mapped_draft_logits.reserve(compact_draft_rows);
+            for (const std::int32_t row : compact_draft_ids) {
+                expected_mapped_draft_logits.push_back(
+                    expected_full_draft_logits[static_cast<std::size_t>(row)]);
+            }
+            const auto max_logit = std::max_element(
+                expected_mapped_draft_logits.begin(),
+                expected_mapped_draft_logits.end());
+            require(max_logit != expected_mapped_draft_logits.end(),
+                    "compact MTP draft-head oracle produced no logits");
+            const std::size_t expected_draft_index =
+                static_cast<std::size_t>(
+                    max_logit - expected_mapped_draft_logits.begin());
+            const std::int32_t expected_draft_token =
+                compact_draft_ids[expected_draft_index];
+            double expected_draft_exp_sum = 0.0;
+            for (const float logit : expected_mapped_draft_logits) {
+                expected_draft_exp_sum += std::exp(
+                    static_cast<double>(logit - *max_logit));
+            }
+            const float expected_draft_probability =
+                static_cast<float>(1.0 / expected_draft_exp_sum);
+
+            MtpDraftHeadBuffers compact_draft_head_buffers =
+                draft_head_buffers;
+            compact_draft_head_buffers.weights =
+                rollback_context->buffers().read_only(
+                    compact_head_weights_buffer);
+            compact_draft_head_buffers.draft_vocabulary =
+                compact_draft_vocabulary;
+            MtpDraftSamplingBuffers compact_draft_sampling_buffers =
+                draft_sampling_buffers;
+            compact_draft_sampling_buffers.draft_vocabulary =
+                compact_draft_vocabulary;
+            const MtpParams draft_params_before =
+                *static_cast<const MtpParams*>(
+                    provisional_params_slot.contents);
+            const std::size_t active_draft_q8_bytes =
+                expected_draft_q8.size() * sizeof(Q81);
+            const std::size_t active_draft_logits_bytes =
+                expected_mapped_draft_logits.size() * sizeof(float);
+            const std::size_t active_draft_id_bytes = sizeof(std::int32_t);
+            const std::size_t active_draft_probability_bytes = sizeof(float);
+            std::vector<std::uint8_t> draft_q8_before(
+                compact_draft_head_buffers.activations_q8_1.length);
+            std::vector<std::uint8_t> draft_logits_before(
+                compact_draft_head_buffers.logits.length);
+            std::vector<std::uint8_t> draft_ids_before(
+                compact_draft_sampling_buffers.output_ids.length);
+            std::vector<std::uint8_t> draft_probabilities_before(
+                compact_draft_sampling_buffers.probabilities.length);
+            std::memcpy(draft_q8_before.data(),
+                        compact_draft_head_buffers.activations_q8_1.contents,
+                        draft_q8_before.size());
+            std::memcpy(draft_logits_before.data(),
+                        compact_draft_head_buffers.logits.contents,
+                        draft_logits_before.size());
+            std::memcpy(draft_ids_before.data(),
+                        compact_draft_sampling_buffers.output_ids.contents,
+                        draft_ids_before.size());
+            std::memcpy(draft_probabilities_before.data(),
+                        compact_draft_sampling_buffers.probabilities.contents,
+                        draft_probabilities_before.size());
+            auto draft_head_command = rollback_context->make_command_buffer(
+                "MTP runtime-bound stages 21–22 compact synthetic head", error);
+            require(draft_head_command != nullptr &&
+                        Encoder::encode(
+                            *rollback_context, *draft_head_command,
+                            "MTP runtime-bound indexed draft head and sampler",
+                            [&](Encoder& encoder,
+                                std::string& encode_error) {
+                                return encode_mtp_draft_head(
+                                           *rollback_context, encoder,
+                                           MatVecWeightFormat::q5_k,
+                                           compact_head_rows,
+                                           compact_draft_head_buffers,
+                                           encode_error) &&
+                                       encode_mtp_draft_sampling(
+                                           *rollback_context, encoder,
+                                           compact_head_rows,
+                                           compact_draft_sampling_buffers,
+                                           encode_error);
+                            },
+                            error) &&
+                        draft_head_command->commit(error) &&
+                        draft_head_command->wait_until_completed(error),
+                    "dispatch runtime-bound MTP stages 21–22: " + error);
+            const auto* const actual_draft_logits =
+                static_cast<const float*>(
+                    compact_draft_head_buffers.logits.contents);
+            const auto* const actual_draft_q8 =
+                static_cast<const std::uint8_t*>(
+                    compact_draft_head_buffers.activations_q8_1.contents);
+            const auto* const actual_draft_token =
+                static_cast<const std::int32_t*>(
+                    compact_draft_sampling_buffers.output_ids.contents);
+            const auto* const actual_draft_probability =
+                static_cast<const float*>(
+                    compact_draft_sampling_buffers.probabilities.contents);
+            const auto unchanged_tail = [](
+                                            const void* actual_base,
+                                            const std::vector<std::uint8_t>& before,
+                                            std::size_t active_bytes) {
+                return active_bytes <= before.size() &&
+                       (active_bytes == before.size() ||
+                        std::memcmp(
+                            static_cast<const std::uint8_t*>(actual_base) +
+                                active_bytes,
+                            before.data() + active_bytes,
+                            before.size() - active_bytes) == 0);
+            };
+            require(std::memcmp(actual_draft_q8, expected_draft_q8.data(),
+                                active_draft_q8_bytes) == 0 &&
+                        std::memcmp(actual_draft_logits,
+                                    expected_mapped_draft_logits.data(),
+                                    active_draft_logits_bytes) == 0 &&
+                        *actual_draft_token == expected_draft_token &&
+                        std::isfinite(*actual_draft_probability) &&
+                        std::abs(*actual_draft_probability -
+                                 expected_draft_probability) < 1.0e-6f,
+                    "MTP stages 21–22 match the Q8_1, indexed-logit, token and probability oracles");
+            require(std::memcmp(provisional_params_slot.contents,
+                                &draft_params_before,
+                                sizeof(draft_params_before)) == 0 &&
+                        std::memcmp(stage20_sample.contents,
+                                    stage20_sample_values.data(),
+                                    stage20_sample_values.size() *
+                                        sizeof(float)) == 0 &&
+                        std::memcmp(compact_head_weights_buffer.contents,
+                                    compact_head_weights.data(),
+                                    compact_head_weights.size() *
+                                        sizeof(block_q5_K)) == 0 &&
+                        std::memcmp(compact_draft_ids_buffer.contents,
+                                    compact_draft_ids.data(),
+                                    compact_draft_ids.size() *
+                                        sizeof(std::int32_t)) == 0 &&
+                        unchanged_tail(actual_draft_q8, draft_q8_before,
+                                       active_draft_q8_bytes) &&
+                        unchanged_tail(actual_draft_logits,
+                                       draft_logits_before,
+                                       active_draft_logits_bytes) &&
+                        unchanged_tail(actual_draft_token, draft_ids_before,
+                                       active_draft_id_bytes) &&
+                        unchanged_tail(actual_draft_probability,
+                                       draft_probabilities_before,
+                                       active_draft_probability_bytes),
+                    "MTP stages 21–22 preserve input views and inactive runtime tails");
+
             const BufferRef runtime_window_ids =
                 provisional_runtime->bind_region(MtpBindRegionId::mtp_ids);
             require(runtime_window_ids &&

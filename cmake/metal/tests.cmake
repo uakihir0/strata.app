@@ -1036,7 +1036,8 @@ target_link_libraries(metal_mtp_bind_layout_test PRIVATE strata_metal_options)
 strata_metal_test(metal_mtp_bind_layout_test host metal_mtp_bind_layout_test)
 add_executable(metal_mtp_storage_test tests/metal/metal_mtp_storage_test.mm)
 target_link_libraries(metal_mtp_storage_test
-  PRIVATE strata_metal_storage_test_engine strata_metal_options)
+  PRIVATE strata_metal_storage_test_engine strata_metal_oracles
+          strata_metal_options)
 target_compile_definitions(metal_mtp_storage_test
   PRIVATE STRATA_METAL_TEST_LOCK_ACCESS=1)
 add_dependencies(metal_mtp_storage_test strata_metallib)
