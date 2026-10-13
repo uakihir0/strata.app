@@ -13495,3 +13495,131 @@ measuring L-15 remain open.
 - **Review required:** Confirm that the MCP tools should call the engine for each Metal planning request. The results are
   cached per process in `_metal_plan_cache`.
 
+### D-IMPL-660: `models.json` lists the seven setup tags, their files and their sources
+
+- **Decision:** `tests/metal/models.json` is schema 1 with one entry per model of section 2.3, keyed by the
+  setup tag from `tools/model_catalog.py` (`Q2_0`, `IQ2_XS`, `IQ3_XXS`, `IQ3_S`, `coder-IQ1_M`,
+  `swift-IQ2_XS`, `swift-IQ3_XXS`). Each model lists its downloaded files with `role` (`shard1`, `shard2`
+  or `mmproj`), `path` (the file name in the model folder), `source` (the Hugging Face URL at the pinned
+  revision), `bytes`, and the three pins `sha256`, `head_64mib_sha256` and `tail_64mib_sha256`. Each model
+  also has `cc_pressure_mib` and a `derived` list (`pack/dense.bin`, `mtp/rt/`) that `check` does not read.
+  The top level records the MTP source (`Qwen/Qwen3.8-Flash-Next` at its pinned revision).
+- **Reason:** 09 sections 1.3 and 2.3 name the file and what it holds, but not its layout. The tags follow
+  `model_catalog.py` (the family's tag plus the quant), because setup names the folders that way. Section
+  2.3's prose names such as "Coder (IQ1_M)" are not folder names. The derived outputs are built on the Mac
+  from the downloads, so pinning them would pin our own builder.
+- **Review required:** Confirm the tags against setup's folder names when setup's step 6 lands, and confirm
+  that `check` should leave the derived outputs out (they are sized, not pinned).
+
+### D-IMPL-661: Sizes come from section 2.4, and section 2.3's total does not match them
+
+- **Decision:** Shard sizes are the Hugging Face byte counts of 03 section 2.4. The mmproj size
+  (907,543,008 B) and the MTP runtime size (823,887,872 B) come from 03 section 2.3, and the `dense.bin` sizes
+  from 03 section 4.5. The unit tests check the shard sizes against typed values and against the header
+  fixtures' `SHARD_LAYOUT`.
+- **Reason:** These are exact byte counts. 09 section 2.3 says "the seven shard 1 files are about 352 GB". The
+  seven shard 1 sizes of section 2.4 add to 287,889,789,504 B (268.1 GiB). The figure of about 352 GB matches
+  those seven plus the two Swift shard 2 files (352,433,765,888 B), so the sentence may count more than it
+  says. The manifest follows section 2.4.
+- **Review required:** The spec owner should confirm which total section 2.3 means and correct the sentence.
+
+### D-IMPL-662: No SHA-256 is recorded, so every pin is null and nothing is invented
+
+- **Decision:** Every `sha256`, `head_64mib_sha256` and `tail_64mib_sha256` value is null. The PLE shard's Git LFS
+  object id is kept only in a note, as the 16-hex prefix 03 section 2.4 gives. `check` treats a null pin as
+  not pinned and fails it (exit 1), so no file passes against a value the repository does not record.
+- **Reason:** No section 2.3 GGUF file has a full SHA-256 in the repository, and 03's LFS id is truncated. The
+  models are not on this checkout and must not be downloaded for this item. A pass against a null value would
+  make "check passes" mean nothing.
+- **Impact:** The T3 "Done when" ("`check` passes" on the reference Mac) cannot hold until the pins are
+  recorded. The acceptance runs' `check --quick` precondition (09 section 3.2) fails closed until then.
+- **Review required:** The owner records the full SHA-256 values from the Hugging Face LFS object ids at the
+  pinned revisions, checked against the reference Mac's files, and the quick hashes, in a reviewed commit.
+  Do not take them from the local files alone, because that would trust whatever was downloaded first.
+
+### D-IMPL-663: `fetch` refuses in this checkout and does not guess setup's step 6
+
+- **Decision:** `fetch TAG...` validates the tags and the models folder (exit 2 when the folder is missing).
+  `fetch --plan TAG...` prints each file's source and size and touches nothing. Otherwise `fetch` exits 1 with
+  "no model was fetched" and runs no download, pack, MTP or config step.
+- **Reason:** `setup.py` is the fail-closed stub, so step 6 of 07 section 4.8 is not in this checkout, and the
+  spec does not name the setup function that `fetch` should call. Inventing that name, or downloading directly,
+  would skip the pack and MTP steps the spec requires.
+- **Review required:** When step 6 lands, replace the refusal with the call 09 section 2.3 describes (`setup.ROOT`
+  set to the model folder, the answers from `--yes`, then setup's config writer). Decide whether a direct
+  downloader is wanted at all.
+
+### D-IMPL-664: The quick check hashes the first and last 64 MiB as two digests, with the size
+
+- **Decision:** `check --quick` first compares the size, then computes the SHA-256 of bytes `[0, min(64 MiB, size))`
+  and of bytes `[max(0, size - 64 MiB), size)` as two separate digests. A file of 128 MiB or less is covered
+  whole. The full check hashes `[0, size)`. Bytes from 64 MiB up to `size - 64 MiB` are covered only by the full
+  check.
+- **Reason:** 09 section 2.3 defines the quick check as "the SHA-256 of the first and last 64 MiB of each file",
+  and the brief requires a changed byte in either 64 MiB to fail `check --quick`. Two digests let each end have its
+  own pin, and the boundaries are exact.
+- **Review required:** The spec does not say whether the two regions are one digest or two. This takes two.
+
+### D-IMPL-665: Exit codes are 0 pass, 1 mismatch or unpinned, 2 missing, and missing wins
+
+- **Decision:** 0 when every checked file passes. 1 when a file's size or hash differs from its pin, or a pin is
+  null, or the manifest is invalid. 2 when the models folder or a model file is missing, when the manifest
+  file itself is missing, or when a tag is unknown (argparse's code). If any file is missing the exit is 2 even
+  if others fail. The size is compared before hashing, and null pins are reported before the size.
+- **Reason:** The brief sets 2 for a missing disk or files; the other codes are mine. `accept/checks.py`
+  treats any non-zero exit as a failed pre-check and reads the last stderr line as the reason, so the summary is
+  printed last on stderr.
+- **Review required:** Confirm the code for unpinned and invalid manifests. Confirm that the acceptance runner
+  should show a missing model as its own state, not as an ordinary failed check.
+
+### D-IMPL-666: The CLI is excluded from discovery, and its unit tests are in `test_test_models.py`
+
+- **Decision:** `tools/metal/test_models.py` is the command-line tool, so `run_python_tests.py` lists it in
+  `NON_UNITTEST_MODULES`, as it does `test_map.py`. Its unit tests are in `tools/metal/test_test_models.py`,
+  which discovery picks up.
+- **Reason:** The runner loads every `test_*.py` and fails a module that collects no tests. `test_models.py`
+  has no TestCase, so without the exclusion the runner would fail on it. The `test_map.py` and
+  `test_test_map.py` pair is the precedent.
+- **Review required:** Confirm the name `test_test_models.py`. If it is renamed, rename the exclusion with it.
+
+### D-IMPL-667: `check` reads each inode once per run
+
+- **Decision:** `check` caches each SHA-256 by device, inode and byte range, for one run only. The five folders that
+  hold the ISTA and Coder PLE shard are hard links to one file, so a full check reads it once, not five times. That
+  saves four reads of 28,800,138,432 B, about 115.2 GB.
+- **Reason:** 03 section 2.4 and 07 section 4.8 say that setup hard-links the shared shard. The full check runs
+  weekly, and reading identical bytes again adds nothing. The cache lives only for one run, so it cannot hide a
+  change made between runs.
+- **Review required:** Confirm that the hard links are the only way the five folders share bytes. If a copy
+  replaces a link, the cache is still correct, because the key includes the inode.
+
+### D-IMPL-668: Unit tests use sparse files at the real 64 MiB boundaries
+
+- **Decision:** The unit tests create a 192 MiB + 4,097 B sparse file with `truncate`, change one byte at a time, and check the
+  quick and full results at offsets 0, 64 MiB - 1, 64 MiB, the middle, size - 64 MiB - 1, size - 64 MiB and size - 1.
+  The expected digests come from a separate hashlib reader. Each change is undone afterwards. The module runs in
+  about 1.4 s. Shrinking the quick window to 63 MiB makes seven cases fail.
+- **Reason:** The brief asks for sparse files so the tests stay fast. Real boundaries test the rule itself, not a
+  scaled-down copy.
+- **Review required:** The tests fix the window at 64 MiB. Changing that rule in 09 section 2.3 means changing
+  these tests in the same commit.
+
+### D-IMPL-669: Swift's mmproj is left out, and `cc_pressure_mib` is null on every model
+
+- **Decision:** The Swift mmproj (907,543,520 B, 03 section 2.3) is not in `models.json`, because 09 section 2.3
+  says `fetch` downloads the image encoder only for Q2_0 and Coder. `cc_pressure_mib` is present on every model
+  and null, because measurement T-9 records it (09 section 11), and T9 names only Q2_0 and Coder.
+- **Reason:** These follow the spec text. 03 section 2.3 lists the `qwen` mmproj for the whole `qwen` family, which
+  covers all four ISTA quants, so the 09 rule may be narrower than the family.
+- **Review required:** Decide whether IQ2_XS, IQ3_XXS, IQ3_S and Swift need mmproj entries for images. If they do,
+  add them (the same qwen file for the ISTA quants, and the Swift file for Swift). This is a spec-level question
+  for the setup owner.
+
+### D-IMPL-670: The speed-projection hash is not a pin for any section 2.3 model
+
+- **Decision:** `data/experimental-speed-projection/Qwen3.8-Flash-Next-experimental-speed-projection.json` has a
+  `base_model_sha256_shard1` (`a4f3b21e…`). It belongs to `unsloth/Qwen3.8-Flash-Next-GGUF` `UD-Q2_K_XL`, which is
+  not a model of section 2.3 and is refused on the Mac. It is not used as a pin.
+- **Reason:** It names a different repository and quantization.
+- **Review required:** None beyond confirming that no T3 pin should come from this file.
+

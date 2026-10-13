@@ -13,8 +13,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 TEST_DIRS = (ROOT / "tools", ROOT / "tools" / "metal", ROOT / "serve")
-# This is a command-line checker. Its unittest coverage lives in test_test_map.py.
-NON_UNITTEST_MODULES = {"tools.metal.test_map"}
+# These are command-line tools. Their unittest coverage lives in test_test_map.py and test_test_models.py.
+NON_UNITTEST_MODULES = {"tools.metal.test_map", "tools.metal.test_models"}
 RUN_MODULE = """\
 import sys
 import unittest
