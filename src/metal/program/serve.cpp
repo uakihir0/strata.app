@@ -1,10 +1,13 @@
 // src/metal/program/serve.cpp - the host-side line protocol (docs/mac/06, section 5).
 #include "strata/metal/serve.hpp"
+#include "strata/metal/watchdog.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cstdarg>
+#include <cstdio>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -147,6 +150,25 @@ void write_request_error(std::FILE* output, std::string_view message) {
     std::string line = "bad request: ";
     line.append(message);
     write_error(output, line);
+}
+
+// One diagnostics line, formatted like fprintf and written through write_report_line, so that it cannot interleave with
+// the watchdog's stall report (docs/mac/06, section 14.3).
+void diagnostic_line(std::FILE* out, const char* format, ...) __attribute__((format(printf, 2, 3)));
+void diagnostic_line(std::FILE* out, const char* format, ...) {
+    std::va_list args;
+    va_start(args, format);
+    std::va_list copy;
+    va_copy(copy, args);
+    const int size = std::vsnprintf(nullptr, 0, format, args);
+    va_end(args);
+    if (size >= 0) {
+        std::string text(static_cast<std::size_t>(size) + 1, '\0');
+        (void) std::vsnprintf(text.data(), text.size(), format, copy);
+        text.resize(static_cast<std::size_t>(size));
+        write_report_line(out, text);
+    }
+    va_end(copy);
 }
 
 class SignalPolicy {
@@ -567,39 +589,39 @@ std::string request_context_error(const ServeRequest& request, std::int64_t cont
 void log_outcome(std::FILE* diagnostics, const ServeRequest& request, std::int64_t reused,
                  std::int64_t generated, const ServeOutcome& outcome) {
     const std::int64_t fresh = static_cast<std::int64_t>(request.token_ids.size()) - reused;
-    std::fprintf(diagnostics,
-                 "strata serve: prompt %zu tokens = %lld reused + %lld read in %.0f ms (%.1f tok/s), "
-                 "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %lld checkpoints%s\n",
-                 request.token_ids.size(), static_cast<long long>(reused), static_cast<long long>(fresh),
-                 outcome.prompt_ms, outcome.prompt_ms > 0.0 ? 1000.0 * static_cast<double>(fresh) / outcome.prompt_ms : 0.0,
-                 static_cast<long long>(generated), outcome.decode_ms,
-                 outcome.decode_ms > 0.0 ? 1000.0 * static_cast<double>(generated) / outcome.decode_ms : 0.0,
-                 static_cast<long long>(outcome.drafts_accepted), static_cast<long long>(outcome.drafts_offered),
-                 static_cast<long long>(outcome.checkpoints), outcome.finish == "cancel" ? " (cancelled)" : "");
+    diagnostic_line(diagnostics,
+                    "strata serve: prompt %zu tokens = %lld reused + %lld read in %.0f ms (%.1f tok/s), "
+                    "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %lld checkpoints%s",
+                    request.token_ids.size(), static_cast<long long>(reused), static_cast<long long>(fresh),
+                    outcome.prompt_ms, outcome.prompt_ms > 0.0 ? 1000.0 * static_cast<double>(fresh) / outcome.prompt_ms : 0.0,
+                    static_cast<long long>(generated), outcome.decode_ms,
+                    outcome.decode_ms > 0.0 ? 1000.0 * static_cast<double>(generated) / outcome.decode_ms : 0.0,
+                    static_cast<long long>(outcome.drafts_accepted), static_cast<long long>(outcome.drafts_offered),
+                    static_cast<long long>(outcome.checkpoints), outcome.finish == "cancel" ? " (cancelled)" : "");
     if (outcome.lookups > 0) {
-        std::fprintf(diagnostics, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)\n",
-                     100.0 * static_cast<double>(outcome.hits) / static_cast<double>(outcome.lookups),
-                     static_cast<long long>(outcome.hits), static_cast<long long>(outcome.lookups));
+        diagnostic_line(diagnostics, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)",
+                        100.0 * static_cast<double>(outcome.hits) / static_cast<double>(outcome.lookups),
+                        static_cast<long long>(outcome.hits), static_cast<long long>(outcome.lookups));
     }
     if (outcome.report_resident_ram) {
-        std::fprintf(diagnostics, "strata serve: resident RAM: %.2f GiB of experts in RAM, %lld exchanged with the "
-                                 "VRAM tier, %lld blob reads from the file\n",
-                     outcome.resident_ram_gib, static_cast<long long>(outcome.exchanges),
-                     static_cast<long long>(outcome.cumulative_file_reads));
+        diagnostic_line(diagnostics, "strata serve: resident RAM: %.2f GiB of experts in RAM, %lld exchanged with the "
+                                     "VRAM tier, %lld blob reads from the file",
+                        outcome.resident_ram_gib, static_cast<long long>(outcome.exchanges),
+                        static_cast<long long>(outcome.cumulative_file_reads));
     }
     if (outcome.report_expert_tiers) {
-        std::fprintf(diagnostics,
-                     "strata serve: expert tiers: GPU %lld hits this request; since the start RAM %lld blobs, "
-                     "files %lld blobs %.1f MB read\n",
-                     static_cast<long long>(outcome.hits), static_cast<long long>(outcome.cumulative_ram_blobs),
-                     static_cast<long long>(outcome.cumulative_expert_file_blobs),
-                     outcome.cumulative_expert_file_mb);
+        diagnostic_line(diagnostics,
+                        "strata serve: expert tiers: GPU %lld hits this request; since the start RAM %lld blobs, "
+                        "files %lld blobs %.1f MB read",
+                        static_cast<long long>(outcome.hits), static_cast<long long>(outcome.cumulative_ram_blobs),
+                        static_cast<long long>(outcome.cumulative_expert_file_blobs),
+                        outcome.cumulative_expert_file_mb);
     }
-    std::fflush(diagnostics);
 }
 
-int run_one_request(ServeBackend& backend, const ServeRequest& request, std::atomic<bool>& stop_requested,
-                    std::FILE* output, std::FILE* diagnostics,
+// The caller holds the request's BusyScope (run_serve_loop), so the watchdog also covers the image load before this call.
+int run_one_request(ServeBackend& backend, const ServeRequest& request, Progress& progress,
+                    std::atomic<bool>& stop_requested, std::FILE* output, std::FILE* diagnostics,
                     const std::function<bool()>& request_finished) {
     const std::int64_t prompt_size = static_cast<std::int64_t>(request.token_ids.size());
     const std::int64_t max_context = std::min(backend.serve_info().context, kServeMaximumContext);
@@ -625,12 +647,25 @@ int run_one_request(ServeBackend& backend, const ServeRequest& request, std::ato
     state.stop_eos = backend.serve_info().stop_eos;
     state.eos_ids = backend.serve_info().eos_ids;
     ServeCallbacks callbacks;
-    callbacks.resume = [&](std::int64_t reused) { return state.resume(reused); };
+    // Every backend event is a beat for the watchdog (docs/mac/06, section 14.1), and names the stage it reports. The
+    // beat and the stage are one locked update, so the watchdog never pairs a new beat with the previous stage.
+    callbacks.resume = [&](std::int64_t reused) {
+        progress.beat("resume");
+        return state.resume(reused);
+    };
     callbacks.prompt_progress = [&](std::int64_t done, std::int64_t total, double ms, double tps) {
+        progress.beat("prompt", std::to_string(done) + "/" + std::to_string(total));
         return state.progress(done, total, ms, tps);
     };
-    callbacks.prompt_reused = [&](std::int64_t reused) { return state.reused(reused); };
-    callbacks.token = [&](std::int32_t id) { return state.token(id); };
+    callbacks.prompt_reused = [&](std::int64_t reused) {
+        progress.beat("decode");
+        return state.reused(reused);
+    };
+    callbacks.token = [&](std::int32_t id) {
+        const bool accepted = state.token(id);
+        progress.beat("decode", "token " + std::to_string(state.emitted_tokens));
+        return accepted;
+    };
     callbacks.should_stop = [&] { return stop_requested.load() || state.eos_seen; };
 
     ServeOutcome outcome;
@@ -649,25 +684,22 @@ int run_one_request(ServeBackend& backend, const ServeRequest& request, std::ato
     if (!state.error.empty()) {
         request_finished();
         write_error(output, "internal serve protocol error: " + state.error);
-        std::fprintf(diagnostics, "strata: internal serve protocol error: %s\n", state.error.c_str());
-        std::fflush(diagnostics);
+        diagnostic_line(diagnostics, "strata: internal serve protocol error: %s", state.error.c_str());
         return 1;
     }
     if (!succeeded) {
         if (failure.kind == ServeFailureKind::Gpu) {
             request_finished();
             write_error(output, "gpu error: " + failure.message);
-            std::fprintf(diagnostics, "strata: GPU error in \"%s\": %s\n",
-                         failure.label.empty() ? "window" : failure.label.c_str(), failure.message.c_str());
-            std::fflush(diagnostics);
+            diagnostic_line(diagnostics, "strata: GPU error in \"%s\": %s",
+                            failure.label.empty() ? "window" : failure.label.c_str(), failure.message.c_str());
             return 1;
         }
         request_finished();
         write_error(output, failure.message.empty() ? "request failed" : failure.message);
         if (failure.kind == ServeFailureKind::Fatal) {
-            std::fprintf(diagnostics, "strata: %s\n",
-                         failure.message.empty() ? "fatal serve error" : failure.message.c_str());
-            std::fflush(diagnostics);
+            diagnostic_line(diagnostics, "strata: %s",
+                            failure.message.empty() ? "fatal serve error" : failure.message.c_str());
             return 1;
         }
         return 0;
@@ -681,8 +713,7 @@ int run_one_request(ServeBackend& backend, const ServeRequest& request, std::ato
         (outcome.finish == "length" && state.emitted_tokens != request.max_new) ||
         (outcome.finish == "cancel" && !was_stopped) || !eos_finish_valid) {
         write_error(output, "internal serve protocol error: incomplete or invalid backend response");
-        std::fprintf(diagnostics, "strata: internal serve protocol error: incomplete or invalid backend response\n");
-        std::fflush(diagnostics);
+        diagnostic_line(diagnostics, "strata: internal serve protocol error: incomplete or invalid backend response");
         return 1;
     }
     std::fprintf(output, "DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f\n",
@@ -1037,6 +1068,13 @@ int run_serve_loop(ServeBackend& backend, const ServeLoopOptions& options) {
     std::FILE* diagnostics = options.diagnostics == nullptr ? stderr : options.diagnostics;
     (void) std::setvbuf(output, nullptr, _IONBF, 0);
 
+    std::uint64_t watchdog_seconds = 0;
+    std::string watchdog_error;
+    if (!parse_watchdog_limit(std::getenv("STRATA_WATCHDOG_S"), watchdog_seconds, watchdog_error)) {
+        std::fprintf(diagnostics, "strata: %s\n", watchdog_error.c_str());
+        return 2;
+    }
+
     SignalPolicy signals;
     if (!signals.install()) {
         std::fprintf(diagnostics, "strata: failed to install serve signal handling\n");
@@ -1049,6 +1087,8 @@ int run_serve_loop(ServeBackend& backend, const ServeLoopOptions& options) {
         std::fprintf(diagnostics, "strata: could not start the stdin reader\n");
         return 2;
     }
+    Progress progress;
+    NoEngineStallReporter stall_reporter;
 
     const ServeInfo& info = backend.serve_info();
     const bool eos_config_valid = (!info.stop_eos || !info.eos_ids.empty()) &&
@@ -1075,8 +1115,21 @@ int run_serve_loop(ServeBackend& backend, const ServeLoopOptions& options) {
                      static_cast<long long>(info.vram_free_mib), static_cast<long long>(suggested));
     }
     const std::string info_line = serve_info_line(info);
-    if (!write_line(output, info_line) ||
-        !write_line(output, "READY " + std::to_string(info.context) + " stop")) {
+    if (!write_line(output, info_line)) {
+        reader.stop();
+        return 1;
+    }
+    // The watchdog starts after INFO and before READY (docs/mac/06, section 2.3, step 12). Its abort is std::abort
+    // unless the caller substitutes one (ServeLoopOptions::watchdog_abort).
+    Watchdog::Hooks watchdog_hooks = Watchdog::system_hooks();
+    if (options.watchdog_abort) watchdog_hooks.abort = options.watchdog_abort;
+    Watchdog watchdog(progress, watchdog_seconds, info.engine, stall_reporter, diagnostics, std::move(watchdog_hooks));
+    if (!watchdog.start()) {
+        std::fprintf(diagnostics, "strata: could not start the watchdog\n");
+        reader.stop();
+        return 2;
+    }
+    if (!write_line(output, "READY " + std::to_string(info.context) + " stop")) {
         reader.stop();
         return 1;
     }
@@ -1130,7 +1183,11 @@ int run_serve_loop(ServeBackend& backend, const ServeLoopOptions& options) {
             write_error(output, context_error);
             continue;
         }
+        // The request's BusyScope starts before the image load, so the watchdog covers the file read as well. The
+        // scope ends with this iteration, after run_one_request returns (docs/mac/06, section 14.1).
+        const BusyScope busy(progress);
         if (request.image) {
+            progress.set_stage("image");
             std::string image_error;
             if (!load_serve_image_embeddings(request, context_limit, image_error)) {
                 finish_request();
@@ -1139,7 +1196,8 @@ int run_serve_loop(ServeBackend& backend, const ServeLoopOptions& options) {
             }
         }
         if (!request.spec_min_p_is_set) request.sampling.spec_min_p = info.spec_min_p;
-        const int result = run_one_request(backend, request, stop_requested, output, diagnostics, finish_request);
+        const int result =
+            run_one_request(backend, request, progress, stop_requested, output, diagnostics, finish_request);
         if (result != 0) {
             reader.stop();
             return result;

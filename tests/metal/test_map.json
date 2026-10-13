@@ -647,6 +647,10 @@
       "label": "model",
       "origin": "03 R5"
     },
+    "dump_format_host_test": {
+      "label": "host",
+      "origin": "03 R11"
+    },
     "dump_eq_nodump": {
       "label": "model",
       "origin": "04 10.4",
@@ -731,6 +735,10 @@
       "label": "model",
       "origin": "09 4.1",
       "planned": "T6"
+    },
+    "watchdog_host_test": {
+      "label": "host",
+      "origin": "06 H11"
     },
     "metal_watchdog_test": {
       "label": "model",
