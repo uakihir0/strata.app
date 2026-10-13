@@ -13302,3 +13302,22 @@ measuring L-15 remain open.
 - **Review required:** Confirm that `g1-09` (a project-written 255-line C++ file) and the Chinese text satisfy the
   spec's "project's licence" source rule. Also confirm that the 46-rule `g1-07` prompt (about 4,600 characters) is
   near its 3,000-token target once the real tokenizer measures it.
+
+### D-IMPL-628: Record that the pinned upstream baseline commit is not on the public repository
+
+- **Decision:** Keep `1678de333d0e0711bc414ad992b640e1a37dd814` as the pinned baseline in
+  every document. Do not substitute another commit, and do not vendor upstream source into this
+  repository to compensate.
+- **Reason:** On 2026-10-13, `gh api repos/Niko1221/Strata/commits/1678de33...` returns HTTP 422
+  (`No commit found`), and `git/refs/tags/v0.1.34` resolves to
+  `eb8bb8bcd90d5cf3930dc83782ce6001df71df67`, not to the pinned SHA. The `ca-*` prompt sets
+  (`make_prompts.py` reads the upstream sources at that commit), the `UPSTREAM_SYNC` check and any
+  drift comparison against the baseline therefore cannot be regenerated from the public upstream.
+- **Impact:** `tests/metal/prompts/` sources and the builder are committed, but the frozen `.ids`,
+  `.txt` and `MANIFEST.json` for the `ca-*` sets are not generated. Commit `1678de33` must be
+  located (a fork, a rewritten history, or the owner's copy) or the baseline must be re-pinned by a
+  reviewed upstream-sync decision.
+- **Review required:** The repository owner must confirm where the `1678de33` commit lives, or
+  approve re-pinning `UPSTREAM_SYNC` and the documents to the v0.1.34 tag commit. This is a
+  provenance decision; no automatic change was made.
+
