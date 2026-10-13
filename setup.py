@@ -12,6 +12,9 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from tools.model_catalog import CONTEXTS, FAMILIES, MODELS  # noqa: E402
 
+# True on macOS. Every Mac branch tests this one switch (docs/mac/07-server-setup-port.md, section 4.1).
+MAC = sys.platform == "darwin"
+
 # The Metal planner (docs/mac/07-server-setup-port.md, section 4.4). The values are from the table in section 4.1.
 ENGINE_PATH = ROOT / "engine" / "strata"
 DATA_DIR = ROOT / "data"

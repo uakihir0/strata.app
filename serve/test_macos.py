@@ -1,7 +1,9 @@
+import importlib.util
 import os
 import select
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -247,6 +249,20 @@ class MetalPlanParse(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         setup.metal_plan(*args, **kwargs)
                 self.assertEqual([], runner.calls)
+
+
+class MacSetting(unittest.TestCase):
+    def test_setup_mac_switch(self):
+        """Runs everywhere: setup.MAC must exist and select the Mac branches by platform (section 4.1)."""
+        self.assertTrue(hasattr(setup, "MAC"), "setup.py must define MAC (docs/mac/07, section 4.1)")
+        self.assertIs(setup.MAC, sys.platform == "darwin")
+        for platform, expected in (("darwin", True), ("linux", False), ("win32", False)):
+            with self.subTest(platform=platform), mock.patch.object(sys, "path", list(sys.path)):
+                spec = importlib.util.spec_from_file_location(f"setup_as_{platform}", setup.__file__)
+                module = importlib.util.module_from_spec(spec)
+                with mock.patch.object(sys, "platform", platform):
+                    spec.loader.exec_module(module)
+                self.assertIs(module.MAC, expected)
 
 
 class MacOSProbes(unittest.TestCase):
