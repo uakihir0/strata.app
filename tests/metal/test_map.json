@@ -51,8 +51,7 @@
     },
     "kernel_env_dispositions_test": {
       "label": "host",
-      "origin": "04 L14",
-      "planned": "L14"
+      "origin": "04 L14"
     },
     "metal_manifest_test": {
       "label": "host",

@@ -692,6 +692,17 @@ set_tests_properties(metal_self_test PROPERTIES ENVIRONMENT "STRATA_METAL_ARCHIV
 add_executable(options_dispositions_test tests/metal/options_dispositions_test.cpp)
 target_link_libraries(options_dispositions_test PRIVATE strata_metal_cli_options)
 strata_metal_test(options_dispositions_test host options_dispositions_test)
+
+# every kernel flag and kernel-scope variable of docs/mac/04, section 9 (L14): the production readers, and the Mac
+# sources for the variables that have no callable reader
+add_executable(kernel_env_dispositions_test tests/metal/kernel_env_dispositions_test.cpp
+               src/metal/engine/prefill_gemm_selector.cpp)
+target_include_directories(kernel_env_dispositions_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(kernel_env_dispositions_test PRIVATE strata_metal_cli_options)
+target_compile_definitions(kernel_env_dispositions_test PRIVATE
+                           STRATA_MAC_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+                           STRATA_MAC_SPEC="${CMAKE_SOURCE_DIR}/docs/mac/04-metal-kernels.md")
+strata_metal_test(kernel_env_dispositions_test host kernel_env_dispositions_test)
 strata_metal_test(metal_cli_modes_test host ${CMAKE_COMMAND} -DSTRATA=$<TARGET_FILE:strata>
                   -P ${CMAKE_SOURCE_DIR}/tests/metal/check_cli_modes.cmake)
 strata_metal_test(metal_geometry_plan_cli_test host ${CMAKE_COMMAND} -DSTRATA=$<TARGET_FILE:strata>

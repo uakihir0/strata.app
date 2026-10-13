@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 
 #include "strata/metal/encoder.hpp"
+#include "strata/metal/kernel_env.hpp"
 #include "../engine/metal_fence.hpp"
 
 #include <algorithm>
@@ -14,21 +15,10 @@
 namespace strata::metal {
 namespace {
 
-enum class DispatchMode { serial, concurrent };
 constexpr std::size_t kMaxInlineBytesPerEncoder = 4096;
 
 bool dispatch_mode(DispatchMode& mode, std::string& error) {
-    const char* const value = std::getenv("STRATA_METAL_DISPATCH");
-    if (value == nullptr || value[0] == '\0' || std::string_view(value) == "serial") {
-        mode = DispatchMode::serial;
-        return true;
-    }
-    if (std::string_view(value) == "concurrent") {
-        mode = DispatchMode::concurrent;
-        return true;
-    }
-    error = "STRATA_METAL_DISPATCH must be 'serial' or 'concurrent'";
-    return false;
+    return parse_dispatch_mode(std::getenv("STRATA_METAL_DISPATCH"), mode, error);
 }
 
 const KernelInfo* find_kernel(std::string_view name) {

@@ -2,6 +2,7 @@
 #include "strata/metal/context.hpp"
 #include "strata/metal/expert_profile.hpp"
 #include "strata/metal/geometry.hpp"
+#include "strata/metal/kernel_env.hpp"
 #include "strata/metal/model_storage.hpp"
 #include "strata/metal/mtp.hpp"
 #include "strata/metal/options.hpp"
@@ -149,12 +150,7 @@ int geometry_plan(const Options& cli, const Geometry& geometry,
         return 2;
     }
     options.prefill_auto_max = configured_prefill_auto_max;
-    if (const char* bf16x2 = std::getenv("STRATA_PREFILL_BF16X2"); bf16x2 != nullptr && *bf16x2 != '\0') {
-        char* end = nullptr;
-        errno = 0;
-        const long value = std::strtol(bf16x2, &end, 10);
-        if (errno == 0 && end != bf16x2 && *end == '\0') options.prefill_bf16x2 = value != 0;
-    }
+    options.prefill_bf16x2 = prefill_bf16x2_enabled(std::getenv("STRATA_PREFILL_BF16X2"));
     if (cli.has("--prefill")) {
         const std::string_view prefill = cli.last_value("--prefill");
         if (prefill == "auto") {
