@@ -174,6 +174,15 @@ add_dependencies(metal_twin_selftest strata_metallib)
 strata_metal_test(metal_twin_selftest metal metal_twin_selftest ${STRATA_METALLIB})
 set_tests_properties(metal_twin_selftest PROPERTIES TIMEOUT 120)
 
+add_executable(metal_util_test tests/metal/metal_util_test.mm)
+target_include_directories(metal_util_test PRIVATE ${STRATA_METAL_GENERATED_DIR})
+target_link_libraries(metal_util_test PRIVATE strata_metal_twins strata_metal_options)
+set_source_files_properties(tests/metal/metal_util_test.mm
+                            PROPERTIES OBJECT_DEPENDS ${STRATA_METALLIB_SHA256_INC})
+add_dependencies(metal_util_test strata_metallib)
+strata_metal_test(metal_util_test metal metal_util_test ${STRATA_METALLIB})
+set_tests_properties(metal_util_test PROPERTIES TIMEOUT 120)
+
 add_executable(metal_mv_test tests/metal/metal_mv_test.mm)
 target_include_directories(metal_mv_test PRIVATE ${STRATA_METAL_GENERATED_DIR})
 target_link_libraries(metal_mv_test PRIVATE
@@ -190,6 +199,11 @@ strata_metal_test(metal_mv_test_concurrent metal
 set_tests_properties(metal_mv_test_concurrent PROPERTIES
   TIMEOUT 120
   ENVIRONMENT "STRATA_METAL_DISPATCH=concurrent")
+strata_metal_test(mv_multi_eq_single metal
+                  metal_mv_test ${STRATA_METALLIB} --multi-eq-single)
+set_tests_properties(mv_multi_eq_single PROPERTIES
+  TIMEOUT 120
+  ENVIRONMENT "STRATA_METAL_DISPATCH=serial")
 
 add_executable(metal_moe_test tests/metal/metal_moe_test.mm)
 target_include_directories(metal_moe_test PRIVATE ${STRATA_METAL_GENERATED_DIR})

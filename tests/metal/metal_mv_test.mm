@@ -8903,6 +8903,15 @@ bool run_q4_k_multi_eq_single(Context& context, std::mt19937_64& rng,
                             flipped_multi_bytes, flipped_singles_bytes);
                         check(!flipped_mismatch,
                               "Q4_K flipped weights preserve NC parity");
+                        // The one-bit weight flip must change the result that the original weights produced.
+                        const auto original_bytes = std::span<const std::uint8_t>(
+                            reinterpret_cast<const std::uint8_t*>(singles.data()),
+                            singles.size() * sizeof(float));
+                        const auto flipped_result_bytes = std::span<const std::uint8_t>(
+                            reinterpret_cast<const std::uint8_t*>(flipped_multi.data()),
+                            flipped_multi.size() * sizeof(float));
+                        check(twin::compare_bytes(flipped_result_bytes, original_bytes).has_value(),
+                              "Q4_K mv_multi_eq_single negative control detects code-bit flip");
 
                         auto divergent_singles = flipped_singles;
                         const auto first_bits =
@@ -9275,6 +9284,15 @@ bool run_q5_k_multi_eq_single(Context& context, std::mt19937_64& rng,
                             flipped_singles.size() * sizeof(float));
                         check(!twin::compare_bytes(multi_bytes, single_bytes),
                               "Q5_K flipped weights preserve NC parity");
+                        // The one-bit weight flip must change the result that the original weights produced.
+                        const auto original_bytes = std::span<const std::uint8_t>(
+                            reinterpret_cast<const std::uint8_t*>(singles.data()),
+                            singles.size() * sizeof(float));
+                        const auto flipped_result_bytes = std::span<const std::uint8_t>(
+                            reinterpret_cast<const std::uint8_t*>(flipped_multi.data()),
+                            flipped_multi.size() * sizeof(float));
+                        check(twin::compare_bytes(flipped_result_bytes, original_bytes).has_value(),
+                              "Q5_K mv_multi_eq_single negative control detects code-bit flip");
                         auto divergent_singles = flipped_singles;
                         const auto first_bits =
                             std::bit_cast<std::uint32_t>(divergent_singles[0]);
@@ -13245,7 +13263,9 @@ int main(int argc, char** argv) {
 
     twin::Options options;
     std::string err;
-    if (!twin::parse_options(argc, argv, 2, options, err)) {
+    const bool multi_eq_single =
+        argc > 2 && std::string_view(argv[2]) == "--multi-eq-single";
+    if (!twin::parse_options(argc, argv, multi_eq_single ? 3 : 2, options, err)) {
         std::fprintf(stderr, "%s\n", err.c_str());
         return 2;
     }
@@ -13255,6 +13275,31 @@ int main(int argc, char** argv) {
     auto context = Context::open(context_options, err);
     check(context != nullptr, "open Metal context", err);
     if (!context) return 1;
+    if (multi_eq_single) {
+        // mv_multi_eq_single (docs/mac/04-metal-kernels.md, section 10.4): every dense mat-vec format and BF16 at
+        // NC = 2, 4 and 8 equals the NC = 1 dispatch column by column, and a one-bit weight flip is detected.
+        std::mt19937_64 rng(options.seed);
+        bool completed = true;
+        completed &= run_q8_0_multi_eq_single(*context, rng, options);
+        completed &= run_q4_0_multi_eq_single(*context, rng, options);
+        completed &= run_q5_0_multi_eq_single(*context, rng, options);
+        completed &= run_q2_0_multi_eq_single(*context, rng, options);
+        completed &= run_iq4_nl_multi_eq_single(*context, rng, options);
+        completed &= run_iq4_xs_multi_eq_single(*context, rng, options);
+        completed &= run_iq3_s_multi_eq_single(*context, rng, options);
+        completed &= run_iq2_xxs_multi_eq_single(*context, rng, options);
+        completed &= run_iq2_xs_multi_eq_single(*context, rng, options);
+        completed &= run_iq2_s_multi_eq_single(*context, rng, options);
+        completed &= run_iq3_xxs_multi_eq_single(*context, rng, options);
+        completed &= run_iq1_m_multi_eq_single(*context, rng, options);
+        completed &= run_q4_k_multi_eq_single(*context, rng, options);
+        completed &= run_q5_k_multi_eq_single(*context, rng, options);
+        completed &= run_q3_k_multi_eq_single(*context, rng, options);
+        completed &= run_q6_k_multi_eq_single(*context, rng, options);
+        completed &= run_bf16_multi_eq_single(*context, rng, options);
+        std::printf("mv_multi_eq_single: %s\n", completed && g_failures == 0 ? "OK" : "FAILED");
+        return completed && g_failures == 0 ? 0 : 1;
+    }
     if (!run_window_output_weight_mapping_tests()) ++g_failures;
 
     std::vector<twin::InputSet> sets;
