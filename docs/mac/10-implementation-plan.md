@@ -273,6 +273,10 @@ Exit criteria:
 - `accept.py server` and `accept.py c3` pass on Q2_0. `accept.py nightly` passes.
 - The Mac golden set passes on the reference Mac.
 
+Status (2026-10-13): the host parts of S2, S7, S10, S11 (the data folder), S12 and S13 are done, with fake-engine tests
+in `serve/test_macos.py`; their reference-Mac parts are open, as [07](07-server-setup-port.md), section 15 says. S5, S6, S8
+and S9 are not started, for the reasons given there. Phase 3 is not complete: the exit criteria above are not met.
+
 ### 3.5 Phase 4: tiered mode
 
 | Task | What | After |

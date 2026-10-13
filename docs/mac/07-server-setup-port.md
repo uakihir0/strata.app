@@ -948,7 +948,9 @@ preconditions. No installer acceptance is claimed yet.
 
 ### 5.2 Planned double-click launchers
 
-No Finder launcher is currently shipped. These are the proposed files for a later Mac installer change:
+The two launchers below are shipped at the repository root. Each one forwards to `setup.sh`, which stops with exit
+code 2 until the Mac installer exists (section 5.1), so a double-click now reports that setup is not implemented. The
+installer change makes them install and start Strata. Their text is:
 
 `START-HERE.command`:
 ```sh
@@ -1612,8 +1614,33 @@ Each item becomes one task in [10-implementation-plan.md](10-implementation-plan
 | S21 | Measurements X-1 to X-8 (section 14) | Each result is in appendix A and the default it drives is updated here |
 
 **Status (2026-10-13).** S3 is in progress. `setup.py` defines `MAC = sys.platform == "darwin"` (section 4.1), and
-`serve/test_macos.py` tests it. Not yet implemented: the other constants of section 4.1, the `serve.macos` import, the
-probes of section 4.2, the Mac step order and refusals of section 4.3, and `--check`. `main()` still refuses to change
-files (D-IMPL-841).
+`serve/test_macos.py` tests it. Not yet implemented: the other constants of section 4.1, the probes of section 4.2, the
+Mac step order and refusals of section 4.3, and `--check`. `main()` still refuses to change files (D-IMPL-841).
+
+The host parts of the following are done. Their tests use a fake engine (shell scripts or a Python stand-in), synthetic
+assets and local sockets, and they are in `serve/test_macos.py`. The reference-Mac part of each is open:
+- **S2.** `START-HERE.command` and `SETUP.command` ship. Each forwards to `setup.sh`, which still exits 2, and
+  `test_command_launchers` checks them. The darwin block of `setup.sh` is unchanged; the arm64 Python selection and
+  the installer steps of section 5.1 are not implemented.
+- **S7.** `get_prebuilt_metal`, `prebuilt_bases`, `smoke_test` and `use_ssl_bundle` (sections 4.7.1-4.7.5). No release
+  URL is configured (`RELEASE_REPOSITORY` is unset), so no ready-made engine is looked for by default. Open: an install
+  of the release asset on the reference Mac, and the certificate hint on a python.org Python.
+- **S10.** `write_run_script`, `quarantine_targets` and `strip_quarantine_targets` (section 4.10).
+  `test_run_script_quoting`, `test_command_launchers` and the quarantine test pass. Open: the "Open Anyway" check of a
+  ZIP download.
+- **S11.** `data_folder` and `create_data_folder` (section 4.12); `test_data_folder` passes. Not done: `start()`
+  (section 4.11), the flags of section 4.14, and the consent for an explicit synced `--data-dir` (it needs
+  `confirm_risk`, not in this checkout).
+- **S12.** `port_in_use` (section 6.1), the SIGHUP handler (6.2), `keep_awake` (6.9) and the death diagnostics (6.5).
+  `test_port_probe`, `test_sighup_shutdown`, `test_death_note` and `test_keep_awake` pass on this host. Open: the
+  engine's SIGHUP ignore in `--serve` (06, section 2.4), so a real Terminal close with a real engine is unverified.
+- **S13.** The `_Apple` reader, the sampler's four Mac readings and the static Mac facts (section 7). The tests fake the
+  macOS probes. `_cpu_name()` returns the brand on a Mac, with no `platform.processor()` fallback. Open: the
+  `/metrics` and `/v1/status` readings on the reference Mac.
+
+Not started in this change: S5 (the geometry files are the engine's output from real model files), S6 (the menus,
+consent and `--check`; the family table lacks the qwen and swift families of IQ2_XS and IQ3_XXS, and `--check` needs S3
+step 1), S8 (`build_engine_metal` needs `cmake_build` and the Xcode check of section 4.7.6) and S9 (steps 6 and 7 are
+the `main()` flow, which stays fail-closed). Decisions: D-IMPL-900 to D-IMPL-917.
 
 ---
