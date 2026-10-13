@@ -357,6 +357,20 @@ OptionParseResult parse_options(const std::vector<std::string_view>& arguments) 
             }
         }
     }
+    if (options.has("--logits-stride")) {
+        for (const std::string& value : options.values.at("--logits-stride")) {
+            if (!positive_integer(value)) {
+                fail(result, "--logits-stride needs a positive integer");
+                return result;
+            }
+        }
+        // The stride keeps rows of a single-token teacher-forced run (docs/mac/03, section 9.1), so --max-new must
+        // be given explicitly as 1; the default of 16 is not accepted.
+        if (!options.has("--max-new") || options.last_value("--max-new") != "1") {
+            fail(result, "--logits-stride needs --max-new 1");
+            return result;
+        }
+    }
 
     bool model_mode = false;
     for (const std::string& name : options.present) {

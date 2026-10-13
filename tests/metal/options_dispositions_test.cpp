@@ -132,7 +132,7 @@ int main() {
         std::vector<std::string> owned{std::string(spec.name)};
         for (std::uint8_t i = 0; i < spec.value_count; ++i) {
             owned.push_back(spec.name == "--plan-w-mib" || spec.name == "--plan-ram-mib" ||
-                                    spec.name == "--gpu-budget-mib"
+                                    spec.name == "--gpu-budget-mib" || spec.name == "--logits-stride"
                                 ? "4096"
                                 : "value");
         }
@@ -142,6 +142,10 @@ int main() {
             owned.emplace_back("out.txt");
         }
         if (spec.name == "--plan-w-mib" || spec.name == "--plan-ram-mib") owned.emplace_back("--plan-only");
+        if (spec.name == "--logits-stride") {
+            owned.emplace_back("--max-new");
+            owned.emplace_back("1");
+        }
         const bool device_action = spec.name == "--help" || spec.name == "--version" ||
                                    spec.name == "--list-devices" || spec.name == "--self-test" ||
                                    spec.name == "--metallib" ||
@@ -247,6 +251,24 @@ int main() {
     check(has_error({"--native", "model.gguf", "--gpu-budget-mib", "4096", "--gpu-budget-mib", "0"},
                     "--gpu-budget-mib needs a positive integer"),
           "validate every repeated GPU budget value");
+    // --logits-stride keeps rows of a one-token run (docs/mac/03, section 9.1): it needs an explicit --max-new 1.
+    check(has_error({"--native", "model.gguf", "--dump-logits", "logits.bin", "--logits-stride", "2"},
+                    "--logits-stride needs --max-new 1"),
+          "logits stride requires --max-new, and the default of 16 is not 1");
+    check(has_error({"--native", "model.gguf", "--logits-stride", "2", "--max-new", "2"},
+                    "--logits-stride needs --max-new 1"),
+          "logits stride rejects a --max-new other than 1");
+    check(has_error({"--native", "model.gguf", "--logits-stride", "2", "--max-new", "1", "--max-new", "4"},
+                    "--logits-stride needs --max-new 1"),
+          "the last --max-new value decides for logits stride");
+    check(parse_options({"--native", "model.gguf", "--dump-logits", "logits.bin", "--logits-stride", "3",
+                         "--max-new", "1"}).exit_code == 0,
+          "logits stride is accepted with --max-new 1");
+    for (const char* value : {"0", "-1", "abc"}) {
+        check(has_error({"--native", "model.gguf", "--max-new", "1", "--logits-stride", value},
+                        "--logits-stride needs a positive integer"),
+              "logits stride validates a positive integer", value);
+    }
     check(has_error({"--plan-only"}, "the Metal engine needs --native"),
           "real-file plan requires native shard");
     check(has_error({"--write-geometry", "out.json"}, "the Metal engine needs --native"),
