@@ -245,6 +245,10 @@ for `STRATA_TEST_MODELS` and `STRATA_RESULTS`, excluded from Spotlight (`mdutil 
 
 ### 2.4 The CUDA reference PC
 
+> **Scope note (owner decision, 2026-10-13, D-IMPL-629):** The CUDA reference PC is outside the project
+> scope. No work is blocked on it, and the criteria that use the CUDA golden set have no reference until the
+> owner chooses a replacement. This section is kept as the specification of the original reference.
+
 The golden data is recorded on a PC with upstream's own build, not on a Mac:
 
 | Item | Requirement |
