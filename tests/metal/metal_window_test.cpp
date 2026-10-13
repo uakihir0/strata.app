@@ -639,6 +639,8 @@ void test_model_fixtures() {
     require(plan.files.size() == 2 && plan.files[0].windows.size() == 1 &&
                 plan.files[1].windows.empty(),
             "Q2_0 must plan one shard-1 window and no PLE shard-2 window");
+    require(strata::metal::verify_window_never_wrap(q2, plan, error),
+            "Q2_0 plan must satisfy the never-wrap rules: " + error);
 
     WindowSources swift;
     std::uint64_t ple_offset = 0;
@@ -653,6 +655,8 @@ void test_model_fixtures() {
     require(plan.files.size() == 2 && plan.files[0].windows.size() == 2 &&
                 plan.files[1].windows.size() == 1,
             "Swift IQ2_XS shard 1 must use two windows separated by the excluded PLE tensor");
+    require(strata::metal::verify_window_never_wrap(swift, plan, error),
+            "Swift IQ2_XS plan must satisfy the never-wrap rules: " + error);
     require(plan.wrapped_unread_bytes >= 252'149'760 &&
                 plan.wrapped_unread_bytes - 252'149'760 < 4 * kWindowPageBytes,
             "Swift wrapped_unread differs from router bytes by " +

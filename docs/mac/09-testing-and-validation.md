@@ -1181,9 +1181,9 @@ name, except `row_t_independent`, which is step 6 of every twin and has no test 
 
 ### 9.1 CTest tests
 
-The test map (`tests/metal/test_map.json`) registers 191 tests: 50 `host`, 113 `metal` and 28 `model`. That total includes
+The test map (`tests/metal/test_map.json`) registers 193 tests: 52 `host`, 113 `metal` and 28 `model`. That total includes
 26 planned tests (1 `host`, 25 `model`) that are not yet in CTest. A fresh `mac-dev` configure of this branch measures
-165 CTest tests: 49 `host`, 113 `metal` and 3 `model`. The bootstrap tests ([08](08-build-and-distribution.md), section
+167 CTest tests: 51 `host`, 113 `metal` and 3 `model`. The bootstrap tests ([08](08-build-and-distribution.md), section
 6.4) are among the registered tests.
 
 | Label | Preset | Runs on |
@@ -1192,7 +1192,7 @@ The test map (`tests/metal/test_map.json`) registers 191 tests: 50 `host`, 113 `
 | `metal` | `mac-metal` | The reference Mac on every push to `main`; the nightly validation-layer run; the family runs; hosted Macs if X-8 allows (section 7.5) |
 | `model` | `mac-model` | The reference Mac, nightly (section 7.2, step 1); the `metal_<area>_model_test` set also under the validation layer on Sunday |
 
-**`host` (50).**
+**`host` (52).**
 
 | Tests | Defined in | What it serves |
 | --- | --- | --- |
@@ -1210,7 +1210,9 @@ The test map (`tests/metal/test_map.json`) registers 191 tests: 50 `host`, 113 `
 | `metal_kv_layout_test` | [04](04-metal-kernels.md), sections 4.5-4.6 and 5.11 | Exact device-free main QSA K/V, indexer and RoPE regions plus the MTP drafter's single K/V layer for fp16, int8, q4_0 and k8v4; four-cell capacity rounding, K8V4-to-int8 drafter mapping, checked extents, non-overlap and invalid-input refusal |
 | `metal_mtp_bind_layout_test` | [04](04-metal-kernels.md), section 5.11 | Device-free normal-mode MTP bind regions, 256-byte start alignment, vocabulary-sized logits, capacity-dependent attention scratch and invalid-input refusal; verifies the unassigned tail stays reserved |
 | `metal_tiered_layout_test` | [05](05-memory-and-residency.md), section 13; work item U5 | Dense/resident copy ranges, profile-ordered resident slots, address/resident tables and alignment-budget checks, plus fail-closed handling when a required GPU base address is unavailable; this pure layout test does not read files or allocate Metal buffers |
-| `metal_window_test` | [05](05-memory-and-residency.md), section 13; work item U2 | 16 KiB outward alignment, the strict 256 MiB merge boundary, device-independent `wrapped_unread`, maxBufferLength failures, aligned and unaligned expert-slab splits, preserved merged-range coverage across a forced oversized gap, unavailable GPU window address rejection, and Q2_0/Swift R1 header-fixture windows; excludes the PLE tensor mapping while allowing page-alignment padding at its edge |
+| `metal_window_test` | [05](05-memory-and-residency.md), section 13; work item U2 | 16 KiB outward alignment, the strict 256 MiB merge boundary, device-independent `wrapped_unread`, maxBufferLength failures, aligned and unaligned expert-slab splits, preserved merged-range coverage across a forced oversized gap, unavailable GPU window address rejection, and Q2_0/Swift R1 header-fixture windows; excludes the PLE tensor mapping while allowing page-alignment padding at its edge; the never-wrap verifier accepts the Q2_0 and Swift plans |
+| `metal_never_wrap_host_test` | [05](05-memory-and-residency.md), section 6; work item U4 | Device-free never-wrap rules through `verify_window_never_wrap`: exact fit and one page over at the mapped file end, PLE padding of exactly one outward page accepted and one page more rejected, PLE padding with no read beside it rejected, a merged window that wraps the PLE payload rejected with the plan unchanged, a tiny PLE inside a shared page accepted, overlapping windows counted once in the union, unplanned window bytes and double-counted unread rejected, payload and slice inventory mismatches rejected, converted router bytes wrapped and counted, and a wide PLE gap left unwrapped by the planner |
+| `metal_window_offset_test` | [05](05-memory-and-residency.md), sections 4.1, 4.2 and 5.3; work item U3 | Full 48-layer, 512-expert, three-role shape on a 1.125 GiB sparse fixture: 18 windows of 64 MiB on slab boundaries, the 590 KB address and 96 KiB resident tables, hand-computed table indices, every slab's address as window base plus window offset, marker bytes read back through the window offset, profile-order warm-up at full shape, and a page-end window whose dense tensor reads through its offset; a window one page past the mapped end is rejected by the layout |
 | `metal_window_scratch_layout_test` | [04](04-metal-kernels.md), section 4.4; D-IMPL-182 | Device-free exact T=8 region extents and 256-byte starts; byte totals at 32,768, 65,536 and 262,144 cells for both 256- and 512-expert router shapes; unsupported model and capacity rejection; overlap and bounds invariants |
 | `metal_window_ple_rows_test` | [04](04-metal-kernels.md), section 5.1; D-IMPL-185, D-IMPL-301; REV-098 | Device-free token-major PLE row construction for T=1..8; absent and partial history, token ID zero, oldest-first predecessors, EOS propagation, artifact hash fixture, fixed qwen4exp geometry and vocabulary checks; committed token suffix initialization, read-only row building, accepted-prefix advancement, zero acceptance, reset, invalid input and transactional state preservation |
 | `metal_geometry_plan_cli_test` | [06](06-engine-host-port.md), work item H5 | Geometry-backed `--plan-only` fit/no-fit output, unsupported-type diagnosis and unknown-format exit |

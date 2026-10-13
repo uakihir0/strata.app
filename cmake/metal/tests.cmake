@@ -1038,6 +1038,16 @@ target_link_libraries(metal_window_test PRIVATE strata_metal_options)
 target_compile_definitions(metal_window_test PRIVATE
                            STRATA_MODEL_HEADER_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/model-headers")
 strata_metal_test(metal_window_test host metal_window_test)
+add_executable(metal_never_wrap_host_test tests/metal/metal_never_wrap_host_test.cpp
+               src/metal/engine/window_plan.cpp)
+target_include_directories(metal_never_wrap_host_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(metal_never_wrap_host_test PRIVATE strata_metal_options)
+strata_metal_test(metal_never_wrap_host_test host metal_never_wrap_host_test)
+add_executable(metal_window_offset_test tests/metal/metal_window_offset_test.cpp
+               src/metal/engine/window_plan.cpp src/metal/engine/window.cpp)
+target_include_directories(metal_window_offset_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(metal_window_offset_test PRIVATE strata_metal_options)
+strata_metal_test(metal_window_offset_test host metal_window_offset_test)
 add_executable(window_params_test tests/metal/window_params_test.cpp
                src/metal/engine/window_params.cpp)
 target_include_directories(window_params_test PRIVATE ${CMAKE_SOURCE_DIR}/include)

@@ -119,4 +119,13 @@ bool plan_windows(const WindowSources& sources, std::uint64_t max_buffer_length,
 bool compute_wrapped_unread(const WindowSources& sources, std::uint64_t& unread_bytes,
                             std::string& error);
 
+/// Check the never-wrap rules of docs/mac/05-memory-and-residency.md, section 6, against a plan
+/// that plan_windows returned for these sources. A window must be page-aligned and lie within the
+/// mapped file. An excluded PLE payload may be covered only as outward padding of at most one page,
+/// beside a read tensor in the same page, and never from inside the payload. Every slice must tile
+/// its included tensor, and the union of the windows minus the included bytes must equal
+/// wrapped_unread_bytes. Read-only: the plan and sources are unchanged on success and on failure.
+bool verify_window_never_wrap(const WindowSources& sources, const WindowPlan& plan,
+                              std::string& error);
+
 }  // namespace strata::metal

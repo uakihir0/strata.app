@@ -14554,3 +14554,98 @@ measuring L-15 remain open.
 - **Review required:** Run the runner with `STRATA_GGUF_PY` set to a pinned llama.cpp `gguf-py` to confirm those three
   modules pass. That run has not been done.
 
+### D-IMPL-850: U4 covers the section 6 rules; 05 has no ring-position never-wrap rule
+
+- **Decision:** The host-verifiable part of U4 is the section 6 rule set: an excluded PLE payload is covered only as
+  outward padding of at most one page beside a read tensor, no window extends past the mapped file, and every byte a
+  window covers is either read or counted in `wrapped_unread`. The brief's "a window or a position must never wrap
+  around the ring or file" is not a rule in 05. The only never-wrap statements in the mac documents concern GGUF bytes
+  mapped as Metal no-copy buffers ([02](02-architecture.md), section 5.3; 05, section 6). The position rings of 04 (the
+  two-slot WindowParams ring, the sampler history ring) are outside U4. The tiered no-GGUF rule (section 6, rule 2) is
+  not verified on the host (D-IMPL-858).
+- **Reason:** Section 6 is the only text that states the never-wrap conditions, so the tests use its wording and
+  boundaries and nothing else.
+- **Review required:** The owner of 05 should confirm that no ring-position rule was intended for U4.
+
+### D-IMPL-851: `verify_window_never_wrap` is the one verifier, and the loader returns its result
+
+- **Decision:** `verify_window_never_wrap` (`src/metal/engine/window_plan.cpp`, declared in
+  `include/strata/metal/window_plan.hpp`) holds the never-wrap checks. `validate_ple_window_exclusion` in
+  `src/metal/engine/window_storage.cpp` keeps its GGUF checks (the PLE tensor's location and its absence from sources and
+  slices) and returns the verifier's result in place of its own overlap loop. The verifier also checks the union on
+  every file, so the loader refuses any plan whose union differs from `wrapped_unread_bytes`.
+- **Reason:** The device-free tests and the loader must apply the same rule. The old loop bounded only the overlap size,
+  so it accepted a window with PLE bytes and no read tensor in their page, and it did not check the union.
+- **Review required:** None beyond the Metal runs, which pass with the change.
+
+### D-IMPL-852: The PLE padding rule reads "shares that page" literally
+
+- **Decision:** A window may overlap an excluded PLE payload only as padding. The overlap is at most `kWindowPageBytes`,
+  inclusive. If it covers the payload's first byte, a read tensor must end before the payload in the same 16 KiB page.
+  If it covers the payload's last byte, a read tensor must start after the payload in the same page. A window strictly
+  inside a payload is rejected. A payload that fits in one page shared by reads on both sides is accepted.
+- **Reason:** 05 section 6, rule 1: "outward page alignment may cover up to 16 KiB of its edge when the preceding or
+  following read tensor shares that page". A padding window with no read beside it is not outward alignment of a read.
+- **Review required:** The owner of 05 should confirm this reading, in particular that a read ending exactly on a page
+  boundary does not allow padding into the next page.
+
+### D-IMPL-853: The planner still merges across a short PLE gap, and the verifier rejects the plan
+
+- **Decision:** `plan_windows` is unchanged. It still merges neighbours closer than 256 MiB, including a PLE payload
+  between them. The verifier rejects that plan, and the loader fails closed with "more than one PLE boundary page", as
+  the existing `metal_window_storage_test` bridge case expects.
+- **Reason:** Splitting at the PLE would make that bridge plan valid and change its documented expectation. Real PLE
+  gaps are above 26 GiB ([05](05-memory-and-residency.md), section 4.2), so the case arises only in synthetic layouts.
+  `--plan-only` would still count the PLE bytes as unread for such a layout.
+- **Review required:** Decide whether the planner should split at the PLE, so that the PLAN line never reports a plan
+  that the loader rejects.
+
+### D-IMPL-854: The union counts overlapping windows once
+
+- **Decision:** The union check is the merged union of each file's windows, minus its included tensor bytes, summed over
+  files, which must equal `wrapped_unread_bytes`. An identical duplicate window adds nothing. For planner output the
+  planner's per-group value equals this union, because groups are at least 256 MiB apart and their spans do not overlap.
+- **Reason:** 05 section 6, rule 3: "the union counts those bytes once".
+- **Review required:** None.
+
+### D-IMPL-855: Exact fit is the window end at the read's page-rounded end, and the page limit is inclusive
+
+- **Decision:** For a read tensor beside a PLE payload, exact fit is a window that ends at the page-rounded end of the
+  read. One page more is one over and is rejected. The limit is inclusive, but outward rounding never produces exactly
+  16 KiB of PLE, because the overlap is at most 16 KiB minus one byte. The tests therefore use the rounded-end fit and
+  one page over, and the planner cannot produce an exact 16 KiB overlap.
+- **Reason:** 05 section 4.2 defines a window end by rounding out, and section 6 gives the limit as "up to 16 KiB".
+- **Review required:** None.
+
+### D-IMPL-856: The new host tests are `metal_never_wrap_host_test` and `metal_window_offset_test`
+
+- **Decision:** Two host-labelled tests are registered in `cmake/metal/tests.cmake`, documented in 09 section 9.1, and
+  listed in `tests/metal/test_map.json` without a `planned` key. `metal_never_wrap_host_test` covers the U4 boundary
+  cases and the verifier. `metal_window_offset_test` covers the U3 offsets and tables at full shape. The Metal
+  `metal_never_wrap_test` and `metal_tiered_copy_test` remain the gate for the live loader.
+- **Reason:** The spec's test names are Metal-labelled. The host halves get their own names so that the labels in the
+  map stay true, as D-IMPL-830 did for the watchdog and dump tests.
+- **Review required:** The owner of 09 should confirm the host and Metal split.
+
+### D-IMPL-857: U3's host arithmetic needs no new production code
+
+- **Decision:** `build_full_mode_layout`, `order_full_mode_warm_experts` and `plan_windows` already implement the spec's
+  formulas: window offset `file_offset - window.start`, GPU address `window.gpuAddress + offset`, expert table index
+  `(l * n_expert + e) * 3 + role`, resident entry `l * n_expert + e`, unused tail zero, and table sizes of 590 KB and 96 KiB
+  at full capacity. This change adds tests only. They check the arithmetic at the full 48 x 512 x 3 shape, against a
+  sparse file and against hand-computed indices.
+- **Reason:** The brief asks for code only where the spec gives an exact formula that is missing. For U3 the formulas
+  were implemented and tested only at 2 and 256 experts.
+- **Review required:** None.
+
+### D-IMPL-858: Sparse-file markers are sampled, and the tiered and warm-up parts stay Metal-side
+
+- **Decision:** `metal_window_offset_test` writes 4-byte markers only at sampled slabs (each window's first and last slab,
+  and every 9973rd slab), so the 1.125 GiB sparse file allocates a few blocks. It checks every slab's table entry against
+  its window base and offset, and reads the sampled markers at the position the table entry implies. The tiered no-GGUF
+  assertion needs the tiered loader (U5) and stays in `metal_tiered_copy_test`. The warm-up wave barrier and the 64 MiB
+  chunk partition live in `window_storage.cpp`, on the Metal side, and are not extracted for host tests.
+- **Reason:** Writing every slab would allocate about 300 MB of blocks for a check that needs a few positions. There is
+  no host object for tiered storage before U5.
+- **Review required:** None.
+

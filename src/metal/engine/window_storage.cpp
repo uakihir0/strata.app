@@ -504,17 +504,8 @@ bool validate_ple_window_exclusion(const strata::GgufModel& model,
         }
     }
 
-    const FileWindowPlan& ple_plan = plan.files[ple_shard];
-    for (const FileWindow& window : ple_plan.windows) {
-        const std::uint64_t overlap_start = std::max(window.start, ple_start);
-        const std::uint64_t overlap_end = std::min(window.end, ple_end);
-        if (overlap_end > overlap_start &&
-            overlap_end - overlap_start > kWindowPageBytes) {
-            error = file.path() + ": a full-mode window overlaps more than one PLE boundary page";
-            return false;
-        }
-    }
-    return true;
+    // Overlap, padding, and union rules are shared with the device-free tests.
+    return verify_window_never_wrap(sources, plan, error);
 }
 
 std::string window_label(const WindowFileSource& source, std::size_t index) {
