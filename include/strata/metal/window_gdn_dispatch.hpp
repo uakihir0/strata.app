@@ -14,6 +14,7 @@
 namespace strata::metal {
 
 class Encoder;
+class KvStore;
 
 struct WindowGDNBlockBuffers {
     BufferRef mixed;
@@ -159,6 +160,28 @@ bool encode_window_accepted_prefix_state_commit(
 /// Standalone transactional form; failure discards the complete state commit.
 bool encode_window_accepted_prefix_state_commit(
     Context& context, CommandBuffer& command_buffer, std::uint32_t rows,
+    const WindowAcceptedPrefixStateCommitBuffers& buffers,
+    std::string& error);
+
+/// Execute a complete accepted-prefix GPU state commit and advance the
+/// session-owned PLE token suffix only after the command buffer completes
+/// successfully. `window_tokens` contains the candidate Window rows;
+/// `accepted_count` selects the prefix replayed by the supplied buffers.
+/// The token IDs, GDN/PLE replay views, QSA replay rows, and QSA append steps
+/// must all describe the same speculative Window. The helper cannot infer
+/// that provenance from raw buffer views. QSA persistent views must belong to
+/// `qsa_store`. A zero-length prefix is rejected because the current QSA
+/// snapshots do not preserve every value a speculative append can overwrite;
+/// the caller must discard and recreate the sequence state after rejection.
+/// If a submitted GPU commit reports an execution failure, discard and
+/// recreate both session and KV state before retrying because writes may have
+/// partially completed.
+/// Callers must serialize this operation with Window preparation and session
+/// reset for the same sequence.
+bool commit_window_accepted_prefix_state(
+    Context& context, SessionStateStorage& session, const KvStore& qsa_store,
+    std::span<const std::uint32_t> window_tokens,
+    std::size_t accepted_count, const Geometry& geometry,
     const WindowAcceptedPrefixStateCommitBuffers& buffers,
     std::string& error);
 

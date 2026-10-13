@@ -2,6 +2,7 @@
 #include "strata/metal/window_gdn_dispatch.hpp"
 
 #include "strata/metal/encoder.hpp"
+#include "strata/metal/kv.hpp"
 #include "strata/metal/window_params.hpp"
 #include "strata/metal/window_scratch.hpp"
 
@@ -637,6 +638,132 @@ bool encode_window_accepted_prefix_state_commit(
                 context, encoder, rows, buffers, encode_error);
         },
         error);
+}
+
+bool commit_window_accepted_prefix_state(
+    Context& context, SessionStateStorage& session, const KvStore& qsa_store,
+    std::span<const std::uint32_t> window_tokens,
+    std::size_t accepted_count, const Geometry& geometry,
+    const WindowAcceptedPrefixStateCommitBuffers& buffers,
+    std::string& error) {
+    error.clear();
+    if (window_tokens.empty() || window_tokens.size() > kWindowScratchTokenRows ||
+        accepted_count > window_tokens.size()) {
+        error =
+            "Window accepted-prefix commit requires 1..8 candidate tokens and a prefix within that window";
+        return false;
+    }
+
+    // Validate session initialization, geometry and every candidate token
+    // before encoding mutable GPU state. The suffix is advanced only after
+    // successful GPU completion below.
+    WindowPleRows validated_rows;
+    if (!session.build_ple_rows(window_tokens, geometry, validated_rows, error)) {
+        return false;
+    }
+
+    if (buffers.gdn_ple.gdn.states.size() != kSessionGdnLayers) {
+        error =
+            "Window accepted-prefix commit requires the supplied session's 36 GDN state views";
+        return false;
+    }
+    const auto same_view = [](BufferRef left, BufferRef right) {
+        return left && right && left.handle == right.handle &&
+               left.contents == right.contents &&
+               left.gpu_address == right.gpu_address &&
+               left.length == right.length && left.offset == right.offset;
+    };
+    for (std::uint32_t ordinal = 0u; ordinal < kSessionGdnLayers; ++ordinal) {
+        GdnSessionStateViews expected;
+        if (!session.gdn_layer(ordinal, expected, error)) return false;
+        const GdnSessionStateViews& supplied =
+            buffers.gdn_ple.gdn.states[ordinal];
+        if (!same_view(supplied.recurrent, expected.recurrent) ||
+            !same_view(supplied.conv_history, expected.conv_history)) {
+            error =
+                "Window accepted-prefix GDN views do not belong to the supplied SessionStateStorage";
+            return false;
+        }
+    }
+    if (!same_view(buffers.gdn_ple.ple.history, session.ple_history())) {
+        error =
+            "Window accepted-prefix PLE history does not belong to the supplied SessionStateStorage";
+        return false;
+    }
+
+    if (qsa_store.layout().cell_capacity != buffers.qsa_cell_capacity ||
+        buffers.qsa_indexers.size() != kSessionQsaLayers) {
+        error =
+            "Window accepted-prefix QSA views require the supplied store capacity and all 12 layers";
+        return false;
+    }
+    const std::size_t tail_snapshot_bytes =
+        kSessionQsaLayers * 3u *
+        static_cast<std::size_t>(INDEXER_HEAD_DIM) * sizeof(float);
+    const std::size_t block_pos_snapshot_bytes =
+        kSessionQsaLayers * sizeof(std::int32_t);
+    BufferRef expected_tail_snapshot;
+    BufferRef expected_block_pos_snapshot;
+    for (std::uint32_t ordinal = 0u; ordinal < kSessionQsaLayers; ++ordinal) {
+        QsaKvLayerViews expected;
+        if (!qsa_store.layer(ordinal, expected, error)) return false;
+        const QsaIndexerAppendBuffers& supplied =
+            buffers.qsa_indexers[ordinal];
+        if (!context.buffers().owns(expected.indexer_tail) ||
+            !context.buffers().owns(expected.indexer_dead) ||
+            !context.buffers().owns(expected.indexer_pooled) ||
+            !context.buffers().owns(expected.indexer_block_pos) ||
+            !same_view(supplied.tail, expected.indexer_tail) ||
+            !same_view(supplied.dead, expected.indexer_dead) ||
+            !same_view(supplied.pooled, expected.indexer_pooled) ||
+            !same_view(supplied.block_position, expected.indexer_block_pos)) {
+            error =
+                "Window accepted-prefix QSA views do not belong to the supplied KvStore";
+            return false;
+        }
+        if (ordinal == 0u) {
+            expected_tail_snapshot = supplied.tail_snapshot;
+            expected_block_pos_snapshot = supplied.block_pos_snapshot;
+        } else if (!same_view(supplied.tail_snapshot,
+                              expected_tail_snapshot) ||
+                   !same_view(supplied.block_pos_snapshot,
+                              expected_block_pos_snapshot)) {
+            error =
+                "Window accepted-prefix QSA layers must share the same packed snapshots";
+            return false;
+        }
+    }
+    if (!context.buffers().owns(expected_tail_snapshot) ||
+        expected_tail_snapshot.contents == nullptr ||
+        expected_tail_snapshot.length < tail_snapshot_bytes ||
+        !context.buffers().owns(expected_block_pos_snapshot) ||
+        expected_block_pos_snapshot.contents == nullptr ||
+        expected_block_pos_snapshot.length < block_pos_snapshot_bytes) {
+        error =
+            "Window accepted-prefix QSA rollback snapshots are missing or undersized";
+        return false;
+    }
+    if (accepted_count == 0u) {
+        error =
+            "zero accepted tokens cannot be finalized with the current QSA snapshots; discard and recreate the sequence state";
+        return false;
+    }
+
+    auto command_buffer =
+        context.make_command_buffer("Window accepted-prefix state commit", error);
+    if (!command_buffer) return false;
+    if (!session.track_use(*command_buffer, error)) return false;
+    if (!encode_window_accepted_prefix_state_commit(
+            context, *command_buffer, static_cast<std::uint32_t>(accepted_count),
+            buffers, error)) {
+        return false;
+    }
+    if (!command_buffer->commit(error) ||
+        !command_buffer->wait_until_completed(error)) {
+        return false;
+    }
+    return session.commit_accepted_ple_tokens(window_tokens, accepted_count,
+                                              geometry, error);
 }
 
 namespace {

@@ -10,6 +10,7 @@
 #include "strata/metal/context.hpp"
 #include "strata/metal/encoder.hpp"
 #include "strata/metal/gdn_dispatch.hpp"
+#include "strata/metal/kv.hpp"
 #include "strata/metal/moe_dispatch.hpp"
 #include "strata/metal/session_state.hpp"
 #include "strata/metal/mv_dispatch.hpp"
@@ -5420,6 +5421,32 @@ bool test_window_gdn_commit_batch(Context& context) {
     auto state_storage = SessionStateStorage::open(context, geometry, error);
     check(state_storage != nullptr, "open batch GDN session state", error);
     if (!state_storage) return false;
+    auto qsa_storage =
+        KvStore::open(context, qsa_cell_capacity, KvFormat::Fp16, error);
+    check(qsa_storage != nullptr, "open accepted-prefix QSA KV store", error);
+    if (!qsa_storage) return false;
+    std::array<QsaKvLayerViews, kSessionQsaLayers> qsa_store_layers{};
+    for (std::uint32_t layer = 0u; layer < kSessionQsaLayers; ++layer) {
+        if (!qsa_storage->layer(layer, qsa_store_layers[layer], error)) {
+            check(false, "resolve accepted-prefix QSA KV layer", error);
+            return false;
+        }
+    }
+    const QsaKvLayout& qsa_layout = qsa_storage->layout();
+    const BufferRef qsa_allocation = qsa_storage->allocation();
+    const std::size_t qsa_tail_stride_bytes =
+        qsa_layout.layers[1].indexer_tail.offset -
+        qsa_layout.layers[0].indexer_tail.offset;
+    const std::size_t qsa_block_pos_stride_bytes =
+        qsa_layout.layers[1].indexer_block_pos.offset -
+        qsa_layout.layers[0].indexer_block_pos.offset;
+    const BufferRef qsa_snapshot_tails = qsa_allocation.slice(
+        qsa_layout.layers[0].indexer_tail.offset,
+        (kSessionQsaLayers - 1u) * qsa_tail_stride_bytes + qsa_tail_bytes);
+    const BufferRef qsa_snapshot_block_positions = qsa_allocation.slice(
+        qsa_layout.layers[0].indexer_block_pos.offset,
+        (kSessionQsaLayers - 1u) * qsa_block_pos_stride_bytes +
+            sizeof(std::int32_t));
 
     auto allocate = [&](const std::string& name, std::size_t bytes) {
         BufferRef view = context.buffers().allocate(name, bytes, error);
@@ -5452,18 +5479,6 @@ bool test_window_gdn_commit_batch(Context& context) {
     const BufferRef qsa_gamma_storage = allocate(
         "accepted-prefix QSA gamma",
         kSessionQsaLayers * qsa_gamma_layer_bytes);
-    const BufferRef qsa_tails =
-        allocate("accepted-prefix QSA tails",
-                 kSessionQsaLayers * qsa_tail_bytes);
-    const BufferRef qsa_dead =
-        allocate("accepted-prefix QSA dead keys",
-                 kSessionQsaLayers * qsa_dead_bytes);
-    const BufferRef qsa_pooled =
-        allocate("accepted-prefix QSA pooled keys",
-                 kSessionQsaLayers * qsa_pooled_bytes);
-    const BufferRef qsa_block_positions =
-        allocate("accepted-prefix QSA block positions",
-                 kSessionQsaLayers * sizeof(std::int32_t));
     const BufferRef qsa_steps =
         allocate("accepted-prefix QSA StepRows",
                  qsa_window_rows * sizeof(StepRow));
@@ -5477,9 +5492,12 @@ bool test_window_gdn_commit_batch(Context& context) {
                  kSessionQsaLayers * sizeof(std::int32_t));
     if (!qkv_replay || !h_replay || !gate_replay || !beta_replay || !z ||
         !output_scratch || !ple_norm || !ple_history || !gamma_storage ||
-        !qsa_raw_storage || !qsa_gamma_storage || !qsa_tails || !qsa_dead ||
-        !qsa_pooled || !qsa_block_positions || !qsa_steps || !qsa_rope ||
-        !qsa_tail_snapshot || !qsa_block_pos_snapshot) {
+        !qsa_raw_storage || !qsa_gamma_storage || !qsa_steps || !qsa_rope ||
+        !qsa_tail_snapshot || !qsa_block_pos_snapshot ||
+        !qsa_snapshot_tails || !qsa_snapshot_block_positions ||
+        qsa_layout.cell_capacity != qsa_cell_capacity ||
+        qsa_tail_stride_bytes % sizeof(float) != 0u ||
+        qsa_block_pos_stride_bytes % sizeof(std::int32_t) != 0u) {
         return false;
     }
 
@@ -5654,23 +5672,13 @@ bool test_window_gdn_commit_batch(Context& context) {
             static_cast<std::size_t>(layer) * qsa_raw_layer_bytes;
         const std::size_t gamma_offset =
             static_cast<std::size_t>(layer) * qsa_gamma_layer_bytes;
-        const std::size_t tail_offset =
-            static_cast<std::size_t>(layer) * qsa_tail_bytes;
-        const std::size_t dead_offset =
-            static_cast<std::size_t>(layer) * qsa_dead_bytes;
-        const std::size_t pooled_offset =
-            static_cast<std::size_t>(layer) * qsa_pooled_bytes;
-        const std::size_t block_pos_offset =
-            static_cast<std::size_t>(layer) * sizeof(std::int32_t);
-        std::memcpy(static_cast<std::byte*>(qsa_tails.contents) + tail_offset,
+        std::memcpy(qsa_store_layers[layer].indexer_tail.contents,
                     initial.tail.data(), qsa_tail_bytes);
-        std::memcpy(static_cast<std::byte*>(qsa_dead.contents) + dead_offset,
+        std::memcpy(qsa_store_layers[layer].indexer_dead.contents,
                     initial.dead.data(), qsa_dead_bytes);
-        std::memcpy(static_cast<std::byte*>(qsa_pooled.contents) +
-                        pooled_offset,
+        std::memcpy(qsa_store_layers[layer].indexer_pooled.contents,
                     initial.pooled.data(), qsa_pooled_bytes);
-        std::memcpy(static_cast<std::byte*>(qsa_block_positions.contents) +
-                        block_pos_offset,
+        std::memcpy(qsa_store_layers[layer].indexer_block_pos.contents,
                     &initial.block_position, sizeof(std::int32_t));
 
         qsa_raw_keys[layer].resize(
@@ -5713,11 +5721,10 @@ bool test_window_gdn_commit_batch(Context& context) {
             qsa_steps,
             qsa_gamma_storage.slice(gamma_offset, qsa_gamma_layer_bytes),
             qsa_rope,
-            qsa_tails.slice(tail_offset, qsa_tail_bytes),
-            qsa_dead.slice(dead_offset, qsa_dead_bytes),
-            qsa_pooled.slice(pooled_offset, qsa_pooled_bytes),
-            qsa_block_positions.slice(block_pos_offset,
-                                      sizeof(std::int32_t)),
+            qsa_store_layers[layer].indexer_tail,
+            qsa_store_layers[layer].indexer_dead,
+            qsa_store_layers[layer].indexer_pooled,
+            qsa_store_layers[layer].indexer_block_pos,
             qsa_tail_snapshot,
             qsa_block_pos_snapshot,
         };
@@ -5738,8 +5745,8 @@ bool test_window_gdn_commit_batch(Context& context) {
     const bool qsa_rejected_tail_pool_is_stale =
         qsa_after_window[0].pooled[0] != qsa_initial[0].pooled[0];
     const QsaIndexerSnapshotBuffers qsa_snapshot_buffers{
-        qsa_tails, qsa_block_positions, qsa_tail_snapshot,
-        qsa_block_pos_snapshot};
+        qsa_snapshot_tails, qsa_snapshot_block_positions,
+        qsa_tail_snapshot, qsa_block_pos_snapshot};
     const bool qsa_window_prepared = run_command(
         context, "Window state-commit QSA snapshot and speculative append",
         [&](CommandBuffer& command, std::string& command_error) {
@@ -5747,7 +5754,10 @@ bool test_window_gdn_commit_batch(Context& context) {
                 context, command, "QSA snapshot and speculative append",
                 [&](Encoder& encoder, std::string& encode_error) {
                     if (!encode_qsa_indexer_snapshot(
-                            context, encoder, qsa_tail_floats, 1u,
+                            context, encoder,
+                            qsa_tail_stride_bytes / sizeof(float),
+                            qsa_block_pos_stride_bytes /
+                                sizeof(std::int32_t),
                             qsa_snapshot_buffers, encode_error)) {
                         return false;
                     }
@@ -5771,31 +5781,59 @@ bool test_window_gdn_commit_batch(Context& context) {
           "prepare speculative QSA indexer state for composite commit", error);
     if (!qsa_window_prepared) return false;
 
-    const std::vector<std::byte> qsa_before_commit_tails(
-        static_cast<const std::byte*>(qsa_tails.contents),
-        static_cast<const std::byte*>(qsa_tails.contents) + qsa_tails.length);
-    const std::vector<std::byte> qsa_before_commit_dead(
-        static_cast<const std::byte*>(qsa_dead.contents),
-        static_cast<const std::byte*>(qsa_dead.contents) + qsa_dead.length);
-    const std::vector<std::byte> qsa_before_commit_pooled(
-        static_cast<const std::byte*>(qsa_pooled.contents),
-        static_cast<const std::byte*>(qsa_pooled.contents) +
-            qsa_pooled.length);
-    const std::vector<std::byte> qsa_before_commit_block_positions(
-        static_cast<const std::byte*>(qsa_block_positions.contents),
-        static_cast<const std::byte*>(qsa_block_positions.contents) +
-            qsa_block_positions.length);
+    const auto concatenate_qsa_state = [&](auto select, std::size_t bytes) {
+        std::vector<std::byte> result;
+        result.reserve(kSessionQsaLayers * bytes);
+        for (const QsaIndexerAppendBuffers& layer : qsa_layers) {
+            const BufferRef view = select(layer);
+            const auto* first = static_cast<const std::byte*>(view.contents);
+            result.insert(result.end(), first, first + bytes);
+        }
+        return result;
+    };
+    const std::vector<std::byte> qsa_before_commit_tails =
+        concatenate_qsa_state(
+            [](const QsaIndexerAppendBuffers& layer) { return layer.tail; },
+            qsa_tail_bytes);
+    const std::vector<std::byte> qsa_before_commit_dead =
+        concatenate_qsa_state(
+            [](const QsaIndexerAppendBuffers& layer) { return layer.dead; },
+            qsa_dead_bytes);
+    const std::vector<std::byte> qsa_before_commit_pooled =
+        concatenate_qsa_state(
+            [](const QsaIndexerAppendBuffers& layer) { return layer.pooled; },
+            qsa_pooled_bytes);
+    const std::vector<std::byte> qsa_before_commit_block_positions =
+        concatenate_qsa_state(
+            [](const QsaIndexerAppendBuffers& layer) {
+                return layer.block_position;
+            },
+            sizeof(std::int32_t));
     auto qsa_state_matches_before_commit = [&] {
-        return std::memcmp(qsa_tails.contents, qsa_before_commit_tails.data(),
-                           qsa_tails.length) == 0 &&
-               std::memcmp(qsa_dead.contents, qsa_before_commit_dead.data(),
-                           qsa_dead.length) == 0 &&
-               std::memcmp(qsa_pooled.contents,
-                           qsa_before_commit_pooled.data(),
-                           qsa_pooled.length) == 0 &&
-               std::memcmp(qsa_block_positions.contents,
-                           qsa_before_commit_block_positions.data(),
-                           qsa_block_positions.length) == 0;
+        for (std::size_t layer = 0u; layer < kSessionQsaLayers; ++layer) {
+            const std::size_t tail_offset = layer * qsa_tail_bytes;
+            const std::size_t dead_offset = layer * qsa_dead_bytes;
+            const std::size_t pooled_offset = layer * qsa_pooled_bytes;
+            const std::size_t block_pos_offset =
+                layer * sizeof(std::int32_t);
+            if (std::memcmp(qsa_layers[layer].tail.contents,
+                            qsa_before_commit_tails.data() + tail_offset,
+                            qsa_tail_bytes) != 0 ||
+                std::memcmp(qsa_layers[layer].dead.contents,
+                            qsa_before_commit_dead.data() + dead_offset,
+                            qsa_dead_bytes) != 0 ||
+                std::memcmp(qsa_layers[layer].pooled.contents,
+                            qsa_before_commit_pooled.data() + pooled_offset,
+                            qsa_pooled_bytes) != 0 ||
+                std::memcmp(
+                    qsa_layers[layer].block_position.contents,
+                    qsa_before_commit_block_positions.data() +
+                        block_pos_offset,
+                    sizeof(std::int32_t)) != 0) {
+                return false;
+            }
+        }
+        return true;
     };
     WindowAcceptedPrefixStateCommitBuffers combined_buffers{
         gdn_ple_buffers, std::span<const QsaIndexerAppendBuffers>(qsa_layers),
@@ -6060,17 +6098,152 @@ bool test_window_gdn_commit_batch(Context& context) {
         passed &= rolled_back;
     }
 
-    const bool committed = run_command(
-        context, "Window GDN/PLE/QSA accepted-prefix commit",
-        [&](CommandBuffer& command, std::string& command_error) {
-            return encode_window_accepted_prefix_state_commit(
-                context, command, rows, combined_buffers, command_error);
-        },
-        error);
+    const std::array<std::uint32_t, 2> initial_ple_tokens{77u, 78u};
+    const bool history_initialized = state_storage->initialize_ple_token_ids(
+        initial_ple_tokens, geometry, error);
+    check(history_initialized,
+          "initialize session PLE token suffix before commit", error);
+    passed &= history_initialized;
+    if (!history_initialized) return false;
+
+    const std::array<std::uint32_t, 3> speculative_tokens{101u, 102u, 103u};
+    const auto ple_suffix_is = [&](std::span<const std::uint32_t> expected) {
+        const auto actual = state_storage->ple_token_id_suffix();
+        return actual.size() == expected.size() &&
+               std::equal(actual.begin(), actual.end(), expected.begin());
+    };
+    const SessionStateLayout& session_layout = state_storage->layout();
+    const BufferRef foreign_recurrent = allocate(
+        "foreign session recurrent state",
+        session_layout.gdn[0].recurrent.bytes);
+    const BufferRef foreign_conv_history = allocate(
+        "foreign session convolution history",
+        session_layout.gdn[0].conv_history.bytes);
+    const BufferRef foreign_ple_history = allocate(
+        "foreign session PLE history", session_layout.ple_history.bytes);
+    if (!foreign_recurrent || !foreign_conv_history || !foreign_ple_history) {
+        return false;
+    }
+    std::memset(foreign_recurrent.contents, 0x3c, foreign_recurrent.length);
+    std::memset(foreign_conv_history.contents, 0x3c,
+                foreign_conv_history.length);
+    std::memset(foreign_ple_history.contents, 0x3c,
+                foreign_ple_history.length);
+    const auto foreign_buffers_unchanged = [&] {
+        const auto has_pattern = [](BufferRef view) {
+            const auto* bytes = static_cast<const unsigned char*>(view.contents);
+            return std::all_of(bytes, bytes + view.length,
+                               [](unsigned char value) {
+                                   return value == 0x3cu;
+                               });
+        };
+        return has_pattern(foreign_recurrent) &&
+               has_pattern(foreign_conv_history) &&
+               has_pattern(foreign_ple_history);
+    };
+    {
+        auto foreign_states = states;
+        foreign_states[0] = {foreign_recurrent, foreign_conv_history};
+        WindowAcceptedPrefixStateCommitBuffers invalid = combined_buffers;
+        invalid.gdn_ple.gdn.states =
+            std::span<const GdnSessionStateViews>(foreign_states);
+        const bool accepted = commit_window_accepted_prefix_state(
+            context, *state_storage, *qsa_storage, speculative_tokens, rows,
+            geometry, invalid, error);
+        const bool rejected = !accepted &&
+            error.find("do not belong to the supplied SessionStateStorage") !=
+                std::string::npos &&
+            ple_suffix_is(initial_ple_tokens) && state_and_history_unchanged() &&
+            qsa_state_matches_before_commit() && foreign_buffers_unchanged();
+        check(rejected,
+              "accepted-prefix finalizer rejects foreign GDN session views",
+              error);
+        passed &= rejected;
+    }
+    {
+        WindowAcceptedPrefixStateCommitBuffers invalid = combined_buffers;
+        invalid.gdn_ple.ple.history = foreign_ple_history;
+        const bool accepted = commit_window_accepted_prefix_state(
+            context, *state_storage, *qsa_storage, speculative_tokens, rows,
+            geometry, invalid, error);
+        const bool rejected = !accepted &&
+            error.find("does not belong to the supplied SessionStateStorage") !=
+                std::string::npos &&
+            ple_suffix_is(initial_ple_tokens) && state_and_history_unchanged() &&
+            qsa_state_matches_before_commit() && foreign_buffers_unchanged();
+        check(rejected,
+              "accepted-prefix finalizer rejects foreign PLE session history",
+              error);
+        passed &= rejected;
+    }
+    auto foreign_qsa_storage =
+        KvStore::open(context, qsa_cell_capacity, KvFormat::Fp16, error);
+    check(foreign_qsa_storage != nullptr,
+          "open a second QSA store for view-owner rejection", error);
+    if (!foreign_qsa_storage) return false;
+    {
+        const bool accepted = commit_window_accepted_prefix_state(
+            context, *state_storage, *foreign_qsa_storage, speculative_tokens,
+            rows, geometry, combined_buffers, error);
+        const bool rejected = !accepted &&
+            error.find("do not belong to the supplied KvStore") !=
+                std::string::npos &&
+            ple_suffix_is(initial_ple_tokens) && state_and_history_unchanged() &&
+            qsa_state_matches_before_commit();
+        check(rejected,
+              "accepted-prefix finalizer rejects foreign QSA KV views", error);
+        passed &= rejected;
+    }
+
+    const bool zero_accepted = commit_window_accepted_prefix_state(
+        context, *state_storage, *qsa_storage, speculative_tokens, 0u,
+        geometry, combined_buffers, error);
+    const bool zero_is_rejected = !zero_accepted &&
+        error.find("zero accepted tokens cannot be finalized") !=
+            std::string::npos &&
+        ple_suffix_is(initial_ple_tokens) && state_and_history_unchanged() &&
+        qsa_state_matches_before_commit();
+    check(zero_is_rejected,
+          "zero accepted tokens fail closed until speculative QSA state is discarded",
+          error);
+    passed &= zero_is_rejected;
+    if (!zero_is_rejected) return false;
+
+    {
+        auto short_qsa = qsa_layers;
+        short_qsa.back().raw_keys = short_qsa.back().raw_keys.slice(
+            0u, static_cast<std::size_t>(rows) * INDEXER_HEAD_DIM *
+                    sizeof(float) -
+                sizeof(float));
+        WindowAcceptedPrefixStateCommitBuffers invalid = combined_buffers;
+        invalid.qsa_indexers =
+            std::span<const QsaIndexerAppendBuffers>(short_qsa);
+        const bool accepted = commit_window_accepted_prefix_state(
+            context, *state_storage, *qsa_storage, speculative_tokens, rows,
+            geometry, invalid, error);
+        const bool rejected = !accepted &&
+            error.find("undersized or misaligned") != std::string::npos &&
+            ple_suffix_is(initial_ple_tokens) && state_and_history_unchanged() &&
+            qsa_state_matches_before_commit();
+        check(rejected,
+              "late GPU validation failure preserves GPU state and PLE token suffix",
+              error);
+        passed &= rejected;
+    }
+
+    const bool committed = commit_window_accepted_prefix_state(
+        context, *state_storage, *qsa_storage, speculative_tokens, rows,
+        geometry, combined_buffers, error);
     check(committed,
-          "encode and complete GDN/PLE/QSA accepted-prefix state", error);
+          "complete GDN/PLE/QSA accepted-prefix commit and host finalization",
+          error);
     passed &= committed;
     if (!committed) return false;
+    const std::array<std::uint32_t, 2> expected_ple_suffix{101u, 102u};
+    const bool host_history_committed = ple_suffix_is(expected_ple_suffix);
+    check(host_history_committed,
+          "advance session PLE token suffix from the accepted prefix only");
+    passed &= host_history_committed;
 
     bool histories_match = true;
     bool states_match = true;
