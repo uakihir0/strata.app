@@ -12802,6 +12802,35 @@ measuring L-15 remain open.
   finalizing this review entry. All inputs are synthetic and this does not
   establish model parity or production inference.
 
+### D-IMPL-414: Compose the MTP draft-head and sampling tail
+
+- **Decision:** Add `encode_mtp_draft_tail` over caller-bound MTP stage-21
+  head and stage-22 sampler views. Before dispatch, require both stages to use
+  the exact same parameter slot, logits view and immutable vocabulary-map
+  token. Then encode Q8_1/head projection and greedy sampling in order. Provide
+  caller-owned `Encoder` and transactional `CommandBuffer` forms.
+- **Reason:** Stage 22 maps a selected logits row back to a full vocabulary
+  token, so its map must be the same validated map used to project stage 21.
+  Independently assembled buffers could otherwise sample logits using an
+  unrelated map, even when both individual encoders are valid. Checking
+  parameter/logits/map identity before dispatch makes that handoff explicit.
+  A sampler error discovered after stage 21 has encoded must propagate to the
+  enclosing transaction so neither stage is submitted. The compact Q5_K
+  fixture exercises this ordering without allocating the full model head.
+  Production scheduling, full-head execution and inspected-model parity
+  remain open.
+- **Review required:** See REV-210. Challenge exact range identity for params
+  and logits, map-token identity and metadata, shared head size/weight format,
+  canonical empty-map versus expired-map handling, stage order, pre-dispatch
+  refusal, late rollback, CMake linkage and the synthetic-only boundary.
+- **Validation:** `mac-dev` built the new engine source;
+  `metal_mtp_storage_test` passed 1/1, including mismatched-map refusal before
+  dispatch, expired-map rejection after backing-allocation rollback, and a
+  late greedy-sampler failure that discards stage 21 and preserves draft-tail
+  views. The full MTP CTest selection passed 28/28 after the review fix;
+  `test_map.py` and `git diff --check` passed. The hostile review is recorded
+  in REV-210.
+
 ### D-IMPL-413: Compose runtime-bound MTP full-layer stages 1–20
 
 - **Decision:** Add `encode_mtp_full_layer` as a T=1 coordinator over the
@@ -12890,6 +12919,32 @@ measuring L-15 remain open.
   stage-20 sample. The runtime-bound 8-byte head is rejected before dispatch
   for the real full-head extent. Final review and broader regression
   validation are recorded in REV-208.
+
+### REV-210: Hostile review of the MTP draft-tail coordinator
+
+- **Scope:** Review the stage-21/22 coordinator API and exact shared params,
+  logits and vocabulary-map identity; head size/format reuse; stage ordering;
+  empty-map versus expired-map handling; map mismatch refusal before dispatch;
+  late stage-22 sampler failure and whole-buffer rollback; CMake/test-map
+  registration; and synthetic versus production/model-parity claims.
+- **Findings:** The hostile reviewer found that if a map's backing view expired,
+  both copied map tokens could convert to false and `same_map` treated them as
+  the no-map full-head selection. For a subset head, that could return a
+  subset-row index as a full-vocabulary token. The reviewer also noted that
+  this record still said review and validation were pending after the suite had
+  passed.
+- **Disposition:** A missing map is now accepted only when it is the canonical
+  empty token (no rows, zero row count and zero full-head size). A token with
+  invalidated backing storage and retained map metadata is rejected before
+  dispatch. A regression fixture creates the token inside a buffer transaction,
+  lets rollback invalidate its backing view, then checks rejection, command
+  buffer discard and unchanged output views. The review-status record was
+  updated after verification. The reviewer found no other actionable issue
+  with stage order, shared views, rollback, build registration or synthetic
+  claims.
+- **Validation:** `mac-dev` rebuilt the changed source;
+  `metal_mtp_storage_test` passed 1/1 and the full MTP CTest selection passed
+  28/28 after the review fix. `test_map.py` and `git diff --check` passed.
 
 ### REV-209: Hostile review of the runtime-bound MTP full-layer coordinator
 
