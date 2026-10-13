@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -90,21 +91,56 @@ void test_logits_dump_layout(const std::string& dir) {
     const std::vector<float> logits = {0.5f, -1.0f, 2.0f, 3.5f, 4.0f,   //
                                        0.25f, 1.25f, -2.0f, 6.0f, 7.0f,  //
                                        8.0f, 9.0f, 10.0f, 11.0f, 12.0f};
-    check(write_logits_dump(path, 5, logits, error), "logits dump of 3 rows of 5 is written", error);
+    check(write_logits_dump(path, 5, 3, logits, error), "logits dump of 3 rows of 5 is written", error);
     const Bytes bytes = read_file(path);
     check(bytes.size() == 8 + 3 * 5 * 4, "logits dump is 8 + rows x n_vocab x 4 bytes", std::to_string(bytes.size()));
     check(int32_at(bytes, 0) == 5, "logits header holds n_vocab first");
-    check(int32_at(bytes, 4) == 3, "logits header holds the row count second");
+    check(int32_at(bytes, 4) == 3, "logits header holds the declared row count second");
     bool values_match = bytes.size() == 8 + logits.size() * 4;
     for (std::size_t i = 0; values_match && i < logits.size(); ++i) values_match = float_index(bytes, 8, i) == logits[i];
     check(values_match, "logits values follow the header as F32, row after row");
 
     error.clear();
-    check(!write_logits_dump(path, 0, logits, error) && !error.empty(), "a zero vocabulary is rejected");
+    check(!write_logits_dump(path, 0, 3, logits, error) && !error.empty(), "a zero vocabulary is rejected");
     error.clear();
-    check(!write_logits_dump(path, 4, logits, error) && !error.empty(), "a partial row is rejected");
+    // Three one-value rows fit the declared count, so only the vocabulary rule can reject them.
+    check(!write_logits_dump(path, 1, 3, std::vector<float> {1.0f, 2.0f, 3.0f}, error) && !error.empty(),
+          "a vocabulary of one is rejected");
     error.clear();
-    check(!write_logits_dump(path, 5, std::span<const float> {}, error) && !error.empty(), "no rows is rejected");
+    check(!write_logits_dump(path, 4, 3, logits, error) && !error.empty(), "a partial row is rejected");
+    error.clear();
+    check(!write_logits_dump(path, 5, 3, std::span<const float> {}, error) && !error.empty(), "no rows is rejected");
+    error.clear();
+    check(!write_logits_dump(path, 5, 0, logits, error) && !error.empty(), "a declared row count of zero is rejected");
+    error.clear();
+    check(!write_logits_dump(path, 5, 2, logits, error) && !error.empty(), "more rows than the declared count is rejected");
+    // tf_compare.py rejects NaN and infinity in the logits, so the writer does too.
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    for (const auto& [index, value] : {std::pair<std::size_t, float> {7, nan}, {14, inf}, {0, -inf}}) {
+        std::vector<float> bad = logits;
+        bad[index] = value;
+        error.clear();
+        check(!write_logits_dump(path, 5, 3, bad, error) && !error.empty(), "non-finite logits are rejected",
+              std::to_string(value));
+    }
+}
+
+// A prompt-path run writes fewer rows than the header declares (docs/mac/09, section 3.1). The header keeps the declared
+// count, and tf_compare.py takes the rows from the file size and the first position from declared minus rows.
+void test_short_logits_dump(const std::string& dir) {
+    const std::string path = dir + "/short.bin";
+    std::string error;
+    const std::vector<float> rows(36 * 5, 0.5f);
+    check(write_logits_dump(path, 5, 100, rows, error), "36 rows of a 100-row run are written", error);
+    const Bytes bytes = read_file(path);
+    check(bytes.size() == 8 + 36 * 5 * 4, "a short dump holds only the rows written", std::to_string(bytes.size()));
+    check(int32_at(bytes, 0) == 5, "a short dump's header holds n_vocab");
+    check(int32_at(bytes, 4) == 100, "a short dump's header holds the declared count, not the rows present");
+    const std::int64_t rows_on_disk = static_cast<std::int64_t>((bytes.size() - 8) / (4 * 5));
+    check(rows_on_disk == 36 && (bytes.size() - 8) % (4 * 5) == 0, "tf_compare reads 36 whole rows from the payload");
+    check(int32_at(bytes, 4) - rows_on_disk == 64, "the first row of a short dump is at position 64",
+          std::to_string(int32_at(bytes, 4) - rows_on_disk));
 }
 
 void test_first_logits_layout(const std::string& dir) {
@@ -117,6 +153,16 @@ void test_first_logits_layout(const std::string& dir) {
     check(float_index(bytes, 0, 0) == 1.0f && float_index(bytes, 0, 5) == 6.0f, "first-logits values start at byte 0");
     error.clear();
     check(!write_first_logits_dump(path, 5, row, error), "a row of the wrong length is rejected");
+    // Empty input is rejected even with n_vocab 0, where the length check alone would pass.
+    error.clear();
+    check(!write_first_logits_dump(path, 0, std::span<const float> {}, error) && !error.empty(),
+          "an empty first-logits dump with n_vocab 0 is rejected");
+    error.clear();
+    check(!write_first_logits_dump(path, 1, std::vector<float> {1.0f}, error) && !error.empty(),
+          "a first-logits vocabulary of one is rejected");
+    error.clear();
+    check(!write_first_logits_dump(path, 2, std::vector<float> {1.0f, std::numeric_limits<float>::quiet_NaN()}, error),
+          "non-finite first logits are rejected");
 }
 
 void test_residual_layout(const std::string& dir) {
@@ -152,6 +198,8 @@ void test_layers_layout(const std::string& dir) {
     error.clear();
     check(!write_layers_dump(path, std::span<const float>(ladder.data(), position_floats - 1), error),
           "a truncated position is rejected");
+    error.clear();
+    check(!write_layers_dump(path, std::span<const float> {}, error) && !error.empty(), "an empty ladder is rejected");
 }
 
 // Section 9.2: where each slice of a layer sits in the 13,840 floats.
@@ -244,6 +292,31 @@ void test_half_layer_offsets(const std::string& dir) {
     error.clear();
     check(!pack_half_layer(short_attention, qsa, error), "an attention block of the wrong width is rejected");
 
+    // A V pool with no other QSA slice is a QSA layer that cannot be written, so it is rejected rather than dropped.
+    HalfLayer pool_only = gdn_layer;
+    pool_only.qsa_v_pool = v_pool;
+    error.clear();
+    check(!pack_half_layer(pool_only, qsa, error) && !error.empty(), "a V pool alone is rejected, not dropped");
+
+    // The QSA slice lengths are checked, including the 511-float kcur and the 255-float V pool.
+    const std::vector<float> kcur_511(511, 1.0f);
+    HalfLayer short_kcur = qsa_layer;
+    short_kcur.qsa_kcur = kcur_511;
+    error.clear();
+    check(!pack_half_layer(short_kcur, qsa, error) && !error.empty(), "a 511-float kcur slice is rejected");
+    const std::vector<float> pool_255(255, 1.0f);
+    HalfLayer short_pool = qsa_layer;
+    short_pool.qsa_v_pool = pool_255;
+    error.clear();
+    check(!pack_half_layer(short_pool, qsa, error) && !error.empty(), "a 255-float V pool slice is rejected");
+    HalfLayer short_gather = qsa_layer;
+    short_gather.qsa_gather_v = std::span<const float>(gather_v.data(), 255);
+    error.clear();
+    check(!pack_half_layer(short_gather, qsa, error) && !error.empty(), "a 255-float gathered V slice is rejected");
+    error.clear();
+    check(!write_halves_dump(dir + "/halves_empty.bin", std::span<const float> {}, error) && !error.empty(),
+          "an empty halves dump is rejected");
+
     // The file: 48 packed layers per position, no header, each layer 55,360 bytes.
     std::vector<float> position;
     for (int layer = 0; layer < 48; ++layer) {
@@ -305,6 +378,30 @@ void test_routing_records(const std::string& dir) {
           "second record: id 7 and a zero weight");
 }
 
+// The bounds tools/make_profile.py reads: layers 0 to 47 and k from 1 to 64. A rejected record writes no bytes.
+void test_routing_bounds(const std::string& dir) {
+    const std::string path = dir + "/routing_bounds.bin";
+    std::FILE* file = std::fopen(path.c_str(), "wb");
+    check(file != nullptr, "routing bounds trace opens");
+    if (file == nullptr) return;
+    std::string error;
+    const std::vector<std::int32_t> one_id {5};
+    const std::vector<float> one_weight {1.0f};
+    check(!append_routing_record(file, 48, one_id, one_weight, error) && !error.empty(), "layer 48 is rejected");
+    check(!append_routing_record(file, -1, one_id, one_weight, error), "a negative layer is rejected");
+    std::vector<std::int32_t> ids65(65);
+    std::vector<float> weights65(65, 1.0f);
+    for (std::size_t i = 0; i < ids65.size(); ++i) ids65[i] = static_cast<std::int32_t>(i);
+    check(!append_routing_record(file, 3, ids65, weights65, error) && !error.empty(), "k of 65 is rejected");
+    const std::vector<std::int32_t> ids64(ids65.begin(), ids65.begin() + 64);
+    const std::vector<float> weights64(weights65.begin(), weights65.begin() + 64);
+    check(append_routing_record(file, 47, ids64, weights64, error), "layer 47 with k of 64 is accepted", error);
+    std::fclose(file);
+    const Bytes bytes = read_file(path);
+    check(bytes.size() == 8 + 64 * 8, "only the accepted record is written", std::to_string(bytes.size()));
+    check(int32_at(bytes, 0) == 47 && int32_at(bytes, 4) == 64, "the accepted record is layer 47, k 64");
+}
+
 }  // namespace
 
 int main() {
@@ -314,11 +411,13 @@ int main() {
         check(false, "a temporary directory for the dump files");
     } else {
         test_logits_dump_layout(dir);
+        test_short_logits_dump(dir);
         test_first_logits_layout(dir);
         test_residual_layout(dir);
         test_layers_layout(dir);
         test_half_layer_offsets(dir);
         test_routing_records(dir);
+        test_routing_bounds(dir);
         std::error_code ignored;
         std::filesystem::remove_all(dir, ignored);
     }

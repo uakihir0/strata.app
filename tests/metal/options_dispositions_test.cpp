@@ -145,6 +145,8 @@ int main() {
         if (spec.name == "--logits-stride") {
             owned.emplace_back("--max-new");
             owned.emplace_back("1");
+            owned.emplace_back("--dump-logits");
+            owned.emplace_back("logits.bin");
         }
         const bool device_action = spec.name == "--help" || spec.name == "--version" ||
                                    spec.name == "--list-devices" || spec.name == "--self-test" ||
@@ -264,6 +266,10 @@ int main() {
     check(parse_options({"--native", "model.gguf", "--dump-logits", "logits.bin", "--logits-stride", "3",
                          "--max-new", "1"}).exit_code == 0,
           "logits stride is accepted with --max-new 1");
+    // The stride is a modifier of --dump-logits: without that flag it has no file and is rejected (D-IMPL-833).
+    check(has_error({"--native", "model.gguf", "--max-new", "1", "--logits-stride", "2"},
+                    "--logits-stride needs --dump-logits"),
+          "logits stride without --dump-logits is rejected");
     for (const char* value : {"0", "-1", "abc"}) {
         check(has_error({"--native", "model.gguf", "--max-new", "1", "--logits-stride", value},
                         "--logits-stride needs a positive integer"),

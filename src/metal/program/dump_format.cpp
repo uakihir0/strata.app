@@ -57,6 +57,14 @@ bool write_file(const std::string& path, const Bytes& bytes, std::string& error)
 
 bool fits_int32(std::size_t value) { return value <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()); }
 
+bool all_finite(std::span<const float> values) {
+    return std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); });
+}
+
+// --dump-routing: the bounds tools/make_profile.py reads (layers 0..47, k 1..64).
+constexpr std::int32_t kRoutingLayerLimit = kDumpLayerCount;
+constexpr std::size_t kRoutingRouteLimit = 64;
+
 // int32 values sit in float slots as their bit patterns (section 9.2).
 void copy_int32s(std::span<const std::int32_t> values, std::span<float> out, std::size_t offset) {
     std::memcpy(out.data() + offset, values.data(), values.size_bytes());
@@ -76,28 +84,46 @@ std::vector<std::int64_t> logits_stride_rows(std::int64_t rows, std::int64_t str
     return kept;
 }
 
-bool write_logits_dump(const std::string& path, std::int32_t n_vocab, std::span<const float> logits,
-                       std::string& error) {
-    if (n_vocab < 1) {
-        error = "the vocabulary size must be positive";
+bool write_logits_dump(const std::string& path, std::int32_t n_vocab, std::int32_t declared_rows,
+                       std::span<const float> logits, std::string& error) {
+    // The rules tools/metal/tf_compare.py applies on read: a vocabulary of at least 2, a positive declared count, at
+    // least one row and no more rows than the declared count, and finite logits.
+    if (n_vocab < 2) {
+        error = "the vocabulary size must be at least 2";
+        return false;
+    }
+    if (declared_rows < 1) {
+        error = "the declared row count must be positive";
         return false;
     }
     const auto width = static_cast<std::size_t>(n_vocab);
-    if (logits.empty() || logits.size() % width != 0 || !fits_int32(logits.size() / width)) {
+    if (logits.empty() || logits.size() % width != 0) {
         error = "logits must hold one or more whole rows of n_vocab values";
+        return false;
+    }
+    if (logits.size() / width > static_cast<std::size_t>(declared_rows)) {
+        error = "logits hold more rows than the declared row count";
+        return false;
+    }
+    if (!all_finite(logits)) {
+        error = "logits must be finite";
         return false;
     }
     Bytes bytes;
     append_int32(bytes, n_vocab);
-    append_int32(bytes, static_cast<std::int32_t>(logits.size() / width));
+    append_int32(bytes, declared_rows);
     append_floats(bytes, logits);
     return write_file(path, bytes, error);
 }
 
 bool write_first_logits_dump(const std::string& path, std::int32_t n_vocab, std::span<const float> logits,
                              std::string& error) {
-    if (n_vocab < 1 || logits.size() != static_cast<std::size_t>(n_vocab)) {
-        error = "the first-logits dump must hold exactly n_vocab values";
+    if (n_vocab < 2 || logits.size() != static_cast<std::size_t>(n_vocab)) {
+        error = "the first-logits dump must hold exactly n_vocab values, and n_vocab must be at least 2";
+        return false;
+    }
+    if (!all_finite(logits)) {
+        error = "logits must be finite";
         return false;
     }
     Bytes bytes;
@@ -132,10 +158,12 @@ bool pack_half_layer(const HalfLayer& layer, std::span<float> out, std::string& 
         error = "a half layer is 13,840 floats";
         return false;
     }
+    // Any QSA slice, the optional V pool included, makes the layer a QSA layer. A V pool with no other QSA slice is
+    // rejected below, rather than dropped.
     const bool qsa_present = !layer.qsa_pre_gate.empty() || !layer.qsa_vcur.empty() ||
                              !layer.qsa_gather_v.empty() || !layer.qsa_ids.empty() ||
                              !layer.qsa_steps.empty() || !layer.qsa_vcur_appended.empty() ||
-                             !layer.qsa_kcur.empty();
+                             !layer.qsa_kcur.empty() || !layer.qsa_v_pool.empty();
     const bool qsa_complete = !layer.qsa_pre_gate.empty() && !layer.qsa_vcur.empty() &&
                               !layer.qsa_gather_v.empty() && !layer.qsa_ids.empty() && !layer.qsa_steps.empty() &&
                               !layer.qsa_vcur_appended.empty() && !layer.qsa_kcur.empty();
@@ -195,8 +223,16 @@ bool append_routing_record(std::FILE* file, std::int32_t layer, std::span<const 
         error = "a routing record needs one weight for each of its one or more ids";
         return false;
     }
+    if (layer < 0 || layer >= kRoutingLayerLimit) {
+        error = "routing layers are 0 to 47";
+        return false;
+    }
+    if (ids.size() > kRoutingRouteLimit) {
+        error = "a routing record holds at most 64 ids";
+        return false;
+    }
     // The rules that tools/make_profile.py applies when it reads a trace: distinct, non-negative ids and finite,
-    // non-negative weights. Its bounds on the layer and on k depend on the model, so they are left to the reader.
+    // non-negative weights.
     std::vector<std::int32_t> sorted(ids.begin(), ids.end());
     std::sort(sorted.begin(), sorted.end());
     if (sorted.front() < 0 || std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {

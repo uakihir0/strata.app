@@ -370,6 +370,13 @@ OptionParseResult parse_options(const std::vector<std::string_view>& arguments) 
             fail(result, "--logits-stride needs --max-new 1");
             return result;
         }
+        // The strided rows have no layout in docs/mac/03, section 9.1, and tools/metal/tf_compare.py reads contiguous
+        // rows, so the stride is only defined as a modifier of --dump-logits (docs/mac/IMPLEMENTATION-DECISIONS.md,
+        // D-IMPL-833).
+        if (!options.has("--dump-logits")) {
+            fail(result, "--logits-stride needs --dump-logits");
+            return result;
+        }
     }
 
     bool model_mode = false;

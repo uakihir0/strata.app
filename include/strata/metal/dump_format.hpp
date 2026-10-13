@@ -22,10 +22,13 @@ inline constexpr std::size_t kDumpHalfLayerFloats = 13840;
 /// The rows that --logits-stride N keeps from a `rows`-row logits dump: row 0, N, 2N, ... and the final row.
 std::vector<std::int64_t> logits_stride_rows(std::int64_t rows, std::int64_t stride, std::string& error);
 
-/// --dump-logits: int32 n_vocab, int32 rows, then rows x n_vocab F32. `logits` holds the rows back to back.
-bool write_logits_dump(const std::string& path, std::int32_t n_vocab, std::span<const float> logits,
-                       std::string& error);
-/// STRATA_DUMP_FIRST_LOGITS: n_vocab F32 with no header.
+/// --dump-logits: int32 n_vocab, int32 declared rows, then the rows x n_vocab F32 that were written. `declared_rows` is
+/// the count the engine planned, n_prompt - 1 + max_new (docs/mac/03, section 9.1), and it goes in the header even when
+/// fewer rows are written (a prompt-path run). `logits` holds the rows back to back. Requires n_vocab >= 2,
+/// 0 < rows <= declared_rows, and finite values, the rules tools/metal/tf_compare.py applies on read.
+bool write_logits_dump(const std::string& path, std::int32_t n_vocab, std::int32_t declared_rows,
+                       std::span<const float> logits, std::string& error);
+/// STRATA_DUMP_FIRST_LOGITS: n_vocab F32 with no header. Requires n_vocab >= 2 and finite values.
 bool write_first_logits_dump(const std::string& path, std::int32_t n_vocab, std::span<const float> logits,
                              std::string& error);
 /// --dump-residual: int32 4, int32 2560, then 4 x 2560 F32.
@@ -57,7 +60,9 @@ bool pack_half_layer(const HalfLayer& layer, std::span<float> out, std::string& 
 bool write_halves_dump(const std::string& path, std::span<const float> halves, std::string& error);
 
 /// One --dump-routing record: int32 layer, int32 k, k x int32 ids, k x F32 weights. Verify-window records carry zeros.
-/// k must be at least 1, the ids distinct and non-negative, and the weights finite and non-negative.
+/// The layer is 0 to 47 and k is 1 to 64, the bounds tools/make_profile.py reads. The ids must be distinct and
+/// non-negative, and the weights finite and non-negative. The id upper bound depends on the model (512, or 256 for a
+/// pruned one), so the reader checks it and the writer does not.
 bool append_routing_record(std::FILE* file, std::int32_t layer, std::span<const std::int32_t> ids,
                            std::span<const float> weights, std::string& error);
 
