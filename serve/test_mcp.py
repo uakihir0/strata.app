@@ -15,11 +15,13 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import mcp_fake_server as fake  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
+from serve import mcp as mcp_module  # noqa: E402
+from serve.mcp import McpCancelled, McpHub, StdioTransport, hub_from_config, mac_path  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -441,6 +443,34 @@ class NoServers(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+
+class MacPath(unittest.TestCase):
+    def test_homebrew_folders_are_appended_only_when_missing_and_present(self):
+        """docs/mac/07, section 6.10: appended, never prepended; present ones are not repeated."""
+        self.assertEqual(mac_path("/usr/bin:/bin", exists={"/opt/homebrew/bin"}.__contains__),
+                         "/usr/bin:/bin:/opt/homebrew/bin")
+        self.assertEqual(mac_path("/opt/homebrew/bin:/usr/bin", exists=lambda p: True),
+                         "/opt/homebrew/bin:/usr/bin:/usr/local/bin")
+        self.assertEqual(mac_path("/usr/bin", exists=lambda p: False), "/usr/bin")
+        self.assertEqual(mac_path(None, exists=lambda p: p == "/usr/local/bin"), "/usr/local/bin")
+        self.assertIsNone(mac_path(None, exists=lambda p: False))
+
+    def test_stdio_start_extends_the_child_path_on_darwin_only(self):
+        def started_with(platform):
+            real = mcp_module.mac_path
+            transport = StdioTransport("tools", {"command": "npx", "args": []})
+            with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}), \
+                    mock.patch.object(mcp_module.sys, "platform", platform), \
+                    mock.patch.object(mcp_module, "mac_path",
+                                      lambda path: real(path, exists=lambda p: p == "/usr/local/bin")), \
+                    mock.patch.object(mcp_module.subprocess, "Popen") as popen, \
+                    mock.patch.object(StdioTransport, "_read"), mock.patch.object(StdioTransport, "_read_stderr"):
+                transport.start()
+            return popen.call_args.kwargs["env"]["PATH"]
+
+        self.assertEqual(started_with("darwin"), "/usr/bin:/bin:/usr/local/bin")
+        self.assertEqual(started_with("linux"), "/usr/bin:/bin")
 
 
 if __name__ == "__main__":

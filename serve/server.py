@@ -517,6 +517,9 @@ class Vision:
         if cfg.get("max_tokens"):
             args += ["--max-tokens", str(cfg["max_tokens"])]
         self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
+        if sys.platform == "darwin" and " " in str(self.dir):   # MAC: the ENC line is space-separated (section 6.11)
+            self.dir.rmdir()
+            self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-", dir="/private/tmp"))
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.stopped = False
         self._start()
@@ -595,7 +598,9 @@ class Vision:
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             if key in self.cache:
-                return self.cache[key]
+                if self.cache[key][0].exists():         # macOS may clean $TMPDIR (3 days unused): then encode again
+                    return self.cache[key]
+                self.cache.pop(key)
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
             try:
@@ -728,6 +733,8 @@ class Service:
         self.idle_unload_s = 0
         self.min_free_unified_memory_mib = 0
         self.before_load = None
+        self.keep_awake = False                          # the config's keep_awake or --keep-awake (section 6.9)
+        self._caffeinate = None                          # the caffeinate process while the model is loaded
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
@@ -787,7 +794,13 @@ class Service:
 
     def ensure_loaded(self):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
-        an advisory unified-memory reading.  The caller holds self.fifo."""
+        an advisory unified-memory reading.  The caller holds self.fifo.  keep_awake then follows the model."""
+        try:
+            self._ensure_loaded()
+        finally:
+            self.keep_awake_sync()
+
+    def _ensure_loaded(self):
         if self.loaded() and not self._vision_down():
             return
         if self.before_load:
@@ -855,11 +868,31 @@ class Service:
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
+            self.keep_awake_sync()
             print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
                   "the next request loads it again", flush=True)
             return "unloaded"
         finally:
             self.fifo.release()
+
+    def keep_awake_sync(self) -> None:
+        """docs/mac/07, section 6.9: with keep_awake, caffeinate runs while the model is loaded and ends at an unload
+        (macos.keep_awake returns None off darwin).  Called with self.fifo held, or once at start-up."""
+        proc = self._caffeinate
+        if proc is not None and proc.poll() is not None:     # it ended by itself: start it again below
+            proc = None
+        want = bool(self.keep_awake) and self.loaded()
+        if proc is not None and not want:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            proc = None
+        if proc is None and want:
+            proc = macos.keep_awake(os.getpid())
+        self._caffeinate = proc
 
     def start_idle_unload(self):
         if not self.idle_unload_s or not hasattr(self.engine, "unload"):
@@ -2177,10 +2210,10 @@ def warn_tight_ram(model_mib) -> None:
         return
     left = total / 2**30 - model_mib / 1024
     if left < 6:
-        print(f"[strata] WARNING: memory is tight - the model plans to use {model_mib / 1024:.1f} GB of this Mac's "
-              f"{total / 2**30:.0f} GB, leaving {left:.1f} GB for macOS and other apps. macOS may compress and "
-              "swap memory or stop the engine if it runs out. Close other apps, or choose a smaller model or "
-              "shorter context.", flush=True)
+        print(f"[strata] WARNING: memory is tight - the model keeps {model_mib / 1024:.1f} GB of this Mac's "
+              f"{total / 2**30:.0f} GB resident, leaving {left:.1f} GB for everything else. macOS will compress and "
+              "swap other apps' memory and may stop the engine if it runs out. Close other apps, or run "
+              "./setup.sh --setup and pick a shorter context or a smaller model.", flush=True)
 
 
 def lan_addresses() -> list[str]:
@@ -2200,6 +2233,37 @@ def lan_addresses() -> list[str]:
         pass
     ok = lambda ip: ip and not ip.startswith(("127.", "169.254.", "0."))
     return ([first] if ok(first) else []) + sorted(ip for ip in ips if ok(ip) and ip != first)
+
+
+def firewall_note(python: str) -> str:
+    """The macOS firewall paragraph of the ready text (docs/mac/07, section 6.3).  `python` is the real binary."""
+    return ("       nothing arrives? The macOS firewall asks once whether Python may accept incoming connections: "
+            "click Allow.\n"
+            "       If you clicked Deny: System Settings > Network > Firewall > Options, set Python to "
+            "\"Allow incoming\n"
+            "       connections\", or run:\n"
+            f"         sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add {python}\n"
+            f"         sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp {python}")
+
+
+def port_in_use(host, port) -> bool:
+    """Is something already serving this port?  A bind that fails says yes; on a Mac a bind that succeeds is not
+    enough (MAC: BSD lets a SO_REUSEADDR bind succeed beside a listener on the wildcard or another address), so a
+    connect to the port decides (docs/mac/07, section 6.1)."""
+    try:
+        Server((host, port), BaseHTTPRequestHandler).server_close()
+    except OSError:
+        return True
+    if sys.platform != "darwin":
+        return False
+    import socket
+    targets = {"127.0.0.1"} | ({host} if host not in ("0.0.0.0", "", "::", "localhost") else set())
+    for t in targets:
+        with socket.socket(socket.AF_INET6 if ":" in t else socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            if s.connect_ex((t, port)) == 0:
+                return True
+    return False
 
 
 def is_loopback_host(host: str) -> bool:
@@ -2428,6 +2492,9 @@ def main() -> int:
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests, so other apps can use unified memory; the next request loads it again (also \"idle_unload_s\" "
                          "in the config; default: never)")
+    ap.add_argument("--keep-awake", action="store_true",
+                    help="keep this Mac from sleeping while the model is loaded (macOS; also \"keep_awake\": true in "
+                         "the config)")
     ap.add_argument("--min-free-unified-memory-mib", type=int, default=None,
                     help="warn when the advisory unified-memory estimate is below this level; it never blocks a "
                          "Metal model load (also \"min_free_unified_memory_mib\" in the config)")
@@ -2458,9 +2525,7 @@ def main() -> int:
     if not is_loopback_host(a.host) and not api_key:
         ap.error("an API key is required when listening on a non-loopback address; set --api-key, STRATA_API_KEY, "
                  "or api_key in the config")
-    try:                                                # before the minutes of loading: is the port free?
-        Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
-    except OSError:
+    if port_in_use(a.host, a.port):                     # before the minutes of loading: is the port free?
         ap.error(f"port {a.port} is already in use - is Strata (or another server) already running? "
                  f"Close it, or start this one with a different --port")
     if cfg.get("tokenizer"):
@@ -2544,6 +2609,7 @@ def main() -> int:
                  " - WARNING: any web page may use the model (no API key)"), flush=True)
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
     svc.min_free_unified_memory_mib = configured_minimum
+    svc.keep_awake = a.keep_awake or cfg.get("keep_awake") is True     # section 6.9; the flag overrides the config
     svc.before_load = a.before_load or cfg.get("before_load") or None
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
@@ -2591,11 +2657,12 @@ def main() -> int:
             print("       from other devices: http://<this Mac's IP address>:" + str(a.port) + "/", flush=True)
         from serve import macos
         if macos.firewall_on():
-            python = os.path.realpath(sys.executable)
-            print("       nothing arrives? In System Settings > Network > Firewall > Options, allow incoming "
-                  "connections for Python, or run:\n         sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add "
-                  + python + "\n         sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "
-                  + python, flush=True)
+            print(firewall_note(os.path.realpath(sys.executable)), flush=True)
+        if sys.platform == "darwin" and not svc.keep_awake:
+            print("       this Mac may sleep when idle and then answers nothing: add \"keep_awake\": true to the "
+                  "config to prevent that while the model is loaded (closing the lid still sleeps a MacBook)",
+                  flush=True)
+    svc.keep_awake_sync()                               # after READY: caffeinate while the model is loaded
     if a.open:
         import webbrowser
         webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
@@ -2606,6 +2673,16 @@ def main() -> int:
         signal.signal(signal.SIGTERM, on_sigterm)
     except (ValueError, OSError, AttributeError):         # not the main thread
         pass
+    if sys.platform == "darwin":                        # MAC: closing the Terminal window sends SIGHUP (section 6.2)
+        def on_sighup(signum, frame):
+            fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)                              # later prints must not fail with EIO on the dead tty
+            raise KeyboardInterrupt                     # the same path as Ctrl+C and SIGTERM: QUIT to the engine
+        try:
+            signal.signal(signal.SIGHUP, on_sighup)
+        except (ValueError, OSError, AttributeError):   # not the main thread
+            pass
     try:
         while True:
             time.sleep(1)

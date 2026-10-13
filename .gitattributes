@@ -3,6 +3,8 @@ bench/prompts/** -text
 
 # POSIX shell scripts use LF line endings on macOS.
 *.sh text eol=lf
+# Finder launchers run through /bin/sh: a CRLF ending fails with "bad interpreter" (docs/mac/07, section 5.2).
+*.command text eol=lf
 
 # MAC: Metal sources and the files CMake parses keep LF on every clone (docs/mac/08-build-and-distribution.md, section 3.5)
 *.metal text eol=lf

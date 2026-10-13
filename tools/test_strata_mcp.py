@@ -968,5 +968,22 @@ class Helpers(unittest.TestCase):
                 tools.strata_start(gpu=0)
 
 
+class SystemFolders(unittest.TestCase):
+    def test_the_macos_list_refuses_system_folders_and_allows_the_temporary_ones(self):
+        """docs/mac/07, section 8.1: the darwin list of system folders; /private/tmp, /private/var/folders and
+        /usr/local stay allowed, and so does a temporary folder."""
+        refused = ("/System/x", "/Library/x", "/Applications/x", "/bin/x", "/sbin/x", "/usr/bin", "/private/etc/x",
+                   "/private/var/x", "/dev/x", "/cores/x", "/opt/homebrew/x", "/Volumes/Recovery/x")
+        allowed = ("/private/tmp/x", "/private/var/folders/x", "/usr/local/x", "/Users/x/Strata-data")
+        for path in refused:
+            with self.subTest(path=path):
+                self.assertTrue(M.is_system_folder(Path(path)))
+        for path in allowed:
+            with self.subTest(path=path):
+                self.assertFalse(M.is_system_folder(Path(path)))
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertFalse(M.is_system_folder(Path(temporary) / "Strata-data"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14835,10 +14835,11 @@ measuring L-15 remain open.
 
 ### D-IMPL-940: The section 8 functions live in setup.py, and nothing calls them yet
 
-- **Decision:** `setup.py` gains `metal_engine_defs`, `metal_vision_defs`, `metal_source_rev`, `source_hash`,
-  `find_tool`, `metal_build_json` and `xcode_and_toolchain` (docs/mac/08 section 8), and, for make_release and
-  verify_release, `llama_pin`, `get_llama_cpp` and `cmake_build`. `main()` is unchanged and still exits 2. The
-  install and build flows (07 S7 and S8) stay open.
+- **Decision:** `setup.py` gains `metal_engine_defs`, `metal_vision_defs`, `source_hash`, `find_tool`,
+  `xcode_and_toolchain` and `metal_build_json` (docs/mac/08 section 8), and, for make_release and verify_release,
+  `llama_pin`, `get_llama_cpp` and `cmake_build`. `main()` is main's. The build flow (07 S8) stays open.
+  After the merge with main, `metal_build_json` uses main's `source_version()` and `metal_source_rev()`, and my
+  `metal_source_rev` is dropped; the S7 install functions are main's.
 - **Reason:** B8 asks for the section 8 functions. The S-track owns the setup flow, but the definitions must be
   written once for the local build and the release.
 - **Review required:** Confirm the S7 and S8 owner accepts these signatures. The spec names upstream versions of
@@ -14931,9 +14932,10 @@ measuring L-15 remain open.
 
 ### D-IMPL-950: verify_release fails closed at steps 5 and 6
 
-- **Decision:** Step 5 needs `setup.get_prebuilt_metal` and `setup.smoke_test` (07 S7), which are absent, so it refuses.
-  Step 6 needs `tools/metal/accept.py` (09 T15), also absent, so it refuses. Step 5 serves the download with
-  `python3 -m http.server` on 127.0.0.1, as the spec says. Step 7 compares the asset members, not the symbols zip. A
+- **Decision:** Step 5 installs the draft with setup's `get_prebuilt_metal(url, updating=True)` and `smoke_test` (07 S7,
+  on main), into a fresh engine folder: `setup.ENGINE_DIR` is pointed there for the install and restored afterwards.
+  A `None` install or a `SetupError` fails the step. The download is served with `python3 -m http.server` on
+  127.0.0.1, as the spec says. Step 6 needs `tools/metal/accept.py` (09 T15), which is absent, so it refuses. Step 7 compares the asset members, not the symbols zip. A
   different toolchain prints the spec's note and reports `ok (rebuild skipped)`, and `--no-rebuild` reports the same.
 - **Reason:** A draft must not verify without its install and acceptance. Passing without them would be wrong.
 - **Review required:** Confirm that `ok (rebuild skipped)` for `--no-rebuild` is the intended output, since the spec does
@@ -15019,9 +15021,360 @@ measuring L-15 remain open.
 - **Decision:** Not done: B22 (its measurements need the reference Mac and the models); the test-repository trial of
   `mac-release.yml`, and the draft verification (both need GitHub and a test repository, and this task forbids
   publication); Developer ID signing and notarisation (no certificate, so those command lines are untested); the
-  reference-Mac repeats of B9 and B10; the licence review (review:B20); and verify_release's steps 5 and 6 (07 S7 and
-  09 T15). The worktree's `third_party/llama.cpp` is an ignored symlink to the dev checkout's pinned clone, which the
+  reference-Mac repeats of B9 and B10; the licence review (review:B20); and verify_release's step 6 (09 T15, which is absent; step 5 uses 07 S7 from main). The worktree's `third_party/llama.cpp` is an ignored symlink to the dev checkout's pinned clone, which the
   builds used.
 - **Reason:** The scope of this task, and parts that do not exist yet.
 - **Review required:** The owner reads this list before the coordinator merges.
+
+### D-IMPL-900: The S-track host items chosen here, and the four left for later
+
+- **Decision:** Done in this change (host part only): S2, S7, S10, S11 (the data folder, section 4.12), S12 and S13.
+  Not started: S5 (geometry files), S6 (menus, consent and `--check`), S8 (`build_engine_metal`) and S9 (steps 6 and
+  7). `main()` stays the fail-closed stub.
+- **Reason:** S5 needs the engine's `--write-geometry` output from real GGUF files. S6 needs the family table, which
+  `tools/model_catalog.py` lacks for IQ2_XS and IQ3_XXS (07 section 4.4.3 ships them for qwen and swift), and its
+  `--check` needs S3 step 1. S8 needs `cmake_build` and `metal_engine_defs` (B8), which are not in this checkout. S9 is
+  the body of `main()`, which must stay fail-closed. Each of the other items is host-checkable with a fake engine.
+- **Review required:** Confirm the S6 deferral, and decide the IQ2_XS and IQ3_XXS families (D-IMPL-917) before S6 starts.
+
+### D-IMPL-901: The two launchers ship now and forward to the fail-closed `setup.sh`
+
+- **Decision:** `START-HERE.command` and `SETUP.command` are added at the repository root, exactly as section 5.2 gives
+  them, with a second comment line saying that `setup.sh` stops with exit code 2. They are mode 0755 with LF endings,
+  and `.gitattributes` gains `*.command text eol=lf`. Section 5.2's opening sentence is replaced to say they ship.
+  `test_command_launchers` checks the on-disk mode and LF endings, checks the index mode (100755) when the file is
+  tracked, and runs both launchers through `/bin/sh` with a stub `setup.sh`.
+- **Reason:** Section 15 names S2 as the launchers; they only forward, so a double-click reports the existing stop
+  message rather than a partial install. A file that is not yet tracked has no index mode to check, so the coordinator's
+  `git add` must take the 0755 bit from disk.
+- **Review required:** Confirm that the launchers may ship before the installer. The first double-click shows exit 2.
+
+### D-IMPL-902: The setup and launcher tests live in `serve/test_macos.py`
+
+- **Decision:** The new tests are classes in `serve/test_macos.py`, the module section 10.3 names for them. No new test
+  module is added, so the rows of 09 section 9.3 do not change.
+- **Reason:** Section 10.3 lists `test_command_launchers`, `test_run_script_quoting`, `test_data_folder`,
+  `test_ssl_setup`, `test_port_probe`, `test_sighup_shutdown`, `test_death_note` and `test_keep_awake` there.
+
+### D-IMPL-903: `setup.py` imports `serve.macos` now; `main()` does not call the new functions
+
+- **Decision:** `setup.py` imports `from serve import macos` (section 4.1). The new functions (`write_run_script`,
+  `data_folder`, `create_data_folder`, `get_prebuilt_metal`, `smoke_test`, `use_ssl_bundle`, `strip_quarantine_targets`)
+  are called only from tests. `main()` still prints the stub message and exits 2, and `tools/test_setup_shell.py` still
+  passes.
+- **Reason:** D-IMPL-841 deferred the import until a caller existed. These are the first callers, and they are tested
+  one piece at a time, as the brief allows for a fail-closed product path.
+
+### D-IMPL-904: The engine install checks the unpacked files before anything moves
+
+- **Decision:** `get_prebuilt_metal` unpacks into `engine/_unpack`, reads `BUILD.json`, and runs the section 4.7.1 checks
+  (version, Metal rev, backend, arch, macOS minimum, GPU families) and the presence of `strata` and `strata.metallib`.
+  Only after all of them pass are the files moved with `os.replace`. A symbolic link in the asset raises `SetupError`
+  before any extraction. A failed check prints `warn: ... compiling instead` and returns None. The temporary folder is
+  removed on every path.
+- **Reason:** Section 4.7.1 says "fails the install" for a symbolic link, and "warns and returns None" for a failed
+  check. A replaced signed binary must never be half-written.
+- **Review required:** None.
+
+### D-IMPL-905: `updating=True` downloads again and replaces the engine; there is no version comparison
+
+- **Decision:** With `updating=True`, the installed engine is not reused. The asset is downloaded and checked, and it
+  replaces the installed files only if the checks pass. Nothing compares the installed version with the release first.
+- **Reason:** Section 4.7.1 does not say how `update_installed_engine` decides that a release is newer. A comparison
+  would be a new rule.
+- **Review required:** Decide whether an update should compare BUILD.json first, to save a download.
+
+### D-IMPL-906: The smoke test parses the engine's actual device output
+
+- **Decision:** `smoke_test` reads `strata --version` as `strata <v> metal <rev>`. For `--list-devices` it reads the
+  `device_name=` and `families=` lines that `src/metal/program/main.cpp` prints, and requires exactly one
+  `device_name=` line and the families `apple7` and `metal4`. The fake engines in the tests are shell scripts that print
+  those lines.
+- **Reason:** Section 06 gives the fields of `--list-devices` but not its line format. The engine's source in this
+  checkout is the only format there is.
+- **Review required:** Confirm that `device_name=` and `families=` are the contract, and tell the engine owner so the
+  format does not change silently.
+
+### D-IMPL-907: No release URL is configured; the override and the bases list are in place
+
+- **Decision:** `RELEASE_REPOSITORY` stays None, so `prebuilt_bases()` returns `[]` by default. `--prebuilt` and
+  `STRATA_PREBUILT_URL` replace the release folders, and a local folder becomes a `file://` URL. With a repository set,
+  the tag folder comes first and the latest folder second. The HEAD probe is kept before the GET.
+- **Reason:** Section 4.1 sets the repository only after the publication destination is chosen (OQ-01).
+- **Review required:** None. OQ-01 stays open.
+
+### D-IMPL-908: A certificate failure stops the install; any other download failure compiles instead
+
+- **Decision:** A `CERTIFICATE_VERIFY_FAILED` error raises `SetupError` with the python.org hint of section 4.7.4. Any
+  other network failure prints `no ready-made engine at <url> (<reason>): compiling instead` and returns None.
+- **Reason:** Without certificates a compile cannot download its sources either, so continuing would only defer the
+  same error.
+- **Review required:** None.
+
+### D-IMPL-909: `data_folder` takes the saved folder as an argument; `create_data_folder` does not fail on a failed exclusion
+
+- **Decision:** `data_folder(root, saved=None)` returns the saved folder when given. The settings file is read by its
+  caller, because the settings reader of section 4.12 is not in this checkout, and no settings format is invented. On a
+  Mac inside a protected or synced folder, it returns `~/Strata-data` and prints an ok line that names the folder. If
+  `tmutil addexclusion` fails, `create_data_folder` prints a note and continues.
+- **Reason:** Section 4.12 gives the Time Machine line as a success message only, and does not make a failed exclusion
+  fatal.
+- **Review required:** Confirm that a failed exclusion is a note, not a stop.
+
+### D-IMPL-910: The run scripts take their arguments explicitly and accept only plain model names
+
+- **Decision:** `write_run_script(root, model, python, config, port)` writes `run-<model>.sh` and `.command` with the
+  arguments of section 4.10 and `shlex.quote` on every word. `model` must match `[A-Za-z0-9][A-Za-z0-9._-]*`, or it
+  raises `ValueError`. `quarantine_targets` returns the two launchers, `setup.sh` and the `engine` folder, and nothing
+  else.
+- **Reason:** The model name becomes a file name and a window title. `quarantine_targets` is tested against real
+  `xattr` on a Mac; `main()` does not call it.
+- **Review required:** None.
+
+### D-IMPL-911: The server's port probe, SIGHUP handler and keep-awake, with the engine side still open
+
+- **Decision:** `port_in_use(host, port)` is a module function (section 6.1), and `main()` calls it. The SIGHUP handler
+  is installed on darwin only (section 6.2). `--keep-awake` is a `store_true` flag with default None, so the config's
+  `keep_awake` applies when the flag is absent (section 6.9). `Service` starts caffeinate after the engine's READY and
+  stops it on unload. A `--lazy` server starts it at its first load, not at startup, so no sleep is blocked while the
+  model is unloaded (`KeepAwakeLazyStart`). The ready text about sleep is printed on darwin only, when the host is not loopback and
+  `keep_awake` is off. The engine's own SIGHUP ignore (06 section 2.4) is not changed, so a Terminal close with a real
+  engine is still unverified.
+- **Reason:** The spec's items are the Done-when of S12. The engine change is a C++ item (H-track).
+- **Review required:** None for the server. The engine side belongs to the H-track owner.
+
+### D-IMPL-912: The Mac's CPU name is the brand string, with no `platform.processor()` fallback
+
+- **Decision:** `serve/telemetry.py` `_cpu_name()` returns `macos.cpu_brand() or None` on a Mac. Off a Mac it still uses
+  `platform.processor()`.
+- **Reason:** Section 7.2 says `_cpu_name()` returns `macos.cpu_brand()` on darwin, and that the upstream fallback
+  returns `"arm"` there. A Mac whose brand cannot be read therefore shows no CPU name, not `arm`.
+- **Review required:** None.
+
+### D-IMPL-913: The death-note test runs a real fake engine, and does not patch `macos.MAC`
+
+- **Decision:** `EngineDeath` starts a Python stand-in through a shell wrapper that uses `exec`, so the signal reaches the
+  Python process, then kills it with SIGKILL or SIGSEGV. It does not patch `macos.MAC`, because `death_note` does not read
+  it. Section 10.3 asks for that patch, which would have no effect.
+- **Reason:** Testing the real subprocess path catches what a stub would hide.
+- **Review required:** None.
+
+### D-IMPL-914: Host, network and build directory for these tests
+
+- **Decision:** The tests ran on Darwin 27.0.1, arm64, with `machdep.cpu.brand_string` `Apple M5 Pro`. That is not a
+  reference-Mac run, and no reference-Mac result is claimed. No test uses the network: asset downloads go to a local
+  `http.server` on 127.0.0.1, and `build-dev` in this worktree is configured with
+  `FETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP` pointing at the main checkout's fetched sources, with
+  `FETCHCONTENT_FULLY_DISCONNECTED=ON`.
+- **Reason:** The brief forbids the reference Mac and network downloads, and the CMake presets would fetch llama.cpp
+  from GitHub otherwise.
+- **Review required:** None.
+
+### D-IMPL-915: The keep-awake end-to-end test uses the mock engine
+
+- **Decision:** `KeepAwakeFromTheServer` starts `serve/server.py --engine mock --config <file>`. It checks that one
+  caffeinate runs under the server process with the config key, with the flag, and not without either. The
+  `--engine strata` path is not used.
+- **Reason:** `keep_awake` is read for both engines, and the strata path needs a tokenizer folder that is not in this
+  checkout.
+- **Review required:** None.
+
+### D-IMPL-916: One mutation run reported a survivor that did not reproduce
+
+- **Decision:** The first full mutation run (39 scripted mutations, one unique snippet each, run against its test class,
+  then restored with a SHA-256 check) reported `run-script-model-name` as surviving. Run alone, and in a second full run with bytecode writing
+  disabled, the same mutation was killed by its test. The second run killed all 39. The cause of the first result is not
+  established. The runner now sets `PYTHONDONTWRITEBYTECODE=1`.
+- **Reason:** The survivor was not reproducible, so it is recorded rather than explained away.
+- **Review required:** None.
+
+### D-IMPL-917: S6's family-table gap is recorded, not fixed
+
+- **Decision:** `tools/model_catalog.py` gives `IQ2_XS` and `IQ3_XXS` no `families` key, while 07 section 4.4.3 ships them
+  for qwen and swift. This change does not edit the catalog, because `tools/strata_mcp.py` reads it too.
+- **Reason:** Fixing it changes the MCP model table, which belongs to S15. S6 cannot list the right models until it is
+  decided.
+- **Review required:** Decide the family lists of IQ2_XS and IQ3_XXS before S6 starts.
+
+### D-IMPL-918: The Mac branches of `setup.py` carry `# MAC:` markers, and the drift count is 3
+
+- **Decision:** The three Mac branches of `setup.py` (the protected-folder rule of `data_folder`, the TCC hint and the
+  Spotlight and Time Machine steps of `create_data_folder`) end with `# MAC:` comments, the convention of section 4.2 and
+  of `serve/server.py`. `tools/metal/drift.json` records `setup.py` at 3 (it was 0), the count `check_drift.py` gives.
+  `--update` was not run, so no other value of the snapshot changed.
+- **Reason:** `check_drift.py` counts `MAC:` on every line. Without the comments, the two `if not MAC:` branches were
+  unmarked Mac edits in a patched upstream file, and the check failed with "marker count expected 0, found 2". Section
+  4.2 says to re-check each marked edit and then record the count, which is what was done.
+- **Review required:** Confirm that the three branches are the only Mac edits to `setup.py`, and that the count is
+  recorded in the merge's diff of `tools/metal/drift.json`.
+
+### D-IMPL-919: The merge keeps main's server features, and only the S-track tests that main does not cover
+
+- **Decision:** For the server features (port probe, SIGHUP handler, `--keep-awake`, the keep-awake state, the ready text
+  and the firewall text), `serve/server.py` is main's version, byte for byte. My ten hunks in it were the same features in
+  another shape, and `keep_awake_sync()` also covers a lazy start and a reload. The `serve/test_macos.py` tests that
+  duplicate main's were dropped: `PortProbe` (main's `test_port_probe`), `SighupShutdown` (`test_sighup_shutdown`),
+  `KeepAwake` (`test_keep_awake`), the Apple reader and sampler tests of `TelemetryMac` (main's `MacTelemetry`), and the
+  stubbed signal cases of `EngineDeath` (main's `MacEngineDiagnostics`). Kept: `KeepAwakeFromTheServer` (the config key
+  and the flag, end to end), `KeepAwakeLazyStart` (a lazy start keeps the Mac awake only after its first load),
+  `EngineDeath.test_death_note_ignores_earlier_runs_in_the_log` (a real fake engine's normal exit), and
+  `TelemetryCpuName` (the brand on a Mac). The S-track setup classes are kept unchanged. The symlink member of the engine
+  test is named `strata-link`, because the zip had a duplicate `strata.metallib` entry.
+- **Reason:** Rule 1 of the merge: one implementation per feature, main's where it covers the spec. Rule 2: keep what
+  main's tests do not cover. This entry supersedes the server parts of D-IMPL-911 (the port probe, SIGHUP, keep-awake and
+  ready text, now main's) and the stub-free part of D-IMPL-913 (the death test now keeps one real-engine case).
+- **Review required:** Confirm that the 07 status names the death diagnostic test as `test_death_note_ignores_earlier_runs_in_the_log`
+  in `serve/test_macos.py`, and that `test_death_note` stays in `serve/test_server.py`.
+
+### D-IMPL-920: The server items the host can check, and the ones it cannot
+
+- **Decision:** Done, host part only: S12 (07 section 6: 6.1, 6.2, 6.3, 6.4, 6.9, 6.10, 6.11), S13 (one off-darwin
+  test and one `/health` test; the `_Apple` reader and the sampler were already in place), S15 (one darwin
+  system-folder test; the MCP rules were already in place) and S19 (the four section 10.3 server tests the host can
+  run). S16 is withdrawn, so there is no work for it. Not done because a fake engine cannot check it: S14 (the Monitor
+  and About texts need a screenshot review on the reference Mac). Outside the server track: the setup items
+  (S2-S11, S18), S17, S20 and S21.
+- **Reason:** The work was scoped to the server track with a fake engine. S14's Done-when is a screenshot review, and
+  the other open parts need the reference Mac or an engine.
+- **Review required:** None.
+
+### D-IMPL-921: The port probe is tested with loopback sockets on the host
+
+- **Decision:** `test_port_probe` binds real sockets on 127.0.0.1 and 0.0.0.0 on a free port, as section 10.3 specifies.
+  The listeners set SO_REUSEADDR, as the server's own socket does. The four rows run only on darwin, because the BSD
+  behaviour they test is darwin's; elsewhere `port_in_use` answers by bind alone.
+- **Reason:** A mock would test only the mock. The sockets are local, and no packet leaves the host.
+- **Review required:** Confirm that wildcard binds on loopback are acceptable under "no network". If not, move the
+  rows to a reference-Mac run.
+
+### D-IMPL-922: The SIGHUP handler stays where section 6.2 puts it, and the test waits 0.5 s
+
+- **Decision:** `main()` installs the SIGHUP handler after the ready text, next to SIGTERM, as section 6.2 gives it.
+  `test_sighup_shutdown` waits for the ready text, then 0.5 s, then sends SIGHUP to the server's process group, as a
+  closed Terminal does.
+- **Reason:** Installing the handler before loading would let a KeyboardInterrupt escape the loading code. The cost is a
+  window between the ready text and the handler in which SIGHUP still ends the process at once. The test's 0.5 s covers
+  that window by timing, not by construction.
+- **Review required:** Decide whether that window matters: a Terminal closed during a real load also ends the process at
+  once.
+
+### D-IMPL-923: `keep_awake` is a `Service` state: started by READY and each load, ended by each unload
+
+- **Decision:** `Service.keep_awake_sync()` runs `macos.keep_awake(os.getpid())` while the model is loaded and ends the
+  process when it is not, so a later load starts a new one. `ensure_loaded()` calls it in a `finally`, `unload()` calls
+  it, and `main()` calls it after READY. The config key is read with `is True`, like the other booleans. `--keep-awake`
+  is a store-true flag, so it can turn the setting on, not off.
+- **Reason:** Section 6.9 starts caffeinate at READY and ends it at an unload. Section 10.3's `test_keep_awake` calls
+  `ensure_loaded()` on a stub engine, so the hook must sit in `Service`.
+- **Review required:** Confirm that a flag which cannot override a `true` config value is acceptable. The config is
+  edited to turn it off.
+
+### D-IMPL-924: The firewall and tight-RAM texts are the section 6.3 and 6.4 texts
+
+- **Decision:** `firewall_note()` returns the section 6.3 paragraph with the real Python path. `warn_tight_ram()` prints
+  the section 6.4 text. The keep-awake line of section 6.9 prints on darwin when the host is not loopback and
+  `keep_awake` is off. The earlier wording differed from these texts and had no tests. The psutil fallback for total RAM
+  off darwin stays, as upstream has it.
+- **Reason:** The 07 texts are the specification of user-facing wording.
+- **Review required:** Check the firewall paragraph against a real Deny-then-Allow run on the reference Mac (not done).
+
+### D-IMPL-925: The vision folder moves only on darwin; the cache check runs on every OS
+
+- **Decision:** A `$TMPDIR` with a space sends the helper's folder to `/private/tmp`, on darwin only (section 6.11, the
+  first change). A cached image whose embeddings file has gone is dropped and encoded again on every OS (section 6.11
+  calls the second change safe everywhere).
+- **Reason:** Follows section 6.11's own split.
+- **Review required:** None.
+
+### D-IMPL-926: The MCP child's PATH is appended, and the command lookup uses the same PATH
+
+- **Decision:** `mac_path()` appends `/opt/homebrew/bin` and `/usr/local/bin` when they are missing from PATH and exist.
+  It never prepends, and it returns PATH unchanged when it adds nothing. On darwin, `StdioTransport.start()` applies it
+  before `shutil.which`, so the command is looked up on the PATH the child gets.
+- **Reason:** Section 6.10's failure is `npx` not found. A lookup on the old PATH would still fail before the child
+  starts.
+- **Review required:** Confirm that searching the extended PATH for the configured command is wanted.
+
+### D-IMPL-927: Tests sit beside the code they test; no new module was added
+
+- **Decision:** `test_death_note` stays in `serve/test_server.py` (`MacEngineDiagnostics`), which already covers the
+  section 6.5 cases, rather than moving to `serve/test_macos.py`. `test_system_folders` is `SystemFolders` in
+  `tools/test_strata_mcp.py`, beside `is_system_folder`. The server texts, vision, off-darwin telemetry and `/health`
+  tests are in `serve/test_server.py`; the PATH tests are in `serve/test_mcp.py`; the section 10.3 server tests are in
+  `serve/test_macos.py`. No module was added, so 09 section 9.3 needs no row and the glob counts are unchanged.
+- **Reason:** A moved copy of the death-note tests would test the same code twice. Section 10.3 names the file only in
+  its table of tests.
+- **Review required:** None.
+
+### D-IMPL-928: `ServerLifecycle` clears the `macos_version` cache
+
+- **Decision:** `ServerLifecycle.setUp` clears the `lru_cache` of `macos.macos_version`. `test_no_raise_anywhere` calls
+  it with `MAC` patched False, which caches `()` for the rest of the process. In the combined run,
+  `test_sighup_shutdown` then skipped with "cannot determine the macOS version". The product code is unchanged.
+- **Reason:** The skip was a test-order effect, not a fact about the host.
+- **Review required:** None.
+
+### D-IMPL-929: The S13 tests check absence off darwin, and the `/health` field
+
+- **Decision:** The off-darwin telemetry test checks that the static keys are exactly the upstream set and that no Mac key
+  appears in `static` or in a sample. `test_health_names_the_computer` starts the mock server and reads `/health`.
+  Neither compares with an upstream key list, which the repository does not hold.
+- **Reason:** S13's "identical to upstream" can be checked here only as the absence of the Mac keys.
+- **Review required:** None.
+
+### D-IMPL-930: The system-folder test runs on any OS, and no existing test changed
+
+- **Decision:** `SystemFolders` checks the section 8.1 list on any OS: the listed folders are refused; `/private/tmp`,
+  `/private/var/folders`, `/usr/local` and a temporary folder are allowed. The case rule of `norm()` is already tested
+  by `tools/metal/test_macos_paths.py`. No existing test was changed, so S15's "no test change" holds.
+- **Reason:** The list is pure path logic and does not need a Mac.
+- **Review required:** None.
+
+### D-IMPL-931: What `test_module_rules` checks
+
+- **Decision:** It parses `serve/macos.py` with `feature_version=(3, 9)`. Every import must be `__future__` or in
+  `sys.stdlib_module_names`. For each call of `subprocess.run`, `Popen`, `call`, `check_call` or `check_output`, and of
+  the module's `_tool` helper, whose first argument is a list literal, the program must be a literal absolute path. It
+  runs on every OS and skips only below Python 3.10.
+- **Reason:** These are section 3.1's rules as the spec states them. `_tool` is the module's own launcher wrapper.
+- **Review required:** None.
+
+### D-IMPL-932: `WebHealthAuthContract` is not added
+
+- **Decision:** The JavaScript contract test of section 10.3 is not in this change. It needs a DOM harness for
+  `serve/web/app.js`, and the repository has none. The host has `node`, but writing a harness is a separate change.
+- **Reason:** A harness is more than the server track covers here.
+- **Review required:** Decide whether the page tests belong with S14.
+
+### D-IMPL-933: The 10 table's S16 follows 07
+
+- **Decision:** 10 section 3.4 listed "S16 | The tools". 07 section 15 withdraws S16 (the PC calibration utility,
+  D-IMPL-236). The 10 row now says withdrawn.
+- **Reason:** 07 is the specification of the item, and the 10 row was stale.
+- **Review required:** Confirm that no other "tools" work is meant under S16.
+
+### D-IMPL-934: The drift record counts the server's MAC markers
+
+- **Decision:** `check_drift.py --update` changed one field of `tools/metal/drift.json` (after a backup): `serve/server.py`
+  from 0 to 3 `# MAC:` markers. Without it `check_drift.py` fails on the new markers. After the update it passes.
+- **Reason:** The check treats any change in a marker count as an item to record. The markers are the P8 convention that
+  section 6 asks for.
+- **Review required:** The next upstream sync must keep this count in step with the markers.
+
+### D-IMPL-935: What "host part" means here
+
+- **Decision:** "Host part" means the tests in the repository that run on macOS 27.0.1, arm64 (Apple M5 Pro), with a mock
+  engine or stubs. No model, no engine process and no reference-Mac acceptance run were used. The machine is the same
+  model as the reference Mac, but this change does not treat it as the reference Mac.
+- **Reason:** The Done-when of each S item is set on the reference Mac, and the user's constraints exclude it here.
+- **Review required:** Decide whether this host counts as a reference Mac for later items.
+
+### D-IMPL-936: What is not done in this change, and why
+
+- **Decision:** Left open: the engine's own SIGHUP ignore in `--serve` mode (06 section 2.4; C++ outside the server
+  track); the reference-Mac checks of S12, S13, S15 and S19; the setup- and engine-owned tests of section 10.3
+  (`test_setup_sh`, `test_command_launchers`, `test_run_script_quoting`, `test_data_folder`, `test_ssl_setup`,
+  `test_engine_swap`, `test_sigint_handler`, `test_geometry_plans`, `test_geometry_equals_files`); S14; S17; S20; S21.
+- **Reason:** Each needs the engine, the reference Mac or the setup track, none of which this change used.
+- **Review required:** Schedule the engine SIGHUP change with the engine's H6 work.
 

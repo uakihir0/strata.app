@@ -255,12 +255,12 @@ A person with a 64 GB Mac can install Strata with `./setup.sh`, run it, and use 
 | S9 | Steps 6 and 7: pack, MTP, disk, args, the final plan, the config | S6, S7 |
 | S10 | Run scripts, `.command` files, quarantine | S9 |
 | S11 | `start()` on a Mac, the data folder, sleep, flags and texts | S9 |
-| S12 | `serve/server.py`: port probe, SIGHUP, the death texts, `keep_awake` | S1 |
-| S13 | `serve/telemetry.py` | S1 |
-| S15 | `tools/strata_mcp.py` | S4 |
-| S16 | The tools | |
+| S12 | `serve/server.py`: port probe, SIGHUP, the death texts, `keep_awake`. **Status: host part done (2026-10-13).** The probe, SIGHUP, `keep_awake`, the texts, the vision folder and the MCP PATH are tested with a mock engine (D-IMPL-920 to 928). Open: the engine's SIGHUP ignore (06, section 2.4) and the reference-Mac checks. | S1 |
+| S13 | `serve/telemetry.py`. **Status: host part done (2026-10-13).** The `_Apple` reader and the Mac sampler keys are tested with stubs, and no Mac key appears off darwin. Open: the reference-Mac readings and S14. | S1 |
+| S15 | `tools/strata_mcp.py`. **Status: host part done (2026-10-13).** The section 8 rules are tested with a fake engine. Open: the reference-Mac run, the MCP golden case (S18) and the Claude Desktop install. | S4 |
+| S16 | Withdrawn, as in 07 section 15: no CUDA calibration utility is shipped on macOS (D-IMPL-236). | |
 | S18 | The Mac golden set and `record_mac_plans.py` | S6, S9 |
-| S19 | `serve/test_macos.py` | S2, S10-S12 |
+| S19 | `serve/test_macos.py`. **Status: server tests done in part (2026-10-13).** Four section 10.3 tests that the host runs pass (`test_port_probe`, `test_sighup_shutdown`, `test_keep_awake`, `test_module_rules`). Open: the setup- and engine-owned tests of that list, `WebHealthAuthContract`, and the reference-Mac pass (07, section 15). | S2, S10-S12 |
 | T12 | The needles and the server run, with S.image | H9, H13 |
 | T14 | The nightly job's five steps and the weekly job | T7-T9, T11, T12 |
 | T18 | The Python layer in the nightly run | T14, S5 |
@@ -273,10 +273,15 @@ Exit criteria:
 - `accept.py server` and `accept.py c3` pass on Q2_0. `accept.py nightly` passes.
 - The Mac golden set passes on the reference Mac.
 
-**Status (2026-10-13).** Host parts of B8, B9, B10 and B11 are done, with the tests in 09 section 9.3 and the
-decisions D-IMPL-940 to D-IMPL-959. Their reference-Mac and publication parts are open, as 08 section 15 lists. The
-rest of phase 3 (the setup flows, the server, the prompt cache and the other tasks above) is not in that change, so
-the exit criteria are not met.
+Status (2026-10-13): the host parts of S2, S7, S10, S11 (the data folder), S12 and S13 are done, with fake-engine tests
+in `serve/test_macos.py`; their reference-Mac parts are open, as [07](07-server-setup-port.md), section 15 says. S5, S6, S8
+and S9 are not started, for the reasons given there.
+
+**Status (2026-10-13), B track.** Host parts of B8, B9, B10 and B11 are done, with the tests in 09 section 9.3 and the
+decisions D-IMPL-940 to D-IMPL-959. Their reference-Mac and publication parts are open, as 08 section 15 lists. S8 (the
+build flow that calls `cmake_build` and `metal_build_json`) is open, so B8 is not complete.
+
+Phase 3 is not complete: the exit criteria above are not met.
 
 ### 3.5 Phase 4: tiered mode
 
@@ -320,7 +325,7 @@ Exit criteria:
   leaves only a draft (B18, T15).
 - Each of M1-M4 has a family file ([09](09-testing-and-validation.md), section 7.4).
 
-**Status (2026-10-13).** Host parts of B12 (steps 5 and 6 of verify_release still refuse), B13, B18 (written, not run)
+**Status (2026-10-13).** Host parts of B12 (step 6 of verify_release still refuses), B13, B18 (written, not run)
 and B20 (the licence review is open) are done. T15, T16 and S14 are not in that change, so the exit criteria are not
 met, and no measurement of B-2, B-5 to B-8 has been taken.
 

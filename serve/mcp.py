@@ -34,6 +34,17 @@ import urllib.request
 
 PROTOCOL = "2025-06-18"               # the MCP revision Strata asks for; the server's answer is used as given
 DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0}
+MAC_PATH_EXTRA = ("/opt/homebrew/bin", "/usr/local/bin")   # Homebrew's folders (docs/mac/07, section 6.10)
+
+
+def mac_path(path: str | None, exists=os.path.isdir) -> str | None:
+    """`path` with the Homebrew folders that are missing from it and exist appended, never prepended: a server started
+    from Finder or launchd may not find npx or uvx, and the user's own order and the system tools keep winning.
+    Returns `path` unchanged when nothing is added."""
+    extra = [folder for folder in MAC_PATH_EXTRA if folder not in (path or "").split(os.pathsep) and exists(folder)]
+    if not extra:
+        return path
+    return os.pathsep.join(([path] if path else []) + extra)
 
 
 class McpError(RuntimeError):
@@ -92,6 +103,10 @@ class StdioTransport:
     def start(self):
         env = dict(os.environ)
         env.update({str(k): str(v) for k, v in (self.cfg.get("env") or {}).items()})
+        if sys.platform == "darwin":                    # MAC: the lookup below and the child see Homebrew's folders
+            path = mac_path(env.get("PATH"))
+            if path:
+                env["PATH"] = path
         command = str(self.cfg["command"])
         exe = shutil.which(command, path=env.get("PATH")) or command
         extra = {"start_new_session": True}             # close() also ends child processes
