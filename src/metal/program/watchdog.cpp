@@ -10,11 +10,9 @@ namespace {
 
 constexpr std::uint64_t kMiB = 1024ull * 1024ull;
 
-void write_line(std::FILE* out, std::string_view text) {
-    if (out == nullptr) return;
-    std::fwrite(text.data(), 1, text.size(), out);
-    std::fputc('\n', out);
-    std::fflush(out);
+std::mutex& report_mutex() {
+    static std::mutex mutex;
+    return mutex;
 }
 
 std::string stage_text(const ProgressState& state) {
@@ -54,10 +52,29 @@ void Progress::end_request() {
     state_.detail.clear();
 }
 
+void write_report_line(std::FILE* out, std::string_view text) {
+    if (out == nullptr) return;
+    std::string line;
+    line.reserve(text.size() + 1);
+    line.append(text);
+    line.push_back('\n');
+    const std::lock_guard<std::mutex> lock(report_mutex());
+    std::fwrite(line.data(), 1, line.size(), out);
+    std::fflush(out);
+}
+
 void Progress::beat() {
     std::lock_guard<std::mutex> lock(mutex_);
     ++state_.beats;
     state_.ticks_at_beat = state_.ticks;
+}
+
+void Progress::beat(std::string_view where, std::string_view detail) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++state_.beats;
+    state_.ticks_at_beat = state_.ticks;
+    state_.where.assign(where);
+    state_.detail.assign(detail);
 }
 
 void Progress::tick() {
@@ -126,9 +143,14 @@ Watchdog::Watchdog(Progress& progress, std::uint64_t limit_seconds, std::string 
 
 Watchdog::~Watchdog() { stop(); }
 
-void Watchdog::start() {
-    if (limit_seconds_ == 0 || thread_.joinable()) return;
-    thread_ = std::thread([this] { run(); });
+bool Watchdog::start() {
+    if (limit_seconds_ == 0 || thread_.joinable()) return true;
+    try {
+        thread_ = std::thread([this] { run(); });
+    } catch (const std::system_error&) {
+        return false;
+    }
+    return true;
 }
 
 void Watchdog::stop() {
@@ -164,29 +186,30 @@ bool Watchdog::poll(std::chrono::steady_clock::time_point now) {
         baseline_time_ = now;
         return false;
     }
-    const auto stalled = now - baseline_time_;
-    if (stalled < std::chrono::seconds(limit_seconds_)) return false;
+    // Compare whole seconds, as unsigned. Converting the limit to a duration of nanoseconds overflows at about 9.2e9 s,
+    // so a huge limit that should never fire would otherwise fire about one second into the request.
+    const auto stalled = std::chrono::duration_cast<std::chrono::seconds>(now - baseline_time_).count();
+    if (stalled < 0 || static_cast<std::uint64_t>(stalled) < limit_seconds_) return false;
     fired_.store(true);
-    const auto stalled_seconds = std::chrono::duration_cast<std::chrono::seconds>(stalled).count();
-    report_and_abort(state, static_cast<std::uint64_t>(stalled_seconds));
+    report_and_abort(state, static_cast<std::uint64_t>(stalled));
     return true;
 }
 
 void Watchdog::write_pass() {
     reporter_.write_engine_pass(diagnostics_);
-    write_line(diagnostics_, format_memory_line(platform::process_memory(), platform::available_memory()));
-    write_line(diagnostics_, reporter_.gpu_line());
+    write_report_line(diagnostics_, format_memory_line(platform::process_memory(), platform::available_memory()));
+    write_report_line(diagnostics_, reporter_.gpu_line());
 }
 
 void Watchdog::report_and_abort(const ProgressState& state, std::uint64_t stalled_seconds) {
     const std::string stage = stage_text(state);
-    write_line(diagnostics_, format_no_progress_line(limit_seconds_, stage));
-    write_line(diagnostics_,
-               format_stall_header(engine_, stage, stalled_seconds, state.ticks - state.ticks_at_beat));
+    write_report_line(diagnostics_, format_no_progress_line(limit_seconds_, stage));
+    write_report_line(diagnostics_,
+                      format_stall_header(engine_, stage, stalled_seconds, state.ticks - state.ticks_at_beat));
     write_pass();
     hooks_.sleep(kStallPassSpacing);
     write_pass();
-    write_line(diagnostics_, kCrashReportHint);
+    write_report_line(diagnostics_, kCrashReportHint);
     reporter_.release_gpu_waits(kGpuWaitReleaseTimeoutMs, diagnostics_);
     std::fflush(diagnostics_);
     hooks_.abort();

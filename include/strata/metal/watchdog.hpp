@@ -37,12 +37,19 @@ struct ProgressState {
     std::string detail;
 };
 
+/// Writes one line of serve diagnostics, with its newline, in a single write under a process-wide mutex. The stall
+/// report and the request thread both write through it, so their lines do not interleave (docs/mac/06, section 14.3).
+void write_report_line(std::FILE* out, std::string_view text);
+
 /// The engine's progress record. The request thread updates it and the watchdog thread reads snapshots.
 class Progress {
 public:
     void begin_request();
     void end_request();
+    /// One beat, leaving the stage as it is.
     void beat();
+    /// One beat and the stage it reports, in one locked update: a snapshot never sees the new beat with the old stage.
+    void beat(std::string_view where, std::string_view detail = {});
     void tick();
     void set_stage(std::string_view where, std::string_view detail = {});
     ProgressState snapshot() const;
@@ -92,8 +99,11 @@ std::string format_memory_line(const std::optional<platform::ProcessMemory>& pro
 std::string format_gpu_line(std::string_view label, std::string_view status, std::uint64_t budget_mib,
                             std::uint64_t allocated_mib);
 
-/// Stall detection on a steady clock. `poll` makes one check, and `start` runs `poll` once per second on a thread.
-/// The default hooks use the system clock, sleep and std::abort; tests substitute their own.
+class WatchdogTestAccess;
+
+/// Stall detection on a steady clock. `start` runs one check per second on a thread, and the checks are private; a
+/// test reaches them through WatchdogTestAccess. The default hooks use the system clock, sleep and std::abort; tests
+/// and the serve loop's watchdog_abort option substitute their own.
 class Watchdog {
 public:
     struct Hooks {
@@ -109,14 +119,18 @@ public:
     Watchdog(const Watchdog&) = delete;
     Watchdog& operator=(const Watchdog&) = delete;
 
-    void start();
+    /// Starts the thread. Returns false when the thread cannot be created, and the serve loop reports a startup error.
+    /// A zero limit starts no thread and returns true.
+    bool start();
     void stop();
-    /// One check at `now`. Fires when the request is busy and neither the request count nor the beat count has changed
-    /// for the limit. Returns true when it fired.
-    bool poll(std::chrono::steady_clock::time_point now);
     bool fired() const { return fired_.load(); }
 
 private:
+    friend class WatchdogTestAccess;
+
+    /// One check at `now`. Fires when the request is busy and neither the request count nor the beat count has changed
+    /// for the limit. Returns true when it fired.
+    bool poll(std::chrono::steady_clock::time_point now);
     void run();
     void write_pass();
     void report_and_abort(const ProgressState& state, std::uint64_t stalled_seconds);
