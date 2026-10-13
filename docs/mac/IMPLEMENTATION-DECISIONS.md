@@ -13321,3 +13321,154 @@ measuring L-15 remain open.
   approve re-pinning `UPSTREAM_SYNC` and the documents to the v0.1.34 tag commit. This is a
   provenance decision; no automatic change was made.
 
+### D-IMPL-680: Put the planner in `setup.py`, and keep `main()` fail-closed
+
+- **Decision:** `metal_plan`, `plan_class`, the PLAN parser and their constants are module-level code in `setup.py`,
+  as section 4.4 places them. `main()`, `setup.sh` and the rest of the file are unchanged, and nothing on the install
+  path calls the planner. Setup still exits 2 on the product path.
+- **Reason:** Section 4.4 places the planner in `setup.py`, and `tools/strata_mcp.py` already looks up
+  `setup.metal_plan` and `setup.plan_class` by name. The install steps that would call it (07 section 4.3) belong to
+  S3-S9, which are not done. Calling the planner from `main()` now would make setup depend on an engine that is not
+  built.
+- **Review required:** Confirm that the planner may sit in the fail-closed `setup.py` before the install flow is wired
+  to it.
+
+### D-IMPL-681: Run the engine with the argument list of section 4.4.1, using absolute paths
+
+- **Decision:** `metal_plan` builds the argument list of 07 section 4.4.1: `--plan-only`, then either
+  `--geometry data/geometry/<family>-<model>.txt` or the downloaded-files form `--pack`, `--native`, optional
+  `--ple-gguf`, `--mtp`. It adds `--expert-profile`, `--expert-cache auto`, `--prefill auto`, `--spec 4`,
+  `--max-context`, `--kv`, `--vram-reserve-mib` and the optional budgets. The engine is `ROOT/engine/strata`, and the
+  profile and geometry paths are absolute. The engine runs through `PLAN_RUNNER` (`subprocess.run`) with
+  `capture_output=True, text=True, timeout=PLAN_TIMEOUT_S`.
+- **Reason:** The spec's paths are relative to the repository root, so they depend on the caller's working directory.
+  Absolute paths remove that dependency. Each option was checked against `src/metal/program/options.cpp` and
+  `main.cpp`. `PLAN_RUNNER` is the seam that lets tests inject a fake runner.
+- **Review required:** None beyond that reading check. The first real `--plan-only` run on the reference Mac should
+  confirm the argument list.
+
+### D-IMPL-682: Add `gpu_budget_mib` to `metal_plan`
+
+- **Decision:** `metal_plan` takes `gpu_budget_mib=None` after `files`. When it is set, the command adds
+  `--gpu-budget-mib N`.
+- **Reason:** Section 4.4.1 writes `--gpu-budget-mib <a.gpu_budget_mib>`, but its signature has no `a` and no such
+  parameter. The keyword keeps every parameter of the given signature, in order. The engine accepts the flag
+  (`options.cpp`).
+- **Review required:** Ask for section 4.4.1's signature to list the parameter.
+
+### D-IMPL-683: Require every field the engine prints, and keep the fields a later engine appends
+
+- **Decision:** `parse_plan_line` requires the 33 keys of `PLAN_FIELDS`: every key `plan_line()` prints except the
+  conditional `reason`. A missing key, a repeated key, a token with no `=`, or an empty value raises `PlanError`. A
+  key outside `PLAN_FIELDS` is kept, and a numeric value becomes an int, because 05 section 3.4 says new keys are
+  appended at the end.
+- **Reason:** A truncated or partial line must not produce a plan with default values. Keeping appended keys matches
+  the stability rule, so a newer engine that appends a key does not break the parser.
+- **Review required:** `PLAN_FIELDS` must change when the engine adds a key that setup reads. A renamed or removed key
+  needs a `metal_rev` bump (05 section 3.4).
+
+### D-IMPL-684: Read signed integers, and keep `mode`, `gpu`, `kv` and `reason` as text
+
+- **Decision:** A value that matches `-?[0-9]+` becomes an int. `mode`, `gpu` and `kv` stay strings even when their
+  value is digits. A non-integer value in a numeric field raises.
+- **Reason:** The engine prints `avail_mib=-1` when the available memory was not given, and `free_mib` can be negative
+  (05 section 3.4). The spec's "all digits" rule cannot express those values. A text field should not change type
+  because its value looks numeric.
+- **Review required:** Confirm the minus-sign reading of the spec's rule "values that are all digits become int".
+
+### D-IMPL-685: Check field ranges, and check each PLAN line against the request
+
+- **Decision:** `fits` and `ram_warning` must be 0 or 1. `mode` must be `full` or `tiered`. `kv` must be one of the four
+  engine names. Counts must be at least 0, `avail_mib` at least -1, and `experts_resident` at most `experts_total`. In
+  `metal_plan`, the exit code must be 0 when `fits=1` and 3 when `fits=0`, and the echoed `context` and `kv` must equal
+  the request. Any other exit code raises, even when a PLAN line was printed.
+- **Reason:** A plan that does not describe the request, or an exit code that contradicts the plan, must not be used.
+  `plan.cpp` sets `result.kv` and `result.context` before every return path, including the unsupported-type path, so
+  the echo checks hold on every path.
+- **Review required:** Confirm that no legitimate engine result uses another exit code. 05 section 3.4 is the only
+  source for the exit codes.
+
+### D-IMPL-686: Allow `reason` only on fits=0 lines, and only the two reason forms of section 3.4
+
+- **Decision:** `reason` is required when `fits=0` and forbidden when `fits=1`. Its raw value must start with
+  `the_model_does_not_fit:` or `unsupported_type_`. `reason_raw` keeps the underscores. `reason` is
+  `reason_raw.replace("_", " ")`.
+- **Reason:** 05 section 3.4 lists these two reasons and says `reason` appears only on fits=0 lines. The check uses the
+  prefix, so the message wording can change without a parser change. The underscore replacement cannot be undone for
+  `unsupported_type_q4_K`, which is why the raw value is kept.
+- **Review required:** Confirm that 05 section 3.4 lists every reason. A third reason would make `metal_plan` raise.
+
+### D-IMPL-687: Make `plan_class` raise on missing or zero inputs
+
+- **Decision:** `plan_class` reads its keys through `_plan_value`, which raises `PlanError` for a missing key. It does not
+  use the spec's `p.get("reason_raw", "")`. A tiered plan with zero experts raises instead of dividing. The thresholds
+  0.85 and 0.40 and the class order come from 07 sections 4.1 and 4.4.2.
+- **Reason:** The task forbids fallback values. With a default of `""`, a fits=0 plan without a reason would be classed
+  `none`, which is a silent wrong answer in the menus.
+- **Review required:** The thresholds are provisional until measurement M-9 (07 section 4.1). Nothing else needs review
+  here.
+
+### D-IMPL-688: Turn engine failures into `PlanError`, with the hints of section 4.4.1
+
+- **Decision:** An exit code other than 0 or 3 raises. The message has the last five stderr lines and one hint:
+  quarantine (exit -9 with no output at all), incomplete files (`Library not loaded` on stderr), or the generic hint.
+  A timeout and an `OSError` from starting the engine also raise `PlanError`. An exit of 0 or 3 without exactly one
+  non-empty stdout line that starts with `PLAN ` raises with the generic hint.
+- **Reason:** The spec defines these hints and the five-line tail. A single exception type lets callers handle every
+  failure the same way. The quarantine hint needs empty output, as the spec's "before any output" says.
+- **Review required:** A SIGKILL that comes after stderr output gets the generic hint, not the quarantine hint. Confirm
+  on the reference Mac what macOS does when it kills an engine that is not trusted.
+
+### D-IMPL-689: Validate the request before the engine runs, and cache the result
+
+- **Decision:** `metal_plan` raises `ValueError`, before any process starts, for an unknown family or model; a KV name
+  outside `fp16`, `int8`, `k8v4`, `q4_0`; a context that is not a positive int (a bool is refused); an unknown vision
+  mode (valid: `none`, `gpu`, `cpu`); or a `files` value that is not a 4-tuple with a non-empty pack, shard and MTP
+  path. `vision="none"` uses reserve 700 MiB. The function keeps the spec's `functools.lru_cache`, so callers share the
+  returned dict, and its docstring says not to modify it. Exceptions are not cached.
+- **Reason:** A request the engine could never answer should not start a process. The spec gives `lru_cache`. Sharing a
+  mutable dict is a risk, and it is recorded here rather than changed silently.
+- **Review required:** Decide whether the planner should return a copy, which costs little, or keep the spec's shared
+  dict.
+
+### D-IMPL-690: Put the unit test in `serve/test_macos.py`, with an injected fake runner and constructed PLAN lines
+
+- **Decision:** `test_metal_plan_parse` is in `serve/test_macos.py`, the module section 10.3 lists for it, and runs
+  everywhere. It replaces `setup.PLAN_RUNNER` with a fake, so no engine runs and no process starts. The PLAN lines are
+  built from the field order of 05 section 3.4 and `plan_line()` in `plan.cpp`. They are constructed for the test, not
+  captured from an engine run. Their totals are internally consistent: `total_mib` and `free_mib` match the components.
+- **Reason:** The task requires a fake runner and no real engine. Section 10.3 describes a shell-script engine, which
+  this test does not use.
+- **Review required:** Replace the constructed lines with `--plan-only` output from the reference Mac once the engine is
+  built.
+
+### D-IMPL-691: Leave `tests/metal/test_map.json` unchanged
+
+- **Decision:** `tests/metal/test_map.json` is not changed. It has no planned key for `test_metal_plan_parse`, so no key
+  is removed.
+- **Reason:** The task limits the change to a planned key. The map check fails in this worktree before and after the
+  change, because `build-dev` does not exist here. Against the main checkout's build it reports one unrelated error
+  (`prompts_manifest_test`).
+- **Review required:** Decide whether `serve/test_macos.py` should get a `python:` entry in
+  `tests/metal/requirements.json`. The planned-key rule did not apply.
+
+### D-IMPL-692: S4 is not complete: the reference-Mac part is unverified
+
+- **Decision:** S4 is recorded as: the parser and the planner's call and failure paths pass their unit tests.
+  "`metal_plan` returns a plan for every model on the reference Mac" is not verified, and S4 must not be marked done
+  from this change.
+- **Reason:** That criterion needs the built engine (06 H4/H5), the model packs and the geometry files (S5). This
+  worktree has no `engine/` folder and no `data/geometry/`.
+- **Review required:** Keep S4 open until a `--plan-only` run on the reference Mac records a plan for each model.
+
+### D-IMPL-693: `tools/strata_mcp.py` now reaches the planner when a Metal engine is installed
+
+- **Decision:** `strata_mcp.py` is not changed. Because `setup.metal_plan` and `setup.plan_class` now exist,
+  `_mac_planner` returns `setup` when the installed engine's backend is `metal`, and the MCP tools then run the real
+  engine. `_mac_model_plan` catches exceptions and logs them, so a `PlanError` returns None to the caller and does not
+  reach the MCP client as an error.
+- **Reason:** This is the wiring section 8 intends. Before this change the MCP planner returned None for Metal, because
+  the two functions were missing.
+- **Review required:** Confirm that the MCP tools should call the engine for each Metal planning request. The results are
+  cached per process in `_metal_plan_cache`.
+
