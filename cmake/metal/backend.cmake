@@ -171,6 +171,7 @@ src/metal/engine/prefill_moe_shared_pipeline.cpp
   src/metal/engine/mtp_params_layout.cpp
   src/metal/engine/mtp_runtime_storage.cpp
   src/metal/engine/mtp_dispatch.cpp
+  src/metal/engine/mtp_draft_tail_dispatch.cpp
   src/metal/engine/mtp_full_layer_dispatch.cpp
   src/metal/engine/prefill.cpp
   src/metal/engine/snapshot.cpp)

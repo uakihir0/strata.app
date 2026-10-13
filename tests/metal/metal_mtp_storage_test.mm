@@ -1709,6 +1709,157 @@ int main(int argc, char** argv) {
             std::memcpy(draft_probabilities_before.data(),
                         compact_draft_sampling_buffers.probabilities.contents,
                         draft_probabilities_before.size());
+
+            MtpDraftVocabularyMap stale_draft_vocabulary;
+            {
+                auto stale_map_transaction =
+                    rollback_context->buffers().transaction();
+                BufferRef stale_map_rows =
+                    rollback_context->buffers().allocate(
+                        "MTP draft-tail stale vocabulary-map fixture",
+                        compact_draft_ids.size() * sizeof(std::int32_t),
+                        error);
+                require(static_cast<bool>(stale_map_rows),
+                        "allocate temporary MTP vocabulary-map fixture: " +
+                            error);
+                std::memcpy(stale_map_rows.contents, compact_draft_ids.data(),
+                            compact_draft_ids.size() *
+                                sizeof(std::int32_t));
+                require(make_mtp_draft_vocabulary_map(
+                            *rollback_context,
+                            rollback_context->buffers().read_only(
+                                stale_map_rows),
+                            compact_head_rows, stale_draft_vocabulary, error),
+                        "validate temporary MTP vocabulary-map fixture: " +
+                            error);
+            }
+            require(!stale_draft_vocabulary &&
+                        stale_draft_vocabulary.row_count() ==
+                            compact_draft_rows &&
+                        stale_draft_vocabulary.full_head_size() ==
+                            compact_head_rows,
+                    "temporary MTP vocabulary map retains metadata after its backing allocation rolls back");
+            MtpDraftHeadBuffers stale_map_head =
+                compact_draft_head_buffers;
+            stale_map_head.draft_vocabulary = stale_draft_vocabulary;
+            MtpDraftSamplingBuffers stale_map_sampling =
+                compact_draft_sampling_buffers;
+            stale_map_sampling.draft_vocabulary = stale_draft_vocabulary;
+            auto stale_map_command = rollback_context->make_command_buffer(
+                "MTP draft-tail stale-map refusal", error);
+            const bool draft_tail_rejects_stale_map =
+                stale_map_command != nullptr &&
+                !encode_mtp_draft_tail(
+                    *rollback_context, *stale_map_command,
+                    MatVecWeightFormat::q5_k, compact_head_rows,
+                    stale_map_head, stale_map_sampling, error) &&
+                error.find("requires live validated vocabulary-map tokens") !=
+                    std::string::npos;
+            std::string stale_map_commit_error;
+            const bool stale_map_command_discarded =
+                stale_map_command != nullptr &&
+                !stale_map_command->commit(stale_map_commit_error) &&
+                stale_map_commit_error.find(
+                    "cannot commit a discarded Metal command buffer") !=
+                    std::string::npos;
+            require(draft_tail_rejects_stale_map &&
+                        stale_map_command_discarded &&
+                        unchanged_view(
+                            compact_draft_head_buffers.activations_q8_1,
+                            draft_q8_before) &&
+                        unchanged_view(compact_draft_head_buffers.logits,
+                                       draft_logits_before) &&
+                        unchanged_view(
+                            compact_draft_sampling_buffers.output_ids,
+                            draft_ids_before),
+                    "MTP draft tail rejects expired map metadata before stage-21 dispatch");
+
+            MtpDraftSamplingBuffers mismatched_tail_sampling =
+                compact_draft_sampling_buffers;
+            mismatched_tail_sampling.draft_vocabulary = {};
+            auto mismatched_tail_command =
+                rollback_context->make_command_buffer(
+                    "MTP draft-tail map-identity refusal", error);
+            const bool draft_tail_rejects_different_map =
+                mismatched_tail_command != nullptr &&
+                !encode_mtp_draft_tail(
+                    *rollback_context, *mismatched_tail_command,
+                    MatVecWeightFormat::q5_k, compact_head_rows,
+                    compact_draft_head_buffers, mismatched_tail_sampling,
+                    error) &&
+                error.find("same validated vocabulary-map token") !=
+                    std::string::npos;
+            std::string mismatched_tail_commit_error;
+            const bool mismatched_tail_command_discarded =
+                mismatched_tail_command != nullptr &&
+                !mismatched_tail_command->commit(
+                    mismatched_tail_commit_error) &&
+                mismatched_tail_commit_error.find(
+                    "cannot commit a discarded Metal command buffer") !=
+                    std::string::npos;
+            require(draft_tail_rejects_different_map &&
+                        mismatched_tail_command_discarded &&
+                        unchanged_view(
+                            compact_draft_head_buffers.activations_q8_1,
+                            draft_q8_before) &&
+                        unchanged_view(compact_draft_head_buffers.logits,
+                                       draft_logits_before),
+                    "MTP draft tail rejects a different sampler map before stage-21 dispatch");
+
+            const MtpParams valid_draft_params = projection_params;
+            projection_params.samp.greedy = 0u;
+            std::memcpy(provisional_params_slot.contents, &projection_params,
+                        sizeof(projection_params));
+            auto late_sampler_failure_command =
+                rollback_context->make_command_buffer(
+                    "MTP draft-tail late sampler rollback", error);
+            const bool draft_tail_late_sampler_failure =
+                late_sampler_failure_command != nullptr &&
+                !Encoder::encode(
+                    *rollback_context, *late_sampler_failure_command,
+                    "MTP draft-head then invalid sampler",
+                    [&](Encoder& encoder, std::string& encode_error) {
+                        return encode_mtp_draft_tail(
+                            *rollback_context, encoder,
+                            MatVecWeightFormat::q5_k, compact_head_rows,
+                            compact_draft_head_buffers,
+                            compact_draft_sampling_buffers, encode_error);
+                    },
+                    error) &&
+                error.find("requires greedy=1 and empty zero-offset history") !=
+                    std::string::npos;
+            std::string late_sampler_commit_error;
+            bool late_sampler_command_discarded = false;
+            if (late_sampler_failure_command) {
+                if (!late_sampler_failure_command->commit(
+                        late_sampler_commit_error)) {
+                    late_sampler_command_discarded =
+                        late_sampler_commit_error.find(
+                            "cannot commit a discarded Metal command buffer") !=
+                        std::string::npos;
+                } else {
+                    (void)late_sampler_failure_command->wait_until_completed(
+                        late_sampler_commit_error);
+                }
+            }
+            projection_params = valid_draft_params;
+            std::memcpy(provisional_params_slot.contents, &projection_params,
+                        sizeof(projection_params));
+            require(draft_tail_late_sampler_failure &&
+                        late_sampler_command_discarded &&
+                        unchanged_view(
+                            compact_draft_head_buffers.activations_q8_1,
+                            draft_q8_before) &&
+                        unchanged_view(compact_draft_head_buffers.logits,
+                                       draft_logits_before) &&
+                        unchanged_view(
+                            compact_draft_sampling_buffers.output_ids,
+                            draft_ids_before) &&
+                        unchanged_view(
+                            compact_draft_sampling_buffers.probabilities,
+                            draft_probabilities_before),
+                    "late MTP stage-22 validation discards stage 21 and preserves the draft-tail views");
+
             auto draft_head_command = rollback_context->make_command_buffer(
                 "MTP runtime-bound stages 21–22 compact synthetic head", error);
             require(draft_head_command != nullptr &&
@@ -1717,17 +1868,13 @@ int main(int argc, char** argv) {
                             "MTP runtime-bound indexed draft head and sampler",
                             [&](Encoder& encoder,
                                 std::string& encode_error) {
-                                return encode_mtp_draft_head(
-                                           *rollback_context, encoder,
-                                           MatVecWeightFormat::q5_k,
-                                           compact_head_rows,
-                                           compact_draft_head_buffers,
-                                           encode_error) &&
-                                       encode_mtp_draft_sampling(
-                                           *rollback_context, encoder,
-                                           compact_head_rows,
-                                           compact_draft_sampling_buffers,
-                                           encode_error);
+                                return encode_mtp_draft_tail(
+                                    *rollback_context, encoder,
+                                    MatVecWeightFormat::q5_k,
+                                    compact_head_rows,
+                                    compact_draft_head_buffers,
+                                    compact_draft_sampling_buffers,
+                                    encode_error);
                             },
                             error) &&
                         draft_head_command->commit(error) &&

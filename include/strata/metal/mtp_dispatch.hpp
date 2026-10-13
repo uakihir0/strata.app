@@ -609,4 +609,23 @@ bool encode_mtp_draft_sampling(Context& context,
                                const MtpDraftSamplingBuffers& buffers,
                                std::string& error);
 
+/// Compose MTP stages 21–22 from caller-bound head and sampler views. The
+/// parameter block, logits view and validated vocabulary-map token must be
+/// identical across both inputs. The caller-owned form requires an ordered
+/// concurrent-group boundary and must propagate failure so late sampler
+/// validation discards the enclosing unsubmitted command buffer.
+bool encode_mtp_draft_tail(Context& context, Encoder& encoder,
+                           MatVecWeightFormat weight_format,
+                           std::uint32_t head_vocab_size,
+                           const MtpDraftHeadBuffers& head,
+                           const MtpDraftSamplingBuffers& sampling,
+                           std::string& error);
+/// Transactional command-buffer form of the ordered MTP stages 21–22 tail.
+bool encode_mtp_draft_tail(Context& context, CommandBuffer& command_buffer,
+                           MatVecWeightFormat weight_format,
+                           std::uint32_t head_vocab_size,
+                           const MtpDraftHeadBuffers& head,
+                           const MtpDraftSamplingBuffers& sampling,
+                           std::string& error);
+
 }  // namespace strata::metal
