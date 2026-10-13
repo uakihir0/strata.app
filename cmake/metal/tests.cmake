@@ -1145,14 +1145,27 @@ target_link_libraries(metal_slot_pool_test PRIVATE strata_metal_engine strata_me
 strata_metal_test(metal_slot_pool_test metal metal_slot_pool_test)
 set_tests_properties(metal_slot_pool_test PROPERTIES TIMEOUT 30)
 add_executable(serve_transcript_test tests/metal/serve_transcript_test.cpp tests/metal/fake_window.cpp
-               src/metal/program/serve.cpp)
+               src/metal/program/serve.cpp src/metal/program/watchdog.cpp)
 target_include_directories(serve_transcript_test PRIVATE ${CMAKE_SOURCE_DIR}/include
                            ${CMAKE_SOURCE_DIR}/tests/metal)
 target_compile_definitions(serve_transcript_test PRIVATE
                            STRATA_SERVE_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/metal/fixtures/serve")
-target_link_libraries(serve_transcript_test PRIVATE strata_metal_options Threads::Threads)
+target_link_libraries(serve_transcript_test PRIVATE strata_metal_options strata_metal_platform Threads::Threads)
 strata_metal_test(serve_transcript_test host serve_transcript_test)
 set_tests_properties(serve_transcript_test PROPERTIES TIMEOUT 30)
+
+# The serve watchdog (docs/mac/06, section 14): fake-clock checks, the stall report, and real stalls in a child serve loop.
+add_executable(watchdog_host_test tests/metal/watchdog_host_test.cpp src/metal/program/serve.cpp
+               src/metal/program/watchdog.cpp)
+target_include_directories(watchdog_host_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(watchdog_host_test PRIVATE strata_metal_platform Threads::Threads)
+strata_metal_test(watchdog_host_test host watchdog_host_test)
+set_tests_properties(watchdog_host_test PROPERTIES TIMEOUT 60)
+
+# The byte layouts of the --dump-* files (docs/mac/03, sections 9.1 and 9.2).
+add_executable(dump_format_host_test tests/metal/dump_format_host_test.cpp src/metal/program/dump_format.cpp)
+target_include_directories(dump_format_host_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+strata_metal_test(dump_format_host_test host dump_format_host_test)
 add_executable(oneshot_output_test tests/metal/oneshot_output_test.cpp src/metal/program/oneshot.cpp
                src/metal/program/stats.cpp)
 target_include_directories(oneshot_output_test PRIVATE ${CMAKE_SOURCE_DIR}/include)

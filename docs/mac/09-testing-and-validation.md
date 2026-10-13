@@ -1181,7 +1181,7 @@ name, except `row_t_independent`, which is step 6 of every twin and has no test 
 
 ### 9.1 CTest tests
 
-With every work item done, a `mac-dev` build registers 188 tests: 47 `host`, 113 `metal` and 28 `model`. The 28 tests
+With every work item done, a `mac-dev` build registers 190 tests: 49 `host`, 113 `metal` and 28 `model`. The 28 tests
 of the bootstrap ([08](08-build-and-distribution.md), section 6.4) are among them.
 
 | Label | Preset | Runs on |
@@ -1190,7 +1190,7 @@ of the bootstrap ([08](08-build-and-distribution.md), section 6.4) are among the
 | `metal` | `mac-metal` | The reference Mac on every push to `main`; the nightly validation-layer run; the family runs; hosted Macs if X-8 allows (section 7.5) |
 | `model` | `mac-model` | The reference Mac, nightly (section 7.2, step 1); the `metal_<area>_model_test` set also under the validation layer on Sunday |
 
-**`host` (47).**
+**`host` (49).**
 
 | Tests | Defined in | What it serves |
 | --- | --- | --- |
@@ -1223,6 +1223,8 @@ of the bootstrap ([08](08-build-and-distribution.md), section 6.4) are among the
 | `options_dispositions_test` | [06](06-engine-host-port.md), work item H4 | Every upstream and Metal CLI flag has its disposition, warning policy and argument count; geometry and simulated-memory validation exits 2 |
 | `metal_cli_modes_test` | [06](06-engine-host-port.md), work item H4 | Empty invocation fails closed; storage-check requires `--native` and rejects plan-only before Metal opens; incompatible device-list, self-test, capture and plan-only combinations exit 2 |
 | `serve_transcript_test` | [06](06-engine-host-port.md), work item H6 | The host serve loop, linked with `tests/metal/fake_window.cpp` (deterministic logits from the seed and position), replays the checked-in stdout/stderr transcripts byte for byte. Cases cover startup key order, GEN/GENI (including a spaced SVE1 path), request errors, context/vocabulary checks, EOS, and a fatal GPU error. SVE1 checks include pre-allocation bounds from image-pad runs, the 256 MiB aggregate limit and file length, partial headers, multiple records, and 2-D M-RoPE positions. Adversarial backends verify `max_new`, PP totals/progress/completion, EOS finish values, rejection of post-EOS tokens and cancellation invariants. Child processes cover a continuing 16 MiB overlong line, queue overflow with and without immediate EOF, CR-terminated EOF, queued STOP, STOP during decode, STOP immediately after DONE, active and preclosed EOF (including EOF with queued QUIT), and SIGINT/SIGHUP between completed requests; each process exits within 5 s where specified. The finish path also has a 64 MiB synchronous input-drain ceiling, which fails closed on excess ([06](06-engine-host-port.md), sections 2.4, 5 and 5.4). |
+| `watchdog_host_test` | [06](06-engine-host-port.md), work item H11 | The serve watchdog (section 14): `STRATA_WATCHDOG_S` parsing; beats and the busy scope; on a fake clock it fires only once the limit has passed with a busy request and no beat, never while idle or beating; the issue #29 line, the stall report header, two passes 2 s apart, the crash-report hint and the abort come in that order. In child serve loops, a stalled request ends by SIGABRT after those lines, a beating request and an idle engine do not, and a malformed limit exits 2. The `metal_watchdog_test` full-mode cases need the engine and a model |
+| `dump_format_host_test` | [03](03-model-reference.md), work item R11 | The `--dump-*` byte layouts of sections 9.1 and 9.2, decoded from the written files: logits and first-logits, residual, layers and halves (each slice at its documented float offset, the zero gap), routing records, and `--logits-stride` row selection. `dump_formats_test` reads Mac dumps and stays model-labelled |
 | `prompts_manifest_test` | Section 2.2 | `python3 -m unittest tools.metal.test_make_prompts`: the prompt sets against their manifest |
 | `test_map` | Section 9.4 | `python3 tools/metal/test_map.py` with `STRATA_BUILD_DIR` set |
 
