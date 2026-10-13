@@ -5,11 +5,19 @@
 // functions of strata/metal/kernel_env.hpp, and STRATA_METAL_GEMM through resolve_prefill_gemm_backend; the test sets
 // each variable with setenv and then reads it with getenv, as the engine does. A variable that has no callable reader
 // is checked against the Mac sources: an ignored name is read by nothing (section 9.3), and an honoured name must be
-// read by some Mac source.
+// read by some Mac source. Two dispositions are checked by running the strata executable: the STRATA_METAL_ICB notice
+// (section 8.3) and the rejection of --check-logits, which section 9.2 keeps but Phase 1 does not read.
+//
+// Phase 1 amendments (docs/mac/IMPLEMENTATION-DECISIONS.md, D-IMPL-960 to D-IMPL-963): STRATA_KV_ROT,
+// STRATA_PREFILL_TIMING, STRATA_PREFILL_DUMP_R and STRATA_DBG_NAN are ignored until the window or the prompt path
+// reads them; --check-logits is not read until the window exists; STRATA_PREFILL_BF16X2 is read with atoi.
 #include "strata/metal/kernel_env.hpp"
 #include "strata/metal/options.hpp"
 #include "strata/metal/prefill_gemm_dispatch.hpp"
 
+#include <sys/wait.h>
+
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +40,9 @@ namespace fs = std::filesystem;
 #ifndef STRATA_MAC_SPEC
 #error "STRATA_MAC_SPEC must name docs/mac/04-metal-kernels.md"
 #endif
+#ifndef STRATA_CLI_BINARY
+#error "STRATA_CLI_BINARY must name the strata executable"
+#endif
 
 int checks = 0;
 int failures = 0;
@@ -48,7 +59,8 @@ void check(bool condition, const std::string& name, const std::string& detail = 
 }
 
 // ---- section 9.2: kernel flags. The rule of section 9.1 gives the warning: a flag that selects another upstream arm
-// warns; a flag whose arm is always on does not. KEEP flags are read by the engine.
+// warns; a flag whose arm is always on does not. No flag is read outside the parser in Phase 1. A KEEP flag is
+// rejected by the CLI with the other inference options until its engine path exists; the test checks that for each.
 struct FlagRow {
     std::string_view name;
     OptionDisposition disposition;
@@ -81,12 +93,13 @@ struct VariableRow {
 };
 
 constexpr VariableRow kVariables[] = {
-    // section 9.3, honoured
-    {"STRATA_KV_ROT", Expect::honoured},
+    // section 9.3, honoured in Phase 1: the memory plan reads it as on or off
     {"STRATA_PREFILL_BF16X2", Expect::honoured},
-    {"STRATA_PREFILL_TIMING", Expect::honoured},
-    {"STRATA_PREFILL_DUMP_R", Expect::honoured},
-    {"STRATA_DBG_NAN", Expect::honoured},
+    // section 9.3, ignored in Phase 1 (D-IMPL-960): each is honoured once the window or the prompt path reads it
+    {"STRATA_KV_ROT", Expect::ignored},
+    {"STRATA_PREFILL_TIMING", Expect::ignored},
+    {"STRATA_PREFILL_DUMP_R", Expect::ignored},
+    {"STRATA_DBG_NAN", Expect::ignored},
     // section 9.3, ignored
     {"STRATA_PROMPT_ATTN_OLD", Expect::ignored},
     {"STRATA_SELECT_OLD", Expect::ignored},
@@ -134,8 +147,6 @@ constexpr VariableRow kVariables[] = {
     {"STRATA_METAL_ICB", Expect::notice},
     {"STRATA_METAL_SMALL_TILES", Expect::ignored},
 };
-
-constexpr std::string_view kIcbNotice = "STRATA_METAL_ICB is not implemented; encoding each window";
 
 // The Mac sources that the engine and its tests compile: the engine, its headers, the platform layer and the n-gram
 // reader. src/kernels holds upstream CUDA code, which the Mac build does not compile except for ngram.cpp.
@@ -204,6 +215,63 @@ const char* set_variable(const char* name, const char* value) {
     return std::getenv(name);
 }
 
+// ---- process checks: the strata executable, run with the environment that the caller has set.
+struct CliRun {
+    int exit_code = -1;
+    std::string output;  // stdout and stderr together
+};
+
+CliRun run_cli(const std::string& arguments) {
+    CliRun run;
+    const std::string command = std::string("\"") + STRATA_CLI_BINARY + "\" " + arguments + " 2>&1";
+    FILE* pipe = popen(command.c_str(), "r");
+    if (pipe == nullptr) return run;
+    char buffer[512];
+    while (std::fgets(buffer, sizeof buffer, pipe) != nullptr) run.output += buffer;
+    const int status = pclose(pipe);
+    if (WIFEXITED(status)) run.exit_code = WEXITSTATUS(status);
+    return run;
+}
+
+// How many lines of `text` equal `line` exactly.
+int count_lines(const std::string& text, std::string_view line) {
+    int count = 0;
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        std::size_t end = text.find('\n', start);
+        if (end == std::string::npos) end = text.size();
+        if (std::string_view(text).substr(start, end - start) == line) ++count;
+        start = end + 1;
+    }
+    return count;
+}
+
+// STRATA_METAL_ICB (section 8.3): the engine reads the variable at start and prints the notice once when it is 1.
+// `--version` returns before any Metal work, so the run needs no GPU.
+void check_icb_notice() {
+    struct Case {
+        const char* label;
+        const char* setting;
+        int expected_lines;
+    };
+    constexpr Case cases[] = {
+        {"unset", nullptr, 0},
+        {"0", "0", 0},
+        {"1", "1", 1},
+    };
+    for (const Case& test : cases) {
+        set_variable("STRATA_METAL_ICB", test.setting);
+        const CliRun run = run_cli("--version");
+        const int lines = count_lines(run.output, kMetalIcbNotice);
+        check(run.exit_code == 0 && lines == test.expected_lines,
+              std::string("STRATA_METAL_ICB ") + test.label + " prints the section 8.3 notice " +
+                  std::to_string(test.expected_lines) + " time(s)",
+              "exit " + std::to_string(run.exit_code) + ", " + std::to_string(lines) + " notice line(s); output: " +
+                  run.output);
+    }
+    set_variable("STRATA_METAL_ICB", nullptr);
+}
+
 void check_flags(const std::vector<SourceFile>& files) {
     for (const FlagRow& row : kFlags) {
         const std::string name(row.name);
@@ -233,13 +301,17 @@ void check_flags(const std::vector<SourceFile>& files) {
         check(extra.exit_code == 2 && extra.error.find("unknown argument: 1") != std::string::npos,
               "flag " + name + " rejects a value", extra.error);
 
-        // read: KEEP flags must reach the engine; every other flag must not
+        // read: no flag is read outside the parser in Phase 1 (section 9.2)
         const std::string reader = literal_reader(files, row.name, "options.cpp");
+        check(reader.empty(), "flag " + name + " is not read by the engine", "read by " + reader);
+
+        // a KEEP flag that the engine does not read yet is rejected by the CLI, never accepted silently (section 9.2).
+        // With a model named, the rejection is the one for inference options that are not wired (src/metal/program).
         if (row.disposition == OptionDisposition::Keep) {
-            check(!reader.empty(), "flag " + name + " is read by " + (reader.empty() ? "the engine" : reader),
-                  "section 9.2 says KEEP, but no Mac source outside the parser reads it");
-        } else {
-            check(reader.empty(), "flag " + name + " is not read by the engine", "read by " + reader);
+            const CliRun run = run_cli(name + " --native model.gguf");
+            check(run.exit_code == 2 &&
+                      run.output.find("planning and inference options are not wired") != std::string::npos,
+                  "flag " + name + " is rejected by the CLI until its engine path exists", run.output);
         }
     }
 }
@@ -376,17 +448,15 @@ int main() {
                 case Expect::ignored:
                     check(reader.empty(), "ignored variable " + name + " is read by nothing", "read by " + reader);
                     break;
-                case Expect::notice: {
-                    bool printed = false;
-                    for (const SourceFile& file : files) printed |= file.text.find(kIcbNotice) != std::string::npos;
-                    check(printed, "variable " + name + " prints its section 8.3 notice",
-                          "docs/mac/04 section 8.3 requires `strata: " + std::string(kIcbNotice) +
-                              "` once; no Mac source prints it");
+                case Expect::notice:
+                    check(!reader.empty(), reader.empty() ? "notice variable " + name + " has no Mac reader"
+                                                          : "notice variable " + name + " is read by " + reader,
+                          "docs/mac/04 section 8.3 says the variable prints a notice, but no Mac source reads it");
                     break;
-                }
             }
         }
 
+        check_icb_notice();
         check_dispatch_mode();
         check_gemm();
         check_prefill_bf16x2();

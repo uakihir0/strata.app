@@ -517,6 +517,10 @@ int main(int argc, char** argv) {
     for (const std::string& warning : parsed.options.warnings) {
         std::fprintf(stderr, "%s\n", warning.c_str());
     }
+    // Once per process, at start: the window encoder does not exist yet, so no window can print it (docs/mac/04, 8.3).
+    if (metal_icb_requested(std::getenv("STRATA_METAL_ICB"))) {
+        std::fprintf(stderr, "%s\n", kMetalIcbNotice);
+    }
     const Options& options = parsed.options;
 
     if (options.has("--help")) {

@@ -4,7 +4,6 @@
 // so the test runs the production reading, not a copy of it.
 #pragma once
 
-#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
@@ -29,15 +28,22 @@ inline bool parse_dispatch_mode(const char* value, DispatchMode& mode, std::stri
     return false;
 }
 
-/// STRATA_PREFILL_BF16X2 as the engine reads it for the memory plan (src/metal/program/main.cpp). Unset, empty, or a
-/// value that strtol does not read as one whole number, leaves the feature off. Any other whole number that is not
-/// zero turns it on.
+/// STRATA_PREFILL_BF16X2 as the engine reads it for the memory plan (src/metal/program/main.cpp). The value is read
+/// with atoi, as upstream reads it (docs/mac/06, section 4.2): a leading whole number counts, so "1x" is 1, and unset,
+/// empty, 0 or a value with no leading number leaves the feature off. Any other non-zero number turns it on.
+/// The code takes strtol's value and narrows it to int, which is what atoi returns on this platform, and it has no
+/// undefined overflow.
 inline bool prefill_bf16x2_enabled(const char* value) {
-    if (value == nullptr || *value == '\0') return false;
-    char* end = nullptr;
-    errno = 0;
-    const long parsed = std::strtol(value, &end, 10);
-    return errno == 0 && end != value && *end == '\0' && parsed != 0;
+    if (value == nullptr) return false;
+    return static_cast<int>(std::strtol(value, nullptr, 10)) != 0;
+}
+
+/// STRATA_METAL_ICB (docs/mac/04, section 8.3; docs/mac/06, section 4.4). Only "1" requests indirect command buffers,
+/// which the Mac does not implement. The engine prints kMetalIcbNotice once at start and ignores the request.
+inline constexpr const char* kMetalIcbNotice = "strata: STRATA_METAL_ICB is not implemented; encoding each window";
+
+inline bool metal_icb_requested(const char* value) {
+    return value != nullptr && std::string_view(value) == "1";
 }
 
 }  // namespace strata::metal

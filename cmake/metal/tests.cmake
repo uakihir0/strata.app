@@ -701,7 +701,9 @@ target_include_directories(kernel_env_dispositions_test PRIVATE ${CMAKE_SOURCE_D
 target_link_libraries(kernel_env_dispositions_test PRIVATE strata_metal_cli_options)
 target_compile_definitions(kernel_env_dispositions_test PRIVATE
                            STRATA_MAC_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-                           STRATA_MAC_SPEC="${CMAKE_SOURCE_DIR}/docs/mac/04-metal-kernels.md")
+                           STRATA_MAC_SPEC="${CMAKE_SOURCE_DIR}/docs/mac/04-metal-kernels.md"
+                           STRATA_CLI_BINARY="$<TARGET_FILE:strata>")
+add_dependencies(kernel_env_dispositions_test strata)
 strata_metal_test(kernel_env_dispositions_test host kernel_env_dispositions_test)
 strata_metal_test(metal_cli_modes_test host ${CMAKE_COMMAND} -DSTRATA=$<TARGET_FILE:strata>
                   -P ${CMAKE_SOURCE_DIR}/tests/metal/check_cli_modes.cmake)
