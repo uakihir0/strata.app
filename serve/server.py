@@ -726,6 +726,8 @@ class Service:
         # Sharing unified memory with other apps is optional: unload the engine after this many idle seconds,
         # run this command before reloading if configured, then reload it on the next request.
         self.idle_unload_s = 0
+        self.keep_awake = False                          # 6.9: prevent idle sleep while the model is loaded (MAC)
+        self.caffeinate = None                           # the caffeinate process that does it, when one runs
         self.min_free_unified_memory_mib = 0
         self.before_load = None
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
@@ -813,7 +815,25 @@ class Service:
             print(f"[strata] the engine had stopped (exit code {code}); starting it again "
                   "(a minute or two) ...", flush=True)
         self.engine.restart()
+        self.start_keep_awake()
         print("[strata] the engine is running again", flush=True)
+
+    def start_keep_awake(self) -> None:
+        """6.9: while the model is loaded, keep the Mac from idle sleep. The caffeinate process ends with this process,
+        and an unload ends it (stop_keep_awake). Off a Mac, macos.keep_awake returns None and nothing runs."""
+        if not self.keep_awake:
+            return
+        self.stop_keep_awake()
+        self.caffeinate = macos.keep_awake(os.getpid())
+
+    def stop_keep_awake(self) -> None:
+        proc, self.caffeinate = self.caffeinate, None
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
     def load(self):
         """POST /load and every generation request: start the engine now if it is unloaded."""
@@ -853,6 +873,7 @@ class Service:
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
             self.engine.unload()
+            self.stop_keep_awake()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
@@ -2398,6 +2419,25 @@ def min_free_unified_memory_warning(minimum: int, free: int | None) -> str | Non
             f"{minimum} MiB; this unvalidated estimate will not block model loading")
 
 
+def port_in_use(host, port) -> bool:
+    """Is something already serving this port? A bind that fails says yes. On a Mac a bind that succeeds is not enough
+    (MAC: BSD lets a SO_REUSEADDR bind succeed beside a listener on the wildcard or on another address), so a connect
+    to the port decides (docs/mac/07-server-setup-port.md, section 6.1). The connect sends no data."""
+    try:
+        Server((host, port), BaseHTTPRequestHandler).server_close()
+    except OSError:
+        return True
+    if sys.platform != "darwin":
+        return False
+    targets = {"127.0.0.1"} | ({host} if host not in ("0.0.0.0", "", "::", "localhost") else set())
+    for target in targets:
+        with socket.socket(socket.AF_INET6 if ":" in target else socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.5)
+            if probe.connect_ex((target, port)) == 0:
+                return True
+    return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -2433,6 +2473,9 @@ def main() -> int:
                          "Metal model load (also \"min_free_unified_memory_mib\" in the config)")
     ap.add_argument("--before-load", help="a command run before the model is loaded again (e.g. to unload another "
                                           "server's model; also \"before_load\" in the config, a string or a list)")
+    ap.add_argument("--keep-awake", action="store_true", default=None,
+                    help="keep this Mac from idle sleep while the model is loaded (overrides \"keep_awake\" in the "
+                         "config; closing the lid of a MacBook still sleeps it)")
     a = ap.parse_args()
     host_error = macos_host_error()
     if host_error:
@@ -2458,9 +2501,7 @@ def main() -> int:
     if not is_loopback_host(a.host) and not api_key:
         ap.error("an API key is required when listening on a non-loopback address; set --api-key, STRATA_API_KEY, "
                  "or api_key in the config")
-    try:                                                # before the minutes of loading: is the port free?
-        Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
-    except OSError:
+    if port_in_use(a.host, a.port):                     # before the minutes of loading: is the port free?
         ap.error(f"port {a.port} is already in use - is Strata (or another server) already running? "
                  f"Close it, or start this one with a different --port")
     if cfg.get("tokenizer"):
@@ -2559,6 +2600,7 @@ def main() -> int:
             print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
     svc.backend = configured_backend_value
+    svc.keep_awake = a.keep_awake if a.keep_awake is not None else cfg.get("keep_awake") is True   # 6.9
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:
@@ -2577,6 +2619,8 @@ def main() -> int:
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
+    if svc.loaded():                                    # 6.9: after READY; a --lazy start waits for its first load
+        svc.start_keep_awake()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
@@ -2589,6 +2633,9 @@ def main() -> int:
             print(f"       from other devices: http://{ip}:{a.port}/   (API: http://{ip}:{a.port}/v1)", flush=True)
         if not ips:
             print("       from other devices: http://<this Mac's IP address>:" + str(a.port) + "/", flush=True)
+        if sys.platform == "darwin" and not svc.keep_awake:     # 6.9: the text names the key that prevents it
+            print('       this Mac may sleep when idle and then answers nothing: add "keep_awake": true to the config '
+                  "to prevent that while the model is loaded (closing the lid still sleeps a MacBook)", flush=True)
         from serve import macos
         if macos.firewall_on():
             python = os.path.realpath(sys.executable)
@@ -2606,6 +2653,16 @@ def main() -> int:
         signal.signal(signal.SIGTERM, on_sigterm)
     except (ValueError, OSError, AttributeError):         # not the main thread
         pass
+    if sys.platform == "darwin":                          # MAC (6.2): the Terminal window closed; stop like Ctrl+C
+        def on_sighup(signum, frame):
+            fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)                                # later prints must not fail with EIO on the dead tty
+            raise KeyboardInterrupt
+        try:
+            signal.signal(signal.SIGHUP, on_sighup)
+        except (ValueError, OSError, AttributeError):
+            pass
     try:
         while True:
             time.sleep(1)
