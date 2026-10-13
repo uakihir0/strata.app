@@ -12716,6 +12716,92 @@ measuring L-15 remain open.
   the final test-only BF16X2 oracle addition. `test_map.py` and
   `git diff --check` passed. See REV-206 for hostile findings and disposition.
 
+### D-IMPL-411: Finalize accepted-prefix GPU state and PLE token history together
+
+- **Decision:** Add `commit_window_accepted_prefix_state` as a synchronous
+  session-aware boundary around the existing GDN/PLE/QSA GPU commit. Validate
+  the session's PLE history, geometry and every candidate token before
+  encoding; require every GDN state and PLE history view to match that session
+  and every persistent QSA view to match the supplied `KvStore`; register the
+  command buffer with `SessionStateStorage`; wait for successful GPU
+  completion; then advance only the accepted token prefix. Require callers to
+  pair token IDs and replay buffers from the same speculative Window. Reject
+  zero acceptance because the existing snapshots do not preserve all QSA
+  state a speculative append may overwrite. After submitted GPU execution
+  failure, require callers to discard and recreate the session and KV state.
+  Require callers to serialize this operation with preparation and reset for
+  the same session. Keep production `Window::run` and accepted-prefix
+  scheduling open.
+- **Reason:** The low-level GPU transaction and host PLE suffix previously
+  required callers to reproduce a fragile ordering contract. A shared,
+  synchronous finalizer makes token-history advancement depend on a confirmed
+  successful state commit and verifies the tracked owner matches the mutated
+  GDN/PLE views and the QSA views belong to the supplied store. The QSA
+  snapshots preserve tails and block positions, while a speculative append can
+  also overwrite `dead` and pooled rows; returning success for zero acceptance
+  would leave rejected state visible. Explicit refusal is safer than claiming
+  rollback the helper cannot perform. The token-to-replay correspondence is
+  not encoded in the current buffer types, so it remains a caller contract.
+  This helper is not a Window scheduler.
+- **Fixture judgment:** Extend the all-layer synthetic GDN/PLE/QSA state test
+  with three candidate tokens and acceptance of the first two. Inject a late
+  malformed QSA view and verify that both GPU state and the session suffix
+  remain unchanged; pass unrelated GDN/PLE views and an unrelated same-context
+  `KvStore` and verify rejection without writes; verify zero acceptance is
+  rejected and leaves the speculative state unchanged from the point the
+  finalizer was called; then verify successful GPU commit advances the suffix
+  to exactly the two accepted IDs. Use actual `KvStore`-owned QSA views rather
+  than detached test allocations. These fixture values do not establish model
+  parity or production Window integration.
+- **Review required:** See REV-207. Challenge token and geometry preflight,
+  session/view association, accepted-count handling, session use tracking,
+  QSA store association and zero-prefix refusal, command-buffer discard and
+  wait-failure recovery, host-history ordering, the token/replay caller
+  precondition, and the synchronous API's boundary relative to the
+  still-missing production scheduler.
+- **Validation:** `mac-dev` built and
+  `ctest --preset mac-metal -R 'metal_window_gdn_commit_batch_test'
+  --output-on-failure` passed 2/2 (serial and concurrent) after adding
+  store-backed QSA views, foreign-store rejection and zero-prefix refusal.
+  Full-suite validation and hostile-review disposition are recorded in
+  REV-207.
+
+### REV-207: Adversarial review of accepted-prefix state finalization
+
+- **Scope:** Review candidate-token validation and replay correspondence,
+  SessionStateStorage and KvStore view identity, accepted-count boundaries,
+  QSA speculative state after zero acceptance, command-buffer submission and
+  completion failure behavior, host PLE suffix ordering, test coverage, and
+  the unconnected production Window boundary.
+- **Findings:** The initial review found that zero acceptance was reported as a
+  successful no-op even though the speculative QSA tail and block position
+  could remain changed. It also found that QSA state views were not bound to a
+  supplied `KvStore`, candidate tokens could not be proven to correspond to
+  the supplied replay buffers, and a submitted GPU execution failure could
+  leave partial state writes. The review record itself was initially missing.
+- **Disposition:** The finalizer now rejects zero acceptance before encoding
+  and explicitly requires the caller to discard and recreate sequence state;
+  the QSA snapshot currently preserves only tails and block positions, not all
+  state a speculative append may overwrite. The API now receives the owning
+  `KvStore` and matches all 12 persistent QSA tail/dead/pooled/block-position
+  views and the store capacity before dispatch. Since the current buffer types
+  carry no speculative-Window identity, pairing candidate tokens with their
+  producing replay rows and QSA steps is an explicit caller precondition.
+  Submitted execution failure is documented as sequence-invalidating and
+  requires recreating session and KV state. The synthetic fixture now uses
+  actual store-owned views and checks foreign-store rejection and zero-prefix
+  refusal. Production `Window::run` remains open.
+- **Follow-up review:** The adversarial reviewer confirmed the zero-prefix
+  refusal, KvStore binding, caller provenance contract and error-recovery
+  requirements, and found no other actionable code or test issue. The reviewer
+  requested that this final review record be updated before commit; this entry
+  records that disposition.
+- **Validation:** `mac-dev` built; the focused serial/concurrent CTests passed
+  2/2; full `mac-metal` passed 106/106; `test_map.py` passed with its existing
+  planned/missing-requirement diagnostics; and `git diff --check` passed after
+  finalizing this review entry. All inputs are synthetic and this does not
+  establish model parity or production inference.
+
 ### REV-206: Adversarial review of full-mode Prefill MoE composition
 
 - **Scope:** Review the 13-stage ordering and its API boundary; checked active
