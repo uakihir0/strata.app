@@ -110,6 +110,10 @@
       "label": "host",
       "origin": "03 R6, 06 H5, D-IMPL-361, REV-158"
     },
+    "oneshot_loop_test": {
+      "label": "host",
+      "origin": "06 H7"
+    },
     "oneshot_output_test": {
       "label": "host",
       "origin": "06 H7"

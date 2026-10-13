@@ -1157,6 +1157,12 @@ add_executable(oneshot_output_test tests/metal/oneshot_output_test.cpp src/metal
                src/metal/program/stats.cpp)
 target_include_directories(oneshot_output_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
 strata_metal_test(oneshot_output_test host oneshot_output_test)
+add_executable(oneshot_loop_test tests/metal/oneshot_loop_test.cpp src/metal/program/oneshot.cpp
+               src/metal/program/stats.cpp)
+target_include_directories(oneshot_loop_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(oneshot_loop_test PRIVATE strata_metal_options)
+strata_metal_test(oneshot_loop_test host oneshot_loop_test)
+set_tests_properties(oneshot_loop_test PROPERTIES TIMEOUT 30)
 set(_metal_weight_store_test_dir ${CMAKE_BINARY_DIR}/metal/weight-store-cli)
 file(MAKE_DIRECTORY ${_metal_weight_store_test_dir})
 strata_metal_test(metal_weight_store_cli_test host ${CMAKE_COMMAND} -DSTRATA=$<TARGET_FILE:strata>

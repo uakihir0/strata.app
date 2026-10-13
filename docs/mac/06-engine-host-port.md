@@ -656,14 +656,17 @@ QUIT
   spaces, which is likely under `~/Library/Application Support` or `/Volumes/...`. A server that never sends spaces is
   unaffected.
 - Unknown keys are skipped silently.
+- The id list is `<id>(,<id>)*`: base-10 integers in [0, 2147483647], separated by single commas, with no spaces,
+  empty fields or trailing comma. Any other form is `ERR bad request: invalid token id: expected an integer in
+  [0, 2147483647]`. This is the form `serve/server.py` writes.
 
 | Key | Type / clamp | Default |
 | --- | --- | --- |
 | `cvec` | control-vector selector | |
-| `temperature` | float | 0 (greedy) |
+| `temperature` | float, at least 0 (a negative value is `ERR bad request: temperature`) | 0 (greedy) |
 | `top_p` | float | 1 |
 | `top_k` | int; must be 1..64 when sampling | 20 |
-| `min_p` | float | 0 |
+| `min_p` | float in [0, 1] (otherwise `ERR bad request: min_p`) | 0 |
 | `penalty_last_n` | int (coupled history cap 4096) | 0 |
 | `penalty_repeat`, `penalty_freq`, `penalty_present` | float | neutral |
 | `seed` | uint64 | |
@@ -679,7 +682,10 @@ The rules match upstream `:4745-4804`.
 - Each record is `int32 {0x31455653, n_tokens, nx, ny, n_embd}` followed by `float32[n_tokens][n_embd]`.
 - `n_tokens == nx*ny`, and `n_embd == 2560`.
 
-**Matching records to the prompt.** Each run of `<|image_pad|>` (248056) tokens consumes the next record, in order.
+**Matching records to the prompt.** Each run of `<|image_pad|>` (248056) tokens consumes the next record, in order,
+and the run must have exactly the record's `n_tokens` rows. A shorter run fails with `image k has n rows but fewer
+<|image_pad|> tokens`; a longer run fails with `image k has n rows but more <|image_pad|> tokens`, so that no run is
+shared by two records.
 
 **M-RoPE positions.**
 - Text token: (p, p, p).
@@ -771,6 +777,7 @@ These messages are deleted with their mechanism: `ERR refilling a lent slot fail
 These messages are new:
 - `ERR gpu error: <description>` (section 2.4)
 - `ERR expert read failed: layer L expert E: <strerror>` (tiered mode, fatal)
+- `ERR image k has n rows but more <|image_pad|> tokens` (section 5.4: the run is longer than the record)
 
 ### 5.8 stderr after each DONE
 
