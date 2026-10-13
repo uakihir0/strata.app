@@ -1,5 +1,7 @@
+import argparse
 import io
 import json
+import math
 import os
 import struct
 import tempfile
@@ -9,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from tools.metal.tf_compare import compare, load, load_ids, main
+from tools.metal.tf_compare import compare, load, load_ids, main, parse_margins, parse_rows
 
 
 class TfCompare(unittest.TestCase):
@@ -36,6 +38,50 @@ class TfCompare(unittest.TestCase):
         self.assertEqual(dump.declared_rows, 5)
         self.assertEqual(dump.first_position, 3)
         np.testing.assert_array_equal(dump.logits, [[1, 2, 0], [0, 1, 3]])
+
+    def test_payload_must_be_whole_rows(self):
+        path = self.root / 'ragged.logits'
+        path.write_bytes(struct.pack('<ii', 3, 2) + np.asarray([1, 2, 0], dtype='<f4').tobytes() + b'\x00' * 5)
+        with self.assertRaisesRegex(ValueError, 'not a whole number of 3-logit rows'):
+            load(path)
+
+    def test_file_cannot_hold_more_rows_than_the_header_declares(self):
+        path = self.dump('overfull.logits', [[1, 2, 0], [0, 1, 3]], declared_rows=1)
+        with self.assertRaisesRegex(ValueError, 'header advertises 1 rows but file contains 2'):
+            load(path)
+
+    def test_invalid_headers_are_rejected(self):
+        for vocab, declared in ((1, 1), (3, 0)):
+            with self.subTest(vocab=vocab, declared=declared):
+                path = self.root / f'bad-{vocab}-{declared}.logits'
+                path.write_bytes(struct.pack('<ii', vocab, declared) + np.zeros(vocab, dtype='<f4').tobytes())
+                with self.assertRaisesRegex(ValueError, 'invalid header'):
+                    load(path)
+
+    def test_infinity_is_rejected_like_nan(self):
+        path = self.dump('inf.logits', [[np.inf, 1, 0], [0, 3, 1]], declared_rows=2)
+        with self.assertRaisesRegex(ValueError, 'NaN or infinity'):
+            load(path)
+
+    def test_row_and_margin_arguments_are_validated(self):
+        for value in ('3:3', '-1:2', '1', 'a:b'):
+            with self.subTest(rows=value):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    parse_rows(value)
+        self.assertEqual(parse_rows('1:4'), (1, 4))
+        for value in ('0.5', '1,0.5', 'nan,1', '-0.1,1', '0.5,1,2'):
+            with self.subTest(margins=value):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    parse_margins(value)
+        self.assertEqual(parse_margins('0.25,2'), (0.25, 2.0))
+
+    def test_margin_bands_are_half_open(self):
+        # Reference margins are exactly 0.5, 1.0 and 0.4: the boundary value belongs to the upper band.
+        reference = load(self.dump('ref.logits', [[1.5, 1.0, 0.0], [2.0, 1.0, 0.0], [0.4, 0.0, -1.0]]))
+        test = load(self.dump('test.logits', [[1.5, 1.0, 0.0], [2.0, 1.0, 0.0], [0.4, 0.0, -1.0]]))
+        result = compare(reference, test, [0, 0, 0, 0])
+        self.assertEqual([(band['range'], band['rows']) for band in result['reference_margin_bands']],
+                         [('[0,0.5)', 1), ('[0.5,1)', 1), ('[1,infinity)', 1)])
 
     def test_token_id_parser_rejects_empty_comma_fields(self):
         path = self.root / 'tokens.ids'
@@ -68,7 +114,7 @@ class TfCompare(unittest.TestCase):
         stderr = io.StringIO()
         with redirect_stderr(stderr):
             self.assertEqual(main([str(reference), str(test), '--ids', str(ids)]), 2)
-        self.assertIn('outside the vocabulary range', stderr.getvalue())
+        self.assertIn(f'token ID {1 << 100} at position 1 is outside the vocabulary range 0:3', stderr.getvalue())
         self.assertNotIn('Traceback', stderr.getvalue())
 
     def test_equal_dumps_report_zero_kl_and_paired_delta(self):
@@ -165,7 +211,8 @@ class TfCompare(unittest.TestCase):
         ids = self.root / 'tokens.ids'
         ids.write_text('0 2 1', encoding='utf-8')
         output = self.root / 'result.json'
-        self.assertEqual(main([str(reference), str(test), '--ids', str(ids), '--json', str(output)]), 0)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(main([str(reference), str(test), '--ids', str(ids), '--json', str(output)]), 0)
         result = json.loads(output.read_text(encoding='utf-8'))
         self.assertEqual(result['same_top1'], 2)
         self.assertEqual(result['rows_compared'], 2)
@@ -180,6 +227,123 @@ class TfCompare(unittest.TestCase):
             self.assertEqual(main([str(reference), str(test), '--ids', str(ids), '--json', str(hard_link)]), 2)
         self.assertEqual(reference.read_bytes(), original_logits)
         self.assertEqual(hard_link.read_bytes(), original_logits)
+
+    def test_rows_without_a_next_token_id_are_omitted(self):
+        rows = [[2, 1, 0], [0, 3, 1], [1, 0, 2]]
+        reference = load(self.dump('ref.logits', rows))
+        test = load(self.dump('test.logits', rows))
+        # Row p predicts ids[p + 1]. With three IDs, row 2 would need ids[3] and is omitted.
+        result = compare(reference, test, [0, 2, 1])
+        self.assertEqual(result['rows_compared'], 2)
+        self.assertEqual(result['last_position'], 1)
+        with self.assertRaisesRegex(ValueError, 'no selected dump row has a corresponding next-token ID'):
+            compare(reference, test, [0])
+
+    def test_dumps_must_have_the_same_vocabulary(self):
+        reference = load(self.dump('ref.logits', [[2, 1, 0], [0, 3, 1]]))
+        test = load(self.dump('test.logits', [[2, 1, 0, 0], [0, 3, 1, 0]]))
+        with self.assertRaisesRegex(ValueError, r'vocabulary sizes differ \(3 vs 4\)'):
+            compare(reference, test, [0, 2, 1])
+
+    def test_negative_token_id_is_outside_the_vocabulary(self):
+        reference = self.dump('ref.logits', [[2, 1, 0], [0, 3, 1]])
+        test = self.dump('test.logits', [[2, 1, 0], [0, 3, 1]])
+        ids = self.root / 'tokens.ids'
+        ids.write_text('0 -1 1', encoding='utf-8')
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), redirect_stdout(io.StringIO()):
+            self.assertEqual(main([str(reference), str(test), '--ids', str(ids)]), 2)
+        self.assertIn('token ID -1 at position 1 is outside the vocabulary range 0:3', stderr.getvalue())
+
+    def test_short_dumps_start_at_their_first_position(self):
+        # Both dumps come from a prompt path: the header declares 5 rows and 2 are present, so row 0 is position 3.
+        reference = load(self.dump('ref.logits', [[2, 1, 0], [0, 3, 1]], declared_rows=5))
+        test = load(self.dump('test.logits', [[2, 1, 0], [6, 2, 0]], declared_rows=5))
+        self.assertEqual(reference.first_position, 3)
+        ids = [0, 1, 2, 0, 2, 1]
+        result = compare(reference, test, ids)
+        self.assertEqual(result['first_position'], 3)
+        self.assertEqual(result['rows_compared'], 2)
+        # Row 1 is position 4 and predicts ids[5]; its reference top-1 is 1 and its test top-1 is 0.
+        self.assertEqual([(item['position'], item['reference_top1'], item['test_top1'])
+                          for item in result['disagreements']], [(4, 1, 0)])
+        # --rows counts rows of the present dump, so row 1 alone is position 4.
+        second = compare(reference, test, ids, rows=(1, 2))
+        self.assertEqual((second['first_position'], second['rows_compared']), (4, 1))
+
+    def test_test_side_ties_select_the_lowest_token_id(self):
+        tied = load(self.dump('tied.logits', [[1, 1, 0]]))
+        same = compare(tied, load(self.dump('same.logits', [[1, 1, 0]])), [0, 2])
+        self.assertEqual(same['same_top1'], 1)
+        result = compare(load(self.dump('ref.logits', [[0, 2, 1]])), tied, [0, 2])
+        self.assertEqual(result['disagreements'][0]['reference_top1'], 1)
+        self.assertEqual(result['disagreements'][0]['test_top1'], 0)
+
+    def test_disagreement_reports_margin_and_next_token_log_probabilities(self):
+        reference = load(self.dump('ref.logits', [[2, 1, 0]]))
+        test = load(self.dump('test.logits', [[0, 2, 1]]))
+        item = compare(reference, test, [0, 2])['disagreements'][0]
+        self.assertAlmostEqual(item['reference_margin'], 1.0, places=12)
+        # The next token is ids[1] = 2. Both rows have the same normaliser, log(e^2 + e + 1).
+        normaliser = math.log(math.exp(2) + math.exp(1) + 1)
+        self.assertAlmostEqual(item['reference_next_logp'], 0.0 - normaliser, places=12)
+        self.assertAlmostEqual(item['test_next_logp'], 1.0 - normaliser, places=12)
+
+    def test_median_and_p99_follow_the_linear_percentile(self):
+        # Row 0 has KL 0. Row 1 has KL k between reference (1/2, 1/2) and test (1/(1+e), e/(1+e)).
+        # With two values the median is k/2, and NumPy's linear 99th percentile is 0.99 k.
+        reference = load(self.dump('ref.logits', [[0.0, 0.0], [0.0, 0.0]]))
+        test = load(self.dump('test.logits', [[0.0, 0.0], [0.0, 1.0]]))
+        p = (0.5, 0.5)
+        q = (1 / (1 + math.e), math.e / (1 + math.e))
+        k = sum(pi * (math.log(pi) - math.log(qi)) for pi, qi in zip(p, q))
+        kl = compare(reference, test, [0, 0, 0])['kl_nats']
+        self.assertAlmostEqual(kl['mean'], k / 2, places=12)
+        self.assertAlmostEqual(kl['median'], k / 2, places=12)
+        self.assertAlmostEqual(kl['p99'], 0.99 * k, places=12)
+        self.assertAlmostEqual(kl['max'], k, places=12)
+
+    def test_margin_bands_come_from_the_reference_only(self):
+        reference = load(self.dump('ref.logits', [[1.2, 1.0, 0.0]]))  # reference margin 0.2
+        test = load(self.dump('test.logits', [[5.0, 0.0, 0.0]]))  # test margin 5.0
+        result = compare(reference, test, [0, 0])
+        self.assertEqual([(band['range'], band['rows']) for band in result['reference_margin_bands']],
+                         [('[0,0.5)', 1), ('[0.5,1)', 0), ('[1,infinity)', 0)])
+
+    def test_log_softmax_stays_finite_for_large_logits(self):
+        # exp(1000) overflows float64, so only the max-shifted form gives finite probabilities.
+        reference = load(self.dump('ref.logits', [[1000.0, 999.0, 0.0]]))
+        test = load(self.dump('test.logits', [[1001.0, 999.0, 0.0]]))
+        result = compare(reference, test, [0, 0])
+
+        def log_softmax(row):
+            row = np.asarray(row, dtype=np.float64)
+            return row - (row.max() + np.log(np.exp(row - row.max()).sum()))
+
+        # KL is unchanged by shifting both rows by the same constant, so the shifted rows give the expected value.
+        ref_logp = log_softmax([0.0, -1.0, -1000.0])
+        test_logp = log_softmax([1.0, -1.0, -1000.0])
+        expected = float(np.sum(np.exp(ref_logp) * (ref_logp - test_logp)))
+        self.assertGreater(expected, 0.05)
+        self.assertAlmostEqual(result['kl_nats']['mean'], expected, places=12)
+        self.assertTrue(math.isfinite(result['perplexity']['reference']))
+
+    def test_row_range_must_lie_inside_the_dumps(self):
+        dump = load(self.dump('ref.logits', [[2, 1, 0], [0, 3, 1]]))
+        with self.assertRaisesRegex(ValueError, 'row range 0:3 is outside the 2 rows'):
+            compare(dump, dump, [0, 2, 1], rows=(0, 3))
+
+    def test_cli_prints_the_default_margin_bands(self):
+        rows = [[1.2, 1.0, 0.0], [2.0, 1.0, 0.0]]  # reference margins 0.2 and 1.0
+        reference = self.dump('ref.logits', rows)
+        test = self.dump('test.logits', rows)
+        ids = self.root / 'tokens.ids'
+        ids.write_text('0 0 0', encoding='utf-8')
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(main([str(reference), str(test), '--ids', str(ids)]), 0)
+        self.assertIn('margin [0,0.5): 1/1 same', stdout.getvalue())
+        self.assertIn('margin [1,infinity): 1/1 same', stdout.getvalue())
 
 
 if __name__ == '__main__':
