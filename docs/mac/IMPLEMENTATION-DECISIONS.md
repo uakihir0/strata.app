@@ -13327,6 +13327,7 @@ measuring L-15 remain open.
 
 ### D-IMPL-629: The CUDA reference PC is out of project scope
 
+- **Status:** Specification rewritten in D-IMPL-960 to D-IMPL-979 (C1, G1, the prompt-path criterion and the golden-set rows of [09](09-testing-and-validation.md), [10](10-implementation-plan.md), [03](03-model-reference.md) and [01](01-requirements.md)). Other documents still name the golden set; see D-IMPL-979.
 - **Decision:** The owner states that the CUDA reference PC is not part of this project. The
   project does not acquire, set up or wait for a CUDA reference machine, and no task is blocked on
   one. The CUDA-recorded golden set (R12, T2, the `record_golden.py` run of section 2.5 of
@@ -13349,6 +13350,7 @@ measuring L-15 remain open.
 
 ### D-IMPL-671: The correctness yardstick for C1 and G1.tf is a per-kernel FP64 oracle
 
+- **Status:** Specification rewritten in D-IMPL-960 to D-IMPL-979 (C1, G1, the prompt-path criterion and the golden-set rows of [09](09-testing-and-validation.md), [10](10-implementation-plan.md), [03](03-model-reference.md) and [01](01-requirements.md)). Other documents still name the golden set; see D-IMPL-979.
 - **Decision:** The owner chose a per-kernel FP64 oracle as the reference for the correctness criteria
   that the CUDA golden set used to supply: `C1.1.*` and `G1.tf` (see [09](09-testing-and-validation.md),
   sections 4.1 and 6.1). Each kernel is checked against an FP64 host reference of the same operation
@@ -15378,3 +15380,134 @@ measuring L-15 remain open.
 - **Reason:** Each needs the engine, the reference Mac or the setup track, none of which this change used.
 - **Review required:** Schedule the engine SIGHUP change with the engine's H6 work.
 
+### D-IMPL-960: The C1 and G1 yardstick is rewritten: kernel checks, and model-level rows that are NOT RUN
+
+- **Decision:** [09](09-testing-and-validation.md) section 4.1 now states C1 as C1.K (the per-kernel FP64 oracle checks and the synthetic full-layer compositions, `ctest --preset mac-metal`) plus the model-level rows. The model-level rows (C1.1.*, C1.5, G1.tf, G1.free, and the prompt-path criteria PP.top1, PP.kl and PP.ppl) name no reference, so they are NOT RUN and never pass. C1.2 and C1.3 are retired. C1.4 is redefined to the model's own rows against an FP64 host router. Section 6.1 splits G1 into kernel-level and NOT RUN steps. `criteria.py` gives each row a `basis`, and `accept.py` reports NOT RUN before any step when a criterion has the reference basis. The other edits are listed in D-IMPL-973 to D-IMPL-977.
+- **Reason:** A whole-model comparison cannot pass from kernel oracles (D-IMPL-671, D-IMPL-629). D-IMPL-671 asked that each C1.1.* ID either keep a precisely defined measured meaning or be retired where no kernel-level meaning exists, and that the whole-model criteria be stated NOT RUN until a model-level reference exists. This entry applies that rule per ID.
+- **Review required:** The owner names the model-level reference (D-IMPL-978, item 1). Until then G1, G3 and the release run cannot pass.
+
+### D-IMPL-961: C1.K is the kernel-level gate of C1
+
+- **Decision:** C1.K is the set of `metal`-label CTests of `ctest --preset mac-metal`: the per-kernel twins of [04](04-metal-kernels.md) section 10 and the synthetic full-layer compositions of section 10.4 and 10.5. Its value is the number of failing tests, and it passes at zero. The plan of `c1` starts with a `c1.kernels` step, which G1's plan includes as its step 2. The oracle classes are stated in 04 section 10.2: R(ε) and the GEMM bounds use FP64; classes B and U(n) use the kernel's own order in float, with the magnitude carried in double. Those are host references of the same operation on the same quantized inputs, but they are not FP64 evaluations.
+- **Reason:** D-IMPL-671 named the twin harness as the replacement. The spec now says which of its oracles are FP64, so the owner can judge the claim.
+- **Consequence:** No measurement is wired for C1.K, so a live `c1` or `g1` run stops with NOT RUN before any step (D-IMPL-970). Until a measure is written, C1.K is run by hand with `ctest --preset mac-metal`, and its result is not recorded in a result folder.
+- **Review required:** Accept or change the float oracles of classes B and U(n) as the FP64 yardstick (D-IMPL-978, item 2).
+
+### D-IMPL-962: C1.1.* keep their metrics; their reference is a model-level reference that is not named
+
+- **Decision:** C1.1.top1, C1.1.kl, C1.1.safe, C1.1.band, C1.1.ppl and C1.1.p99 keep their metric definitions, their gating flags (p99 reported only) and their operators. Each compares the Mac's teacher-forced logits on a `tf-*` set with a model-level reference R, which the specification does not name. The thresholds are derived from R's own floor: two valid paths of R on each text, measured the way T-1 measured CUDA's, and R's cross reference L(t) where R has one. m₁ is derived from T-2 for R, with no provisional value. The provisional table of the earlier text was upstream's published CUDA floor, and it is withdrawn. Their criteria rows have basis `reference`, so `judge()` returns NOT RUN whatever the value.
+- **Reason:** These IDs have no kernel-level meaning: each asks whether the model's logits agree with a reference. Retiring them would lose the record of the metric, so they are kept as NOT RUN. Keeping them as NOT RUN lets the owner's reference be specified without renaming IDs.
+- **Review required:** D-IMPL-978, item 1.
+
+### D-IMPL-963: C1.2 is retired
+
+- **Decision:** C1.2 (the Mac against llama.cpp: same top-1 at least L(t) − 1 point, KL at most 1.5 × L(t)) is retired. Its gating threshold is L(t), the CUDA-to-llama.cpp spread (T-3). That spread needs the CUDA reference, which is out of scope, so no threshold can be derived. The row stays in `criteria.py` with basis `retired`, and no run lists it.
+- **Reason:** No derived threshold without the CUDA reference, and no kernel-level meaning. A threshold may not be chosen to make a result pass (P3).
+- **Review required:** Whether llama.cpp at `3cf03257`, on its CPU backend, becomes the model-level reference, with its own floor measured between two of its paths. That would re-admit a llama.cpp comparison (D-IMPL-978, item 3).
+
+### D-IMPL-964: C1.3 is retired; the residual ladder is a diagnostic
+
+- **Decision:** C1.3 (per-slot residual against CUDA and llama.cpp) is retired. Its bound is the CUDA-to-llama.cpp spread per slot, and the residual of a real text is a whole-model quantity with no kernel-level meaning. The `c1.layers` steps keep their dumps and have no criterion. They are the diagnostic of the bisection in [09](09-testing-and-validation.md) section 10.1. `ladder_compare.py` stays a tool, and its test is T6's, not a gate. R-5 in [03](03-model-reference.md) section 10 is not measured.
+- **Reason:** As D-IMPL-963.
+- **Review required:** D-IMPL-978, item 3.
+
+### D-IMPL-965: C1.4 is redefined: the model's own rows, against an FP64 host router
+
+- **Decision:** C1.4.ids and C1.4.weights keep their operators, thresholds (no mismatch except a boundary swap within 2^-16; relative weight error at most 1e-5) and gating. Their reference changes from CUDA's `router.routing` record to an FP64 host router on the Mac's own `mixed` input at each (p, l) of one run over the 1,000 positions of `tf-doc`. The basis is `model`: the row is NOT RUN without the models. The synthetic route cases stay in C1.K. R-1 (03, section 10) is now measured this way, and its CUDA form is out of scope.
+- **Reason:** The router check has a kernel-level reference (FP64), and it needs the model's own data, not CUDA's. The old check also compared the Mac with CUDA's routing, which is the golden-set yardstick.
+- **Consequence:** C1.4 checks the router's arithmetic on the model's inputs. It does not show whole-model agreement, which 4.1 says in terms.
+- **Review required:** D-IMPL-978, item 4 (the 1e-5 provisional tolerance is R-1's expectation, not yet measured against the FP64 router).
+
+### D-IMPL-966: C1.5 is kept and is NOT RUN
+
+- **Decision:** C1.5 keeps its metric (the first token after the prompt path has the same top-1 as the reference where the reference's margin is at least m₁) and its gating flag. Its basis is `reference`, so it is NOT RUN. The prompt path keeps its kernel checks (04 section 10.3) and its Mac-against-Mac check across chunk sizes (`prefill_chunk_independent`, 04 section 10.4), which need no reference.
+- **Reason:** The first-token row is a whole-model logit comparison, as C1.1 is.
+- **Review required:** D-IMPL-978, item 1.
+
+### D-IMPL-967: G1 is split into kernel-level checks and NOT RUN checks
+
+- **Decision:** [09](09-testing-and-validation.md) section 6.1's table gives each step's basis. Kernel-level, passable on the Mac from fixtures and oracles: step 2's C1.K. Needs a model, NOT RUN where the model is absent: step 1 (`ctest --preset mac-model`), step 2's C1.4, step 5 (C2 nightly arms, Mac against Mac), step 6 (BENCH.plain) and step 7 (R-1 and R-5). Needs a model-level reference, NOT RUN until one is named: step 2's C1.1 and C1.5, step 3 (G1.tf) and step 4 (G1.free). G1 cannot pass in this specification. A G1 result is NOT RUN, and `docs/mac/gates/G1.md` records it so. [10](10-implementation-plan.md) section 3.3 says the same.
+- **Reason:** D-IMPL-671's consequence. A G1 pass would claim that the model is correct on the strength of kernel oracles.
+- **Consequence:** Because G3's release run includes C1 (step 2) and G1.tf (step 3) of section 8, G3 cannot pass either. The conditional items L18 and L21, which wait for gates C1-C4 (10, section 3.8), also wait.
+- **Review required:** D-IMPL-978, items 1 and 6.
+
+### D-IMPL-968: G1.tf and G1.free are reference rows that read no file
+
+- **Decision:** G1.tf and G1.free keep their pass rules: the 256-position rule with 100% where the reference's margin is at least m₁ and 95% over all 2,560 positions (G1.tf), and the free-run rule (G1.free). Their criteria rows have basis `reference`, so they are NOT RUN. Their steps in `runs.py` read no reference file (`reads` is empty), and the steps name no golden file.
+- **Reason:** A step reads what its criteria compare against. A reference, when it is named, brings its own files.
+- **Review required:** D-IMPL-978, item 1.
+
+### D-IMPL-969: The prompt-path criteria are NOT RUN too
+
+- **Decision:** PP.top1, PP.kl and PP.ppl compare the Mac with CUDA's `pp-32k.logits`, and their yardstick Y_pp is CUDA's own two chunk sizes. They have basis `reference` and are NOT RUN until a model-level reference is named. PP.chunk stays reported. [09](09-testing-and-validation.md) section 4.5 has a scope note, and its yardstick text is changed to the reference's own two chunk sizes.
+- **Reason:** The same rule as D-IMPL-671 applies to them: they compare whole-model logits with golden data. This goes beyond the C1 and G1 request, and the owner should confirm it.
+- **Review required:** D-IMPL-978, item 5.
+
+### D-IMPL-970: `criteria.py` gives each row a basis, and NOT RUN is explicit
+
+- **Decision:** `Criterion` has a `basis`: `kernel`, `model` (the default), `reference`, `retired` or `runner` (STEP.*). `judge()` returns a NOT RUN verdict (`skip()`) for a `reference` row whatever the value, and raises ValueError for a `retired` row. The refusal of an underived threshold stays for the other rows. Rows whose basis changed: C1.K (new, `kernel`), C1.1.* and C1.5 (`reference`), C1.2 and C1.3 (`retired`, operator `retired`), C1.4.* (`model`), G1.tf and G1.free (`reference`), PP.top1, PP.kl and PP.ppl (`reference`), STEP.* (`runner`). Every other row keeps its operator, threshold, gating flag and note.
+- **Reason:** "make the code's NOT RUN behaviour explicit for model-dependent ones". A reference row must never pass, even when the value equals the threshold.
+- **Review required:** none.
+
+### D-IMPL-971: The runs and the runner refuse a reference-only run before any step
+
+- **Decision:** `plan_c1` starts with a `c1.kernels` step (`ctest --preset mac-metal`, criteria C1.K), in the short and the full form, and `plan_g1` includes it. The reads of golden files are removed from the reference steps (`c1.tf`, `c1.first`, `g1.tf`, `g1.free`), and `c1.layers` keeps its dump with no criterion. The `c1` run lists C1.K and drops C1.2 and C1.3. `accept.first_reason` returns "<IDs> needs a model-level reference, which the specification does not name (D-IMPL-671, D-IMPL-960)" before any other check when a criterion has the reference basis. Such a run stops with NOT RUN (exit 2), writes no result folder, and spends no engine time. Before this, `c1` said "criteria not measured yet".
+- **Reason:** A run that cannot pass should say why at once. The reason is the reference, which is the true blocker.
+- **Review required:** none.
+
+### D-IMPL-972: The test changes, and the assertions that encoded the golden meaning
+
+- **Decision:** In `tools/metal/test_accept.py`: `SPEC_IDS` gains C1.K; `CASES` gains C1.K (0, 0, 1). The planted-case test for a `reference` row asserted a pass on equal values, which was the golden-set meaning. It now asserts NOT RUN on equal and on planted values, not passed and not blocking, with the message. A `retired` row asserts that `judge()` raises. The derived-threshold test moved its example from C1.1.top1 (now a reference row) to REG.decode (a model row with a derived threshold). New tests cover: reference rows never pass, even with a threshold; retired rows have no verdict; the bases are known values; retired IDs are in no run; the reference rows are exactly the model-level set; the c1 plan starts with `c1.kernels`; the G1 plan includes it and its reference steps read nothing; the unmeasured c1 run names the reference in its NOT RUN line. `tools/metal/test_bench.py` has no C1 or G1 reference, and it is unchanged.
+- **Reason:** Those assertions encoded the old golden meaning (equal values pass).
+- **Result:** `python -m unittest tools.metal.test_accept tools.metal.test_bench`: 206 tests, OK (198 before this change).
+- **Review required:** none.
+
+### D-IMPL-973: The golden-set rows are marked out of scope, not deleted
+
+- **Decision:** Marked "out of project scope (D-IMPL-629)", with the replacement noted, and not deleted: [03](03-model-reference.md) section 9's intro, R12 (replacement C1.K), and the R-1 and R-5 rows of section 10 (R-1's procedure now uses the Mac's rows; R-5 is not measured); [09](09-testing-and-validation.md) sections 1.1 (P2, P3, P5), 1.3 (the golden manifest and `record_golden.py` rows), 2.4 and 2.5 (scope notes), 3.2 (`--golden`, the `c1` row and the criterion table), 4.1, 4.5, 6.1, 6.3, 7.2 (the `c1 --short` and Friday rows), 7.3 (steps 2 and 3), 8 (intro and steps 2 and 3), 9.1 (`metal_router_replay` and `metal_moe_real_inputs_unavailable`), 9.3, 10.1 (the reference steps), 11 (T-1, T-2, T-3, T-7, T-8, R-1, R-5), 12 (intro, T2, T6, T19); [10](10-implementation-plan.md) the phase 1 table row R12 + T2, the phase 1 measurements and exit criterion, the phase 2 T6 row, the G1 gate text, section 4 step 4, the section 5 rows (R-1, R-5, T-1, T-2, T-3, T-7, T-8) and the CUDA PC row of section 8. The T2 "Done when" is kept as "former condition".
+- **Reason:** D-IMPL-629 keeps these rows as records. The owner asked for marks.
+- **Review required:** none.
+
+### D-IMPL-974: The kernels spec names the FP64 yardstick and no longer needs CUDA data for the twins
+
+- **Decision:** [04](04-metal-kernels.md) section 10.1: the `random` set's RMS scale comes from the Mac's own dumps of a model run (1 where unknown), and the `real` set's activations come from the Mac's own `--dump-halves` run of the same rows, not from a CUDA dump. The FP64 oracle works on any quantized input, so the source does not change the check. Section 10.2 gains the paragraph on which oracles are FP64 and which are float evaluations. Section 3.1's "KL against CUDA" row, 3.2 step 4, 3.9's intro, the 9.5 column header and the L9 work item now name C1.K and the model-level rows. Section 10.5's note that CUDA-captured goldens are unavailable stays true.
+- **Reason:** The `real` set was the only place the twins used CUDA data.
+- **Review required:** D-IMPL-978, item 2 (the activations source and the oracle classes).
+
+### D-IMPL-975: The requirements name the new checks
+
+- **Decision:** [01](01-requirements.md): REQ-COR-01 and REQ-COR-03 keep their goals. Their texts say that the CUDA build is out of scope and that the verification is C1.K and C1.4, with C1.1, C1.5, G1.tf and G1.free NOT RUN. Their Verified-by cells list `accept:C1.K` and drop `accept:C1.2` and `accept:C1.3`. The G1 row of the gate table and the section 14 target for C1.1.p99 are updated. `tests/metal/requirements.json` is unchanged, since both requirements still have no checks, and `test_map` passes.
+- **Reason:** The cells must name criteria that exist, and the requirement goals must say what is now unverified.
+- **Review required:** D-IMPL-978, item 8.
+
+### D-IMPL-976: Verification record of this change
+
+- **Decision:** On 2026-10-13, in the worktree `c1-yardstick` (branch `feature/c1-fp64-yardstick`): `python -m unittest tools.metal.test_accept tools.metal.test_bench` gives 206 tests, OK. `tools/metal/run_python_tests.py` with `STRATA_GGUF_PY` set to the project's llama.cpp `gguf-py` gives 44 of 44 modules passed, with `test_accept` and `test_bench` among them. `build-dev` was configured from this worktree with the venv Python (3.12.13; `Python3_EXECUTABLE` set). `STRATA_BUILD_DIR=build-dev tools/metal/test_map.py` exits 0 with "all checks passed". `build-dev` is ignored by git (`build*/`). Not run: `ctest --preset mac-metal` (not built, so C1.K is not measured), and every acceptance run that needs a model. One unit run in about seventy failed once, and the cause was reproduced: while any process named `strata` runs on the Mac, seven `RunnerEndToEnd` tests fail, because that class runs the real `pgrep -x strata` (`checks.no_engine_running`) and does not isolate it. This is pre-existing and was not changed here, since the test edits were limited to golden-meaning assertions (D-IMPL-979).
+- **Reason:** The record of what was checked, and what was not.
+- **Review required:** none.
+
+### D-IMPL-977: The sync verdict and check_drift are unchanged
+
+- **Decision:** `tools/metal/check_drift.py` still writes the golden verdict ("golden: record again") and its tests are unchanged. [09](09-testing-and-validation.md) section 2.5's rule on when the set is recorded again, and [10](10-implementation-plan.md) section 4, keep their text under the scope notes. No code changes the verdict.
+- **Reason:** What a compatibility change requires now is a process decision, not a consequence of the C1 rewrite.
+- **Review required:** D-IMPL-978, item 7.
+
+### D-IMPL-978: Review required from the owner
+
+- **Decision:** This entry records no decision. The owner decides these items before the coordinator merges:
+  1. Name the model-level reference R for C1.1, C1.5, G1.tf, G1.free and the PP.* rows, and how its floor is measured. Candidates: llama.cpp at `3cf03257` on its CPU backend (no CUDA), which needs a second path for its floor; or none. Until one is named, G1, G3 and the release run cannot pass.
+  2. Accept or change the oracles of classes B and U(n), which are float evaluations in the kernel's own order and not FP64 (D-IMPL-961; 04 section 10.2). Accept the `real` activations from the Mac's own dumps (D-IMPL-974).
+  3. Confirm that C1.2 and C1.3 are retired (D-IMPL-963, D-IMPL-964), and whether llama.cpp re-enters as a model-level reference.
+  4. Confirm C1.4 on the model's rows against the FP64 host router, and its 1e-5 provisional tolerance, which R-1 measures (D-IMPL-965). Confirm also that a row over the model's own inputs, judged by a kernel oracle, is allowed under the rule that no criterion passes from kernel oracles where the spec named a whole-model comparison. The old C1.4 named one, the router replay against CUDA's record.
+  5. Confirm the extension of the reference rule to PP.top1, PP.kl and PP.ppl (D-IMPL-969).
+  6. Phase 3 and G1: under 6.1 as written, phase 3 waits for a G1 pass, which needs the reference. Decide whether a kernel-level G1 is enough, or whether phase 3 proceeds on the reference Mac while G1 stays NOT RUN.
+  7. The `check_drift.py` golden verdict and the sync process of 10 section 4 (D-IMPL-977): what a compatibility change requires now.
+  8. The goals of REQ-COR-01 and REQ-COR-03 stand while their verification is partly NOT RUN (D-IMPL-975).
+- **Reason:** These are owner choices or normative statements that the specification cannot settle.
+- **Review required:** The owner, before the merge.
+
+### D-IMPL-979: What is not done in this change
+
+- **Decision:** Not done: no measurement, and no run. There is no model in this checkout, no reference on the reference Mac, and `ctest --preset mac-metal` was not run. Other documents still name CUDA or the golden set as the yardstick and were not rewritten: [00](00-feasibility-study.md) (the 256-token and 10-prompt claim of the G1 gate, which 09 6.1 now makes NOT RUN), [02](02-architecture.md), [03](03-model-reference.md) section 9's text below its new scope note, and R-5's CUDA procedure in section 10, [04](04-metal-kernels.md) section 10.5's note, [06](06-engine-host-port.md), [08](08-build-and-distribution.md) (no C1 text), [11](11-risks-and-open-questions.md) (the CUDA PC risk and its owner), [README](README.md), and the audit folder. The S18 "Mac golden set" of [07](07-server-setup-port.md) is a different, Mac-recorded set for the setup plans, and is not in this change. The plan has no step for G1's step 1 (`ctest --preset mac-model`), and none existed before this change. `RunnerEndToEnd` does not isolate `checks.no_engine_running()`, so a running `strata` process on the Mac fails seven of its tests (D-IMPL-976); the fix is a patch in its setUp, which the owner may approve. Existing entries were edited only to add the status lines to D-IMPL-629 and D-IMPL-671. Nothing is committed.
+- **Reason:** The scope of the request is C1, G1, the criteria code and the rows named in it. The other documents are listed so that the owner can decide.
+- **Review required:** The owner reads this list before the coordinator merges.
