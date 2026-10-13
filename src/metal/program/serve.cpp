@@ -1,5 +1,6 @@
 // src/metal/program/serve.cpp - the host-side line protocol (docs/mac/06, section 5).
 #include "strata/metal/serve.hpp"
+#include "strata/metal/watchdog.hpp"
 
 #include <algorithm>
 #include <array>
@@ -588,9 +589,10 @@ void log_outcome(std::FILE* diagnostics, const ServeRequest& request, std::int64
     std::fflush(diagnostics);
 }
 
-int run_one_request(ServeBackend& backend, const ServeRequest& request, std::atomic<bool>& stop_requested,
-                    std::FILE* output, std::FILE* diagnostics,
+int run_one_request(ServeBackend& backend, const ServeRequest& request, Progress& progress,
+                    std::atomic<bool>& stop_requested, std::FILE* output, std::FILE* diagnostics,
                     const std::function<bool()>& request_finished) {
+    const BusyScope busy(progress);
     const std::int64_t prompt_size = static_cast<std::int64_t>(request.token_ids.size());
     const std::int64_t max_context = std::min(backend.serve_info().context, kServeMaximumContext);
     const std::string context_error = request_context_error(request, max_context);
@@ -615,12 +617,28 @@ int run_one_request(ServeBackend& backend, const ServeRequest& request, std::ato
     state.stop_eos = backend.serve_info().stop_eos;
     state.eos_ids = backend.serve_info().eos_ids;
     ServeCallbacks callbacks;
-    callbacks.resume = [&](std::int64_t reused) { return state.resume(reused); };
+    // Every backend event is a beat for the watchdog (docs/mac/06, section 14.1), and names the stage it reports.
+    callbacks.resume = [&](std::int64_t reused) {
+        progress.beat();
+        progress.set_stage("resume");
+        return state.resume(reused);
+    };
     callbacks.prompt_progress = [&](std::int64_t done, std::int64_t total, double ms, double tps) {
+        progress.beat();
+        progress.set_stage("prompt", std::to_string(done) + "/" + std::to_string(total));
         return state.progress(done, total, ms, tps);
     };
-    callbacks.prompt_reused = [&](std::int64_t reused) { return state.reused(reused); };
-    callbacks.token = [&](std::int32_t id) { return state.token(id); };
+    callbacks.prompt_reused = [&](std::int64_t reused) {
+        progress.beat();
+        progress.set_stage("decode");
+        return state.reused(reused);
+    };
+    callbacks.token = [&](std::int32_t id) {
+        const bool accepted = state.token(id);
+        progress.beat();
+        progress.set_stage("decode", "token " + std::to_string(state.emitted_tokens));
+        return accepted;
+    };
     callbacks.should_stop = [&] { return stop_requested.load() || state.eos_seen; };
 
     ServeOutcome outcome;
@@ -1010,6 +1028,13 @@ int run_serve_loop(ServeBackend& backend, const ServeLoopOptions& options) {
     std::FILE* diagnostics = options.diagnostics == nullptr ? stderr : options.diagnostics;
     (void) std::setvbuf(output, nullptr, _IONBF, 0);
 
+    std::uint64_t watchdog_seconds = 0;
+    std::string watchdog_error;
+    if (!parse_watchdog_limit(std::getenv("STRATA_WATCHDOG_S"), watchdog_seconds, watchdog_error)) {
+        std::fprintf(diagnostics, "strata: %s\n", watchdog_error.c_str());
+        return 2;
+    }
+
     SignalPolicy signals;
     if (!signals.install()) {
         std::fprintf(diagnostics, "strata: failed to install serve signal handling\n");
@@ -1022,6 +1047,8 @@ int run_serve_loop(ServeBackend& backend, const ServeLoopOptions& options) {
         std::fprintf(diagnostics, "strata: could not start the stdin reader\n");
         return 2;
     }
+    Progress progress;
+    NoEngineStallReporter stall_reporter;
 
     const ServeInfo& info = backend.serve_info();
     const bool eos_config_valid = (!info.stop_eos || !info.eos_ids.empty()) &&
@@ -1048,8 +1075,14 @@ int run_serve_loop(ServeBackend& backend, const ServeLoopOptions& options) {
                      static_cast<long long>(info.vram_free_mib), static_cast<long long>(suggested));
     }
     const std::string info_line = serve_info_line(info);
-    if (!write_line(output, info_line) ||
-        !write_line(output, "READY " + std::to_string(info.context) + " stop")) {
+    if (!write_line(output, info_line)) {
+        reader.stop();
+        return 1;
+    }
+    // The watchdog starts after INFO and before READY (docs/mac/06, section 2.3, step 12).
+    Watchdog watchdog(progress, watchdog_seconds, info.engine, stall_reporter, diagnostics);
+    watchdog.start();
+    if (!write_line(output, "READY " + std::to_string(info.context) + " stop")) {
         reader.stop();
         return 1;
     }
@@ -1112,7 +1145,8 @@ int run_serve_loop(ServeBackend& backend, const ServeLoopOptions& options) {
             }
         }
         if (!request.spec_min_p_is_set) request.sampling.spec_min_p = info.spec_min_p;
-        const int result = run_one_request(backend, request, stop_requested, output, diagnostics, finish_request);
+        const int result =
+            run_one_request(backend, request, progress, stop_requested, output, diagnostics, finish_request);
         if (result != 0) {
             reader.stop();
             return result;
