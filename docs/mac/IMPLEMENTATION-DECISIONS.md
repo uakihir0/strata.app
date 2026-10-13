@@ -14649,3 +14649,187 @@ measuring L-15 remain open.
   no host object for tiered storage before U5.
 - **Review required:** None.
 
+### D-IMPL-870: T11 is done on the host in its pure-logic form; the reference Mac's runs stay open
+
+- **Decision:** The host-verifiable part of T11 is `tools/metal/accept/bench.py`, tested by `tools/metal/test_bench.py` on
+  synthetic text in the formats of 09 section 3.1. It covers how a run becomes a value (through `engine.py`), the spread
+  rule, PF-1 and PF-2, the regression bar and comparison with their skips, the trend rule, the BENCH rows and the host
+  checks of section 5.1. `accept.py pf` is wired to PF-1 and PF-2. Still open: the reference Mac's `bench` and `pf` runs,
+  `tools/metal/accept/engines.py`, and `tests/metal/upstream_speed.json` (section 5.3, outside the goal's sections).
+  Section 12 and the phase 2 table of 10 say so.
+- **Reason:** A run needs a model, the reference Mac and the previous release. None of these exists in this checkout, so
+  only the logic the spec makes exact can be verified here.
+- **Review required:** The owner of 09 should confirm that this split is the "host logic done" of the T11 row.
+
+### D-IMPL-871: `pf` gets its measure; `bench` does not, until its baseline exists
+
+- **Decision:** `RunSpec("pf")` takes `measure=measure_pf`. `RunSpec("bench")` keeps no measure, so a live `accept.py bench`
+  still stops with `criteria not measured yet: ... (task T11)` before any step. `bench_verdicts` and `regression_verdicts`
+  are tested and ready for the wiring.
+- **Reason:** The bench run lists REG.decode, REG.prefill and REG.trend. Those need the previous release's baseline
+  (`engines.py`, absent), and the spread re-run of 5.1 step 3 is not in its plan. A measure now would either invent a
+  baseline or print a PASS without the REG rows. PF-1 and PF-2 need neither.
+- **Review required:** None. Wiring `bench` is a follow-up with `engines.py`.
+
+### D-IMPL-872: A criterion the spec lets a run skip is NOT RUN, and it does not block
+
+- **Decision:** `criteria.Verdict` has a `skipped` flag (default false), and `criteria.skip(id, note)` returns a verdict
+  with `passed` None and `skipped` true. `blocks` is false for a skipped verdict. The PASS line names the skipped IDs, for
+  example `accept bench: PASS (7 criteria, 1.2 min) (NOT RUN, skipped: REG.decode, REG.prefill, REG.trend)`, and the
+  criterion row in `result.json` has `pass: null`. A missing baseline therefore gives NOT RUN for the criterion, never a
+  pass.
+- **Reason:** The gating column of 5.4 reads "Yes, unless skipped or noisy", so a skip must not fail the run. It must not
+  read as a pass either, so the line names it.
+- **Review required:** The owner of 09 should confirm that a run with a skipped REG.* is PASS with the names, and not NOT
+  RUN as a whole. This is the one place where the spec allows either reading, and the choice is one line in `accept.py`.
+
+### D-IMPL-873: A three-run spread above 5% is NOT RUN until the re-run is in the plan
+
+- **Decision:** `measure_arm` raises `BenchError` when the three-run spread of decode or prefill is above 5%, because
+  5.1 step 3 then needs three more runs. `summarize` implements the six-run rule too (median of six, `noisy` above 5%), but
+  no plan produces six runs yet.
+- **Reason:** The plan is static, and a conditional re-run needs a runner change. A three-run median is not used as if it
+  were settled.
+- **Review required:** None. The live T11 work adds the re-run step, which then needs its own check.
+
+### D-IMPL-874: Medians, spread and the 5% boundary
+
+- **Decision:** The median is `statistics.median`, so for six runs it is the mean of the middle two. The spread is
+  `(max - min) / median`, and it is over the limit only when strictly greater than 0.05. A rate must be a finite positive
+  number. Run counts other than 3 and 6 are refused.
+- **Reason:** 5.1 steps 2 and 3 give the median and the spread, and "above 5%" is strict.
+- **Review required:** None.
+
+### D-IMPL-875: The regression bar uses T-4's provisional default until T-4 records a value
+
+- **Decision:** `regression_bar(None)` is 0.95, the provisional default of section 11 (coefficient of variation at most
+  2%). Above 2% the bar is 1 - 2.5 x CV. A negative or non-finite CV is refused. The spec gives no upper bound on CV, so at
+  CV 0.4 or more the bar is zero or less and the check cannot fail. That case is left open.
+- **Reason:** Sections 5.4 and 11 say the default stands until the measurement is recorded.
+- **Review required:** The owner of 09 should say whether a CV bound is wanted, for example NOT RUN above some CV.
+
+### D-IMPL-876: REG.decode is judged on its worst prompt, and noisy points are excluded
+
+- **Decision:** REG.decode is the lowest current-over-previous ratio of the mtp decode medians on ca-1k, ca-4k and ca-32k.
+  A point whose current or previous summary is noisy is not judged and is named in the note. If every point is noisy the
+  criterion is skipped. REG.prefill is the same rule on the ca-32k prefill median.
+- **Reason:** The criterion is "for each", so the worst ratio decides it. 5.4 says a noisy result cannot fail the check.
+  One number is the criterion's value, so the message names one ratio.
+- **Review required:** None.
+
+### D-IMPL-877: A refused flag is a skip; any other failure of the previous release is NOT RUN
+
+- **Decision:** `previous_engine_skip(exit, stderr)` returns the skip note `previous release refused the arguments:
+  unknown argument: <flag>` when stderr has `unknown argument:`. A non-zero exit without that line raises `BenchError`,
+  which is NOT RUN. Section 5.4 also skips an exit while loading the model or the pack. The loader's message is not in the
+  spec, so that case is not recognised and is NOT RUN until the message is known.
+- **Reason:** Failing closed. A guessed skip would hide a broken previous release.
+- **Review required:** The live T11 work should record the previous release's loader message, to make the skip exact.
+
+### D-IMPL-878: REG.trend is the largest change among the four REG points
+
+- **Decision:** The value is the change, against the previous night of the same engine, of whichever point moved most: the
+  mtp decode medians on ca-1k, ca-4k and ca-32k, and the ca-32k prefill median. The note says "printed: more than 3%" when
+  the size is above 3% (strictly). It is reported and never gating. With no previous night it is skipped.
+- **Reason:** 5.4 says "a change of more than 3% is printed" but does not name the numbers. These are the numbers REG.*
+  compare.
+- **Review required:** The owner of 09 should confirm which numbers the trend means.
+
+### D-IMPL-879: PF-2 and PF-1 are medians from one `pf` run, with the chunk checked
+
+- **Decision:** PF-2 is the median of the three ca-32k prefill rates. PF-1 is the ca-128k median over the ca-32k median,
+  both from the same invocation of `pf`. The time to first token on ca-32k (median) is in the PF-2 note. The chunk line is
+  required for both prompts, and it must give the same chunk in all three runs of a prompt. The chunks are in the notes.
+- **Reason:** 5.2 defines the rates and the same-run comparison, and says the chunk is read and recorded. A chunk that
+  changes between identical runs makes the rates incomparable, so that is an error rather than a number.
+- **Review required:** None.
+
+### D-IMPL-880: The benchmark reuses `engine.py`'s parser and adds none
+
+- **Decision:** `bench.parse_run` calls `engine.parse_one_shot` with `need_prefill=True`, because every benchmark prompt is
+  longer than one token and prints a prefill line, and with `need_chunk=True` for PF. `bench.py` has no regular
+  expression of its own.
+- **Reason:** 09 section 3.1 names `engine.py` as the one parser of these lines.
+- **Review required:** None.
+
+### D-IMPL-881: The section 5.1 host checks: their rules, and which runs they apply to
+
+- **Decision:** `bench.host_checks()` makes four checks before a benchmark run. `pmset -g batt` must name `AC Power`.
+  `pmset -g` must report `lowpowermode` or `powermode` as 0. `pmset -g therm` must show both `No thermal warning level has
+  been recorded` and `No performance warning level has been recorded`. `sysctl -n kern.memorystatus_level` must be at
+  least 50. The pgrep check is `checks.no_engine_running`, which every run already makes. An unmet check is NOT RUN with
+  exit 2 before any step. The checks run for every run with `RunSpec.benchmark`: `bench`, `pf`, `g1` and `g2`, because
+  g1 and g2 time the BENCH arms (section 6).
+- **Reason:** Section 5.1 lists these checks and their values. G1 and G2 time the benchmark arms, so the same host rule
+  applies to them.
+- **Review required:** This Mac has no thermal warning, so the warning form of `pmset -g therm` is unverified. The parse
+  follows 09's wording. The first throttled run on the reference Mac should confirm it.
+
+### D-IMPL-882: The thermal rule fails closed
+
+- **Decision:** A thermal state passes only when both `No ... warning level has been recorded` lines are present. Any other
+  line that names a thermal or performance warning level counts as a warning and fails. Output with neither line set is
+  unreadable and fails, so a missing line is never a pass.
+- **Reason:** A host that cannot report its thermal state must not be measured. The captured text of this Mac has the two
+  No lines and a third line about CPU power status, which is not a warning.
+- **Review required:** None, beyond D-IMPL-881's note on the warning form.
+
+### D-IMPL-883: `result.json` records the thermal state and the memory level
+
+- **Decision:** The `host` object gains `thermal_warning` (true, false, or null) and `memory_status_level` (an integer or
+  null). Both are best effort, as the other host fields are. `power` and `low_power_mode` now come from parsers in
+  `result.py` with the same values as before.
+- **Reason:** Section 5.1 says each host check value is recorded in `result.json`. The new keys are additions to schema 1,
+  and the schema's readers ignore unknown keys, as `build_result` documents for `restricted`.
+- **Review required:** The owner of 09 should confirm that adding keys does not need a schema bump.
+
+### D-IMPL-884: BENCH.other is one verdict per other point, and it never blocks
+
+- **Decision:** Each arm and prompt other than mtp and plain on ca-4k gets one `BENCH.other` verdict with its decode median.
+  `BENCH.mtp.target` is judged against 60 tok/s and is reported, not blocking, because its row is not gating.
+- **Reason:** One verdict per point keeps every value in `result.json`, and the row's gating flag carries the rule.
+- **Review required:** None.
+
+### D-IMPL-885: Runner rules for benchmark runs are tested in `test_bench.py`
+
+- **Decision:** `test_bench.py` loads `accept.py` as `test_accept.py` does, and tests: a `bench` or `pf` dry run without
+  models is NOT RUN with the models reason; a `pf` run with a battery stops with exit 2 before any step and writes no
+  result folder; `pf` has a measure and `bench` does not; a skipped criterion passes the run and is named on the PASS
+  line. `test_accept.py` is unchanged.
+- **Reason:** The T11 rules sit with the T11 tests. `test_accept.py` keeps covering the runner's shared behaviour.
+- **Review required:** None.
+
+### D-IMPL-886: The 9.3 row is a concrete path, and the glob count stays at 0
+
+- **Decision:** `tools/metal/test_bench.py` is a row of its own in 09 section 9.3, so `test_map.py` excludes it from the
+  `tools/metal/test_*.py (0 modules)` glob count. The section's count sentence reads 40/40 modules on 2026-10-13, the
+  result of `run_python_tests.py` in this worktree with `STRATA_GGUF_PY` set to the main checkout's gguf-py, because
+  three modules need it (the same three fail without it, before this change).
+- **Reason:** `test_map.py` documents that concrete paths in backticks are separately documented and not counted by the
+  glob. The gguf-py path is an environment setting, not a code change.
+- **Review required:** None.
+
+### D-IMPL-887: The `skipped` flag is a field of `Verdict`, not a new criterion value
+
+- **Decision:** A skip is a `Verdict` with `skipped` true, not a new value such as "NOT RUN" in `passed`. `passed` stays
+  `True`, `False` or `None`, and `None` now means "report" or "skipped". `blocks` decides the run, so the change is in
+  one place.
+- **Reason:** The existing rows and tests depend on `passed` being a boolean or `None` for reported rows, and `blocks` is
+  the single rule that decides a run. A new flag keeps both.
+- **Review required:** None.
+
+
+### D-IMPL-888: A skipped gating criterion makes the run NOT RUN, not PASS
+
+- **Decision:** In `tools/metal/accept.py`, a run in which a gating criterion is skipped (section 5.4, for
+  example `REG.decode` with no previous release) ends with `accept <run>: NOT RUN: skipped (section 5.4): <ids>`,
+  exit code 2, and `status: not-run` in `result.json`, with the skipped criteria still listed. A skipped
+  criterion that does not gate the run is still named on a PASS line.
+- **Reason:** The rule that a NOT RUN never becomes a PASS (AGENTS.md, and the exit-code contract of
+  section 3.2) applies to measurements that were not taken. The first version let a skipped regression check
+  pass the run, which would let a release or gate pass without its regression check. Failing closed is the
+  conservative reading of the spec, which allows the skip but does not say that the run passes without it.
+- **Review required:** Confirm that a skipped `REG.*` must stop the run from counting for a gate. If the
+  owner wants the skip to pass a non-release run, change the single branch in `accept.py` and its test
+  `test_a_skipped_gating_criterion_makes_the_run_not_run_never_pass`.
+

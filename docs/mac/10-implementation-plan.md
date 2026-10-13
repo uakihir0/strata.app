@@ -217,7 +217,7 @@ suffix drafter, sampling and the prompt path.
 | H11 | The watchdog and the stall report | H6, L10 |
 | T6 | C1: `ladder_compare.py`, `metal_router_replay`, `metal_layer_replay` | T5, L9 |
 | T8 | C2, every arm | L11, H8 |
-| T11 | The benchmark, PF-1, PF-2 and the regression check | T4, L13 |
+| T11 | The benchmark, PF-1, PF-2 and the regression check. **Status: partly done.** The host logic is in `tools/metal/accept/bench.py` and tested by `test_bench.py`, and `accept.py pf` is wired to PF-1 and PF-2. Open: the reference Mac's runs of `bench` and `pf`, `engines.py` (the REG.* baseline), the re-run of 5.1 step 3 that `bench` needs, and `upstream_speed.json` ([09](09-testing-and-validation.md), section 12) | T4, L13 |
 | T13 (part) | `metal_gpu_time_test` and `metal_watchdog_test`, with their full-mode cases; the tiered cases come in phase 4 | L13, H11 |
 | T7 (part) | `accept.py g1` and `docs/mac/gates/` | T6, T8, T11 |
 

@@ -82,6 +82,7 @@ need a model loading window of their own, and produce result files rather than a
 | `tools/metal/accept/engine.py` | The one parser of the engine's output lines | 3.1 |
 | `tools/metal/accept/criteria.py` | Every criterion's ID, operator, threshold and gating flag, in one table | 3.2, 10.3 |
 | `tools/metal/accept/fake_engine.py`, `tools/metal/test_accept.py` | The fake engine and the runner's own tests | 3.2 |
+| `tools/metal/accept/bench.py` | The benchmark's host logic: a run's value, the spread rule, PF-1 and PF-2, the regression bar and comparison, the trend rule, the BENCH rows and the host checks (`test_bench.py`) | 5.1-5.4 |
 | `tools/metal/accept/engines.py` | Fetches and unpacks the previous release's engine | 5.4 |
 | `tools/metal/accept/pressure_smoke.py` | The memory-pressure smoke step | 5.5, 9.2 |
 | `tests/metal/images/` | `red.png` and `osaka.png`, the images of S.image | 4.7 |
@@ -912,6 +913,15 @@ Mac, in the same run:
 
 Before the first release there is no previous engine. REG.* is then skipped with the note `no previous release`.
 
+**Status (T11, host logic).** `tools/metal/accept/bench.py` holds the host-verifiable part, and `test_bench.py` tests it
+on synthetic text. It covers the run-to-value mapping (through `engine.py`'s parser), the spread rule of 5.1, PF-1 and
+PF-2 (`accept.py pf` is wired to them, and needs the chunk line), the regression bar of 5.4 with its skips, the trend
+rule, the BENCH rows, and the host checks of 5.1 (AC power, low power mode, thermal state, memory status; `pgrep` is
+shared with every run). A failed check stops a benchmark with exit 2. **Not done:** `accept.py bench` has no `measure`
+yet, because REG.* needs the previous release's baseline (`engines.py`, absent) and the three more runs of step 3 for a
+spread above 5% are not in the plan, so a three-run spread above 5% is NOT RUN. No benchmark has been run on the
+reference Mac, so BENCH, PF and REG have no measured values, and T-4 and T-5 are not recorded.
+
 ### 5.5 Robustness
 
 | Test | Label or run | What it does | Pass when |
@@ -1391,7 +1401,7 @@ its reviewer and is not in the map.
 ### 9.3 The Python layer
 
 `tools/metal/run_python_tests.py` discovers current `test_*.py` modules under `tools/`, `tools/metal/` and `serve/`,
-then runs each in a fresh process. It passed 35/35 modules on 2026-10-07. Rows marked planned are absent and are not
+then runs each in a fresh process. It passed 40/40 modules on 2026-10-13. Rows marked planned are absent and are not
 run. `tools/metal/test_map.py` is a CLI checker exercised through CTest, not a unittest module.
 
 | Modules | Defined in | Runs on |
@@ -1410,6 +1420,7 @@ run. `tools/metal/test_map.py` is a CLI checker exercised through CTest, not a u
 | `tools/metal/test_model_headers.py` | [03](03-model-reference.md), work item R1 | macOS Python suite. Checks shard sizes and tensor totals, fixed metadata and the shared PLE shard, rejects duplicate fixture JSON keys, and invokes `ggufhdr.py` on a generated header. |
 | `tools/metal/test_dense_vs_gguf.py` | [03](03-model-reference.md), work item R5 | Synthetic single- and split-shard packs; deterministic sampling; source-hash and pack-form checks for converted rows; full comparison and rejection of a flipped byte, missing or native-marked float row, stale shard size, duplicate conversion, duplicate catalogue identity and unknown model identity. |
 | `tools/metal/test_accept.py` | Section 3.2 | macOS Python suite; the criteria table (every ID, a planted difference per ID, the message), the engine parser on captured output, the fake engine's planted kinds, the pre-run checks, and end-to-end runs through a test-only registry |
+| `tools/metal/test_bench.py` | Section 5 (`accept/bench.py`) | macOS Python suite; synthetic one-shot text in the formats of section 3.1: the spread rule, PF-1 and PF-2 with their planted differences, the regression bar and comparison with the skips of section 5.4, the trend rule, the BENCH rows, the section 5.1 host checks on captured pmset text, and the runner's NOT RUN rules for benchmark runs |
 | `tools/metal/test_tf_compare.py` | Section 3.3 | macOS Python suite; synthetic dumps with hand-checked outcomes: the file-size rule and the short prompt-path dump, ties, margin bands, token-ID errors, non-finite values, row ranges and JSON aliasing |
 | `tools/metal/test_lc_dump_format.py` | Section 2.5 | macOS Python suite; the logits and ladder writers (the logits read by `tf_compare.py`, the ladder read in the section 9.1 layout), a failure on a renamed or resized graph node, and no output left under the final name |
 | `tools/metal/test_ladder_compare.py` | Section 4.1 | Planned; file absent (work item T6) |
@@ -1592,7 +1603,7 @@ Each item becomes one task in [10-implementation-plan.md](10-implementation-plan
 | T8 | C2 (section 4.2), every arm | `accept.py c2` passes on Q2_0; arm (d) shows at least 95% accepted drafts |
 | T9 | C3 (section 4.3): the tool wrappers, C3.reread, C3.repeat; T-9 | `accept.py c3` passes on Q2_0 with every check; `cc_pressure_mib` is in `models.json` for Q2_0 and Coder |
 | T10 | C4 (section 4.4), part 2 | `accept.py c4` passes on Q2_0 and Coder |
-| T11 | The benchmark, PF-1, PF-2 and the regression check (section 5); `engines.py`; `upstream_speed.json` | `accept.py bench` and `pf` give their numbers; the host checks stop a run on battery with exit 2; the regression check skips, with its note, against an engine that refuses a flag |
+| T11 | The benchmark, PF-1, PF-2 and the regression check (section 5); `engines.py`; `upstream_speed.json` | `accept.py bench` and `pf` give their numbers; the host checks stop a run on battery with exit 2; the regression check skips, with its note, against an engine that refuses a flag. **Status: host logic done** (`accept/bench.py`, `test_bench.py`: the values, PF-1 and PF-2, the bar and the skips, the trend rule, the host checks; `accept.py pf` is wired to them). **Not done:** the reference Mac's runs of `bench` and `pf` (no model here), `bench` itself (its REG.* need `engines.py`, which is absent, and the re-run of 5.1 step 3), and `upstream_speed.json` (section 5.3) |
 | T12 | The needles and the server run (sections 4.6 and 4.7), with S.image and `tests/metal/images/` | `accept.py needle` and `accept.py server` pass on Q2_0 |
 | T13 | `metal_gpu_time_test`, `metal_watchdog_test` (with [06](06-engine-host-port.md) H11), `metal_alloc_fail_test`, the pressure smoke step (section 5.5) | The three tests pass; the smoke step's numbers are in its result |
 | T14 | The nightly job's five steps and the `weekly` job (section 7.2), with the patch to [08](08-build-and-distribution.md), section 12.2 | A week of nightly and weekly runs has a result folder for every run and every slice |
