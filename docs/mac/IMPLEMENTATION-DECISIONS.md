@@ -13382,6 +13382,18 @@ measuring L-15 remain open.
   specification. After that the branch is rebased onto main, the test is registered, and its planned
   key is removed in the same commit.
 
+### D-IMPL-776: Configure the Python of the CMake tests with the project venv
+
+- **Decision:** The local build directory is configured with `-DPython3_EXECUTABLE=<repo>/.venv/bin/python`.
+  The preset itself does not set this variable and is unchanged.
+- **Reason:** With `cmake --preset mac-dev` alone, CMake selects the Homebrew Python 3.14, which lacks `jinja2`.
+  `prompts_manifest_test` then fails at `import jinja2` in `make_prompts.py`. With the venv interpreter,
+  `ctest --preset mac-host` passes 46/46 on the merged main. The venv is the interpreter that
+  `requirements.txt` describes.
+- **Review required:** Decide whether the preset (or CI) should pass the venv interpreter explicitly, or
+  whether the dependency should be installed for the system interpreter. The preset is not changed here,
+  since AGENTS.md limits documented build commands to those in the presets.
+
 ### D-IMPL-680: Put the planner in `setup.py`, and keep `main()` fail-closed
 
 - **Decision:** `metal_plan`, `plan_class`, the PLAN parser and their constants are module-level code in `setup.py`,
