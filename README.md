@@ -15,8 +15,10 @@ Production inference is incomplete. The Prefill and Window production path is no
 the current command-line program rejects model inference options. The macOS setup and server
 integration also remain in progress. `./setup.sh` currently checks for Apple silicon and macOS 27 or newer,
 then exits with a clear not-implemented status before creating an environment or changing files. It is not an
-installer. CUDA kernels and parity harnesses are reference-only and are not built into a Mac backend. A successful build or a
-host or kernel test does not establish that end-to-end model inference is available. See the current status and design notes in
+installer. `setup.py --check-host` only reports read-only host facts; full `setup.py --check`, installation and
+model inference remain unavailable. CUDA kernels and parity harnesses are reference-only and are not built into a
+Mac backend. A successful build or a host or kernel test does not establish that end-to-end model inference is
+available. See the current status and design notes in
 [docs/mac](docs/mac/README.md), especially the [engine port](docs/mac/06-engine-host-port.md) and
 [setup and server port](docs/mac/07-server-setup-port.md).
 

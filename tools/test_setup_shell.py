@@ -65,6 +65,62 @@ class SetupShell(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertIn("macOS setup is not implemented yet", result.stderr)
 
+    def test_setup_py_host_check_is_read_only_and_full_check_remains_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for relative in (
+                "setup.py",
+                "serve/__init__.py",
+                "serve/macos.py",
+                "tools/model_catalog.py",
+            ):
+                source = ROOT / relative
+                destination = root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+
+            host_check = subprocess.run(
+                [sys.executable, str(root / "setup.py"), "--check-host"],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            after_host_check = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            full_check = subprocess.run(
+                [sys.executable, str(root / "setup.py"), "--check"],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            after_full_check = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+
+        self.assertIn(host_check.returncode, (0, 1), host_check.stdout + host_check.stderr)
+        if host_check.returncode == 0:
+            self.assertIn("Strata host check passed", host_check.stdout)
+        else:
+            self.assertIn("error:", host_check.stderr)
+        self.assertEqual(before, after_host_check, "host check must not create or modify files")
+        self.assertEqual(2, full_check.returncode, full_check.stdout + full_check.stderr)
+        self.assertIn("macOS setup is not implemented yet", full_check.stderr)
+        self.assertEqual(before, after_full_check, "full model check must remain fail-closed")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -147,10 +147,11 @@ def _send(obj, sel: bytes, restype=ctypes.c_uint64, *args, argtypes=()):
 
 
 @functools.lru_cache(maxsize=None)
-def metal_devices() -> tuple:
+def metal_devices(*, include_ram: bool = True) -> tuple:
     """Return the default Metal device with stable inventory fields and its Metal capabilities.
 
-    `working_set` is the device working-set size in bytes; it is not a model-fit estimate (docs/mac/07, principle P3)."""
+    `working_set` is the device working-set size in bytes; it is not a model-fit estimate (docs/mac/07, principle P3).
+    `include_ram=False` leaves the independent physical-memory probe to callers that must validate the device first."""
     if not MAC:
         return ()
     try:
@@ -164,11 +165,14 @@ def metal_devices() -> tuple:
                if _send(dev, b"supportsFamily:", ctypes.c_bool, n, argtypes=(ctypes.c_long,))]
         ws = int(_send(dev, b"recommendedMaxWorkingSetSize"))
         gpu = ioreg_gpu()
-        return ({"index": 0, "name": name, "working_set": ws, "wired_limit": wired_limit(),
-                 "max_buffer": int(_send(dev, b"maxBufferLength")),
-                 "unified": bool(_send(dev, b"hasUnifiedMemory", ctypes.c_bool)), "families": fam,
-                 "cores": gpu.get("cores"), "ram": ram_bytes(), "arch": "apple",
-                 "driver": ".".join(str(x) for x in macos_version())},)
+        result = {"index": 0, "name": name, "working_set": ws, "wired_limit": wired_limit(),
+                  "max_buffer": int(_send(dev, b"maxBufferLength")),
+                  "unified": bool(_send(dev, b"hasUnifiedMemory", ctypes.c_bool)), "families": fam,
+                  "cores": gpu.get("cores"), "arch": "apple",
+                  "driver": ".".join(str(x) for x in macos_version())}
+        if include_ram:
+            result["ram"] = ram_bytes()
+        return (result,)
     except (OSError, AttributeError, ValueError):
         return ()
 

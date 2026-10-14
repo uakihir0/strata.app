@@ -15713,3 +15713,28 @@ measuring L-15 remain open.
 - **Review required:** Verify that every CI caller of the runner has system `python3` available. Test modules still
   use only `.venv/bin/python`; the driver never falls back to an arbitrary interpreter.
 
+### D-IMPL-984: Add a read-only host check without opening the setup path
+
+- **Decision:** Add `setup.py --check-host` as a read-only subset of step 1 in 07 section 4.3. Check macOS,
+  architecture and Rosetta in the specified order, macOS 27+, one usable unified-memory Metal device with Apple 7
+  and Metal 4, and readable physical memory. Report the GPU, RAM, Low Power Mode and CPU facts when available.
+  Refuse legacy CUDA/HIP and multi-GPU selectors; accept only Metal and GPU 0. Below 32 GiB, print a performance
+  warning without prompting because this command does not install anything. Keep full `--check`, installation,
+  model planning and direct `main()` calls fail-closed. Disable bytecode writes for script execution so imports do
+  not leave `__pycache__` in the checkout.
+- **Reason:** The full `--check` in 07 section 4.6 downloads or builds an engine and plans catalogue models. The
+  required engine and model inputs are not available, so mapping that behavior to a lightweight host check would
+  claim a model-fit result without the engine. A separate flag provides useful hardware diagnostics without
+  changing the full-check contract or enabling the unfinished installer.
+- **Consequence:** The command reports host readiness only. It does not test Xcode, download/build the engine, plan
+  models, create environments, write files, or establish end-to-end inference support. A future install must still
+  request the consent required by section 4.3 on systems below 32 GiB.
+- **Validation:** `tools.test_setup_check` and `tools.test_setup_shell` passed 19/19 with mocked probe failures,
+  selector refusals, probe order, and a temporary-checkout byte-for-byte side-effect check. A live
+  `/usr/bin/python3 setup.py --check-host` passed on Mac17,9 (M5 Pro, 64 GB, macOS 27.0.1, Xcode 27); it reported
+  the default Metal device and did not create project files. The full Python suite is being rerun after this change.
+- **Adversarial review:** Pending.
+- **Review required:** Review the separate `--check-host` name, its warning-only low-memory behavior, and the fact
+  that it deliberately does not probe Xcode or model fit. Do not treat this command as installer or inference
+  acceptance.
+

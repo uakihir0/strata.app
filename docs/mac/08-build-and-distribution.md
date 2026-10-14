@@ -1,6 +1,6 @@
 # 08. Build and distribution: compiling, testing and publishing the Mac engine
 
-Status: design specification, 2026-10-07. The macOS CMake build, host and Metal tests, and Mac-only CI workflows are implemented. The installer, end-to-end inference, model acceptance runner, release asset tools, and release workflow are not implemented.
+Status: design specification, 2026-10-14. The macOS CMake build, host and Metal tests, and Mac-only CI workflows are implemented. `setup.py --check-host` reports read-only host facts; the installer, full model-planning check, end-to-end inference, model acceptance runner, release asset tools, and release workflow are not implemented.
 Upstream baseline: [Niko1221/Strata](https://github.com/Niko1221/Strata) v0.1.34, commit `1678de33`.
 Source audits: [audit/B-engine-host.md](audit/B-engine-host.md), section 7 (build and tests on macOS), and
 [audit/C-python-setup-serve.md](audit/C-python-setup-serve.md), section 9 (packaging).
@@ -90,7 +90,7 @@ measurement or review may overturn.
 | `src/platform/direct_file.cpp` | The `F_NOCACHE` branch at `:308` | 3.2 |
 | `.gitattributes` | Three lines: LF for `*.metal`, the manifest and `METAL_REV` | 3.5 |
 | `.gitignore` | `.DS_Store`, `*.gputrace` | 3.5 |
-| `setup.py` | Fail-closed CLI stub, plus the build definitions and metadata helpers of section 8 (no setup flow calls them yet) | 8 |
+| `setup.py` | Read-only `--check-host`; install CLI remains fail-closed, plus the build definitions and metadata helpers of section 8 (no setup flow calls them yet) | 8 |
 | `tools/vision/strata_vision.cpp` | The thread-count fix ([06](06-engine-host-port.md), H13) | 9 |
 
 **Markers.** Every edited line is marked, so `tools/metal/check_drift.py` can count the markers per file. It fails when
@@ -732,8 +732,9 @@ A build preset of the same name exists for each.
 `dense_vs_gguf_test` ([09](09-testing-and-validation.md)) also fails closed until `STRATA_TEST_MODELS` contains all
 seven completed catalogue packs.
 
-`mac-release` uses `build/` for the CMake Release configuration. `setup.py --build` is not implemented; `setup.py`
-currently exits before changing files. Build the configured release with `cmake --build --preset mac-release`.
+`mac-release` uses `build/` for the CMake Release configuration. `setup.py --build` is not implemented; except for
+the read-only `setup.py --check-host`, its CLI exits before changing files. Build the configured release with
+`cmake --build --preset mac-release`.
 
 The presets do not set `STRATA_GGML_DIR`. A developer passes it on the command line to skip the oracle's download
 (section 13).
@@ -750,11 +751,12 @@ checks; it does not run this proposed test.
 
 ## 8. Setup build integration: definitions, identity and metadata
 
-`setup.py`'s `main()` still exits with status 2 before changing files. No flow calls the functions below yet: the
-install flow of 07 (S7, merged from main) does not use them, and the build flow (S8) is open. The functions exist in
-`setup.py` next to main's S-track helpers, with the release helpers
-`llama_pin`, `get_llama_cpp` and `cmake_build` that make_release.py uses (work item B8; D-IMPL-940 and D-IMPL-945). The
-tests are in `tools/test_setup_metal.py`. Sections 8.3 to 8.5 describe them as implemented.
+`setup.py`'s `main()` exits with status 2 before changing files for every option except the read-only
+`--check-host`. No install flow calls the functions below yet: the install flow of 07 (S7, merged from main) does not
+use them, and the build flow (S8) is open. The functions exist in `setup.py` next to main's S-track helpers, with
+the release helpers `llama_pin`, `get_llama_cpp` and `cmake_build` that make_release.py uses (work item B8;
+D-IMPL-940 and D-IMPL-945). The tests are in `tools/test_setup_metal.py`. Sections 8.3 to 8.5 describe them as
+implemented.
 
 ### 8.1 `metal_engine_defs(llama)`
 

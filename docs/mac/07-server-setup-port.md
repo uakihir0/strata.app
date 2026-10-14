@@ -11,6 +11,8 @@ Every `file:line` reference is relative to the upstream repository root.
 
 This document specifies the planned Mac user experience outside the engine process. The current checkout has no
 working installer or end-to-end inference product; its fail-closed behavior is stated explicitly in section 5.1.
+The implemented `setup.py --check-host` is a read-only subset of the hardware step in section 4.3; it does not
+implement the engine-download and model-planning `--check` flow in section 4.6.
 - `setup.sh` and the double-click launchers;
 - `setup.py`: install, `--check`, start and update;
 - `serve/server.py`, the HTTP server that owns the engine process;
@@ -49,8 +51,9 @@ The detailed sections below specify the target behavior. They do not imply that 
 production inference flows already work.
 
 Current source behavior:
-- `setup.sh`, `setup.py`, and the MCP installer entrypoint fail closed; they do not create an environment, write settings,
-  download models, or expose a setup command. The setup planner is not available.
+- `setup.sh`, the full `setup.py --check` and installation entrypoints, and the MCP installer entrypoint fail closed;
+  they do not create an environment, write settings, download models, or expose an install command. The setup planner
+  is not available. `setup.py --check-host` only reports read-only host facts.
 - The HTTP server and MCP entrypoint reject unsupported hosts before loading configuration. They require native Apple
   silicon, macOS 27 or newer, and Python 3.10 or newer.
 - MCP hardware output describes the Mac, its memory, and one Metal device. Install recommendations remain informational
@@ -341,6 +344,17 @@ Implementation: steps 3 and 4 of `main()` (`setup.py:3001-3039`) go into `if not
 
 It returns `gpu = {**dev, "count": 1, "archs": ["apple"]}`, and `main()` sets `hip = False`, `amd = []`, `multi = []`,
 `sel = [0]`, `chosen = [gpu]`, `avx2 = avx512 = False`. The caffeinate assertion starts here (section 4.13).
+
+**Implemented subset — `setup.py --check-host`.** This command executes the host-only checks above in their documented
+order: native Apple silicon and Rosetta status, macOS 27+, one usable unified-memory Metal device with
+`apple7`/`metal4`, readable physical RAM, Low Power Mode and CPU facts. It prints a warning below 32 GiB without
+prompting because the command is diagnostic only. `--backend cuda`/`hip`, `--gpus`, `--layer-split` and `--gpu` values
+other than 0 are refused. `--backend metal` and `--gpu 0` are accepted. Invalid or missing probe fields fail
+closed.
+
+The command creates no environment, files, engine, downloads or model plan. The full `--check` contract in section
+4.6 still downloads or builds an engine and plans the available models, and remains unimplemented. Other setup and
+install options remain fail-closed.
 
 ### 4.4 `metal_plan`, `plan_class` and the geometry files
 
@@ -931,9 +945,10 @@ Calibration is withdrawn from the macOS product (D-IMPL-236). The PC CUDA tuner,
 ### 5.1 `setup.sh`
 
 `setup.sh` currently checks the host before stopping with exit code 2. It requires Darwin, Apple silicon, and macOS 27
-or newer. It does not select Python, create `.venv`, install packages, download models, or run `setup.py`. Direct
-`setup.py` execution and calls to `setup.main()` also stop before changing files. This is intentional until the Mac
-installer and Metal planner are implemented.
+or newer. It does not select Python, create `.venv`, install packages, download models, or run `setup.py`. The
+standalone `setup.py --check-host` command reports host facts without changing files. Full `setup.py --check`, install
+options and direct `setup.main()` calls stop before changing files. This is intentional until the Mac installer and
+Metal planner are implemented.
 
 | Host | Result |
 | --- | --- |
@@ -942,9 +957,10 @@ installer and Metal planner are implemented.
 | macOS older than 27, or an unreadable version | Exit 1 with a version or detection message. |
 | Apple silicon on macOS 27 or newer | Exit 2 with the setup-not-implemented message; no environment is created. |
 
-`tools/test_setup_shell.py` exercises the non-Mac refusal, the supported-Mac stop when run on a qualifying machine,
-and the direct Python CLI refusal. The Mac-specific case is skipped when the host does not meet its OS and Python
-preconditions. No installer acceptance is claimed yet.
+`setup.py --check-host` uses these same host gates and returns 0 only when the hardware probes pass. It reports RAM
+below 32 GiB as a warning and never asks for install consent. `tools/test_setup_shell.py` covers the read-only CLI,
+unchanged files, the still-closed full `--check`, non-Mac refusal and launcher behavior. No installer acceptance is
+claimed yet.
 
 ### 5.2 Planned double-click launchers
 
@@ -1613,9 +1629,10 @@ Each item becomes one task in [10-implementation-plan.md](10-implementation-plan
 | S20 | Mac-only project documentation (section 11) | Root and docs describe the supported target and clearly mark any unimplemented setup or inference path |
 | S21 | Measurements X-1 to X-8 (section 14) | Each result is in appendix A and the default it drives is updated here |
 
-**Status (2026-10-13).** S3 is in progress. `setup.py` defines `MAC = sys.platform == "darwin"` (section 4.1), and
-`serve/test_macos.py` tests it. Not yet implemented: the other constants of section 4.1, the probes of section 4.2, the
-Mac step order and refusals of section 4.3, and `--check`. `main()` still refuses to change files (D-IMPL-841).
+**Status (2026-10-14).** S3 is in progress. `setup.py` defines `MAC = sys.platform == "darwin"` (section 4.1), and
+`serve/test_macos.py` tests it. `setup.py --check-host` exercises a read-only subset of the host probes and step 1
+(section 4.3). The remaining Mac install step order and refusals, full `--check`, and installation are not implemented.
+`main()` still refuses every install and model-planning path before changing files (D-IMPL-984).
 
 The host parts of the following are done. Their tests use a fake engine (shell scripts or a Python stand-in), synthetic
 assets and local sockets, and they are in `serve/test_macos.py`. The reference-Mac part of each is open:

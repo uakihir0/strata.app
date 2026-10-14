@@ -7,6 +7,7 @@ import functools
 import hashlib
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -19,6 +20,9 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+# Keep CLI entry points from leaving Python bytecode in the checkout.
+if __name__ == "__main__":
+    sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT))
 from serve import macos  # noqa: E402
 from tools.model_catalog import CONTEXTS, FAMILIES, MODELS  # noqa: E402
@@ -68,6 +72,7 @@ RELEASE_REPOSITORY = "uakihir0/strata.app"
 MIN_ENGINE = (0, 1, 34)
 MIN_ENGINE_METAL = 1
 MACOS_MIN = (27, 0)
+MAC_RAM_FLOOR_GB = 32
 METALLIB = "strata.metallib"
 ENGINE_DIR = ROOT / "engine"
 ENGINE_EXECUTABLES = ("strata", "strata-vision")
@@ -695,7 +700,219 @@ def cmake_build(src: Path, build: Path, target: str, defs: list[str]) -> None:  
     subprocess.run([cmake, "--build", str(build), "--target", target], check=True)
 
 
+def _check_option_problem(arguments: list[str]) -> str | None:
+    """Validate the small set of legacy hardware selectors understood by the read-only check."""
+    index = 0
+    while index < len(arguments):
+        raw = arguments[index]
+        option, separator, inline_value = raw.partition("=")
+        if option in ("--gpus", "--layer-split"):
+            return "a Mac has one GPU: --gpus and --layer-split do not apply"
+        if option not in ("--backend", "--gpu"):
+            return f"setup.py --check-host does not accept {raw!r}; installation options remain disabled"
+        if separator:
+            value = inline_value
+        elif index + 1 < len(arguments) and not arguments[index + 1].startswith("--"):
+            value = arguments[index + 1]
+            index += 1
+        else:
+            return f"{option} needs a value"
+        if option == "--backend":
+            backend = value.lower()
+            if backend in ("cuda", "hip"):
+                return f"--backend {backend} is for NVIDIA / AMD cards; a Mac uses Metal (leave --backend out)"
+            if backend != "metal":
+                return f"--backend {value!r} is not supported by the read-only Mac check"
+        else:
+            try:
+                gpu = int(value)
+            except ValueError:
+                return f"--gpu must be 0 on a Mac, not {value!r}"
+            if gpu != 0:
+                return "a Mac has one GPU (number 0)"
+        index += 1
+    return None
+
+
+def _checked_version(value) -> tuple[int, int] | None:
+    if (
+        not isinstance(value, (tuple, list))
+        or len(value) < 2
+        or any(type(part) is not int or part < 0 for part in value)
+    ):
+        return None
+    return value[0], value[1]
+
+
+def _checked_device(value) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    name = value.get("name")
+    families = value.get("families")
+    if (
+        not isinstance(name, str)
+        or not name.strip()
+        or type(value.get("unified")) is not bool
+        or not isinstance(families, (list, tuple, set))
+        or any(not isinstance(family, str) for family in families)
+    ):
+        return None
+    return value
+
+
+def _core_summary(value) -> str | None:
+    if not isinstance(value, (tuple, list)):
+        return None
+    if not value:
+        return ""
+    cores = []
+    for level in value:
+        if not isinstance(level, dict):
+            return None
+        name = level.get("name")
+        count = level.get("cores")
+        if not isinstance(name, str) or not name.strip() or type(count) is not int or count <= 0:
+            return None
+        cores.append(f"{count} {name.strip()}")
+    return " + ".join(cores)
+
+
+def _check_error(message: str, hint: str | None = None) -> int:
+    print(f"error: {message}", file=sys.stderr)
+    if hint:
+        print(f"hint: {hint}", file=sys.stderr)
+    return 1
+
+
+def check_mac_host(arguments: list[str]) -> int:
+    """Run the read-only macOS step-1 host checks; this does not install or start anything."""
+    if not MAC:
+        return _check_error("Strata setup check supports macOS only.")
+
+    try:
+        machine = platform.machine().lower()
+    except Exception:
+        machine = ""
+    try:
+        translated = macos.translated()
+    except Exception:
+        return _check_error("could not determine whether Python is running under Rosetta")
+    if translated is True:
+        return _check_error(
+            "this Python runs under Rosetta (x86_64)",
+            "install an arm64 Python (Homebrew in /opt/homebrew, or python.org's universal2 installer), "
+            "delete the .venv folder and run ./setup.sh again",
+        )
+    if translated is not False:
+        return _check_error("could not determine whether Python is running under Rosetta")
+    if not machine:
+        return _check_error("this Mac's CPU architecture cannot be read")
+    if machine not in ("arm64", "aarch64"):
+        return _check_error("Strata needs a Mac with Apple silicon (M1 or newer); this Mac has an Intel CPU")
+
+    try:
+        version = _checked_version(macos.macos_version())
+    except Exception:
+        version = None
+    if version is None:
+        return _check_error("this Mac's macOS version cannot be read")
+    if version < MACOS_MIN:
+        return _check_error(
+            f"Strata needs macOS {MACOS_MIN[0]} or newer; this Mac has macOS {version[0]}.{version[1]}"
+        )
+
+    try:
+        devices = macos.metal_devices(include_ram=False)
+    except Exception:
+        return _check_error("could not read the default Metal device")
+    if not isinstance(devices, (tuple, list)):
+        return _check_error("the Metal device probe returned malformed data")
+    if not devices:
+        return _check_error("no Metal GPU was found")
+    if len(devices) != 1:
+        return _check_error(f"a Mac must expose one default Metal GPU; found {len(devices)}")
+    device = _checked_device(devices[0])
+    if device is None:
+        return _check_error("the Metal device probe returned incomplete or malformed capabilities")
+    try:
+        problem = macos.device_problem(device)
+    except Exception:
+        return _check_error("could not verify this GPU's Metal capabilities")
+    if problem is not None:
+        if not isinstance(problem, str) or not problem:
+            return _check_error("the Metal capability probe returned malformed data")
+        return _check_error(problem)
+
+    try:
+        ram_bytes = macos.ram_bytes()
+    except Exception:
+        ram_bytes = 0
+    if type(ram_bytes) is not int or ram_bytes <= 0:
+        return _check_error("this Mac's physical memory cannot be read")
+    gib = 1024 ** 3
+    ram_gib = ram_bytes / gib
+    name = device["name"].strip()
+    cores = device.get("cores")
+    core_text = f", {cores}-core GPU" if type(cores) is int and cores > 0 else ""
+    working_set = device.get("working_set")
+    if type(working_set) is int and working_set > 0:
+        print(
+            f"GPU: {name}{core_text}; device working set {working_set / gib:.1f} GiB "
+            f"of {ram_gib:.0f} GiB unified memory"
+        )
+    else:
+        print(f"GPU: {name}{core_text}; unified memory")
+    wired_limit = device.get("wired_limit")
+    if type(wired_limit) is int and wired_limit > 0:
+        print(f"note: iogpu.wired_limit_mb is set to {wired_limit}")
+    print(f"RAM: {ram_gib:.0f} GiB")
+    if ram_bytes < MAC_RAM_FLOOR_GB * gib:
+        print(
+            f"warning: RAM is below {MAC_RAM_FLOOR_GB} GiB; most model experts would be read "
+            "from the SSD for each token and performance may be very slow"
+        )
+
+    try:
+        low_power = macos.low_power_mode()
+    except Exception:
+        low_power = None
+    if low_power is True:
+        print("warning: Low Power Mode is on; the GPU runs slower (System Settings > Battery)")
+    elif low_power is None:
+        print("warning: Low Power Mode status could not be read")
+    elif type(low_power) is not bool:
+        print("warning: Low Power Mode probe returned malformed data; status is unknown")
+
+    try:
+        brand = macos.cpu_brand()
+    except Exception:
+        brand = None
+    if brand is None or brand == "":
+        print("warning: CPU name could not be read; using a generic Apple silicon label")
+        brand = "Apple silicon"
+    elif not isinstance(brand, str) or not brand.strip():
+        print("warning: CPU name probe returned malformed data; using a generic Apple silicon label")
+        brand = "Apple silicon"
+    try:
+        levels = macos.perf_levels()
+    except Exception:
+        levels = None
+    core_summary = _core_summary(levels)
+    if core_summary is None:
+        print("warning: CPU core-class information could not be read")
+    print(f"CPU: {brand.strip()}" + (f" ({core_summary} cores)" if core_summary else ""))
+
+    option_problem = _check_option_problem(arguments)
+    if option_problem is not None:
+        return _check_error(option_problem)
+    print("Strata host check passed. This check is read-only; installation and model inference are not enabled.")
+    return 0
+
+
 def main() -> int:
+    arguments = sys.argv[1:]
+    if arguments and arguments[0] == "--check-host":
+        return check_mac_host(arguments[1:])
     print("macOS setup is not implemented yet; no files were changed.", file=sys.stderr)
     return 2
 

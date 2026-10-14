@@ -129,7 +129,10 @@
     "REQ-PLT-03": [],
     "REQ-PLT-04": [],
     "REQ-PLT-05": [],
-    "REQ-PLT-06": [],
+    "REQ-PLT-06": [
+      "python:tools/test_setup_check.py",
+      "python:tools/test_setup_shell.py"
+    ],
     "REQ-PLT-07": [],
     "REQ-PRF-01": [],
     "REQ-PRF-02": [],

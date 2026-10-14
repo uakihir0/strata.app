@@ -11,8 +11,9 @@ is still being developed.
 ## Product status
 
 Treat inference and setup as work in progress. The production Prefill and Window path is not fully
-wired, and the current command-line program rejects model inference options. `setup.sh` verifies Apple silicon
-and macOS 27 or newer, then exits before creating an environment or changing files; `setup.py` is also fail-closed.
+wired, and the current command-line program rejects model inference options. `setup.sh` verifies Apple silicon and
+macOS 27 or newer, then exits before creating an environment or changing files. `setup.py --check-host` runs
+read-only host probes; full `--check`, installation and inference options remain fail-closed.
 Do not describe the repository as a working end-to-end model runner or present planned setup and server behavior as
 implemented. The status and specifications are in `docs/mac/README.md`,
 `docs/mac/06-engine-host-port.md`, and `docs/mac/07-server-setup-port.md`.
