@@ -45,6 +45,7 @@ jobs:
           python-version: "3.13"
       - name: Install pinned Python and build tools
         run: |
+          echo "STRATA_DRIVER_PYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
           python -m venv .venv
           .venv/bin/pip install --disable-pip-version-check -r requirements.txt
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
@@ -60,7 +61,7 @@ jobs:
           ctest --preset mac-metal
       - name: Run the Python test layer
         if: github.event_name == 'workflow_dispatch' && inputs.day == ''
-        run: .venv/bin/python tools/metal/run_python_tests.py
+        run: '"$STRATA_DRIVER_PYTHON" tools/metal/run_python_tests.py'
       - name: Run model-backed and nightly acceptance gate
         if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.day != '')
         env:
@@ -89,7 +90,7 @@ jobs:
           done
           cp build-vision/bin/strata-vision engine/.strata-vision.new
           mv -f engine/.strata-vision.new engine/strata-vision
-          .venv/bin/python tools/metal/run_python_tests.py
+          "$STRATA_DRIVER_PYTHON" tools/metal/run_python_tests.py
           if [ -f tools/metal/accept.py ]; then
             .venv/bin/python tools/metal/accept.py nightly
           else

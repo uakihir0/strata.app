@@ -15685,3 +15685,31 @@ measuring L-15 remain open.
   exercised. Verify that both metadata constants remain identical; the identity change alone does not establish that
   a release asset is available or satisfy a Phase 0 exit criterion.
 
+### D-IMPL-983: Run Python tests with the project virtual environment
+
+- **Decision:** Launch the standard-library-only `tools/metal/run_python_tests.py` driver with an interpreter outside
+  the project `.venv` (`python3` from a clean developer shell, `/usr/bin/python3` after the documented PATH change,
+  or the absolute interpreter selected by `actions/setup-python`). It always starts test modules with the fixed
+  `.venv/bin/python`. If that interpreter is missing or cannot start, stop before running more modules and print the
+  commands needed to recreate the environment.
+- **Reason:** System Python 3.14 did not have the project's `jinja2` dependency, while `.venv` contains the pinned
+  project dependencies. The runner itself imports only the standard library, so launching it with the system
+  interpreter lets its own diagnostic handle a missing `.venv`. In CI, capture the selected interpreter's absolute
+  path before adding `.venv/bin` to `GITHUB_PATH`. Falling back for test modules would make results depend on how the
+  runner was invoked and could fail on undeclared system packages.
+- **Consequence:** Contributors must create `.venv` and install `requirements.txt` before running the suite. The
+  runner driver can still report a missing or broken environment; once ready, test modules run in isolated processes
+  with the same pinned interpreter.
+- **Validation:** `tools.metal.test_run_python_tests` passed 7/7 under system Python 3.14.8 and the project Python
+  3.12.13 environment. The focused runner and workflow modules passed 24/24 after their final changes. The full
+  Python runner passed 44/44 modules after updating the release URL test to match D-IMPL-982. The CLI diagnostic path
+  is covered with a temporary checkout lacking `.venv`. Tests requiring unavailable model/tokenizer inputs or the
+  optional `jsonschema` package remain conditionally skipped.
+- **Adversarial-review resolution:** Review found that a `python3` command after `.venv/bin` is added to PATH, or
+  direct `.venv/bin/python` invocation, can bypass the driver's missing-interpreter diagnostic. The Mac developer
+  workflow now uses `/usr/bin/python3`; CI and hardware workflows capture the `actions/setup-python` interpreter
+  before updating PATH. A subprocess test verifies the driver's exit 2 guidance when `.venv` is absent, and workflow
+  tests lock in the interpreter selection.
+- **Review required:** Verify that every CI caller of the runner has system `python3` available. Test modules still
+  use only `.venv/bin/python`; the driver never falls back to an arbitrary interpreter.
+

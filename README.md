@@ -62,7 +62,7 @@ The documented test entry points are:
 ```sh
 ctest --preset mac-host
 ctest --preset mac-metal
-.venv/bin/python tools/metal/run_python_tests.py
+python3 tools/metal/run_python_tests.py
 ```
 
 `mac-host` runs tests that do not need a GPU; `mac-metal` needs an Apple GPU. The `mac-model` preset runs

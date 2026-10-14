@@ -1410,9 +1410,12 @@ can safely execute unreviewed PR code without access to secrets or persistent re
 
 `tools/metal/run_python_tests.py` finds `tools/test_*.py`, the unittest modules in `tools/metal/`, and
 `serve/test_*.py`. It excludes `tools/metal/test_map.py`, a command-line checker whose unittest coverage is
-`tools/metal/test_test_map.py`. The runner runs each module with unittest's standard test loader in its own process,
-because several modules patch `setup` globals at import time ([07](07-server-setup-port.md), section 10.1). A
-module that collects zero tests is a failure. It prints a header for each module and exits 1 when any module fails.
+`tools/metal/test_test_map.py`. Launch the standard-library-only driver with a Python interpreter outside the project
+`.venv` (`/usr/bin/python3` in the macOS developer workflow); it starts each module with the project's
+`.venv/bin/python` and unittest's standard test loader in its own process, because several modules patch `setup`
+globals at import time ([07](07-server-setup-port.md), section 10.1). A missing or broken `.venv` is reported before
+discovery, with commands to recreate it. A module that collects zero tests is a failure. It prints a header for each
+module and exits 1 when any module fails.
 
 ### 12.2 `mac-hardware.yml`
 
@@ -1515,7 +1518,7 @@ cmake --preset mac-dev
 cmake --build --preset mac-dev --parallel
 ctest --preset mac-host
 ctest --preset mac-metal
-.venv/bin/python tools/metal/run_python_tests.py
+/usr/bin/python3 tools/metal/run_python_tests.py
 ```
 
 CMake fetches the pinned llama.cpp revision automatically. Keep `.venv/bin` first in `PATH` before configuring so

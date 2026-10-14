@@ -33,11 +33,12 @@ jobs:
           python-version: "3.13"
       - name: Install pinned Python and build tools
         run: |
+          echo "STRATA_DRIVER_PYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
           python -m venv .venv
           .venv/bin/pip install --disable-pip-version-check -r requirements.txt
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Run every Python test module
-        run: .venv/bin/python tools/metal/run_python_tests.py
+        run: '"$STRATA_DRIVER_PYTHON" tools/metal/run_python_tests.py'
       - name: Check source drift
         run: .venv/bin/python tools/metal/check_drift.py
       - name: Check release policy

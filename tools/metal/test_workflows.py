@@ -88,6 +88,42 @@ class WorkflowConfiguration(unittest.TestCase):
         self.assertIn("::error::", command)
         self.assertIn("exit 1", command)
 
+    def test_python_test_driver_stays_outside_the_project_virtualenv(self):
+        expected_calls = {"ci.yml": ("mac-host", 1), "mac-hardware.yml": ("hardware", 2)}
+        for filename, (job_name, expected_count) in expected_calls.items():
+            workflow = load_yaml(WORKFLOWS / filename)
+            steps = workflow["jobs"][job_name]["steps"]
+            install = next(
+                step for step in steps
+                if step.get("name") == "Install pinned Python and build tools"
+            )
+            capture = 'STRATA_DRIVER_PYTHON=$(python -c \'import sys; print(sys.executable)\')'
+            path_update = 'echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"'
+            self.assertIn(capture, install["run"])
+            self.assertLess(install["run"].index(capture), install["run"].index(path_update))
+
+            calls = [
+                step for step in steps
+                if "tools/metal/run_python_tests.py" in step.get("run", "")
+            ]
+            self.assertEqual(expected_count, len(calls), filename)
+            for step in calls:
+                runner_commands = [
+                    line.strip()
+                    for line in step["run"].splitlines()
+                    if "tools/metal/run_python_tests.py" in line
+                ]
+                self.assertEqual(
+                    ['"$STRATA_DRIVER_PYTHON" tools/metal/run_python_tests.py'],
+                    runner_commands,
+                    filename,
+                )
+
+        developer_workflow = (
+            ROOT / "docs" / "mac" / "08-build-and-distribution.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("/usr/bin/python3 tools/metal/run_python_tests.py", developer_workflow)
+
     def test_ci_build_uses_cmake_fetchcontent_without_setup_helpers(self):
         workflow = load_yaml(WORKFLOWS / "ci.yml")
         steps = workflow["jobs"]["mac-host"]["steps"]
