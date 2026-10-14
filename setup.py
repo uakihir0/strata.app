@@ -60,12 +60,11 @@ _HINT_TIMEOUT = (f"the engine took more than {PLAN_TIMEOUT_S} s to plan: run eng
                  "by hand and report its output")
 _HINT_OTHER = "delete the engine folder and run setup again (setup --build compiles one)"
 
-# The Mac install (docs/mac/07-server-setup-port.md, sections 4.1, 4.7, 4.10 and 4.12). The release URLs need a
-# publication destination (OQ-01): until RELEASE_REPOSITORY is set, no ready-made engine is looked for by default.
+# The Mac install (docs/mac/07-server-setup-port.md, sections 4.1, 4.7, 4.10 and 4.12).
 PREBUILT_ASSET = "strata-macos-arm64.zip"
 PREBUILT_TAG_URL = "https://github.com/{repository}/releases/download/v{version}-metal.{metal_rev}/"
 PREBUILT_URL = "https://github.com/{repository}/releases/latest/download/"
-RELEASE_REPOSITORY = None
+RELEASE_REPOSITORY = "uakihir0/strata.app"
 MIN_ENGINE = (0, 1, 34)
 MIN_ENGINE_METAL = 1
 MACOS_MIN = (27, 0)

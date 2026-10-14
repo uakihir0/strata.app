@@ -1,6 +1,6 @@
 # Implementation decisions and review items
 
-Status: working log, 2026-10-12.
+Status: working log, 2026-10-14.
 
 This file records choices made while implementing the plan. A recorded choice does not
 make a hardware gate, a human review, or an external resource available. Update the
@@ -21,23 +21,24 @@ requirement.
 
 ### D-IMPL-002: Keep the fork local until its owner is known
 
-- **Status:** Superseded by D-IMPL-225 on 2026-10-07. The project has an independent repository identity; its
-  publication destination and release-test repository remain open under OQ-01.
+- **Status:** Superseded by D-IMPL-225 on 2026-10-07. Its publication-identity precondition is now superseded by
+  D-IMPL-982; the separate release-test repository remains open under OQ-01.
 - **Decision:** Work in this local repository on the requested `codex` branch. Use
   `strata.app` as the planned repository name, but leave `{FORK}` placeholders in
   published-facing specifications and do not invent a GitHub owner or test
   repository.
-- **Reason:** The plan records the slug `strata.app` as planned but leaves its owner
-  and the release test repository open (OQ-01). This checkout has no Git remote.
+- **Reason:** At the time of this decision, the plan recorded `strata.app` as planned
+  but left its owner and the release-test repository open (OQ-01), and this checkout
+  had no Git remote.
   Inventing either value would create misleading clone, issue, workflow, and release
   URLs.
 - **Plan status:** The user requested local implementation to proceed without waiting
   for these human choices. Work is therefore being done as a local bootstrap despite
   the formal Phase 0 precondition. This checkout does not claim Phase 0 completion or
   a conforming published fork.
-- **Review required:** The repository owner must confirm the GitHub `owner/repository`
-  and test repository before Phase 0 can be accepted or those URLs and release
-  workflows are used externally.
+- **Review required:** The publication identity is recorded in D-IMPL-982. The
+  release-test repository and remaining Phase 0 criteria stay open; no artifact is
+  published by the identity change.
 
 ### D-IMPL-003: Treat local hardware checks as evidence, not as gate completion
 
@@ -61,10 +62,11 @@ requirement.
   no first run on a self-hosted `strata-ref` runner is considered approved by this
   implementation.
 - **Reason:** B21 explicitly requires a second person to check the runner rules
-  before the first workflow runs on that machine. This checkout has no GitHub remote
-  or configured runner. Manual hardware runs are restricted to `main` and PRs
-  cannot target the configurable Mac runner, but actor permissions and runner-group
-  workflow restrictions still need owner configuration.
+  before the first workflow runs on that machine. The project GitHub remote is
+  configured as `strata.app` for `uakihir0/strata.app` (D-IMPL-982), but no
+  self-hosted `strata-ref` runner is configured. Manual hardware runs are
+  restricted to `main` and PRs cannot target the configurable Mac runner, but actor
+  permissions and runner-group workflow restrictions still need owner configuration.
 - **Review required:** A second person must review the runner restrictions in
   `docs/mac/08-build-and-distribution.md` section 12.4 before the first hardware
   workflow is enabled.
@@ -233,7 +235,8 @@ requirement.
   responses, missing or lightweight release tags, a stale tag on main, an
   unpublished release PR and a post-publication PR whose head differs from the
   base branch. Retain the current release branch until its successor is merged.
-  Resolve OQ-01 before enabling remote release checks.
+  The publication slug is recorded in D-IMPL-982; configure and verify the
+  release-test repository before running B12 or B18.
 
 ### D-IMPL-014: Defer remote release-history checks until the repository is known
 
@@ -241,14 +244,16 @@ requirement.
   published GitHub release-history check only when `setup.RELEASE_REPOSITORY` is configured.
   When unset, ordinary `main` development checks emit a notice and defer remote
   history; release branches and tags fail closed.
-- **Reason:** OQ-01 is unresolved and this checkout has no remote. Failing every
+- **Reason:** When this decision was made, OQ-01 was unresolved and the checkout
+  had no remote. Failing every
   Linux CI run because the publishing repository is intentionally unset would
   block unrelated implementation work, while guessing a repository could check
   or publish against the wrong release history. Release preparation cannot
   proceed without checking the destination's revision history.
-- **Review required:** Set and verify the intended `setup.RELEASE_REPOSITORY`, then require
-  `check_release_policy.py --remote` in CI before treating release-history
-  validation as active.
+- **Review required:** `setup.RELEASE_REPOSITORY` is now set to the confirmed
+  repository in D-IMPL-982. Keep the workflow and release-test repository checks
+  open until the separate release-test repository is configured and the release
+  policy is validated; no artifact is published by this change.
 
 ### D-IMPL-015: Keep hardware acceptance fail-closed and recover queued runs
 
@@ -5484,20 +5489,21 @@ requirement.
 
 ### D-IMPL-225: Separate repository identity from source provenance
 
-- **Status:** Superseded by D-IMPL-227 and D-IMPL-239 for supported platforms and source-tree scope.
+- **Status:** Superseded by D-IMPL-227 and D-IMPL-239 for supported platforms and source-tree scope. Its publication
+  identity uncertainty is superseded by D-IMPL-982.
 
 - **Decision:** Give the project its own Git history and repository identity. Preserve its Strata v0.1.34 source
   provenance, copyright notices and licenses; rewriting history does not make copied code clean-room work. Keep tracked
   engine, setup, test, fixture, audit and build-plan files required by the cross-platform product or Metal plan. Rename
   the prototype directory to `docs/mac/spikes/metal-build/mac-port/` and the setting to
   `setup.RELEASE_REPOSITORY`. Remove ignored `build-dev` outputs after implementation tests finish.
-- **Reason:** The checkout has no configured remote or GitHub publication identity, so local history can be prepared
+- **Reason:** At the time of this decision, the checkout had no configured remote or GitHub publication identity, so local history could be prepared
   but hosting metadata cannot be changed. The cleanup audit found no safe tracked-source deletion: platform code and
   fixtures remain necessary for supported systems and validation. Removing them would drop product support or test
   coverage. Only ignored generated `build-dev` outputs are cleanup candidates. Provenance avoids implying that copied
   source was independently authored.
-- **Validation:** The Python runner passed all 42/42 modules; after the review fix, the focused drift-policy suite passed 15/15 and loads the production `drift.json`; release-policy tests passed 33/33; workflow tests passed 11/11; macOS path test passed 1/1; `test_map.py` and `git diff --check` passed. The full CTest run for D-IMPL-224 registered 76 tests, with 75 passing and one expected model-input skip on Mac17,9 (64 GB, macOS 27.0.1). Before rewriting the local `codex` history, verify every retained project tree, a linear history with no Strata commit ancestry, `main` unchanged, and a clean worktree. Remove ignored build outputs after the final implementation test run.
-- **Review required:** Confirm the publication repository slug before configuring release URLs or changing remote/GitHub metadata. No remote is configured in this checkout. Keep the golden `no_arithmetic` list conservative; expanding it requires a numerical-impact review, a regression test and a recorded reason.
+- **Validation:** The Python runner passed all 42/42 modules; after the review fix, the focused drift-policy suite passed 15/15 and loads the production `drift.json`; release-policy tests passed 33/33; workflow tests passed 11/11; macOS path test passed 1/1; `test_map.py` and `git diff --check` passed. The full CTest run for D-IMPL-224 registered 76 tests, with 75 passing and one expected model-input skip on Mac17,9 (64 GB, macOS 27.0.1). The historical validation was run before the remote was configured. Before rewriting the local `codex` history, verify every retained project tree, a linear history with no Strata commit ancestry, `main` unchanged, and a clean worktree. Remove ignored build outputs after the final implementation test run.
+- **Review required:** The publication identity is recorded in D-IMPL-982; the separate release-test repository remains open. Keep the golden `no_arithmetic` list conservative; expanding it requires a numerical-impact review, a regression test and a recorded reason.
 - **Adversarial-review resolution:** Descartes found that sections 09-11 described server/options/logging as exempt while `tools/metal/drift.json` exempted only `src/platform/**`. Preserve the narrower executable policy: only the platform glob is exempt today, and every other `src/` or `include/` change requires a new golden recording. Added direct verdict tests tied to the production drift configuration for platform, server, options, headers and non-engine paths; the compatibility procedure and risk summaries now state the same rule.
 
 ### D-IMPL-226: Validate the Prefill BF16 remainder against the device scale
@@ -5525,7 +5531,7 @@ requirement.
 
 - **Decision:** Run the optional CI job only on pushes to `main` and `release/**`, and run reference-hardware jobs only on `main`. Do not schedule CI for pull requests until a runner can safely execute untrusted code. Keep manual hardware dispatch restricted to `main` and validate its requested acceptance day before checkout.
 - **Reason:** The repository is macOS-only and has no safe hosted PR runner configured. Cross-platform Linux jobs were removed with D-IMPL-227. The reference runner contains persistent model and result data, so PR branches must never execute there. Runner-group restrictions are still required because a manually selected ref can supply a different workflow definition.
-- **Validation:** Workflow configuration tests passed 11/11 after the trigger and runner-condition changes; CMake host and Metal suites passed 37/37 and 41/41. No remote CI run was possible because this checkout has no Git remote.
+- **Validation:** Workflow configuration tests passed 11/11 after the trigger and runner-condition changes; CMake host and Metal suites passed 37/37 and 41/41. At the time of those tests, no remote CI run was possible because this checkout had no Git remote.
 - **Review required:** Configure the repository's trusted Mac runner and runner-group policy before enabling these workflows; the local YAML checks do not verify GitHub-side runner permissions.
 
 ### D-IMPL-600: Declare every run and criterion now, and measure none until its owner lands
@@ -7615,7 +7621,7 @@ measuring L-15 remain open.
 
 | ID | Item | Why it needs review | Blocking point |
 | --- | --- | --- | --- |
-| REV-001 | Confirm GitHub owner/repository and release test repository | OQ-01 leaves both open; no remote is configured | Before external URLs and release workflows are used |
+| REV-001 | Configure and validate the release-test repository | The publication repository `uakihir0/strata.app` and its account permissions are confirmed (D-IMPL-982); the separate test repository remains open | Before B12/B18 or release automation is run |
 | REV-002 | Confirm model assets/result storage and CUDA reference availability | The local Mac matches the required compute specs, but no model disk is mounted and no CUDA PC is available | Before model/golden tests and acceptance gates |
 | REV-003 | Review self-hosted runner isolation and workflow permissions | B21 requires a second-person review | Before the first workflow runs on `strata-ref` |
 | REV-004 | Verify independent local history | The rewritten `codex` history must have no Strata commit ancestry while retaining a clear source-provenance record and every project tree | Before publishing or opening a pull request |
@@ -15219,6 +15225,7 @@ measuring L-15 remain open.
 
 ### D-IMPL-907: No release URL is configured; the override and the bases list are in place
 
+- **Status:** Superseded by D-IMPL-982; the publication repository is now configured, while release-asset availability remains unverified.
 - **Decision:** `RELEASE_REPOSITORY` stays None, so `prebuilt_bases()` returns `[]` by default. `--prebuilt` and
   `STRATA_PREBUILT_URL` replace the release folders, and a local folder becomes a `file://` URL. With a repository set,
   the tag folder comes first and the latest folder second. The HEAD probe is kept before the GET.
@@ -15652,4 +15659,29 @@ measuring L-15 remain open.
   runner's processes, and the suite does not reproduce the crash. Recording it avoids guessing a cause.
 - **Review required:** If the reports recur, capture the crashing process's command line when it occurs; the
   reports do not contain it.
+
+### D-IMPL-982: Configure the confirmed publication repository
+
+- **Decision:** Set `RELEASE_REPOSITORY` to `uakihir0/strata.app` in both `setup.py` and
+  `tools/metal/release_metadata.py`. The canonical fetch and push destination is
+  `https://github.com/uakihir0/strata.app.git`. This checkout's `strata.app` remote stores the same repository
+  without the optional `.git` suffix in both directions.
+- **Evidence:** The GitHub connector confirmed that `uakihir0/strata.app` is public and that the current account has
+  write/admin permissions. `git remote -v` shows the configured `strata.app` remote resolving to that repository for
+  both fetch and push.
+- **Reason:** The publication destination is established by the checked-out remote and independent GitHub repository
+  metadata. Configuring one slug in setup and release tooling lets the release policy compare the code's destination
+  with the checked-out repository and `GITHUB_REPOSITORY`.
+- **Consequence:** This resolves only the publication-identity part of OQ-01. The separate release-test repository is
+  still unknown; B12/B18 and Phase 0 remain open. The remote is named `strata.app` in this checkout, while
+  `check_release_policy.py --remote` currently checks the `origin` remote, so a successful remote-policy run remains
+  unverified. No workflow, remote configuration, or release artifact is changed or published by this decision.
+- **Validation:** With the project Python 3.12.13 environment, the focused release-policy, verify-release,
+  workflow, and make-release unittest modules passed 92/92. `check_release_policy.py` passed its local checks;
+  an import-time assertion confirmed that both repository constants and the generated prebuilt URLs use
+  `uakihir0/strata.app`; `git diff --check` passed. The `--remote` check was not run because this checkout has a
+  `strata.app` remote rather than the `origin` remote that the policy currently requires.
+- **Review required:** Keep publication blocked until the release-test repository is configured and B12/B18 are
+  exercised. Verify that both metadata constants remain identical; the identity change alone does not establish that
+  a release asset is available or satisfy a Phase 0 exit criterion.
 

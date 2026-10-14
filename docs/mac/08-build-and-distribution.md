@@ -1392,8 +1392,9 @@ import them automatically. Common rules:
   must happen within 30 days of the original run. The hardware dispatch guard validates that the day is 1-7 before
   self-hosted jobs can start.
 - Python steps run in a venv created from `requirements.txt`, so `cmake` and `ninja` are the pinned wheels.
-- `ci.yml`, `mac-hardware.yml` and `.github/dependabot.yml` are prepared in this local checkout. No GitHub remote or
-  `strata-ref` runner is configured here; these files have not run in GitHub Actions.
+- `ci.yml`, `mac-hardware.yml` and `.github/dependabot.yml` are prepared in this local checkout. The configured
+  `strata.app` remote points to `uakihir0/strata.app` (D-IMPL-982), but no `strata-ref` runner is configured here;
+  these files have not run in GitHub Actions.
 
 ### 12.1 `ci.yml`
 
@@ -1565,7 +1566,7 @@ Open items, decided outside measurement:
 
 | Item | Decided when | Until then |
 | --- | --- | --- |
-| `{REPOSITORY}`, the project's `owner/repository` | Phase 0 ([10](10-implementation-plan.md)) | The workflows and `check_release_policy.py` read it from `setup.RELEASE_REPOSITORY`; nothing is published |
+| A release-test repository for B12 and B18 | Before testing release automation | The publication repository is configured as `uakihir0/strata.app`; this identity change publishes no artifact |
 | A trusted macOS 27 arm64 CI runner | When the repository owner configures `MAC_HOSTED_RUNNER` | `mac-host` is skipped while unset. PRs do not execute on the configured runner. Hardware acceptance remains on the self-hosted `strata-ref` runner. A binary with `minos 27.0` does not start on macOS 26. |
 | Developer ID signing | When the owner has an Apple Developer account, after B-5 and B-6 | Ad hoc releases (section 11.5) |
 | The licence review | Before the first release (work item B20) | `LICENSES.txt` as in section 11.9 |

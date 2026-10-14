@@ -251,11 +251,11 @@ and `from serve import macos`. This import runs on every OS: the module is stand
 | `METALLIB` | | `"strata.metallib"` |
 | `GEOMETRY_DIR` | | `ROOT / "data" / "geometry"` |
 
-`{REPOSITORY}` is the project's eventual GitHub `owner/repository`. Configure the module constant
-`RELEASE_REPOSITORY` only after a publication destination is selected; the current checkout has no remote. The
-`STRATA_PREBUILT_URL` environment variable and `--prebuilt` option override the default `PREBUILT_URL`.
+`{REPOSITORY}` is `uakihir0/strata.app` for this checkout. Both fetch and push URLs of the configured
+`strata.app` remote point at that public repository, and `RELEASE_REPOSITORY` is set to the same slug (D-IMPL-982).
+This identity update does not publish an artifact. The separate release-test repository remains open under OQ-01.
+The `STRATA_PREBUILT_URL` environment variable and `--prebuilt` option override the default `PREBUILT_URL`.
 
-The public repository slug may be `strata.app`; its owner and destination are not configured ([11](11-risks-and-open-questions.md), OQ-01).
 Only the repository takes that name: the product stays Strata, and so do its binaries, files and folders (`strata`,
 `strata.metallib`, `strata-macos-arm64.zip`, `Strata-data`, `~/Library/Caches/strata`) and its texts.
 macOS treats a folder whose name ends in `.app` as an application bundle (content type
@@ -1579,7 +1579,7 @@ Open items, decided outside measurement:
 
 | Item | Decided when | Until then |
 | --- | --- | --- |
-| GitHub publication destination (`owner/repository`) and release-test repository (OQ-01) | Before release automation or publication | No remote is configured; leave `setup.RELEASE_REPOSITORY` unset and defer remote checks. `strata.app` is only a proposed public slug. |
+| Release-test repository (OQ-01) | Before testing the release pipeline (B12, B18) | The publication repository is `uakihir0/strata.app`. The separate test repository is not configured; this identity change publishes no artifact. |
 | Whether `normalise()` and `test_prebuilt_hip_zip` fixes (section 10.1) go upstream | Before the first release | They live in the project with `# MAC:` markers |
 
 ---
@@ -1622,9 +1622,10 @@ assets and local sockets, and they are in `serve/test_macos.py`. The reference-M
 - **S2.** `START-HERE.command` and `SETUP.command` ship. Each forwards to `setup.sh`, which still exits 2, and
   `test_command_launchers` checks them. The darwin block of `setup.sh` is unchanged; the arm64 Python selection and
   the installer steps of section 5.1 are not implemented.
-- **S7.** `get_prebuilt_metal`, `prebuilt_bases`, `smoke_test` and `use_ssl_bundle` (sections 4.7.1-4.7.5). No release
-  URL is configured (`RELEASE_REPOSITORY` is unset), so no ready-made engine is looked for by default. Open: an install
-  of the release asset on the reference Mac, and the certificate hint on a python.org Python.
+- **S7.** `get_prebuilt_metal`, `prebuilt_bases`, `smoke_test` and `use_ssl_bundle` (sections 4.7.1-4.7.5). The default
+  release URLs target `uakihir0/strata.app`; availability and validation of an engine asset have not been established
+  here, and this identity change publishes no artifact. Open: an install of a release asset on the reference Mac, and
+  the certificate hint on a python.org Python.
 - **S10.** `write_run_script`, `quarantine_targets` and `strip_quarantine_targets` (section 4.10).
   `test_run_script_quoting`, `test_command_launchers` and the quarantine test pass. Open: the "Open Anyway" check of a
   ZIP download.

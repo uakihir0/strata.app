@@ -324,7 +324,7 @@ ID has a hyphen (L-6); a work item does not (L6).
 - **Into upstream:** `file:line`, relative to the upstream repository root at commit `1678de33`, for example
   `src/program/generate.cpp:160-415`. They stay valid at that commit; across syncs, `check_drift.py` watches the
   upstream ranges the project copies ([10](10-implementation-plan.md), section 4.3).
-- **The project:** `{REPOSITORY}` stands for the eventual GitHub `owner/repository`; no destination is configured yet
+- **The project:** `{REPOSITORY}` stands for the configured GitHub `owner/repository`, `uakihir0/strata.app`
   ([10](10-implementation-plan.md), section 3.1).
 - **The reference Mac:** the M5 Pro 64 GB (20-core GPU) on macOS 27.0 (26A428) with Xcode 27.0 (27A266a) where every
   measurement was taken. It is also the self-hosted CI runner `strata-ref` ([appendix
@@ -348,9 +348,9 @@ ID has a hyphen (L-6); a work item does not (L6).
 The macOS port specification, audit reports, and spikes live in `docs/mac/`. The repository keeps the Mac build,
 Metal, setup and validation documentation; retired PC installation and backend guides are not part of the product docs.
 
-This local checkout contains the documented source baseline and the Phase 0 Metal build skeleton. The current CTest and Python results are recorded above. The publication repository and release-test repository remain unconfigured under OQ-01; the model disk and CUDA reference PC are unavailable. Phase 0 is therefore still open. See [IMPLEMENTATION-DECISIONS.md](IMPLEMENTATION-DECISIONS.md).
+This local checkout contains the documented source baseline and the Phase 0 Metal build skeleton. The current CTest and Python results are recorded above. The publication identity is configured as `uakihir0/strata.app`; the separate release-test repository remains unconfigured under OQ-01. The model disk and CUDA reference PC are unavailable. Phase 0 is therefore still open. See [IMPLEMENTATION-DECISIONS.md](IMPLEMENTATION-DECISIONS.md).
 
-The repository, documentation set and source reference are already present in this working tree. The remaining Phase 0 preflight in [10](10-implementation-plan.md), section 3.1, is to configure a publication repository when one exists and prepare the reference machines described in section 8. `UPSTREAM_SYNC` records the source baseline for provenance and compatibility checks; Git history is independent of the upstream repository. The current checkout has no configured remote, so no publication destination is claimed.
+The repository, documentation set and source reference are already present in this working tree. The publication identity is set to the configured `strata.app` remote; the remaining Phase 0 preflight in [10](10-implementation-plan.md), section 3.1, includes preparing the reference machines described in section 8 and satisfying the runner criteria. `UPSTREAM_SYNC` records the source baseline for provenance and compatibility checks; Git history is independent of the upstream repository. No artifact is published by the identity change.
 
 The B1-B5 Metal build skeleton (root edits, CMake backend and metallib build) is already present. Phase 0 ends only when its remaining exit criteria hold, including CI on the selected publication repository, `mac-hardware.yml` on `strata-ref`, `check_drift.py`, and `test_map.py`.
 

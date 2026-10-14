@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 MIN_ENGINE = (0, 1, 34)
 MIN_ENGINE_METAL = 1
-RELEASE_REPOSITORY: str | None = None
+RELEASE_REPOSITORY: str | None = "uakihir0/strata.app"
 
 # The release files (docs/mac/08-build-and-distribution.md, section 11.2).
 ASSET_NAME = "strata-macos-arm64.zip"

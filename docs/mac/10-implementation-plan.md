@@ -118,10 +118,11 @@ than those of earlier phases.
 ### 3.1 Phase 0: the repository, the build and CI
 
 The working tree already contains the project docs, source baseline reference, build skeleton and local test maps.
+The publication identity is configured as `uakihir0/strata.app` in `setup.RELEASE_REPOSITORY` and
+`tools/metal/release_metadata.py`, matching the confirmed public GitHub repository (D-IMPL-982). This identity
+change does not publish an artifact. The separate release-test repository and the Phase 0 runner and hardware
+criteria remain open.
 Phase 0 still requires:
-- **Set the publication identity** when the repository is hosted: configure `{REPOSITORY}` and
-  `setup.RELEASE_REPOSITORY` consistently with the checked-out GitHub repository. Until then, keep release-history
-  checks local and do not publish release artifacts.
 - **Keep specifications beside the implementation.** `test_map.py` reads
   `docs/mac/01-requirements.md` and `docs/mac/09-testing-and-validation.md`; work items take their reference inputs
   from `docs/mac/spikes/`. Changes to a specification land with the code or test they describe.
@@ -621,7 +622,8 @@ threshold of [09](09-testing-and-validation.md) changes by its section 10.3.
 | Out of project scope (D-IMPL-629): the CUDA reference PC, an sm_120 card with 12 GB or more and 64 GB of RAM ([09](09-testing-and-validation.md), section 2.4) | Not needed | The golden set, which is not recorded. C1.K runs on the reference Mac | C1.1, C1.5, G1.tf and G1.free are NOT RUN until a model-level reference is named (D-IMPL-671, D-IMPL-960) ([11](11-risks-and-open-questions.md), section 2) |
 | A 48 GB Apple10 Mac | Phase 4 | The authoritative form of G2; M-8 | G2 runs on the reference Mac with the balloon |
 | Macs of the M1, M2, M3 and M4 generations, for a few hours each; 32 GB or more for `accept.py family` | Phase 5, and again for each release candidate | The family runs; the family parts of L-2 to L-8 and L-10 to L-15; M-8 on 32 and 36 GB | REQ-PLT-03 cannot hold, and the release notes say "tested on M5 only" |
-| A GitHub repository for the project, and a test repository for the release pipeline | Phase 0, phase 5 | CI, releases; B12 and B18 | — |
+| The project publication repository, `uakihir0/strata.app`, is configured; this does not complete Phase 0 or publish an artifact | Phase 0 | Publication identity | — |
+| A separate GitHub test repository for the release pipeline | Phase 5 | B12 and B18 | Release pipeline integration remains incomplete |
 | A GitHub-hosted macOS 27 arm64 image | When GitHub offers one | `mac-host` on pull requests | The macOS workflow remains the only product build and test path ([08](08-build-and-distribution.md), section 14) |
 | An Apple Developer account | Optional | Developer ID signing and notarisation | Ad hoc releases ([08](08-build-and-distribution.md), section 11.5) |
 
