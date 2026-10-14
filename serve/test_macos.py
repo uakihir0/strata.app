@@ -829,6 +829,14 @@ class EngineInstall(unittest.TestCase):
     def test_prebuilt_bases_order_and_overrides(self):
         env = _enter(self, mock.patch.dict(os.environ))
         env.pop("STRATA_PREBUILT_URL", None)
+        self.assertEqual(
+            [
+                "https://github.com/uakihir0/strata.app/releases/download/v0.1.34-metal.1/",
+                "https://github.com/uakihir0/strata.app/releases/latest/download/",
+            ],
+            setup.prebuilt_bases(),
+        )
+        _enter(self, mock.patch.object(setup, "RELEASE_REPOSITORY", None))
         self.assertEqual([], setup.prebuilt_bases())
         _enter(self, mock.patch.object(setup, "RELEASE_REPOSITORY", "example/strata"))
         self.assertEqual(["https://github.com/example/strata/releases/download/v0.1.34-metal.1/",
